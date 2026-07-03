@@ -5,7 +5,7 @@
 [![CI](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/isaacbentley/sdr-aaronia-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/isaacbentley/sdr-aaronia-rs)
 [![MSRV](https://img.shields.io/badge/rustc-1.85+-ab6000.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
-[![License: GPL-3.0-or-later](https://img.shields.io/crates/l/sdr-aaronia-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
+[![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/sdr-aaronia-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
 A comprehensive Rust library for interfacing with Aaronia Spectran SDR devices. 
 
