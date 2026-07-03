@@ -594,7 +594,7 @@ impl Kernel for HttpSource {
             }
         }
 
-        let mut o = self.output.slice();
+        let o = self.output.slice();
         // Copy available samples to output
         let samples_to_copy = std::cmp::min(self.sample_buffer.len(), o.len());
         for sample in o.iter_mut().take(samples_to_copy) {
