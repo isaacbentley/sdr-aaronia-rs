@@ -1,9 +1,5 @@
 use crate::Result;
-use futuresdr::macros::async_trait;
-use futuresdr::runtime::{
-    Block, BlockMeta, BlockMetaBuilder, Kernel, MessageIo, MessageIoBuilder, StreamIo,
-    StreamIoBuilder, WorkIo,
-};
+use futuresdr::prelude::*;
 use num_complex::Complex32;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{trace, warn};
@@ -77,7 +73,7 @@ impl HttpSinkBuilder {
     }
 
     /// Build the FutureSDR Block.
-    pub fn build(self) -> Result<Block> {
+    pub fn build(self) -> Result<HttpSink> {
         HttpSink::new(
             self.base_url,
             self.frequency,
@@ -91,6 +87,7 @@ impl HttpSinkBuilder {
 }
 
 /// `FutureSDR` block for transmitting IQ samples to an Aaronia RTSA via HTTP.
+#[derive(Block)]
 pub struct HttpSink {
     endpoints_client: HttpEndpointsClient,
     frequency: f64,
@@ -103,6 +100,8 @@ pub struct HttpSink {
     /// via [`HttpSink::dropped_samples`] so a caller can detect a
     /// persistently failing TX link instead of it silently going quiet.
     dropped_samples: u64,
+    #[input]
+    input: futuresdr::runtime::buffer::DefaultCpuReader<Complex32>,
 }
 
 impl HttpSink {
@@ -115,7 +114,7 @@ impl HttpSink {
         _timeout_ms: u64,
         auth_method: AuthMethod,
         streaming_delay: f64,
-    ) -> Result<Block> {
+    ) -> Result<Self> {
         let endpoints_client = HttpEndpointsClient::new(base_url, auth_method)?;
 
         let now = SystemTime::now()
@@ -123,21 +122,17 @@ impl HttpSink {
             .unwrap()
             .as_secs_f64();
 
-        Ok(Block::new(
-            BlockMetaBuilder::new("HttpSink").build(),
-            StreamIoBuilder::new().add_input::<Complex32>("in").build(),
-            MessageIoBuilder::new().build(),
-            Self {
-                endpoints_client,
-                frequency,
-                sample_rate,
-                buffer_size,
-                sample_buffer: Vec::with_capacity(buffer_size * 2),
-                last_transmission_end_time: now,
-                streaming_delay,
-                dropped_samples: 0,
-            },
-        ))
+        Ok(Self {
+            endpoints_client,
+            frequency,
+            sample_rate,
+            buffer_size,
+            sample_buffer: Vec::with_capacity(buffer_size * 2),
+            last_transmission_end_time: now,
+            streaming_delay,
+            dropped_samples: 0,
+            input: futuresdr::runtime::buffer::DefaultCpuReader::default(),
+        })
     }
 
     /// Total complex samples dropped so far because a `push_samples` call
@@ -220,19 +215,18 @@ impl HttpSink {
     }
 }
 
-#[async_trait]
+#[doc(hidden)]
 impl Kernel for HttpSink {
     async fn work(
         &mut self,
-        io: &mut WorkIo,
-        sio: &mut StreamIo,
-        _mio: &mut MessageIo<Self>,
-        _meta: &mut BlockMeta,
+        io: &mut futuresdr::runtime::WorkIo,
+        _mio: &mut futuresdr::runtime::MessageOutputs,
+        _meta: &mut futuresdr::runtime::BlockMeta,
     ) -> anyhow::Result<()> {
-        let i = sio.input(0).slice::<Complex32>();
+        let input_len = self.input.slice().len();
 
-        if i.is_empty() {
-            if io.finished {
+        if input_len == 0 {
+            if self.input.finished() {
                 // Flush remaining samples if the flowgraph is finishing
                 if !self.sample_buffer.is_empty() {
                     let _ = self.push_batch().await;
@@ -246,13 +240,16 @@ impl Kernel for HttpSink {
         let mut consumed = 0;
 
         // Drain input into our buffer until buffer_size is reached
-        while consumed < i.len() {
-            let available_space = self.buffer_size.saturating_sub(self.sample_buffer.len());
-            let to_take = available_space.min(i.len() - consumed);
+        while consumed < input_len {
+            {
+                let i = self.input.slice();
+                let available_space = self.buffer_size.saturating_sub(self.sample_buffer.len());
+                let to_take = available_space.min(i.len() - consumed);
 
-            self.sample_buffer
-                .extend_from_slice(&i[consumed..consumed + to_take]);
-            consumed += to_take;
+                self.sample_buffer
+                    .extend_from_slice(&i[consumed..consumed + to_take]);
+                consumed += to_take;
+            }
 
             if self.sample_buffer.len() >= self.buffer_size {
                 // Buffer full, push a batch
@@ -260,7 +257,12 @@ impl Kernel for HttpSink {
             }
         }
 
-        sio.input(0).consume(consumed);
+        self.input.consume(consumed);
+
+        if self.input.finished() && consumed == input_len {
+            // Next call will handle io.finished
+        }
+
         Ok(())
     }
 }

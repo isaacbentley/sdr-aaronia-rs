@@ -1,9 +1,6 @@
 use crate::{Error, Result};
-use futuresdr::macros::async_trait;
-use futuresdr::runtime::{
-    Block, BlockMeta, BlockMetaBuilder, Kernel, MessageIo, MessageIoBuilder, StreamIo,
-    StreamIoBuilder, WorkIo,
-};
+use futuresdr::prelude::*;
+
 use num_complex::Complex32;
 
 use bytes::Bytes;
@@ -31,7 +28,10 @@ pub struct StreamStats {
 /// This block provides an adapter between the RTSA HTTP streaming protocol and
 /// a `FutureSDR` flowgraph. For most direct asynchronous streaming use cases,
 /// the core path is [`HttpEndpointsClient::start_stream`] instead of this block.
+#[derive(Block)]
 pub struct HttpSource {
+    #[output]
+    output: futuresdr::runtime::buffer::DefaultCpuWriter<Complex32>,
     // Connection configuration
     base_url: String,
     // Note: actual frequency and sample_rate come from stream metadata
@@ -79,7 +79,7 @@ impl HttpSource {
         _reference_level: f64,
         buffer_size: usize,
         timeout_ms: u64,
-    ) -> Result<Block> {
+    ) -> Result<Self> {
         Self::with_advanced_options(
             base_url,
             frequency,
@@ -107,7 +107,7 @@ impl HttpSource {
         input_name: Option<String>,
         rate_reduction: Option<u32>,
         scale: Option<f64>,
-    ) -> Result<Block> {
+    ) -> Result<Self> {
         // Security: Validate and sanitize the base URL (preserve existing validation)
         let parsed_url = url::Url::parse(&base_url)
             .map_err(|_| Error::Protocol(format!("Invalid base URL format: {}", base_url)))?;
@@ -156,30 +156,24 @@ impl HttpSource {
         // Initialize stream parser for chosen format
         let stream_parser = StreamParser::new(stream_format, None)?;
 
-        Ok(Block::new(
-            BlockMetaBuilder::new("HttpSource").build(),
-            StreamIoBuilder::new()
-                .add_output::<Complex32>("out")
-                .build(),
-            MessageIoBuilder::new().build(),
-            Self {
-                base_url,
-                endpoints_client,
-                streaming_client,
-                sample_buffer: VecDeque::with_capacity(buffer_size * 2),
-                stream_format,
-                stream_parser,
-                input_name,
-                rate_reduction,
-                scale,
-                stream_active: false,
-                current_frequency: frequency,
-                current_sample_rate: sample_rate,
-                stream_response: None, // Initialize to None
-                buffer_size,
-                auth_method,
-            },
-        ))
+        Ok(Self {
+            output: futuresdr::runtime::buffer::DefaultCpuWriter::default(),
+            base_url,
+            endpoints_client,
+            streaming_client,
+            sample_buffer: VecDeque::with_capacity(buffer_size * 2),
+            stream_format,
+            stream_parser,
+            input_name,
+            rate_reduction,
+            scale,
+            stream_active: false,
+            current_frequency: frequency,
+            current_sample_rate: sample_rate,
+            stream_response: None, // Initialize to None
+            buffer_size,
+            auth_method,
+        })
     }
 
     async fn start_stream(&mut self) -> Result<()> {
@@ -547,13 +541,11 @@ impl HttpSource {
     }
 }
 
-#[async_trait]
 impl Kernel for HttpSource {
     async fn init(
         &mut self,
-        _sio: &mut StreamIo,
-        _mio: &mut MessageIo<Self>,
-        _meta: &mut BlockMeta,
+        _mio: &mut futuresdr::runtime::MessageOutputs,
+        _meta: &mut futuresdr::runtime::BlockMeta,
     ) -> anyhow::Result<()> {
         info!("HttpSource: INITIALIZED - Starting HTTP stream connection");
         self.start_stream().await?;
@@ -563,10 +555,9 @@ impl Kernel for HttpSource {
 
     async fn work(
         &mut self,
-        io: &mut WorkIo,
-        sio: &mut StreamIo,
-        _mio: &mut MessageIo<Self>,
-        _meta: &mut BlockMeta,
+        io: &mut futuresdr::runtime::WorkIo,
+        _mio: &mut futuresdr::runtime::MessageOutputs,
+        _meta: &mut futuresdr::runtime::BlockMeta,
     ) -> anyhow::Result<()> {
         {
             debug!(
@@ -574,10 +565,10 @@ impl Kernel for HttpSource {
                 self.sample_buffer.len()
             );
         }
-        let o = sio.output(0).slice::<Complex32>();
+        let o_len = self.output.slice().len();
 
         // If we don't have enough samples in buffer, try to fetch more
-        if self.sample_buffer.len() < o.len() {
+        if self.sample_buffer.len() < o_len {
             match self.fetch_samples().await {
                 Ok(fetched) => {
                     if fetched == 0 {
@@ -603,6 +594,7 @@ impl Kernel for HttpSource {
             }
         }
 
+        let mut o = self.output.slice();
         // Copy available samples to output
         let samples_to_copy = std::cmp::min(self.sample_buffer.len(), o.len());
         for sample in o.iter_mut().take(samples_to_copy) {
@@ -613,7 +605,7 @@ impl Kernel for HttpSource {
                 .expect("Buffer length verified");
         }
 
-        sio.output(0).produce(samples_to_copy);
+        self.output.produce(samples_to_copy);
 
         // Log sample production periodically
         if samples_to_copy > 0 {
@@ -776,7 +768,7 @@ impl HttpSourceBuilder {
     }
 
     /// Build with basic options (backward compatibility)
-    pub fn build(self) -> Result<Block> {
+    pub fn build(self) -> Result<HttpSource> {
         HttpSource::with_advanced_options(
             self.base_url,
             self.frequency,

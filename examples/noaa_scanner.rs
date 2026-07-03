@@ -293,11 +293,11 @@ impl NoaaScanner {
         let mut flowgraph = Flowgraph::new();
 
         // FutureSDR blocks
-        let iq_source = VectorSource::new(iq_samples);
+        let iq_source = VectorSource::<Complex32>::new(iq_samples);
 
         // FM demodulator using phase differentiation
         let mut last_sample = Complex32::new(0.0, 0.0);
-        let fm_demod = Apply::new(move |sample: &Complex32| -> f32 {
+        let fm_demod: Apply<_, Complex32, f32> = Apply::new(move |sample: &Complex32| -> f32 {
             let phase_diff = (sample * last_sample.conj()).arg();
             last_sample = *sample;
             phase_diff
@@ -311,15 +311,13 @@ impl NoaaScanner {
         let audio_sink = AudioSink::new(self.config.audio_rate as u32, 1);
 
         // Connect the pipeline with clean, readable calls
-        let source_id = flowgraph.add_block(iq_source)?;
-        let demod_id = flowgraph.add_block(fm_demod)?;
-        let resamp_id = flowgraph.add_block(resampler)?;
-        let audio_id = flowgraph.add_block(audio_sink)?;
+        let source_id = flowgraph.add_block(iq_source);
+        let demod_id = flowgraph.add_block(fm_demod);
+        let resamp_id = flowgraph.add_block(resampler);
+        let audio_id = flowgraph.add_block(audio_sink);
 
         // Simple, linear connection pattern
-        flowgraph.connect_stream(source_id, "out", demod_id, "in")?;
-        flowgraph.connect_stream(demod_id, "out", resamp_id, "in")?;
-        flowgraph.connect_stream(resamp_id, "out", audio_id, "in")?;
+        futuresdr::macros::connect!(flowgraph, source_id > demod_id > resamp_id > audio_id);
 
         Ok(flowgraph)
     }
