@@ -24,6 +24,7 @@ allow = [
     "CDLA-Permissive-2.0",
     "GPL-3.0-or-later",
     "CC0-1.0",
+    "MPL-2.0",
 ]
 
 [sources]
