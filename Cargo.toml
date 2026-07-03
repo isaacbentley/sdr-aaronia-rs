@@ -1,0 +1,109 @@
+[package]
+name = "sdr-aaronia-rs"
+description = "Unified Rust interface for Aaronia Spectran V6 SDRs: native RTSA SDK, HTTP streaming, and RTSA capture-file sources"
+license = "GPL-3.0-or-later"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
+readme = "README.md"
+keywords = ["sdr", "aaronia", "spectran", "rf", "iq"]
+categories = ["hardware-support", "api-bindings", "science"]
+exclude = ["tests/*.rtsa", "tests/sdk/", "tests/asan/", ".github/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+reqwest = { version = "0.13", features = ["blocking", "json", "stream"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+thiserror = "2.0"
+bytes = { version = "1.0", optional = true }
+tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time"], optional = true }
+tracing = "0.1"
+url = { version = "2.4", optional = true }
+futuresdr = { version = "0.0.38", default-features = false, features = ["audio"], optional = true }
+futures = { version = "0.3", optional = true }
+byteorder = { version = "1.5", optional = true }
+bitflags = { version = "2.0", optional = true }
+half = { version = "2.3", optional = true }
+futures-timer = { version = "3.0", optional = true }
+memmap2 = { version = "0.9", optional = true }
+
+num-complex = "0.4"
+tempfile = { version = "3.8", optional = true }
+anyhow = { version = "1.0", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
+
+[dev-dependencies]
+anyhow = "1.0"
+tracing-subscriber = "0.3"  # For examples
+
+proptest = "1.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+wiremock = "0.6" # For HTTP endpoint resiliency testing
+
+# Each `[[bench]]` declares one criterion harness binary. Run with
+# `cargo bench --bench <name>`. Coverage:
+#   parse_int16_packet  — HTTP int16 packet parse throughput
+#   decompress_block    — Rice + wavelet decode throughput
+#   rtsa_open_and_read  — RTSA file open + sample read (LFS fixture)
+[[bench]]
+name = "parse_int16_packet"
+harness = false
+
+[[bench]]
+name = "decompress_block"
+harness = false
+
+[[bench]]
+name = "rtsa_open_and_read"
+harness = false
+
+[features]
+default    = ["http", "file", "sdr-source", "ffi"]
+http       = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json",
+              "dep:url", "dep:bytes", "dep:futures", "dep:half"]
+file       = ["dep:byteorder", "dep:bitflags", "dep:memmap2",
+              "dep:tempfile"]
+futuresdr  = ["http", "dep:futuresdr", "dep:futures-timer", "dep:anyhow"]
+sdr-source = ["http", "file", "dep:crossbeam-channel", "dep:anyhow"]
+ffi        = ["http", "file"]
+native-sdk = ["libloading", "widestring"]
+
+[[example]]
+name = "noaa_scanner"
+required-features = ["futuresdr", "http"]
+
+[[example]]
+name = "native_sdk_basic"
+required-features = ["native-sdk"]
+
+[[example]]
+name = "dump_metadata"
+required-features = ["file"]
+
+[[example]]
+name = "device_control"
+required-features = ["http"]
+
+[[example]]
+name = "http_iq_quickstart"
+required-features = ["http"]
+
+[[example]]
+name = "read_rtsa_file"
+required-features = ["file"]
+
+[[example]]
+name = "channel_hopping"
+required-features = ["sdr-source"]
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+libloading = { version = "0.7", optional = true }
+widestring = { version = "1.1", optional = true }

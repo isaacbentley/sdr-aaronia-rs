@@ -1,0 +1,239 @@
+use crate::Result;
+use futuresdr::macros::async_trait;
+use futuresdr::runtime::{
+    Block, BlockMeta, BlockMetaBuilder, Kernel, MessageIo, MessageIoBuilder, StreamIo,
+    StreamIoBuilder, WorkIo,
+};
+use num_complex::Complex32;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{trace, warn};
+
+use crate::http_endpoints::{AuthMethod, HttpEndpointsClient, TxSampleRequest};
+
+/// Builder for the `FutureSDR` [`HttpSink`] block.
+pub struct HttpSinkBuilder {
+    base_url: String,
+    frequency: f64,
+    sample_rate: f64,
+    buffer_size: usize,
+    timeout_ms: u64,
+    auth_method: AuthMethod,
+    streaming_delay: f64,
+}
+
+impl Default for HttpSinkBuilder {
+    fn default() -> Self {
+        Self::new("http://localhost:54664")
+    }
+}
+
+impl HttpSinkBuilder {
+    /// Create a new HttpSinkBuilder with a target base URL.
+    pub fn new(base_url: &str) -> Self {
+        Self {
+            base_url: base_url.to_string(),
+            frequency: 100e6,
+            sample_rate: 1e6,
+            buffer_size: 65536,
+            timeout_ms: 15000,
+            auth_method: AuthMethod::None,
+            streaming_delay: 0.1, // Default 100ms
+        }
+    }
+
+    /// Set the target transmission center frequency in Hz.
+    #[must_use]
+    pub fn frequency(mut self, freq: f64) -> Self {
+        self.frequency = freq;
+        self
+    }
+
+    /// Set the target transmission sample rate in Hz.
+    #[must_use]
+    pub fn sample_rate(mut self, rate: f64) -> Self {
+        self.sample_rate = rate;
+        self
+    }
+
+    /// Set the internal buffer size (number of samples per chunk sent via HTTP).
+    #[must_use]
+    pub fn buffer_size(mut self, size: usize) -> Self {
+        self.buffer_size = size;
+        self
+    }
+
+    /// Set the streaming delay in seconds. This allows queuing of transmission requests ahead of time to accommodate jitter.
+    #[must_use]
+    pub fn streaming_delay(mut self, delay_s: f64) -> Self {
+        self.streaming_delay = delay_s;
+        self
+    }
+
+    /// Set the authentication method for the endpoint.
+    #[must_use]
+    pub fn auth(mut self, auth: AuthMethod) -> Self {
+        self.auth_method = auth;
+        self
+    }
+
+    /// Build the FutureSDR Block.
+    pub fn build(self) -> Result<Block> {
+        HttpSink::new(
+            self.base_url,
+            self.frequency,
+            self.sample_rate,
+            self.buffer_size,
+            self.timeout_ms,
+            self.auth_method,
+            self.streaming_delay,
+        )
+    }
+}
+
+/// `FutureSDR` block for transmitting IQ samples to an Aaronia RTSA via HTTP.
+pub struct HttpSink {
+    endpoints_client: HttpEndpointsClient,
+    frequency: f64,
+    sample_rate: f64,
+    buffer_size: usize,
+    sample_buffer: Vec<Complex32>,
+    last_transmission_end_time: f64,
+    streaming_delay: f64,
+}
+
+impl HttpSink {
+    #[allow(clippy::too_many_arguments, clippy::new_ret_no_self)]
+    pub fn new(
+        base_url: String,
+        frequency: f64,
+        sample_rate: f64,
+        buffer_size: usize,
+        _timeout_ms: u64,
+        auth_method: AuthMethod,
+        streaming_delay: f64,
+    ) -> Result<Block> {
+        let endpoints_client = HttpEndpointsClient::new(base_url, auth_method)?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        Ok(Block::new(
+            BlockMetaBuilder::new("HttpSink").build(),
+            StreamIoBuilder::new().add_input::<Complex32>("in").build(),
+            MessageIoBuilder::new().build(),
+            Self {
+                endpoints_client,
+                frequency,
+                sample_rate,
+                buffer_size,
+                sample_buffer: Vec::with_capacity(buffer_size * 2),
+                last_transmission_end_time: now,
+                streaming_delay,
+            },
+        ))
+    }
+
+    async fn push_batch(&mut self) -> Result<()> {
+        if self.sample_buffer.is_empty() {
+            return Ok(());
+        }
+
+        let num_complex = self.sample_buffer.len();
+        let samples_slice: &[f32] = unsafe {
+            std::slice::from_raw_parts(self.sample_buffer.as_ptr() as *const f32, num_complex * 2)
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let desired_start = now + self.streaming_delay;
+
+        // Ensure we don't start before the previous burst ended to prevent overlaps
+        let start_time = desired_start.max(self.last_transmission_end_time);
+
+        // Duration of this burst in seconds
+        let duration = num_complex as f64 / self.sample_rate;
+        let end_time = start_time + duration;
+
+        // Keep 1 sample spacing between consecutive requests
+        self.last_transmission_end_time = end_time + (1.0 / self.sample_rate);
+
+        let req = TxSampleRequest {
+            start_time,
+            end_time,
+            start_frequency: self.frequency - self.sample_rate / 2.0,
+            end_frequency: self.frequency + self.sample_rate / 2.0,
+            step_frequency: None,
+            min_power: -2.0,
+            max_power: 2.0,
+            sample_size: 2, // 2 elements for complex floats
+            sample_depth: 1,
+            unit: "volt".to_string(),
+            payload: "iq".to_string(),
+            push: true,
+            samples: samples_slice,
+        };
+
+        match self.endpoints_client.push_samples(&req).await {
+            Ok(_) => {
+                trace!("Successfully pushed {} samples to RTSA", num_complex);
+                self.sample_buffer.clear();
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to push samples to RTSA: {}", e);
+                // Drop on failure to prevent unbounded stalling in the flowgraph stream
+                self.sample_buffer.clear();
+                Err(e)
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Kernel for HttpSink {
+    async fn work(
+        &mut self,
+        io: &mut WorkIo,
+        sio: &mut StreamIo,
+        _mio: &mut MessageIo<Self>,
+        _meta: &mut BlockMeta,
+    ) -> anyhow::Result<()> {
+        let i = sio.input(0).slice::<Complex32>();
+
+        if i.is_empty() {
+            if io.finished {
+                // Flush remaining samples if the flowgraph is finishing
+                if !self.sample_buffer.is_empty() {
+                    let _ = self.push_batch().await;
+                }
+                io.finished = true;
+                return Ok(());
+            }
+            return Ok(());
+        }
+
+        let mut consumed = 0;
+
+        // Drain input into our buffer until buffer_size is reached
+        while consumed < i.len() {
+            let available_space = self.buffer_size.saturating_sub(self.sample_buffer.len());
+            let to_take = available_space.min(i.len() - consumed);
+
+            self.sample_buffer
+                .extend_from_slice(&i[consumed..consumed + to_take]);
+            consumed += to_take;
+
+            if self.sample_buffer.len() >= self.buffer_size {
+                // Buffer full, push a batch
+                let _ = self.push_batch().await;
+            }
+        }
+
+        sio.input(0).consume(consumed);
+        Ok(())
+    }
+}

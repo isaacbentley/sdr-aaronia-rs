@@ -1,0 +1,33 @@
+# cargo-deny configuration. CI currently runs `check advisories` only;
+# the sections below keep the defaults explicit so further gates
+# (licenses, bans, sources) can be enabled deliberately.
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    "RUSTSEC-2025-0052", # async-std has been discontinued; required by futuresdr
+]
+
+[licenses]
+version = 2
+# The crate itself is GPL-3.0-or-later.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-or-later",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+
+[sources]
+# `sdr-source-rs` is consumed as a pinned git dependency until it is
+# published to crates.io.
+unknown-git = "allow"

@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+.DS_Store
+
+# Proprietary Aaronia SDK artifacts (header/DLL/import lib) used for local
+# FFI-conformance verification only. Marked CONFIDENTIAL AND PROPRIETARY by
+# Aaronia — must not be redistributed in this public repository.
+tests/sdk/
