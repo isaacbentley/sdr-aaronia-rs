@@ -2,7 +2,7 @@
 name = "sdr-aaronia-rs"
 description = "Unified Rust interface for Aaronia Spectran V6 SDRs: native RTSA SDK, HTTP streaming, and RTSA capture-file sources"
 license = "GPL-3.0-or-later"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
@@ -12,7 +12,7 @@ categories = ["hardware-support", "api-bindings", "science"]
 exclude = ["tests/*.rtsa", "tests/sdk/", "tests/asan/", ".github/"]
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["http", "file", "sdr-source", "ffi", "native-sdk"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
