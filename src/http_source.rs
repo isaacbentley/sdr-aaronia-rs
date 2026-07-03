@@ -68,7 +68,9 @@ pub struct HttpSource {
 }
 
 impl HttpSource {
-    /// New.
+    /// Build a FutureSDR `Block` wrapping an `HttpSource` with basic
+    /// options; use [`HttpSourceBuilder`] or [`Self::with_advanced_options`]
+    /// for finer control (auth, input selection, rate reduction, scale).
     #[allow(clippy::new_ret_no_self)]
     pub fn new(
         base_url: String,
@@ -661,7 +663,8 @@ pub struct HttpSourceBuilder {
 }
 
 impl HttpSourceBuilder {
-    /// New.
+    /// Create a builder targeting `base_url` with the standard defaults
+    /// (100 MHz / 1 MS/s / Int16 / no auth).
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
@@ -678,7 +681,7 @@ impl HttpSourceBuilder {
         }
     }
 
-    /// Frequency.
+    /// Set the initial center frequency, in Hz.
     #[must_use]
     pub fn frequency(mut self, freq: f64) -> Self {
         self.frequency = freq;
@@ -691,7 +694,7 @@ impl HttpSourceBuilder {
         Ok(self)
     }
 
-    /// Sample rate.
+    /// Set the initial sample rate, in Hz.
     #[must_use]
     pub fn sample_rate(mut self, rate: f64) -> Self {
         self.sample_rate = rate;
@@ -704,21 +707,21 @@ impl HttpSourceBuilder {
         Ok(self)
     }
 
-    /// Reference level.
+    /// Set the initial reference level, in dBm.
     #[must_use]
     pub fn reference_level(mut self, level: f64) -> Self {
         self.reference_level = level;
         self
     }
 
-    /// Buffer size.
+    /// Set the internal sample buffer capacity, in samples.
     #[must_use]
     pub fn buffer_size(mut self, size: usize) -> Self {
         self.buffer_size = size;
         self
     }
 
-    /// Timeout ms.
+    /// Set the connection-establishment timeout, in milliseconds.
     #[must_use]
     pub fn timeout_ms(mut self, timeout: u64) -> Self {
         self.timeout_ms = timeout;
@@ -764,7 +767,9 @@ impl HttpSourceBuilder {
         self
     }
 
-    /// With native sdk.
+    /// No-op kept for backward API compatibility. `HttpSource` always
+    /// streams over HTTP; routing through the native SDK instead lives in
+    /// [`crate::sdk_source`] / [`crate::unified_source`].
     #[must_use]
     pub fn with_native_sdk(self, _enable: bool) -> Self {
         self

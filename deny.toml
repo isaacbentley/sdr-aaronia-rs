@@ -1,13 +1,15 @@
-# cargo-deny configuration. CI currently runs `check advisories` only;
-# the sections below keep the defaults explicit so further gates
-# (licenses, bans, sources) can be enabled deliberately.
+# cargo-deny configuration. CI runs `cargo deny check` (advisories,
+# licenses, bans, sources) — see `.github/workflows/ci.yml`'s `deny` job.
 
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    "RUSTSEC-2025-0052", # async-std has been discontinued; required by futuresdr
-]
+# No advisories are currently ignored. The Phase-1 dependency diet
+# removed `async-std` (previously pulled in transitively via
+# `futuresdr`) from the tree entirely, so the `RUSTSEC-2025-0052` ignore
+# that used to live here no longer matches anything — `cargo deny`
+# already flags a stale ignore as a hard error, which is what caught
+# this.
 
 [licenses]
 version = 2

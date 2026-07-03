@@ -13,7 +13,7 @@
 
 use futures::stream::StreamExt;
 use sdr_aaronia_rs::http_endpoints::{
-    AuthMethod, HttpEndpointsClient, InputProcessingType, StreamParams,
+    AuthMethod, HttpEndpointsClient, InputProcessingType, StreamParams, TxSampleRequest,
 };
 use sdr_aaronia_rs::http_streaming::{DropDetector, PayloadType, StreamFormat};
 use std::time::{Duration, Instant};
@@ -479,4 +479,56 @@ async fn live_unified_source() {
     );
 
     source.stop_streaming().await.expect("stop_streaming");
+}
+
+/// Push a single small burst of IQ samples via `POST /sample`. Confirms
+/// the HTTP TX path (`HttpEndpointsClient::push_samples`, and the
+/// `HttpSink` FutureSDR block that wraps it) is actually accepted by a
+/// real RTSA-Suite PRO server — unlike the native `TxStream` path (no TX
+/// hardware available locally to verify against), the HTTP endpoint is
+/// live-testable regardless of the attached device's capabilities, since
+/// `/sample` accepts pushed samples independent of RX/TX support.
+#[tokio::test]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+async fn live_tx_push_sample() {
+    let c = client();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    // Schedule a few seconds out so the server has time to accept and
+    // queue the burst rather than rejecting a start_time in the past.
+    let start_time = now + 2.0;
+    let sample_rate = 1e6;
+    let samples: Vec<f32> = (0..2048)
+        .flat_map(|i| {
+            let phase = i as f32 * 0.1;
+            [phase.cos() * 0.01, phase.sin() * 0.01]
+        })
+        .collect();
+    let num_complex = samples.len() / 2;
+    let end_time = start_time + num_complex as f64 / sample_rate;
+
+    let req = TxSampleRequest {
+        start_time,
+        end_time,
+        start_frequency: 299e6,
+        end_frequency: 301e6,
+        step_frequency: Some(sample_rate),
+        min_power: -2.0,
+        max_power: 2.0,
+        sample_size: 2,
+        sample_depth: 1,
+        unit: "volt".to_string(),
+        payload: "iq".to_string(),
+        push: true,
+        samples: &samples,
+    };
+
+    c.push_samples(&req).await.expect("push_samples");
+    println!(
+        "pushed {} complex samples via /sample (start_time={:.3}, end_time={:.3})",
+        num_complex, start_time, end_time
+    );
 }

@@ -457,7 +457,8 @@ impl Default for StreamParamsBuilder {
 }
 
 impl StreamParamsBuilder {
-    /// New.
+    /// Create a builder with the `/stream` endpoint defaults (JSON
+    /// format, no limit/rate-reduction/scale).
     pub fn new() -> Self {
         Self {
             params: StreamParams {
@@ -471,49 +472,54 @@ impl StreamParamsBuilder {
         }
     }
 
-    /// Format.
+    /// Set the wire format (`json`, `int16`, `float16`, `float32`).
     #[must_use]
     pub fn format(mut self, format: crate::http_streaming::StreamFormat) -> Self {
         self.params.format = format;
         self
     }
 
-    /// Limit.
+    /// Cap the stream at this many packets before the server closes the
+    /// connection (`?limit=N`).
     #[must_use]
     pub fn limit(mut self, limit: u32) -> Self {
         self.params.limit = Some(limit);
         self
     }
 
-    /// Rate reduction.
+    /// Ask the server to thin the sample rate by this integer factor
+    /// (`?rate_reduction=N`).
     #[must_use]
     pub fn rate_reduction(mut self, factor: u32) -> Self {
         self.params.rate_reduction = Some(factor);
         self
     }
 
-    /// Rate adaption.
+    /// Enable or disable the server's automatic rate adaptation
+    /// (`?rate_adaption=0|1`).
     #[must_use]
     pub fn rate_adaption(mut self, enabled: bool) -> Self {
         self.params.rate_adaption = Some(enabled);
         self
     }
 
-    /// Input.
+    /// Select a named input stream other than the server's default
+    /// (`?input=`).
     #[must_use]
     pub fn input(mut self, input: String) -> Self {
         self.params.input = Some(input);
         self
     }
 
-    /// Scale.
+    /// Set the server-side integer encode multiplier (`?scale=N`); see
+    /// [`StreamParams`] for the encode/decode semantics.
     #[must_use]
     pub fn scale(mut self, scale: f64) -> Self {
         self.params.scale = Some(scale);
         self
     }
 
-    /// Build.
+    /// Consume the builder and produce the final [`StreamParams`].
     pub fn build(self) -> StreamParams {
         self.params
     }

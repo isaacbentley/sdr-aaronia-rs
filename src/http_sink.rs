@@ -99,6 +99,10 @@ pub struct HttpSink {
     sample_buffer: Vec<Complex32>,
     last_transmission_end_time: f64,
     streaming_delay: f64,
+    /// Total complex samples dropped so far because a push failed. Exposed
+    /// via [`HttpSink::dropped_samples`] so a caller can detect a
+    /// persistently failing TX link instead of it silently going quiet.
+    dropped_samples: u64,
 }
 
 impl HttpSink {
@@ -131,14 +135,31 @@ impl HttpSink {
                 sample_buffer: Vec::with_capacity(buffer_size * 2),
                 last_transmission_end_time: now,
                 streaming_delay,
+                dropped_samples: 0,
             },
         ))
+    }
+
+    /// Total complex samples dropped so far because a `push_samples` call
+    /// failed. A steadily increasing count indicates the TX link is
+    /// unhealthy — `work()` cannot fail the flowgraph on a transient push
+    /// error (that would kill the whole graph over one dropped HTTP
+    /// request), so this counter is the way to detect a persistently
+    /// broken link instead of transmission silently going quiet.
+    pub fn dropped_samples(&self) -> u64 {
+        self.dropped_samples
     }
 
     async fn push_batch(&mut self) -> Result<()> {
         if self.sample_buffer.is_empty() {
             return Ok(());
         }
+
+        // `Complex32` is `#[repr(C)] { re: f32, im: f32 }`, so it has
+        // identical layout to `[f32; 2]`; this guards against a future
+        // change to that representation breaking the raw-pointer cast
+        // below.
+        const _: () = assert!(std::mem::size_of::<Complex32>() == 2 * std::mem::size_of::<f32>());
 
         let num_complex = self.sample_buffer.len();
         let samples_slice: &[f32] = unsafe {
@@ -184,8 +205,14 @@ impl HttpSink {
                 Ok(())
             }
             Err(e) => {
-                warn!("Failed to push samples to RTSA: {}", e);
-                // Drop on failure to prevent unbounded stalling in the flowgraph stream
+                self.dropped_samples += num_complex as u64;
+                warn!(
+                    "Failed to push {} samples to RTSA (total dropped: {}): {}",
+                    num_complex, self.dropped_samples, e
+                );
+                // Drop on failure to prevent unbounded stalling in the flowgraph stream.
+                // `dropped_samples()` lets a caller detect a persistently
+                // failing link instead of TX silently going quiet.
                 self.sample_buffer.clear();
                 Err(e)
             }

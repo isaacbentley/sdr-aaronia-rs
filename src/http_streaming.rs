@@ -52,7 +52,7 @@ pub enum StreamFormat {
 }
 
 impl StreamFormat {
-    /// As str.
+    /// Wire-format name used in the `?format=` query parameter.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Json => "json",
@@ -408,7 +408,7 @@ pub enum DropResult {
     /// span between this packet's `start_time` and the previous packet's
     /// `end_time`.
     Drop {
-        /// Gap seconds
+        /// Length of the detected gap, in seconds.
         gap_seconds: f64,
     },
 }
@@ -422,7 +422,7 @@ impl Default for DropDetector {
 }
 
 impl DropDetector {
-    /// New.
+    /// Create a detector with the given gap tolerance, in seconds.
     pub fn new(tolerance: f64) -> Self {
         Self {
             tolerance,
@@ -454,17 +454,18 @@ impl DropDetector {
         result
     }
 
-    /// Drops.
+    /// Cumulative number of drops detected so far.
     pub fn drops(&self) -> u64 {
         self.drops
     }
 
-    /// Cumulative gap seconds.
+    /// Cumulative gap time, in seconds, attributed to detected drops.
     pub fn cumulative_gap_seconds(&self) -> f64 {
         self.cumulative_gap
     }
 
-    /// Reset.
+    /// Clear all accumulated drop statistics and forget the last
+    /// observed packet.
     pub fn reset(&mut self) {
         self.last_end_time = None;
         self.drops = 0;

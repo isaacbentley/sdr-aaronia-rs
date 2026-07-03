@@ -1350,17 +1350,55 @@ pub struct NativeSdkSource {
     sample_buffer: VecDeque<Complex32>,
 }
 
+/// Device health telemetry from the SDK's `AARTSAAPI_ConfigHealth` tree.
+///
+/// Field names (`fronttemp`, `fpgatemp`, `boardpower`) are taken from the
+/// `/healthstatus` HTTP endpoint's JSON tree, captured live from a
+/// SPECTRAN V6 ECO — both surfaces read the same underlying device health
+/// model, so the naming is expected to match, but this has not been
+/// directly exercised against the native `AARTSAAPI_ConfigHealth` call on
+/// real hardware (no Windows/Linux dev box with the SDK installed).
+/// Verify against a live device before depending on this in production.
 #[derive(Debug, Clone, Default)]
 pub struct HealthState {
-    pub temperature: f64,
-    pub voltage: f64,
+    /// Frontend temperature in °C (`fronttemp`), if reported.
+    pub front_temp_c: Option<f64>,
+    /// FPGA temperature in °C (`fpgatemp`), if reported.
+    pub fpga_temp_c: Option<f64>,
+    /// Board power draw in watts (`boardpower`), if reported.
+    pub board_power_w: Option<f64>,
 }
 
+/// GPS telemetry from the SDK's `AARTSAAPI_ConfigHealth` tree.
+///
+/// See [`HealthState`] for the field-naming provenance note.
+///
+/// `latitude`/`longitude`/`altitude`/`time` are `None` unless the
+/// corresponding validity flag (`gpsposvalid`/`gpstimevalid`) is true —
+/// live captures show the device reports a real `gpsposvalid: false`
+/// alongside literal-zero lat/long when no fix is available, and treating
+/// that zero as a real coordinate would put "no GPS fix" at Null Island.
 #[derive(Debug, Clone, Default)]
 pub struct GpsState {
-    pub latitude: f64,
-    pub longitude: f64,
-    pub altitude: f64,
+    /// Number of satellites in view (`satellites`), if reported.
+    pub satellites: Option<u32>,
+    /// Whether `latitude`/`longitude`/`altitude` hold a valid fix
+    /// (`gpsposvalid`).
+    pub position_valid: bool,
+    /// Latitude in degrees (`gpslatitude`). `None` unless
+    /// `position_valid`.
+    pub latitude: Option<f64>,
+    /// Longitude in degrees (`gpslongitude`). `None` unless
+    /// `position_valid`.
+    pub longitude: Option<f64>,
+    /// Altitude in meters (`gpselevation`). `None` unless
+    /// `position_valid`.
+    pub altitude: Option<f64>,
+    /// Whether `time` holds a valid GPS time (`gpstimevalid`).
+    pub time_valid: bool,
+    /// GPS time (`gpstime`), seconds since the Unix epoch. `None` unless
+    /// `time_valid`.
+    pub time: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1398,6 +1436,28 @@ impl NativeSdkSource {
         }
     }
 
+    /// Read a health/GPS leaf value, trying the float accessor first and
+    /// falling back to the integer accessor. Boolean-typed nodes (e.g.
+    /// `gpsposvalid`) are exposed through one of these two numeric
+    /// getters by the SDK — there is no dedicated bool getter in the
+    /// bound API — so this covers both representations rather than
+    /// guessing which one a given firmware uses.
+    unsafe fn read_health_value(
+        &self,
+        device: &mut AARTSAAPI_Device,
+        config: &mut AARTSAAPI_Config,
+    ) -> Option<f64> {
+        unsafe {
+            if let Ok(v) = self.client.get_config_float(device, config) {
+                return Some(v);
+            }
+            if let Ok(v) = self.client.get_config_integer(device, config) {
+                return Some(v as f64);
+            }
+            None
+        }
+    }
+
     unsafe fn walk_health_tree(
         &self,
         device: &mut AARTSAAPI_Device,
@@ -1405,52 +1465,68 @@ impl NativeSdkSource {
         health: &mut HealthState,
         gps: &mut GpsState,
     ) -> Result<()> {
-        let mut current = match self.client.config_first(device, group)? {
-            Some(c) => c,
-            None => return Ok(()),
-        };
+        unsafe {
+            let mut current = match self.client.config_first(device, group)? {
+                Some(c) => c,
+                None => return Ok(()),
+            };
 
-        loop {
-            if let Ok(name) = self.client.get_config_name(device, &mut current) {
-                // Read floats if the node name matches
-                match name.as_str() {
-                    "temperature" => {
-                        if let Ok(val) = self.client.get_config_float(device, &mut current) {
-                            health.temperature = val;
+            loop {
+                if let Ok(name) = self.client.get_config_name(device, &mut current) {
+                    // Field names verified live against `/healthstatus`
+                    // (see `HealthState`/`GpsState` docs) — the exact
+                    // `AARTSAAPI_ConfigHealth` tree naming is inferred,
+                    // not independently confirmed.
+                    match name.as_str() {
+                        "fronttemp" => {
+                            health.front_temp_c = self.read_health_value(device, &mut current);
                         }
-                    }
-                    "voltage" => {
-                        if let Ok(val) = self.client.get_config_float(device, &mut current) {
-                            health.voltage = val;
+                        "fpgatemp" => {
+                            health.fpga_temp_c = self.read_health_value(device, &mut current);
                         }
-                    }
-                    "latitude" => {
-                        if let Ok(val) = self.client.get_config_float(device, &mut current) {
-                            gps.latitude = val;
+                        "boardpower" => {
+                            health.board_power_w = self.read_health_value(device, &mut current);
                         }
-                    }
-                    "longitude" => {
-                        if let Ok(val) = self.client.get_config_float(device, &mut current) {
-                            gps.longitude = val;
+                        "satellites" => {
+                            gps.satellites = self
+                                .read_health_value(device, &mut current)
+                                .map(|v| v as u32);
                         }
-                    }
-                    "altitude" => {
-                        if let Ok(val) = self.client.get_config_float(device, &mut current) {
-                            gps.altitude = val;
+                        "gpsposvalid" => {
+                            gps.position_valid = self
+                                .read_health_value(device, &mut current)
+                                .is_some_and(|v| v != 0.0);
                         }
+                        "gpslatitude" => {
+                            gps.latitude = self.read_health_value(device, &mut current);
+                        }
+                        "gpslongitude" => {
+                            gps.longitude = self.read_health_value(device, &mut current);
+                        }
+                        "gpselevation" => {
+                            gps.altitude = self.read_health_value(device, &mut current);
+                        }
+                        "gpstimevalid" => {
+                            gps.time_valid = self
+                                .read_health_value(device, &mut current)
+                                .is_some_and(|v| v != 0.0);
+                        }
+                        "gpstime" => {
+                            gps.time = self.read_health_value(device, &mut current);
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                }
+
+                // Recurse into children
+                let _ = self.walk_health_tree(device, &mut current, health, gps);
+
+                if !self.client.config_next(device, group, &mut current)? {
+                    break;
                 }
             }
-
-            // Recurse into children
-            let _ = self.walk_health_tree(device, &mut current, health, gps);
-
-            if !self.client.config_next(device, group, &mut current)? {
-                break;
-            }
+            Ok(())
         }
-        Ok(())
     }
 
     pub unsafe fn get_health_and_gps(&mut self) -> Result<(HealthState, GpsState)> {
@@ -1463,6 +1539,21 @@ impl NativeSdkSource {
             let mut health = HealthState::default();
             let mut gps = GpsState::default();
             self.walk_health_tree(&mut device, &mut health_root, &mut health, &mut gps)?;
+
+            // Reconcile validity after the full walk: tree traversal order
+            // is not guaranteed, so `gpsposvalid`/`gpstimevalid` might be
+            // visited after the values they gate. Clearing here (rather
+            // than gating inline) guarantees an invalid fix never leaks
+            // out as a false Null-Island coordinate.
+            if !gps.position_valid {
+                gps.latitude = None;
+                gps.longitude = None;
+                gps.altitude = None;
+            }
+            if !gps.time_valid {
+                gps.time = None;
+            }
+
             Ok((health, gps))
         }
     }
@@ -1586,6 +1677,17 @@ impl NativeSdkSource {
         }
     }
 
+    /// Configure the `sweepsa` (spectrum sweep) config group.
+    ///
+    /// > [!WARNING]
+    /// > Hardware-unverified: the `main/startfreq`/`main/stopfreq`/
+    /// > `main/rbw`/`main/vbw` config paths are inferred from the naming
+    /// > convention used elsewhere in the SDK config tree, not confirmed
+    /// > against a live `sweepsa`-mode device (the developer's V6 ECO
+    /// > only exercises `iqreceiver` mode). Each key is set best-effort —
+    /// > a missing key is silently skipped, matching the eco-mode
+    /// > tolerance in [`Self::configure_iq_receiver`] — so verify the
+    /// > resulting device state before relying on this in production.
     pub unsafe fn configure_sweepsa(&mut self, config: &SweepsaConfig) -> Result<()> {
         unsafe {
             let device = self
@@ -1985,14 +2087,47 @@ impl Drop for NativeSdkSource {
     }
 }
 
+/// Timing and frequency parameters for one burst handed to
+/// [`TxStream::write_samples`].
+///
+/// The official header documents `AARTSAAPI_Packet::startTime`/`endTime`
+/// as "seconds since start of the unix epoch" — an SDK-supplied wall
+/// clock, not zero. Real timestamps matter for TX: they're how the
+/// device schedules the burst against its own master stream time (see
+/// [`NativeSdkClient::get_master_stream_time`]), so a caller should read
+/// that clock and derive `start_time`/`end_time` from it rather than
+/// passing zero.
+#[derive(Debug, Clone, Copy)]
+pub struct TxBurst {
+    /// Burst start time, seconds since the Unix epoch (device master
+    /// stream time, not wall-clock `SystemTime::now()`).
+    pub start_time: f64,
+    /// Burst end time, seconds since the Unix epoch.
+    pub end_time: f64,
+    /// Center frequency of the burst, in Hz.
+    pub center_frequency_hz: f64,
+    /// IQ sample rate of the burst, in Hz.
+    pub sample_rate_hz: f64,
+}
+
 /// Unverified hardware transmit path using `AARTSAAPI_SendPacket`.
 pub struct TxStream<'a> {
     client: Arc<NativeSdkClient>,
     device: &'a mut AARTSAAPI_Device,
 }
 
+// SAFETY: `AARTSAAPI_Device` wraps a raw pointer (`d: *mut c_void`) to
+// SDK-internal state, which makes the auto-derived `Send`/`Sync` both
+// absent by default. `TxStream` borrows the device *exclusively*
+// (`&'a mut AARTSAAPI_Device`), so the borrow checker already prevents
+// any concurrent access through this handle — `Send` only permits
+// *moving* the whole stream (and its exclusive borrow) to another
+// thread, which is sound. `Sync` is deliberately not implemented:
+// nothing in this API takes `&self`, so there is no use case for
+// sharing `&TxStream` across threads, and doing so would require the
+// SDK to tolerate concurrent calls on one device handle, which is
+// undocumented and not assumed here.
 unsafe impl Send for TxStream<'_> {}
-unsafe impl Sync for TxStream<'_> {}
 
 impl<'a> TxStream<'a> {
     pub(crate) fn new(client: Arc<NativeSdkClient>, device: &'a mut AARTSAAPI_Device) -> Self {
@@ -2003,26 +2138,52 @@ impl<'a> TxStream<'a> {
     ///
     /// > [!WARNING]
     /// > Hardware-unverified on the V6. The developer's ECO lacks TX capability.
-    pub unsafe fn write_samples(&mut self, channel: i32, samples: &[Complex32]) -> Result<()> {
-        let packet = AARTSAAPI_Packet {
-            cbsize: std::mem::size_of::<AARTSAAPI_Packet>() as i64,
-            stream_id: 0,
-            flags: 0,
-            start_time: 0.0,
-            end_time: 0.0,
-            start_frequency: 0.0,
-            step_frequency: 0.0, // Sample rate?
-            span_frequency: 0.0,
-            rbw_frequency: 0.0,
-            num: samples.len() as i64,
-            total: samples.len() as i64,
-            size: std::mem::size_of_val(samples) as i64,
-            stride: 2, // Complex IQ contains 2 floats
-            fp32: samples.as_ptr() as *mut f32,
-            interleave: 0,
-        };
+    pub unsafe fn write_samples(
+        &mut self,
+        channel: i32,
+        burst: TxBurst,
+        samples: &[Complex32],
+    ) -> Result<()> {
+        unsafe {
+            // `Complex32` is `#[repr(C)] { re: f32, im: f32 }`, so it has
+            // identical layout to `[f32; 2]`; this guards against a future
+            // change to that representation breaking the raw-pointer cast
+            // below.
+            const _: () =
+                assert!(std::mem::size_of::<Complex32>() == 2 * std::mem::size_of::<f32>());
 
-        self.client.send_packet(self.device, channel, &packet)
+            let half_span = burst.sample_rate_hz / 2.0;
+            let packet = AARTSAAPI_Packet {
+                cbsize: std::mem::size_of::<AARTSAAPI_Packet>() as i64,
+                stream_id: 0,
+                flags: 0,
+                start_time: burst.start_time,
+                end_time: burst.end_time,
+                start_frequency: burst.center_frequency_hz - half_span,
+                // Per the official header, stepFrequency is "bin size or
+                // sample rate of the data" — for time-domain IQ, that's
+                // the sample rate.
+                step_frequency: burst.sample_rate_hz,
+                span_frequency: burst.sample_rate_hz,
+                rbw_frequency: 0.0,
+                num: samples.len() as i64,
+                total: samples.len() as i64,
+                // Per the official header, `size` is "size of each
+                // sample" (in floats), not the total buffer size. One
+                // complex IQ sample is 2 floats.
+                size: 2,
+                stride: 2, // Complex IQ contains 2 floats
+                // SAFETY: `AARTSAAPI_Packet::fp32` is `*mut f32` in the
+                // official header even for outbound (SendPacket) use;
+                // the send path is documented as read-only over this
+                // buffer, so casting away `const` here does not expose
+                // the caller's immutable slice to an actual mutation.
+                fp32: samples.as_ptr() as *mut f32,
+                interleave: 0,
+            };
+
+            self.client.send_packet(self.device, channel, &packet)
+        }
     }
 }
 

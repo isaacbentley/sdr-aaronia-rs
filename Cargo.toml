@@ -74,7 +74,7 @@ file       = ["dep:byteorder", "dep:bitflags", "dep:memmap2",
 futuresdr  = ["http", "dep:futuresdr", "dep:futures-timer", "dep:anyhow"]
 sdr-source = ["http", "file", "dep:crossbeam-channel", "dep:anyhow"]
 ffi        = ["http", "file"]
-native-sdk = ["libloading", "widestring"]
+native-sdk = ["dep:libloading", "dep:widestring"]
 
 [[example]]
 name = "noaa_scanner"

@@ -1619,7 +1619,7 @@ impl RtsaSource {
         Ok(Some(SampleData::Iq(samples)))
     }
 
-    /// Metadata.
+    /// The comprehensive metadata parsed from this file's chunk headers.
     pub fn metadata(&self) -> &RtsaMetadata {
         &self.metadata
     }
@@ -1868,7 +1868,14 @@ impl RtsaSource {
         (score as f32 / total as f32) * 100.0
     }
 
-    /// Read samples.
+    /// Read up to `num_samples` samples from the stream, optionally
+    /// restricted to a specific `sub_stream_id`. Returns `Ok(None)` at
+    /// end of stream; a single call returns at most one chunk's worth of
+    /// samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure or a malformed chunk.
     pub fn read_samples(
         &mut self,
         num_samples: usize,
@@ -2044,12 +2051,12 @@ impl RtsaSource {
         }
     }
 
-    /// Current position.
+    /// The current read cursor, in samples from the start of the stream.
     pub fn current_position(&self) -> u64 {
         self.current_sample_index
     }
 
-    /// Total samples.
+    /// Total number of samples in the stream, per the file's metadata.
     pub fn total_samples(&self) -> u64 {
         self.metadata.total_samples
     }
@@ -2064,16 +2071,17 @@ impl RtsaSource {
             .saturating_sub(self.current_sample_index)
     }
 
-    /// Is eof.
+    /// Whether the read cursor has reached the end of the stream.
     pub fn is_eof(&self) -> bool {
         self.current_sample_index >= self.metadata.total_samples
     }
 
-    /// Seek to sample.
+    /// Seek the read cursor to an absolute sample index.
     ///
     /// # Errors
     ///
-    /// Returns an error if the operation fails.
+    /// Returns an error if `sample_index` is out of bounds or does not
+    /// fall within any known SAMP chunk.
     pub fn seek_to_sample(&mut self, sample_index: u64) -> Result<()> {
         if sample_index >= self.metadata.total_samples {
             return Err(Error::FileFormat {
@@ -2106,11 +2114,11 @@ impl RtsaSource {
         })
     }
 
-    /// Reset.
+    /// Seek the read cursor back to the first sample of the stream.
     ///
     /// # Errors
     ///
-    /// Returns an error if the operation fails.
+    /// Returns an error on I/O failure while seeking the underlying file.
     pub fn reset(&mut self) -> Result<()> {
         self.current_sample_index = 0;
         self.chunk_scan_hint = 0;

@@ -296,11 +296,12 @@ pub struct AdaptiveChunkReader {
 }
 
 impl AdaptiveChunkReader {
-    /// New.
+    /// Open `path` as a memory-mapped RTSA file with a 64 KB starting
+    /// read-ahead window.
     ///
     /// # Errors
     ///
-    /// Returns an error if the operation fails.
+    /// Returns an error if the file cannot be opened or memory-mapped.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(Self {
             mmap_reader: MmapRtsaReader::new(path)?,
@@ -337,7 +338,8 @@ impl AdaptiveChunkReader {
         self.mmap_reader.read_chunk(offset, size)
     }
 
-    /// Get performance stats.
+    /// Returns the current cache statistics and read-ahead window size
+    /// (in bytes).
     pub fn get_performance_stats(&self) -> (CacheStats, usize) {
         (self.mmap_reader.get_cache_stats(), self.read_ahead_size)
     }

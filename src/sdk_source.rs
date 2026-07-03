@@ -1,30 +1,34 @@
 //! Aaronia RTSA Native SDK Integration
 //!
-//! This module provides access to the native SDK functionality.
+//! This module provides a high-level wrapper over [`crate::native_sdk`].
+//!
+//! Unlike `native_sdk` itself, this module carries **no** internal
+//! platform/feature fallback: `lib.rs` gates `pub mod sdk_source;` behind
+//! the exact same condition (`feature = "native-sdk"` and
+//! `target_os = "windows"` or `"linux"`) that `native_sdk` uses, so
+//! everything below is only ever compiled when the native SDK is
+//! actually available. Callers on unsupported platforms simply don't see
+//! this module — there is no runtime fallback path to construct or call
+//! (an earlier revision of this file *had* a `#[cfg(not(...))]` runtime
+//! fallback, but that condition can never be true inside a module gated
+//! identically at the crate root, so it was dead code and used before
+//! this file compiled a `use anyhow::anyhow` import that no longer
+//! exists in this crate).
+//!
+//! For HTTP-based streaming from an Aaronia RTSA Suite Pro instance, use
+//! [`crate::AaroniaSource`] (in [`crate::unified_source`]) instead.
 
-use crate::{Error, Result};
+use crate::Result;
 use std::time::Duration;
 
-#[cfg(feature = "native-sdk")]
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod native_sdk {
     // Re-export everything from the native_sdk module
     pub use crate::native_sdk::*;
 }
 
 /// High-level SDK source wrapper for easier integration with the native Spectran V6 SDK.
-///
-/// # Note on HTTP Fallback
-/// The HTTP fallback capability in `SdkSource` is deprecated/unsupported. For HTTP-based
-/// streaming from an Aaronia RTSA Suite Pro instance, please use `AaroniaSource` (located in the
-/// `unified_source` module) instead of `SdkSource`. On unsupported platforms (such as macOS or
-/// platforms without the `native-sdk` feature enabled), this struct will return errors when attempting
-/// to initialize or stream.
 pub struct SdkSource {
-    #[cfg(feature = "native-sdk")]
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
     native_source: Option<crate::native_sdk::NativeSdkSource>,
-
     config: SdkConfig,
 }
 
@@ -37,9 +41,13 @@ pub struct SdkConfig {
     /// mode-qualified enumeration — and opening uses the qualified form,
     /// defaulting to `<family>/raw` when no mode is given.
     pub device_type: String,
+    /// Center frequency in Hz.
     pub center_frequency: f64,
+    /// IQ span (sample rate) in Hz.
     pub span_frequency: f64,
+    /// Reference level in dBm.
     pub reference_level: f64,
+    /// Device operation timeout.
     pub timeout: Duration,
 }
 
@@ -81,10 +89,7 @@ impl SdkSource {
     /// Create a new SDK source with default configuration
     pub fn new() -> Self {
         Self {
-            #[cfg(feature = "native-sdk")]
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
             native_source: None,
-
             config: SdkConfig::default(),
         }
     }
@@ -92,51 +97,22 @@ impl SdkSource {
     /// Create a new SDK source with custom configuration
     pub fn with_config(config: SdkConfig) -> Self {
         Self {
-            #[cfg(feature = "native-sdk")]
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
             native_source: None,
-
             config,
         }
     }
 
     /// Initialize the SDK source
     pub async fn initialize(&mut self) -> Result<()> {
-        #[cfg(feature = "native-sdk")]
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            let mut native_source = unsafe { crate::native_sdk::NativeSdkSource::new()? };
-            unsafe { native_source.initialize()? };
-            self.native_source = Some(native_source);
-            Ok(())
-        }
-
-        #[cfg(not(all(
-            feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
-        )))]
-        {
-            Err(anyhow!(
-                "Native SDK is not supported on this platform. Please use AaroniaSource instead."
-            ))
-        }
+        let mut native_source = unsafe { crate::native_sdk::NativeSdkSource::new()? };
+        unsafe { native_source.initialize()? };
+        self.native_source = Some(native_source);
+        Ok(())
     }
 
     /// Check if the source is available
     pub fn is_available(&self) -> bool {
-        #[cfg(feature = "native-sdk")]
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            self.native_source.is_some()
-        }
-
-        #[cfg(not(all(
-            feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
-        )))]
-        {
-            false
-        }
+        self.native_source.is_some()
     }
 
     /// Get the current configuration
@@ -151,76 +127,51 @@ impl SdkSource {
 
     /// Start streaming from the SDK source
     pub async fn start_streaming(&mut self) -> Result<()> {
-        #[cfg(feature = "native-sdk")]
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            if let Some(ref mut native_source) = self.native_source {
-                unsafe {
-                    // Enumerate with the bare family; open with the
-                    // mode-qualified string. Passing a mode-qualified
-                    // string to enumeration makes the SDK silently
-                    // return zero devices.
-                    let family = self.config.device_family().to_string();
-                    let open_mode = self.config.device_open_mode();
-                    let devices = native_source.find_devices(&family)?;
-                    if devices.is_empty() {
-                        return Err(Error::Sdk(format!("No {} devices found", family)));
-                    }
+        let native_source = self
+            .native_source
+            .as_mut()
+            .ok_or_else(|| crate::Error::Sdk("Source not initialized".to_string()))?;
 
-                    let device_info = &devices[0];
-                    if !device_info.ready() {
-                        return Err(Error::Sdk("Device not ready".to_string()));
-                    }
-
-                    native_source.open_device(&open_mode, &device_info.serial_number)?;
-
-                    // Configure device
-                    native_source.configure_iq_receiver(
-                        self.config.center_frequency,
-                        self.config.span_frequency,
-                        self.config.reference_level,
-                    )?;
-
-                    // Start streaming
-                    native_source.start_streaming()?;
-                }
-                return Ok(());
+        unsafe {
+            // Enumerate with the bare family; open with the
+            // mode-qualified string. Passing a mode-qualified
+            // string to enumeration makes the SDK silently
+            // return zero devices.
+            let family = self.config.device_family().to_string();
+            let open_mode = self.config.device_open_mode();
+            let devices = native_source.find_devices(&family)?;
+            if devices.is_empty() {
+                return Err(crate::Error::Sdk(format!("No {} devices found", family)));
             }
-            Err(Error::Sdk("Source not initialized".to_string()))
-        }
 
-        #[cfg(not(all(
-            feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
-        )))]
-        {
-            Err(anyhow!(
-                "Native SDK is not supported on this platform. Please use AaroniaSource instead."
-            ))
+            let device_info = &devices[0];
+            if !device_info.ready() {
+                return Err(crate::Error::Sdk("Device not ready".to_string()));
+            }
+
+            native_source.open_device(&open_mode, &device_info.serial_number)?;
+
+            // Configure device
+            native_source.configure_iq_receiver(
+                self.config.center_frequency,
+                self.config.span_frequency,
+                self.config.reference_level,
+            )?;
+
+            // Start streaming
+            native_source.start_streaming()?;
         }
+        Ok(())
     }
 
     /// Stop streaming
     pub async fn stop_streaming(&mut self) -> Result<()> {
-        #[cfg(feature = "native-sdk")]
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            if let Some(ref mut native_source) = self.native_source {
-                unsafe { native_source.stop_streaming()? };
-                return Ok(());
-            }
-            Err(Error::Sdk("Source not initialized".to_string()))
-        }
-
-        #[cfg(not(all(
-            feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
-        )))]
-        {
-            Err(anyhow!(
-                "Native SDK is not supported on this platform. Please use AaroniaSource instead."
-            ))
-        }
+        let native_source = self
+            .native_source
+            .as_mut()
+            .ok_or_else(|| crate::Error::Sdk("Source not initialized".to_string()))?;
+        unsafe { native_source.stop_streaming()? };
+        Ok(())
     }
 
     /// Read samples from the source
@@ -229,31 +180,18 @@ impl SdkSource {
         buffer: &mut Vec<num_complex::Complex32>,
         max_samples: usize,
     ) -> Result<usize> {
-        #[cfg(feature = "native-sdk")]
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            if let Some(ref mut native_source) = self.native_source {
-                let n = unsafe { native_source.read_samples(buffer, max_samples)? };
-                return Ok(n);
-            }
+        match self.native_source.as_mut() {
+            Some(native_source) => Ok(unsafe { native_source.read_samples(buffer, max_samples)? }),
+            None => Ok(0),
         }
-
-        let _ = buffer;
-        let _ = max_samples;
-        Ok(0)
     }
 
     /// Check if streaming is active
     pub fn is_streaming(&self) -> bool {
-        #[cfg(feature = "native-sdk")]
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            if let Some(ref native_source) = self.native_source {
-                return native_source.is_streaming();
-            }
-        }
-
-        false
+        self.native_source
+            .as_ref()
+            .map(|s| s.is_streaming())
+            .unwrap_or(false)
     }
 }
 
@@ -396,13 +334,38 @@ mod tests {
         assert!(!source.is_streaming());
     }
 
-    #[tokio::test]
-    async fn test_sdk_source_read_samples_empty() {
+    /// Poll a future to completion with a no-op waker, with no async
+    /// runtime dependency. `sdk_source` is gated to `native-sdk` +
+    /// windows/linux and does *not* require the `http` feature, so its
+    /// tests can't assume `tokio` is in the dependency graph — `#[tokio::
+    /// test]` here previously broke `cargo test --no-default-features
+    /// --features native-sdk` (no `http`, hence no `tokio`) the moment
+    /// this module's tests actually ran on a supported OS (a case the
+    /// crate's macOS-only local dev loop can't exercise, since this
+    /// whole module compiles away there). Sound here specifically
+    /// because `SdkSource::read_samples`'s body never `.await`s
+    /// anything that can return `Pending` — it's a synchronous FFI call
+    /// wrapped in `async fn` purely to match the rest of the crate's
+    /// async surface — so the first `poll` always resolves.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(val) => val,
+            std::task::Poll::Pending => panic!(
+                "read_samples() unexpectedly returned Pending; it must complete synchronously"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_sdk_source_read_samples_empty() {
         let mut source = SdkSource::new();
 
         // Without initialization, should return 0 samples
         let mut buffer = Vec::new();
-        let n = source.read_samples(&mut buffer, 1024).await.unwrap();
+        let n = block_on(source.read_samples(&mut buffer, 1024)).unwrap();
         assert_eq!(n, 0);
         assert!(buffer.is_empty());
     }
