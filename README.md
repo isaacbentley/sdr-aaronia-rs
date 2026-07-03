@@ -11,7 +11,7 @@ A comprehensive Rust library for interfacing with Aaronia Spectran SDR devices.
 
 *Disclaimer: This project is not affiliated with Aaronia AG. Aaronia, SPECTRAN, and RTSA-Suite PRO are trademarks of Aaronia AG.*
 
-`sdr-aaronia-rs` provides a unified API for interacting with Aaronia hardware, abstracting away the underlying transport layers. It supports native SDK connections, HTTP streaming, and RTSA file sources through a single, consistent interface with deterministic source selection.
+`sdr-aaronia-rs` provides a unified API for interacting with Aaronia hardware, abstracting away the underlying transport layers. It supports native SDK connections, bidirectional HTTP streaming (RX/TX), and RTSA file sources through a single, consistent interface with deterministic source selection.
 
 ## Overview
 
@@ -26,7 +26,7 @@ Interfacing with SDR hardware typically requires choosing between proprietary na
 ## Key Features
 
 - **Native SDK Integration:** Direct hardware access via Aaronia RTSA-Suite PRO with zero-copy sample processing, real-time IQ data, and automatic platform library detection. Enforces hardware constraints (e.g., `span * 1.5 ≤ receiverclock`) prior to streaming.
-- **Advanced HTTP Streaming:** Supports JSON, Int16, Float16, and Float32 streaming formats over chunked HTTP connections. Implements the complete RTSA HTTP specification with Basic Auth and token-based enterprise authentication.
+- **Advanced HTTP Streaming (RX & TX):** Supports JSON, Int16, Float16, and Float32 streaming formats over chunked HTTP connections. Implements the complete RTSA HTTP specification with Basic Auth and token-based enterprise authentication, including a dynamic HTTP TX sink for transmitting IQ data.
 - **RTSA File Processing:** Full RTSA specification implementation for reading memory-mapped captures, including metadata extraction and multi-stream support.
 - **Device Management:** Real-time control of streaming parameters, device health monitoring, input stream enumeration, and hierarchical configuration.
 - **FutureSDR Integration:** Provides seamless integration with FutureSDR flowgraphs via native blocks.
@@ -228,23 +228,29 @@ async fn main() -> Result<()> {
 
 ### FutureSDR Integration (Advanced)
 
-For existing [FutureSDR](https://github.com/FutureSDR/FutureSDR) users, the low-level block API seamlessly integrates high-throughput streams into a flowgraph:
+For existing [FutureSDR](https://github.com/FutureSDR/FutureSDR) users, the low-level block API seamlessly integrates high-throughput streams (both RX and TX) into a flowgraph:
 
 ```rust,ignore,no_run
-use sdr_aaronia_rs::HttpSourceBuilder;
+use sdr_aaronia_rs::{HttpSourceBuilder, HttpSinkBuilder};
 use futuresdr::runtime::Flowgraph;
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    // Low-level FutureSDR block
+    // Low-level FutureSDR blocks
     let source = HttpSourceBuilder::new("http://127.0.0.1:54664")
-        .frequency(146.52e6)  // 2m amateur band
-        .sample_rate(25e3)    // 25 kHz bandwidth
+        .frequency(146.52e6)
+        .sample_rate(25e3)
+        .build()?;
+        
+    let sink = HttpSinkBuilder::new("http://127.0.0.1:54664")
+        .frequency(433.0e6)
+        .sample_rate(1e6)
         .build()?;
 
     // Use in FutureSDR flowgraph
     let mut fg = Flowgraph::new();
     let _src = fg.add_block(source);
+    let _sink = fg.add_block(sink);
     // ... connect to other blocks
 
     Ok(())
