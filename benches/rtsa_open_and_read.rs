@@ -59,6 +59,19 @@ fn bench_open_and_read(c: &mut Criterion) {
         return;
     }
 
+    // Verify we can open the file. If decompression fails due to missing
+    // proprietary tooling, skip gracefully instead of panicking the benchmark runner.
+    if let Err(e) = RtsaSource::open(&path) {
+        let err_msg = format!("{:?}", e);
+        if err_msg.contains("RTSAFileTool was not found") {
+            eprintln!(
+                "skipping rtsa_open_and_read bench: RTSAFileTool not found (Aaronia RTSA-Suite PRO required for decompression)."
+            );
+            return;
+        }
+        panic!("unexpected error opening fixture: {}", e);
+    }
+
     let mut group = c.benchmark_group("rtsa_open_and_read");
     // Reduce sample count — opening + reading a 4.4 MB file is
     // expensive (mmap + chunk walk + slice copy). Default 100 samples
