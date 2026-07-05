@@ -507,9 +507,10 @@ impl AaroniaSource {
             self.config.bandwidth_hz = meta.bandwidth;
         }
         if let Some(center) = meta.center_frequency
-            && center > 0.0 {
-                self.config.center_frequency = center;
-            }
+            && center > 0.0
+        {
+            self.config.center_frequency = center;
+        }
         self.file_source = Some(source);
 
         Ok(())

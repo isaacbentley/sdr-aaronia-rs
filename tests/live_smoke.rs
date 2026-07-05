@@ -62,7 +62,10 @@ async fn live_control_plane() {
 async fn input_with_payload(c: &HttpEndpointsClient, want: &PayloadType) -> Option<String> {
     let inputs = c.get_inputs().await.expect("/inputs");
     for name in inputs {
-        if c.get_sample(Some(&name)).await.is_ok_and(|sample| sample.payload == *want) {
+        if c.get_sample(Some(&name))
+            .await
+            .is_ok_and(|sample| sample.payload == *want)
+        {
             return Some(name);
         }
     }

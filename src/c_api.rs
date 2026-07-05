@@ -283,10 +283,11 @@ pub unsafe extern "C" fn aaronia_source_builder_http_source(
 ) {
     unsafe {
         if let Some(builder) = builder.as_mut()
-            && !base_url.is_null() {
-                let url = CStr::from_ptr(base_url).to_string_lossy().into_owned();
-                builder.http_source(url);
-            }
+            && !base_url.is_null()
+        {
+            let url = CStr::from_ptr(base_url).to_string_lossy().into_owned();
+            builder.http_source(url);
+        }
     }
 }
 
@@ -305,10 +306,11 @@ pub unsafe extern "C" fn aaronia_source_builder_file_source(
 ) {
     unsafe {
         if let Some(builder) = builder.as_mut()
-            && !file_path.is_null() {
-                let path = CStr::from_ptr(file_path).to_string_lossy().into_owned();
-                builder.file_source(path);
-            }
+            && !file_path.is_null()
+        {
+            let path = CStr::from_ptr(file_path).to_string_lossy().into_owned();
+            builder.file_source(path);
+        }
     }
 }
 

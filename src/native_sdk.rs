@@ -2119,7 +2119,11 @@ impl Drop for NativeSdkSource {
                 error!("Error stopping streaming during drop: {}", e);
             }
 
-            if let Some(e) = self.handle.take().and_then(|mut h| self.client.close_handle(&mut h).err()) {
+            if let Some(e) = self
+                .handle
+                .take()
+                .and_then(|mut h| self.client.close_handle(&mut h).err())
+            {
                 error!("Error closing handle during drop: {}", e);
             }
         }

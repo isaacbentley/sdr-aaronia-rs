@@ -1345,16 +1345,18 @@ fn find_config_item_by_name_prefix(items: &[serde_json::Value], prefix: &str) ->
     // let-chains (RFC 2497) are currently unstable.
     for item in items {
         if let Some(name) = item.get("name").and_then(|n| n.as_str())
-            && name.starts_with(prefix) {
-                return Some(name.to_string());
-            }
+            && name.starts_with(prefix)
+        {
+            return Some(name.to_string());
+        }
         // Recurse into nested item lists. Real RTSA missions nest
         // hardware blocks inside scene-group items; older clients that
         // only scanned the root array missed them.
         if let Some(nested) = item.get("items").and_then(|v| v.as_array())
-            && let Some(found) = find_config_item_by_name_prefix(nested, prefix) {
-                return Some(found);
-            }
+            && let Some(found) = find_config_item_by_name_prefix(nested, prefix)
+        {
+            return Some(found);
+        }
     }
     None
 }
@@ -1641,13 +1643,17 @@ mod tests {
                                                 "      Config name: {:?}",
                                                 config_map.get("name")
                                             );
-                                            if let Some(items_array) = config_map.get("items").and_then(|i| i.as_array()) {
+                                            if let Some(items_array) =
+                                                config_map.get("items").and_then(|i| i.as_array())
+                                            {
                                                 println!(
                                                     "      Config items: {} available",
                                                     items_array.len()
                                                 );
                                                 for (i, item) in items_array.iter().enumerate() {
-                                                    if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                                    if let Some(name) =
+                                                        item.get("name").and_then(|n| n.as_str())
+                                                    {
                                                         println!("        [{}] {}", i, name);
                                                     }
                                                 }

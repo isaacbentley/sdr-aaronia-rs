@@ -1073,10 +1073,11 @@ impl RtsaSource {
                 // available, iterating in deterministic stream_id order.
                 for strm in &sorted_strm_chunks {
                     if let Some(sr) = strm.sample_rate
-                        && sr > 0.0 {
-                            sample_rate = sr as f64;
-                            break;
-                        }
+                        && sr > 0.0
+                    {
+                        sample_rate = sr as f64;
+                        break;
+                    }
                 }
             }
         }
@@ -1092,10 +1093,11 @@ impl RtsaSource {
                 // order.
                 for strm in &sorted_strm_chunks {
                     if let Some(cf) = strm.center_frequency
-                        && cf > 0.0 {
-                            center_frequency = Some(cf as f64);
-                            break;
-                        }
+                        && cf > 0.0
+                    {
+                        center_frequency = Some(cf as f64);
+                        break;
+                    }
                 }
             }
         }
@@ -1293,9 +1295,10 @@ impl RtsaSource {
             reader.seek(SeekFrom::Start(search_start))?;
             let mut buffer = vec![0u8; (search_end - search_start) as usize];
             if reader.read(&mut buffer)? > 0
-                && let Some(i) = buffer.windows(4).position(|w| w == b"DSFH") {
-                    return Ok(search_start + i as u64);
-                }
+                && let Some(i) = buffer.windows(4).position(|w| w == b"DSFH")
+            {
+                return Ok(search_start + i as u64);
+            }
         }
         Self::broad_search_for_chunk(reader, file_size, b"DSFH")
     }
