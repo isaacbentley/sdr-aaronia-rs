@@ -4,7 +4,6 @@ description = "Unified Rust interface for Aaronia Spectran V6 SDRs: native RTSA 
 license = "GPL-3.0-or-later"
 version = "0.2.1"
 edition = "2024"
-rust-version = "1.86"
 repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
 readme = "README.md"
 keywords = ["sdr", "aaronia", "spectran", "rf", "iq"]

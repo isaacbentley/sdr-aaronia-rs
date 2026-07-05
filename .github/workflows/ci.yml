@@ -59,7 +59,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86.0"
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -81,7 +81,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86.0"
+          toolchain: stable
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
@@ -91,32 +91,6 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
-
-  msrv:
-    name: MSRV (1.86)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          lfs: false
-
-      - name: Install Linux Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
-
-      # MSRV is build-only: proptest et al. occasionally tighten their
-      # MSRV past ours, so `cargo test` on 1.86 can break even when
-      # `cargo build` is clean. Keep this job as "is our public API
-      # still buildable on the documented MSRV?".
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.86.0"
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: cargo build
-        run: cargo build --all-features
 
   miri:
     name: Miri (decompression + http_streaming + utils)
@@ -182,7 +156,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86.0"
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -222,7 +196,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86.0"
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -247,7 +221,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86.0"
+          toolchain: stable
           components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2

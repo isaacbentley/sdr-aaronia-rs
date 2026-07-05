@@ -3,7 +3,6 @@
 [![Crates.io](https://img.shields.io/crates/v/sdr-aaronia-rs.svg)](https://crates.io/crates/sdr-aaronia-rs)
 [![Docs.rs](https://docs.rs/sdr-aaronia-rs/badge.svg)](https://docs.rs/sdr-aaronia-rs)
 [![CI](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/rustc-1.86+-ab6000.svg)](https://blog.rust-lang.org/2025/04/03/Rust-1.86.0.html)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/sdr-aaronia-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
 A comprehensive Rust library for interfacing with Aaronia Spectran SDR devices. 
@@ -389,7 +388,7 @@ Read access to `/remoteconfig` works without a license, so a read-only check can
 
 ## MSRV & Semver Policy
 
-- **MSRV:** 1.86
+- **MSRV:** This crate does not maintain an explicit Minimum Supported Rust Version (MSRV) policy and tracks the latest `stable` compiler.
 - **Semver:** This crate follows semantic versioning. While in `0.x.y`, breaking API changes will result in a minor version bump (e.g. `0.1.x` to `0.2.0`). MSRV bumps will also occur on minor version releases.
 
 ## Testing & Contributing
