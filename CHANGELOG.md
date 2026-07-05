@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [v0.1.2] - 2026-07-05
+## [v0.2.0] - 2026-07-05
 
 ### Added
 - Native SDK support for configurable receiver channel (`Rx1`, `Rx2`, `Rx1And2`).

@@ -6,3 +6,6 @@
 # FFI-conformance verification only. Marked CONFIDENTIAL AND PROPRIETARY by
 # Aaronia — must not be redistributed in this public repository.
 tests/sdk/
+
+# Local agent configuration/memory
+.agents/
