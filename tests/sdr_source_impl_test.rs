@@ -1,11 +1,11 @@
-use sdr_aaronia_rs::sdr_source_impl::{AaroniaBackend, AaroniaSdrSource};
-use sdr_aaronia_rs::sdr_source::{SdrSource, SourceConfig, DwellAdvice};
 use sdr_aaronia_rs::http_streaming::StreamFormat;
+use sdr_aaronia_rs::sdr_source::{DwellAdvice, SdrSource, SourceConfig};
+use sdr_aaronia_rs::sdr_source_impl::{AaroniaBackend, AaroniaSdrSource};
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use std::time::{Duration, Instant};
-use std::sync::Arc;
 
 struct MockAdvice;
 impl DwellAdvice for MockAdvice {
@@ -17,7 +17,7 @@ impl DwellAdvice for MockAdvice {
 #[test]
 fn test_aaronia_sdr_source_creation() {
     let backend = AaroniaBackend::Http("http://example.com".to_string());
-    
+
     let source = AaroniaSdrSource {
         backend,
         center_frequency_hz: 1e9,
@@ -57,7 +57,7 @@ async fn test_sdr_source_start_single_channel() {
 
     Mock::given(method("GET"))
         .and(path("/stream"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; 100])) 
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; 100]))
         .mount(&mock_server)
         .await;
 
@@ -79,7 +79,9 @@ async fn test_sdr_source_start_single_channel() {
         dwell_extension: Duration::ZERO,
     };
 
-    let handle = Box::new(source).start(config, Arc::new(MockAdvice)).unwrap();
+    let handle = Box::new(source)
+        .start(config, Arc::new(MockAdvice))
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     (handle.stop)();
@@ -111,7 +113,7 @@ async fn test_sdr_source_start_hopping() {
 
     Mock::given(method("GET"))
         .and(path("/stream"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; 100])) 
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; 100]))
         .mount(&mock_server)
         .await;
 
@@ -133,7 +135,9 @@ async fn test_sdr_source_start_hopping() {
         dwell_extension: Duration::ZERO,
     };
 
-    let handle = Box::new(source).start(config, Arc::new(MockAdvice)).unwrap();
+    let handle = Box::new(source)
+        .start(config, Arc::new(MockAdvice))
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     (handle.stop)();

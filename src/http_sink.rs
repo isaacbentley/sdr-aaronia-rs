@@ -123,7 +123,9 @@ impl HttpSink {
         let dropped_samples_clone = dropped_samples.clone();
 
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            crate::Error::Io(std::io::Error::other("HttpSink must be created within a Tokio runtime context"))
+            crate::Error::Io(std::io::Error::other(
+                "HttpSink must be created within a Tokio runtime context",
+            ))
         })?;
 
         handle.spawn(async move {
@@ -146,7 +148,8 @@ impl HttpSink {
 
                 if let Err(e) = endpoints_client.push_samples(&req).await {
                     let num_complex = samples.len() / 2;
-                    dropped_samples_clone.fetch_add(num_complex as u64, std::sync::atomic::Ordering::Relaxed);
+                    dropped_samples_clone
+                        .fetch_add(num_complex as u64, std::sync::atomic::Ordering::Relaxed);
                     warn!("Failed to push {} samples to RTSA: {}", num_complex, e);
                 }
             }
@@ -171,7 +174,8 @@ impl HttpSink {
     /// request), so this counter is the way to detect a persistently
     /// broken link instead of transmission silently going quiet.
     pub fn dropped_samples(&self) -> u64 {
-        self.dropped_samples.load(std::sync::atomic::Ordering::Relaxed)
+        self.dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn push_batch(&mut self) -> Result<()> {
@@ -199,7 +203,12 @@ impl HttpSink {
 
         self.last_transmission_end_time = end_time + (1.0 / self.sample_rate);
 
-        if self.tx.send((samples_vec, start_time, end_time)).await.is_err() {
+        if self
+            .tx
+            .send((samples_vec, start_time, end_time))
+            .await
+            .is_err()
+        {
             warn!("Failed to send samples to background HTTP task (channel closed)");
         }
 

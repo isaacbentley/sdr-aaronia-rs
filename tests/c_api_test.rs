@@ -1,10 +1,10 @@
 use sdr_aaronia_rs::c_api::{
-    aaronia_endpoints_client_free, aaronia_endpoints_client_new, aaronia_last_error,
-    aaronia_source_build, aaronia_source_builder_center_frequency,
-    aaronia_source_builder_free,
+    AaroniaFfiError, aaronia_endpoints_client_free, aaronia_endpoints_client_new,
+    aaronia_get_error_message, aaronia_last_error, aaronia_source_build,
+    aaronia_source_builder_center_frequency, aaronia_source_builder_free,
     aaronia_source_builder_http_source, aaronia_source_builder_new,
     aaronia_source_builder_reference_level, aaronia_source_builder_span_frequency,
-    aaronia_string_free, aaronia_get_error_message, AaroniaFfiError,
+    aaronia_string_free,
 };
 use std::ffi::{CStr, CString};
 
@@ -21,7 +21,7 @@ fn test_c_api_builder_lifecycle() {
         let url = CString::new("http://example.com").unwrap();
         aaronia_source_builder_http_source(builder, url.as_ptr());
 
-        // We could call build, but it will fail due to no mock server. 
+        // We could call build, but it will fail due to no mock server.
         // Let's just free the builder.
         aaronia_source_builder_free(builder);
     }
@@ -31,7 +31,7 @@ fn test_c_api_builder_lifecycle() {
 fn test_c_api_build_failure_sets_error() {
     unsafe {
         let builder = aaronia_source_builder_new();
-        
+
         let url = CString::new("http://invalid-url.local").unwrap();
         aaronia_source_builder_http_source(builder, url.as_ptr());
 
@@ -40,7 +40,7 @@ fn test_c_api_build_failure_sets_error() {
 
         let err_ptr = aaronia_last_error();
         assert!(!err_ptr.is_null());
-        
+
         let err_msg = CStr::from_ptr(err_ptr).to_string_lossy();
         assert!(err_msg.contains("failed"));
 
@@ -55,7 +55,7 @@ fn test_c_api_endpoints_client_lifecycle() {
         let url = CString::new("http://example.com").unwrap();
         let client = aaronia_endpoints_client_new(url.as_ptr());
         assert!(!client.is_null());
-        
+
         aaronia_endpoints_client_free(client);
     }
 }

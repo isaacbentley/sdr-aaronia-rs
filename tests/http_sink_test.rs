@@ -45,7 +45,10 @@ async fn test_http_sink_builder_and_flowgraph() -> anyhow::Result<()> {
     let mut fg = Flowgraph::new();
     connect!(fg, src > sink);
 
-    Runtime::new().run_async(fg).await.expect("Flowgraph execution failed");
+    Runtime::new()
+        .run_async(fg)
+        .await
+        .expect("Flowgraph execution failed");
     Ok(())
 }
 
@@ -72,6 +75,9 @@ async fn test_http_sink_work_server_error() -> anyhow::Result<()> {
     let mut fg = Flowgraph::new();
     connect!(fg, src > sink);
 
-    Runtime::new().run_async(fg).await.expect("Flowgraph execution failed");
+    Runtime::new()
+        .run_async(fg)
+        .await
+        .expect("Flowgraph execution failed");
     Ok(())
 }

@@ -386,7 +386,10 @@ async fn test_get_samples_success() {
         .await;
 
     let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
-    let samples = client.get_samples(None, None).await.expect("Failed to get samples");
+    let samples = client
+        .get_samples(None, None)
+        .await
+        .expect("Failed to get samples");
     assert_eq!(samples.len(), 1);
 }
 
@@ -436,7 +439,10 @@ async fn test_probe_remote_config_license() {
 
     let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
     let status = client.probe_remote_config_write_license().await;
-    assert_eq!(status, sdr_aaronia_rs::http_endpoints::RemoteConfigStatus::AuthenticationRequired);
+    assert_eq!(
+        status,
+        sdr_aaronia_rs::http_endpoints::RemoteConfigStatus::AuthenticationRequired
+    );
 }
 
 #[tokio::test]
@@ -451,7 +457,7 @@ async fn test_set_remote_config() {
             "items": []
         }
     });
-    
+
     Mock::given(method("PUT"))
         .and(path("/remoteconfig"))
         .respond_with(ResponseTemplate::new(200).set_body_json(&config_json))
@@ -459,6 +465,11 @@ async fn test_set_remote_config() {
         .await;
 
     let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
-    let result = client.simple_remote_config("Block_IQDemodulator_0", config_json.as_object().unwrap().clone()).await;
+    let result = client
+        .simple_remote_config(
+            "Block_IQDemodulator_0",
+            config_json.as_object().unwrap().clone(),
+        )
+        .await;
     assert!(result.is_ok());
 }
