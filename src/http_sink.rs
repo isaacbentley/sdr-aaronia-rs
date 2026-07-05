@@ -2,7 +2,7 @@ use crate::Result;
 use futuresdr::prelude::*;
 use num_complex::Complex32;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{trace, warn};
+use tracing::warn;
 
 use crate::http_endpoints::{AuthMethod, HttpEndpointsClient, TxSampleRequest};
 
@@ -89,17 +89,13 @@ impl HttpSinkBuilder {
 /// `FutureSDR` block for transmitting IQ samples to an Aaronia RTSA via HTTP.
 #[derive(Block)]
 pub struct HttpSink {
-    endpoints_client: HttpEndpointsClient,
-    frequency: f64,
     sample_rate: f64,
     buffer_size: usize,
     sample_buffer: Vec<Complex32>,
     last_transmission_end_time: f64,
     streaming_delay: f64,
-    /// Total complex samples dropped so far because a push failed. Exposed
-    /// via [`HttpSink::dropped_samples`] so a caller can detect a
-    /// persistently failing TX link instead of it silently going quiet.
-    dropped_samples: u64,
+    tx: tokio::sync::mpsc::Sender<(Vec<f32>, f64, f64)>, // (samples, start_time, end_time)
+    dropped_samples: std::sync::Arc<std::sync::atomic::AtomicU64>,
     #[input]
     input: futuresdr::runtime::buffer::DefaultCpuReader<Complex32>,
 }
@@ -122,15 +118,48 @@ impl HttpSink {
             .unwrap()
             .as_secs_f64();
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<f32>, f64, f64)>(16);
+        let dropped_samples = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dropped_samples_clone = dropped_samples.clone();
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            crate::Error::Io(std::io::Error::other("HttpSink must be created within a Tokio runtime context"))
+        })?;
+
+        handle.spawn(async move {
+            while let Some((samples, start_time, end_time)) = rx.recv().await {
+                let req = TxSampleRequest {
+                    start_time,
+                    end_time,
+                    start_frequency: frequency - sample_rate / 2.0,
+                    end_frequency: frequency + sample_rate / 2.0,
+                    step_frequency: None,
+                    min_power: -2.0,
+                    max_power: 2.0,
+                    sample_size: 2,
+                    sample_depth: 1,
+                    unit: "volt".to_string(),
+                    payload: "iq".to_string(),
+                    push: true,
+                    samples: &samples,
+                };
+
+                if let Err(e) = endpoints_client.push_samples(&req).await {
+                    let num_complex = samples.len() / 2;
+                    dropped_samples_clone.fetch_add(num_complex as u64, std::sync::atomic::Ordering::Relaxed);
+                    warn!("Failed to push {} samples to RTSA: {}", num_complex, e);
+                }
+            }
+        });
+
         Ok(Self {
-            endpoints_client,
-            frequency,
             sample_rate,
             buffer_size,
             sample_buffer: Vec::with_capacity(buffer_size * 2),
             last_transmission_end_time: now,
             streaming_delay,
-            dropped_samples: 0,
+            tx,
+            dropped_samples,
             input: futuresdr::runtime::buffer::DefaultCpuReader::default(),
         })
     }
@@ -142,7 +171,7 @@ impl HttpSink {
     /// request), so this counter is the way to detect a persistently
     /// broken link instead of transmission silently going quiet.
     pub fn dropped_samples(&self) -> u64 {
-        self.dropped_samples
+        self.dropped_samples.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn push_batch(&mut self) -> Result<()> {
@@ -150,16 +179,13 @@ impl HttpSink {
             return Ok(());
         }
 
-        // `Complex32` is `#[repr(C)] { re: f32, im: f32 }`, so it has
-        // identical layout to `[f32; 2]`; this guards against a future
-        // change to that representation breaking the raw-pointer cast
-        // below.
         const _: () = assert!(std::mem::size_of::<Complex32>() == 2 * std::mem::size_of::<f32>());
 
         let num_complex = self.sample_buffer.len();
         let samples_slice: &[f32] = unsafe {
             std::slice::from_raw_parts(self.sample_buffer.as_ptr() as *const f32, num_complex * 2)
         };
+        let samples_vec = samples_slice.to_vec();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -167,51 +193,18 @@ impl HttpSink {
             .as_secs_f64();
         let desired_start = now + self.streaming_delay;
 
-        // Ensure we don't start before the previous burst ended to prevent overlaps
         let start_time = desired_start.max(self.last_transmission_end_time);
-
-        // Duration of this burst in seconds
         let duration = num_complex as f64 / self.sample_rate;
         let end_time = start_time + duration;
 
-        // Keep 1 sample spacing between consecutive requests
         self.last_transmission_end_time = end_time + (1.0 / self.sample_rate);
 
-        let req = TxSampleRequest {
-            start_time,
-            end_time,
-            start_frequency: self.frequency - self.sample_rate / 2.0,
-            end_frequency: self.frequency + self.sample_rate / 2.0,
-            step_frequency: None,
-            min_power: -2.0,
-            max_power: 2.0,
-            sample_size: 2, // 2 elements for complex floats
-            sample_depth: 1,
-            unit: "volt".to_string(),
-            payload: "iq".to_string(),
-            push: true,
-            samples: samples_slice,
-        };
-
-        match self.endpoints_client.push_samples(&req).await {
-            Ok(_) => {
-                trace!("Successfully pushed {} samples to RTSA", num_complex);
-                self.sample_buffer.clear();
-                Ok(())
-            }
-            Err(e) => {
-                self.dropped_samples += num_complex as u64;
-                warn!(
-                    "Failed to push {} samples to RTSA (total dropped: {}): {}",
-                    num_complex, self.dropped_samples, e
-                );
-                // Drop on failure to prevent unbounded stalling in the flowgraph stream.
-                // `dropped_samples()` lets a caller detect a persistently
-                // failing link instead of TX silently going quiet.
-                self.sample_buffer.clear();
-                Err(e)
-            }
+        if self.tx.send((samples_vec, start_time, end_time)).await.is_err() {
+            warn!("Failed to send samples to background HTTP task (channel closed)");
         }
+
+        self.sample_buffer.clear();
+        Ok(())
     }
 }
 

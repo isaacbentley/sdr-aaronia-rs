@@ -1,7 +1,7 @@
 use sdr_aaronia_rs::sdr_source_impl::{AaroniaBackend, AaroniaSdrSource};
 use sdr_aaronia_rs::sdr_source::{SdrSource, SourceConfig, DwellAdvice};
 use sdr_aaronia_rs::http_streaming::StreamFormat;
-use sdr_aaronia_rs::http_endpoints::AuthMethod;
+
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use std::time::{Duration, Instant};

@@ -1,10 +1,10 @@
 use sdr_aaronia_rs::c_api::{
     aaronia_endpoints_client_free, aaronia_endpoints_client_new, aaronia_last_error,
     aaronia_source_build, aaronia_source_builder_center_frequency,
-    aaronia_source_builder_file_source, aaronia_source_builder_free,
+    aaronia_source_builder_free,
     aaronia_source_builder_http_source, aaronia_source_builder_new,
     aaronia_source_builder_reference_level, aaronia_source_builder_span_frequency,
-    aaronia_source_free, aaronia_string_free, aaronia_get_error_message, AaroniaFfiError,
+    aaronia_string_free, aaronia_get_error_message, AaroniaFfiError,
 };
 use std::ffi::{CStr, CString};
 

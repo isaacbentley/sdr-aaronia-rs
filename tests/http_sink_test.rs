@@ -8,8 +8,8 @@ use sdr_aaronia_rs::http_sink::HttpSinkBuilder;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[test]
-fn test_http_sink_builder() {
+#[tokio::test]
+async fn test_http_sink_builder() {
     let builder = HttpSinkBuilder::new("http://example.com:8080")
         .frequency(2.4e9)
         .sample_rate(20e6)
