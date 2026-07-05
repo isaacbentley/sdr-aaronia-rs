@@ -282,12 +282,11 @@ pub unsafe extern "C" fn aaronia_source_builder_http_source(
     base_url: *const c_char,
 ) {
     unsafe {
-        if let Some(builder) = builder.as_mut() {
-            if !base_url.is_null() {
+        if let Some(builder) = builder.as_mut()
+            && !base_url.is_null() {
                 let url = CStr::from_ptr(base_url).to_string_lossy().into_owned();
                 builder.http_source(url);
             }
-        }
     }
 }
 
@@ -305,12 +304,11 @@ pub unsafe extern "C" fn aaronia_source_builder_file_source(
     file_path: *const c_char,
 ) {
     unsafe {
-        if let Some(builder) = builder.as_mut() {
-            if !file_path.is_null() {
+        if let Some(builder) = builder.as_mut()
+            && !file_path.is_null() {
                 let path = CStr::from_ptr(file_path).to_string_lossy().into_owned();
                 builder.file_source(path);
             }
-        }
     }
 }
 

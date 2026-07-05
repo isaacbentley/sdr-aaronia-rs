@@ -42,12 +42,11 @@ impl Deref for PooledIqBuffer {
 
 impl Drop for PooledIqBuffer {
     fn drop(&mut self) {
-        if let Some(mut buf) = self.buffer.take() {
-            if let Some(pool) = &self.pool {
+        if let Some(mut buf) = self.buffer.take()
+            && let Some(pool) = &self.pool {
                 buf.clear();
                 let _ = pool.send(buf);
             }
-        }
     }
 }
 

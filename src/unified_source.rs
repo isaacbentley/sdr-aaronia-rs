@@ -506,11 +506,10 @@ impl AaroniaSource {
         if meta.bandwidth > 0.0 {
             self.config.bandwidth_hz = meta.bandwidth;
         }
-        if let Some(center) = meta.center_frequency {
-            if center > 0.0 {
+        if let Some(center) = meta.center_frequency
+            && center > 0.0 {
                 self.config.center_frequency = center;
             }
-        }
         self.file_source = Some(source);
 
         Ok(())
@@ -1185,11 +1184,9 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/IQ-Sample-Data-CW-2410MHz-1MHzSampleRate.rtsa"
         );
-        if let Ok(meta) = std::fs::metadata(fixture) {
-            if meta.len() == 132 {
-                println!("Skipping test: LFS fixture missing");
-                return;
-            }
+        if std::fs::metadata(fixture).is_ok_and(|meta| meta.len() == 132) {
+            println!("Skipping test: LFS fixture missing");
+            return;
         }
         let mut builder = AaroniaSourceBuilder::new();
         builder.file_source(fixture);

@@ -2086,12 +2086,10 @@ impl NativeSdkSource {
                 self.device_connected = false;
             }
 
-            if let Some(mut device) = self.device.take() {
-                if let Some(handle) = self.handle.as_mut() {
-                    // Close device
-                    if let Err(e) = self.client.close_device(handle, &mut device) {
-                        error!("Failed to close device: {}", e);
-                    }
+            if let (Some(mut device), Some(handle)) = (self.device.take(), self.handle.as_mut()) {
+                // Close device
+                if let Err(e) = self.client.close_device(handle, &mut device) {
+                    error!("Error closing device during drop: {}", e);
                 }
             }
 
@@ -2121,10 +2119,8 @@ impl Drop for NativeSdkSource {
                 error!("Error stopping streaming during drop: {}", e);
             }
 
-            if let Some(mut handle) = self.handle.take() {
-                if let Err(e) = self.client.close_handle(&mut handle) {
-                    error!("Error closing handle during drop: {}", e);
-                }
+            if let Some(e) = self.handle.take().and_then(|mut h| self.client.close_handle(&mut h).err()) {
+                error!("Error closing handle during drop: {}", e);
             }
         }
     }
