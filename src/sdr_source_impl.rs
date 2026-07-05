@@ -53,13 +53,23 @@ pub enum AaroniaBackend {
 /// backend). File backends ignore hopping — RTSA capture files carry
 /// a single centre frequency in their metadata.
 pub struct AaroniaSdrSource {
+    /// Transport selection: HTTP endpoint, capture file, or native SDK.
     pub backend: AaroniaBackend,
+    /// Initial center frequency, in Hz.
     pub center_frequency_hz: f64,
+    /// Reference level, in dBm.
     pub reference_level_dbm: f64,
     /// Samples requested per `read_samples` call. Larger blocks
     /// amortise HTTP chunk decode overhead; smaller blocks reduce
     /// latency. The orchestrator's default is 65 536.
     pub block_size: usize,
+    /// HTTP `/stream` wire format passthrough for the
+    /// [`AaroniaBackend::Http`] backend; `None` uses the library default
+    /// (binary Float32). Ignored by the file and native-SDK backends.
+    /// Exists so orchestrators can select e.g. Int16 (half the network
+    /// bandwidth of Float32) without reaching into the unified source
+    /// themselves.
+    pub stream_format: Option<crate::http_streaming::StreamFormat>,
 }
 
 /// Tunable: how long to actively drain the read buffer after a
@@ -101,6 +111,7 @@ impl SdrSource for AaroniaSdrSource {
             center_frequency_hz,
             reference_level_dbm,
             block_size,
+            stream_format,
         } = *self;
         let block_size = block_size.max(1024);
         let span_hz = config.sample_rate_hz;
@@ -128,7 +139,12 @@ impl SdrSource for AaroniaSdrSource {
                     match &backend {
                         AaroniaBackend::Http(url) => {
                             builder.http_source(url.clone());
-                            info!("Aaronia HTTP source: {}", url);
+                            if let Some(format) = stream_format {
+                                builder.stream_format(format);
+                                info!("Aaronia HTTP source: {} (format: {})", url, format.as_str());
+                            } else {
+                                info!("Aaronia HTTP source: {}", url);
+                            }
                         }
                         AaroniaBackend::File(path) => {
                             builder.file_source(path.to_string_lossy().as_ref());

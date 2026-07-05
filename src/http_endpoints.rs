@@ -457,12 +457,22 @@ impl Default for StreamParamsBuilder {
 }
 
 impl StreamParamsBuilder {
-    /// Create a builder with the `/stream` endpoint defaults (JSON
-    /// format, no limit/rate-reduction/scale).
+    /// Create a builder with the `/stream` endpoint defaults (Float32
+    /// binary format, no limit/rate-reduction/scale).
+    ///
+    /// The default wire format is **Float32**, not JSON. An earlier
+    /// revision defaulted to JSON, which is the slowest and most fragile
+    /// format for high-rate IQ (a 61 MSPS stream rendered as ASCII
+    /// decimal is an order of magnitude more bandwidth, and a dropped
+    /// connection mid-document surfaces as confusing serde "EOF while
+    /// parsing" errors) — any call site that forgot an explicit
+    /// `.format(..)` silently inherited that footgun in production. JSON
+    /// remains available via `.format(StreamFormat::Json)` for debugging,
+    /// where human-readable payloads are the point.
     pub fn new() -> Self {
         Self {
             params: StreamParams {
-                format: crate::http_streaming::StreamFormat::Json,
+                format: crate::http_streaming::StreamFormat::Float32,
                 limit: None,
                 rate_reduction: None,
                 rate_adaption: None,
@@ -1355,6 +1365,21 @@ fn find_config_item_by_name_prefix(items: &[serde_json::Value], prefix: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (field report from fpv-viewer): the params-builder
+    /// default must be a binary format. A JSON default meant any call
+    /// site that forgot `.format(..)` streamed high-rate IQ as ASCII —
+    /// slow, and the connection died mid-document with cryptic serde
+    /// EOF errors.
+    #[test]
+    fn stream_params_default_format_is_float32() {
+        let params = StreamParamsBuilder::new().build();
+        assert_eq!(
+            params.format,
+            crate::http_streaming::StreamFormat::Float32,
+            "default stream format must be binary Float32, never JSON"
+        );
+    }
 
     #[test]
     fn test_auth_method_creation() {

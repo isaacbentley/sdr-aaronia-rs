@@ -1677,6 +1677,49 @@ impl NativeSdkSource {
         }
     }
 
+    /// Select which receiver channel(s) the `spectranv6/raw` pipeline
+    /// captures.
+    ///
+    /// [`Self::configure_iq_receiver`] defaults `device/receiverchannel`
+    /// to `"Rx1"`; call this afterwards to switch to Rx2 or dual-channel
+    /// capture.
+    ///
+    /// > [!WARNING]
+    /// > `Rx2` and `Rx1And2` are hardware-unverified: the developer's V6
+    /// > ECO is a single-channel device, so only `Rx1` has been exercised
+    /// > against real hardware. In `Rx1And2` mode the SDK interleaves both
+    /// > channels into one packet — [`Self::read_samples`] honours the
+    /// > packet's `stride` field, so it will extract the *first* channel
+    /// > correctly, but a proper dual-channel demux API (both channels
+    /// > out) is still future work.
+    ///
+    /// Only available in raw mode; eco `iqreceiver` drives a fixed
+    /// single-channel pipeline, and the config key doesn't exist there.
+    pub unsafe fn set_receiver_channel(&mut self, channel: RxChannel) -> Result<()> {
+        unsafe {
+            if !matches!(self.open_mode, Some(DeviceOpenMode::Raw)) {
+                return Err(Error::Sdk(format!(
+                    "device/receiverchannel is only available on spectranv6/raw; \
+                     current open mode: {:?}",
+                    self.open_mode
+                )));
+            }
+
+            let device = self
+                .device
+                .as_mut()
+                .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
+            let mut root = self.client.get_config_root(device)?;
+            let mut config =
+                self.client
+                    .find_config(device, &mut root, "device/receiverchannel")?;
+            self.client
+                .set_config_string(device, &mut config, channel.as_config_str())?;
+            info!("Set receiver channel to {}", channel.as_config_str());
+            Ok(())
+        }
+    }
+
     /// Configure the `sweepsa` (spectrum sweep) config group.
     ///
     /// > [!WARNING]
@@ -2083,6 +2126,38 @@ impl Drop for NativeSdkSource {
                     error!("Error closing handle during drop: {}", e);
                 }
             }
+        }
+    }
+}
+
+/// Receiver channel selection for the `spectranv6/raw` pipeline's
+/// `device/receiverchannel` config item.
+///
+/// The full SPECTRAN V6 has two RF inputs; the V6 ECO has one. The config
+/// strings (`"Rx1"`, `"Rx2"`, `"Rx1+Rx2"`) come from the official
+/// RTSA-API-Samples; `"Rx1"` is what [`NativeSdkSource::
+/// configure_iq_receiver`] has always written and is the only variant
+/// verified against real hardware (see
+/// [`NativeSdkSource::set_receiver_channel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RxChannel {
+    /// First RF input (default).
+    Rx1,
+    /// Second RF input (full V6 only; hardware-unverified).
+    Rx2,
+    /// Both inputs, interleaved into one packet (full V6 only;
+    /// hardware-unverified).
+    Rx1And2,
+}
+
+impl RxChannel {
+    /// The exact string the SDK config item expects.
+    pub fn as_config_str(&self) -> &'static str {
+        match self {
+            Self::Rx1 => "Rx1",
+            Self::Rx2 => "Rx2",
+            Self::Rx1And2 => "Rx1+Rx2",
         }
     }
 }

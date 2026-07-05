@@ -148,6 +148,25 @@ impl AaroniaConfig {
         self
     }
 
+    /// Set the HTTP wire format for `/stream` (default when unset:
+    /// [`StreamFormat::Float32`](crate::http_streaming::StreamFormat)).
+    /// Only meaningful for HTTP sources; ignored by file and native-SDK
+    /// backends.
+    #[must_use]
+    pub fn stream_format(mut self, format: crate::http_streaming::StreamFormat) -> Self {
+        self.stream_format = Some(format);
+        self
+    }
+
+    /// Set the server-side `?scale=N` integer encode multiplier for
+    /// `/stream`. Only meaningful for HTTP sources with an integer wire
+    /// format.
+    #[must_use]
+    pub fn stream_scale(mut self, scale: f64) -> Self {
+        self.stream_scale = Some(scale);
+        self
+    }
+
     /// Set the device serial number
     #[must_use]
     pub fn device_serial(mut self, serial: String) -> Self {
@@ -922,6 +941,21 @@ impl AaroniaSourceBuilder {
     /// Force a specific source type
     pub fn force_source_type(&mut self, source_type: SourceType) -> &mut Self {
         self.config.force_source_type = Some(source_type);
+        self
+    }
+
+    /// Set the HTTP `/stream` wire format (default when unset: Float32).
+    /// Only meaningful for HTTP sources.
+    pub fn stream_format(&mut self, format: crate::http_streaming::StreamFormat) -> &mut Self {
+        self.config.stream_format = Some(format);
+        self
+    }
+
+    /// Set the server-side `?scale=N` integer encode multiplier for the
+    /// HTTP `/stream` endpoint. Only meaningful for HTTP sources with an
+    /// integer wire format.
+    pub fn stream_scale(&mut self, scale: f64) -> &mut Self {
+        self.config.stream_scale = Some(scale);
         self
     }
 

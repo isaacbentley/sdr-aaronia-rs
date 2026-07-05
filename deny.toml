@@ -25,6 +25,7 @@ allow = [
     "GPL-3.0-or-later",
     "CC0-1.0",
     "MPL-2.0",
+    "Zlib",
 ]
 
 [sources]

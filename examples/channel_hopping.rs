@@ -38,6 +38,9 @@ fn main() -> anyhow::Result<()> {
         center_frequency_hz: 446.0e6,
         reference_level_dbm: -20.0,
         block_size: 8192,
+        // None = library default (binary Float32). Set Some(StreamFormat::
+        // Int16) to halve network bandwidth at high sample rates.
+        stream_format: None,
     });
 
     let advice = Arc::new(DummyAdvice);

@@ -90,7 +90,7 @@ jobs:
         run: cargo clippy --all-features --all-targets -- -D warnings
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.86)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,12 +103,12 @@ jobs:
           sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
 
       # MSRV is build-only: proptest et al. occasionally tighten their
-      # MSRV past ours, so `cargo test` on 1.85 can break even when
+      # MSRV past ours, so `cargo test` on 1.86 can break even when
       # `cargo build` is clean. Keep this job as "is our public API
       # still buildable on the documented MSRV?".
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85.0"
+          toolchain: "1.86.0"
 
       - uses: Swatinem/rust-cache@v2
 
