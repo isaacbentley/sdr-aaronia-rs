@@ -331,3 +331,134 @@ async fn test_push_samples_success() {
     let result = client.push_samples(&req).await;
     assert!(result.is_ok());
 }
+
+#[tokio::test]
+async fn test_get_sample_success() {
+    let mock_server = MockServer::start().await;
+    let sample_json = serde_json::json!({
+        "startTime": 0.0,
+        "endTime": 1.0,
+        "startFrequency": 1e9,
+        "endFrequency": 2e9,
+        "stepFrequency": 0.0,
+        "minPower": -100,
+        "maxPower": 0,
+        "sampleSize": 3,
+        "sampleDepth": 1,
+        "unit": "dBm",
+        "payload": "iq",
+        "samples": 3
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/sample"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&sample_json))
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+    let sample = client.get_sample(None).await.expect("Failed to get sample");
+    assert_eq!(sample.sample_size, 3);
+}
+
+#[tokio::test]
+async fn test_get_samples_success() {
+    let mock_server = MockServer::start().await;
+    let sample_json = serde_json::json!([{
+        "startTime": 0.0,
+        "endTime": 1.0,
+        "startFrequency": 1e9,
+        "endFrequency": 2e9,
+        "stepFrequency": 0.0,
+        "minPower": -100,
+        "maxPower": 0,
+        "sampleSize": 3,
+        "sampleDepth": 1,
+        "unit": "dBm",
+        "payload": "iq",
+        "samples": 3
+    }]);
+
+    Mock::given(method("GET"))
+        .and(path("/samples"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&sample_json))
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+    let samples = client.get_samples(None, None).await.expect("Failed to get samples");
+    assert_eq!(samples.len(), 1);
+}
+
+#[tokio::test]
+async fn test_shutdown_application_success() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/app/process"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+    let result = client.shutdown_application().await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_configure_capture_success() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/control"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+    let control = sdr_aaronia_rs::http_endpoints::CaptureControl {
+        frequency_center: Some(1e9),
+        ..Default::default()
+    };
+    let result = client.configure_capture(control).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_probe_remote_config_license() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/remoteconfig"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+    let status = client.probe_remote_config_write_license().await;
+    assert_eq!(status, sdr_aaronia_rs::http_endpoints::RemoteConfigStatus::AuthenticationRequired);
+}
+
+#[tokio::test]
+async fn test_set_remote_config() {
+    let mock_server = MockServer::start().await;
+    let config_json = serde_json::json!({
+        "request": 42,
+        "config": {
+            "type": "group",
+            "name": "root",
+            "label": "Root",
+            "items": []
+        }
+    });
+    
+    Mock::given(method("PUT"))
+        .and(path("/remoteconfig"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&config_json))
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+    let result = client.simple_remote_config("Block_IQDemodulator_0", config_json.as_object().unwrap().clone()).await;
+    assert!(result.is_ok());
+}
