@@ -1,7 +1,8 @@
 //! Core SDR source traits and types.
 //!
 //! This module provides the standard `SdrSource` interface previously
-//! maintained in `sdr-source-rs`, now integrated directly to allow for
+//! maintained in `sdr-source-rs` (since renamed to
+//! `orecchiette-sdr-source-rs`), now integrated directly to allow for
 //! a zero-dependency architecture.
 
 use num_complex::Complex32;

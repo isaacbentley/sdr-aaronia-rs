@@ -29,6 +29,7 @@ allow = [
 ]
 
 [sources]
-# `sdr-source-rs` is consumed as a pinned git dependency until it is
-# published to crates.io.
-unknown-git = "allow"
+# The former `sdr-source-rs` git dependency was vendored into
+# `src/sdr_source.rs` (its successor `orecchiette-sdr-source-rs` will be
+# consumed from crates.io once published), so no git sources remain.
+unknown-git = "deny"
