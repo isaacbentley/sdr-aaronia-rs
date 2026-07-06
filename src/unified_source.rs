@@ -393,6 +393,26 @@ impl AaroniaSource {
         // Test connection immediately
         (client.test_connection().await).map_err(|e| Error::Protocol(format!("Failed to connect to Aaronia RTSA Suite Pro at {}. Is it running and accessible? Error: {}", base_url, e)))?;
 
+        // Tune the hardware to the requested frequency *before* opening the
+        // stream.  Without this the `/stream` endpoint returns whatever the
+        // RTSA Suite is already configured to, completely ignoring the
+        // caller's `center_frequency` / `span_frequency`.
+        info!(
+            "Tuning HTTP source to center={:.3} MHz, span={:.3} MHz, ref_level={} dBm",
+            self.config.center_frequency / 1e6,
+            self.config.span_frequency / 1e6,
+            self.config.reference_level,
+        );
+        client
+            .configure_capture(crate::http_endpoints::CaptureControl {
+                frequency_center: Some(self.config.center_frequency),
+                frequency_span: Some(self.config.span_frequency),
+                reference_level: Some(self.config.reference_level as f32),
+                control_type: crate::http_endpoints::ControlType::Capture,
+                ..Default::default()
+            })
+            .await?;
+
         // Create a channel for sending samples from the async task to AaroniaSource
         let (sender, receiver) = tokio::sync::mpsc::channel(100); // Buffer up to 100 Vec<Complex32>
 
