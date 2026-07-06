@@ -29,7 +29,7 @@ allow = [
 ]
 
 [sources]
-# The former `sdr-source-rs` git dependency was vendored into
-# `src/sdr_source.rs` (its successor `orecchiette-sdr-source-rs` will be
-# consumed from crates.io once published), so no git sources remain.
+# `sdr_source` re-exports the published `orecchiette-sdr-source-rs`
+# crates.io crate (formerly a vendored copy, then a git dependency),
+# so no git sources remain.
 unknown-git = "deny"
