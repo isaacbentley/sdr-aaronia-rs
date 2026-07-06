@@ -33,7 +33,9 @@ pub mod http_source;
 pub mod http_streaming;
 #[cfg(feature = "sdr-source")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sdr-source")))]
-pub mod sdr_source;
+pub mod sdr_source {
+    pub use orecchiette_sdr_source_rs::*;
+}
 #[cfg(feature = "sdr-source")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sdr-source")))]
 pub mod sdr_source_impl;
