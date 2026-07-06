@@ -62,6 +62,7 @@ pub struct HttpSource {
 
     // Configuration
     buffer_size: usize,
+    reference_level: f64,
 
     // Authentication
     auth_method: AuthMethod,
@@ -77,7 +78,7 @@ impl HttpSource {
         base_url: String,
         frequency: f64,
         sample_rate: f64,
-        _reference_level: f64,
+        reference_level: f64,
         buffer_size: usize,
         timeout_ms: u64,
     ) -> Result<Self> {
@@ -85,6 +86,7 @@ impl HttpSource {
             base_url,
             frequency,
             sample_rate,
+            reference_level,
             buffer_size,
             timeout_ms,
             StreamFormat::Float32, // Default to float32 for compatibility
@@ -101,6 +103,7 @@ impl HttpSource {
         base_url: String,
         frequency: f64,
         sample_rate: f64,
+        reference_level: f64,
         buffer_size: usize,
         timeout_ms: u64,
         stream_format: StreamFormat,
@@ -175,6 +178,7 @@ impl HttpSource {
             current_sample_rate: sample_rate,
             stream_response: None, // Initialize to None
             buffer_size,
+            reference_level,
             auth_method,
             tokio_handle,
         })
@@ -535,6 +539,34 @@ impl HttpSource {
                 info!("Successfully configured RTSA device: connect=true, run=true");
                 // Give device a moment to process the configuration
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                // Tune the hardware to the requested frequency *before* opening the stream.
+                // Uses the unlicensed `/control` endpoint so it is free and always succeeds.
+                info!(
+                    "Tuning HTTP source to center={:.3} MHz, span={:.3} MHz, ref_level={} dBm",
+                    self.current_frequency / 1e6,
+                    self.current_sample_rate / 1e6,
+                    self.reference_level,
+                );
+                match self
+                    .endpoints_client
+                    .configure_capture(crate::http_endpoints::CaptureControl {
+                        frequency_center: Some(self.current_frequency),
+                        frequency_span: Some(self.current_sample_rate),
+                        reference_level: Some(self.reference_level as f32),
+                        control_type: crate::http_endpoints::ControlType::Capture,
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        info!("Successfully tuned RTSA device center frequency and span");
+                    }
+                    Err(e) => {
+                        warn!("Could not tune RTSA device via /control: {}", e);
+                    }
+                }
+
                 Ok(())
             }
             Err(e) => {
@@ -795,6 +827,7 @@ impl HttpSourceBuilder {
             self.base_url,
             self.frequency,
             self.sample_rate,
+            self.reference_level,
             self.buffer_size,
             self.timeout_ms,
             self.stream_format,
