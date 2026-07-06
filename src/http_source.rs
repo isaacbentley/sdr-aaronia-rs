@@ -554,9 +554,7 @@ impl Kernel for HttpSource {
         info!("HttpSource: INITIALIZED - Starting HTTP stream connection");
         let handle = self.tokio_handle.clone();
         if let Some(handle) = handle {
-            handle.block_on(async {
-                self.start_stream().await
-            })?;
+            handle.block_on(async { self.start_stream().await })?;
         } else {
             self.start_stream().await?;
         }
@@ -582,9 +580,7 @@ impl Kernel for HttpSource {
         if self.sample_buffer.len() < o_len {
             let handle = self.tokio_handle.clone();
             let fetch_res = if let Some(handle) = handle {
-                handle.block_on(async {
-                    self.fetch_samples().await
-                })
+                handle.block_on(async { self.fetch_samples().await })
             } else {
                 self.fetch_samples().await
             };
@@ -608,9 +604,7 @@ impl Kernel for HttpSource {
                     futures_timer::Delay::new(std::time::Duration::from_millis(1000)).await;
                     let handle = self.tokio_handle.clone();
                     let reconnect_res = if let Some(handle) = handle {
-                        handle.block_on(async {
-                            self.start_stream().await
-                        })
+                        handle.block_on(async { self.start_stream().await })
                     } else {
                         self.start_stream().await
                     };
