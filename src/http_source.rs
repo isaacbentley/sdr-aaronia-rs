@@ -65,6 +65,7 @@ pub struct HttpSource {
 
     // Authentication
     auth_method: AuthMethod,
+    tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 impl HttpSource {
@@ -156,6 +157,8 @@ impl HttpSource {
         // Initialize stream parser for chosen format
         let stream_parser = StreamParser::new(stream_format, None)?;
 
+        let tokio_handle = tokio::runtime::Handle::try_current().ok();
+
         Ok(Self {
             output: futuresdr::runtime::buffer::DefaultCpuWriter::default(),
             base_url,
@@ -173,6 +176,7 @@ impl HttpSource {
             stream_response: None, // Initialize to None
             buffer_size,
             auth_method,
+            tokio_handle,
         })
     }
 
@@ -548,7 +552,14 @@ impl Kernel for HttpSource {
         _meta: &mut futuresdr::runtime::BlockMeta,
     ) -> anyhow::Result<()> {
         info!("HttpSource: INITIALIZED - Starting HTTP stream connection");
-        self.start_stream().await?;
+        let handle = self.tokio_handle.clone();
+        if let Some(handle) = handle {
+            handle.block_on(async {
+                self.start_stream().await
+            })?;
+        } else {
+            self.start_stream().await?;
+        }
         info!("HttpSource: HTTP streaming connection established successfully");
         Ok(())
     }
@@ -569,7 +580,16 @@ impl Kernel for HttpSource {
 
         // If we don't have enough samples in buffer, try to fetch more
         if self.sample_buffer.len() < o_len {
-            match self.fetch_samples().await {
+            let handle = self.tokio_handle.clone();
+            let fetch_res = if let Some(handle) = handle {
+                handle.block_on(async {
+                    self.fetch_samples().await
+                })
+            } else {
+                self.fetch_samples().await
+            };
+
+            match fetch_res {
                 Ok(fetched) => {
                     if fetched == 0 {
                         // No samples available, sleep briefly to prevent busy-waiting
@@ -586,7 +606,15 @@ impl Kernel for HttpSource {
                     self.stream_active = false;
                     // Try to reconnect after a delay
                     futures_timer::Delay::new(std::time::Duration::from_millis(1000)).await;
-                    if let Err(reconnect_err) = self.start_stream().await {
+                    let handle = self.tokio_handle.clone();
+                    let reconnect_res = if let Some(handle) = handle {
+                        handle.block_on(async {
+                            self.start_stream().await
+                        })
+                    } else {
+                        self.start_stream().await
+                    };
+                    if let Err(reconnect_err) = reconnect_res {
                         warn!("Failed to reconnect: {}", reconnect_err);
                     }
                     return Ok(()); // Don't fail the entire flowgraph
