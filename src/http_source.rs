@@ -9,7 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 // Import our new advanced streaming capabilities
 use crate::http_endpoints::{AuthMethod, HttpEndpointsClient};
-use crate::http_streaming::{StreamFormat, StreamParser};
+use crate::http_streaming::{StreamFormat, StreamParser, DropDetector};
 
 /// Stream statistics for monitoring
 #[derive(Debug, Clone)]
@@ -21,6 +21,26 @@ pub struct StreamStats {
     pub buffer_level: usize,
     pub buffer_capacity: usize,
     pub input_name: Option<String>,
+    pub input_msps: f64,
+    pub dropped_packets: u64,
+    pub packet_rate: f64,
+}
+
+impl Default for StreamStats {
+    fn default() -> Self {
+        Self {
+            active: false,
+            format: StreamFormat::Int16,
+            current_frequency: 0.0,
+            current_sample_rate: 0.0,
+            buffer_level: 0,
+            buffer_capacity: 0,
+            input_name: None,
+            input_msps: 0.0,
+            dropped_packets: 0,
+            packet_rate: 0.0,
+        }
+    }
 }
 
 /// `FutureSDR` integration block for advanced Aaronia HTTP streaming.
@@ -67,6 +87,10 @@ pub struct HttpSource {
     // Authentication
     auth_method: AuthMethod,
     tokio_handle: Option<tokio::runtime::Handle>,
+
+    // Shared statistics and drop detection
+    shared_stats: Option<std::sync::Arc<std::sync::RwLock<StreamStats>>>,
+    drop_detector: DropDetector,
 }
 
 impl HttpSource {
@@ -181,6 +205,8 @@ impl HttpSource {
             reference_level,
             auth_method,
             tokio_handle,
+            shared_stats: None,
+            drop_detector: DropDetector::default(),
         })
     }
 
@@ -414,6 +440,10 @@ impl HttpSource {
 
         let mut total_samples_added = 0;
 
+        for packet in &packets {
+            let _ = self.drop_detector.observe(packet);
+        }
+
         for packet in packets {
             // Update current stream metadata from the parsed packet. The
             // packet reports its frequency *range*; the tuned frequency is
@@ -462,11 +492,18 @@ impl HttpSource {
             }
         }
 
+        if let Some(ref shared) = self.shared_stats {
+            if let Ok(mut stats) = shared.write() {
+                *stats = self.get_stream_stats();
+            }
+        }
+
         Ok(total_samples_added)
     }
 
     /// Get current stream statistics for monitoring
     pub fn get_stream_stats(&self) -> StreamStats {
+        let stats = self.stream_parser.stats();
         StreamStats {
             active: self.stream_active,
             format: self.stream_format,
@@ -475,6 +512,9 @@ impl HttpSource {
             buffer_level: self.sample_buffer.len(),
             buffer_capacity: self.buffer_size * 2,
             input_name: self.input_name.clone(),
+            input_msps: stats.samples_per_second / 1e6,
+            dropped_packets: self.drop_detector.drops(),
+            packet_rate: stats.packet_rate,
         }
     }
 }
@@ -706,6 +746,7 @@ pub struct HttpSourceBuilder {
     /// before transmission and is independent of the per-packet `scale`
     /// JSON field.
     scale: Option<f64>,
+    shared_stats: Option<std::sync::Arc<std::sync::RwLock<StreamStats>>>,
 }
 
 impl HttpSourceBuilder {
@@ -724,6 +765,7 @@ impl HttpSourceBuilder {
             input_name: None,                   // Auto-select input
             rate_reduction: None,
             scale: None,
+            shared_stats: None,
         }
     }
 
@@ -817,13 +859,19 @@ impl HttpSourceBuilder {
     /// streams over HTTP; routing through the native SDK instead lives in
     /// [`crate::sdk_source`] / [`crate::unified_source`].
     #[must_use]
+    pub fn with_shared_stats(mut self, stats: std::sync::Arc<std::sync::RwLock<StreamStats>>) -> Self {
+        self.shared_stats = Some(stats);
+        self
+    }
+
+    #[must_use]
     pub fn with_native_sdk(self, _enable: bool) -> Self {
         self
     }
 
     /// Build with basic options (backward compatibility)
     pub fn build(self) -> Result<HttpSource> {
-        HttpSource::with_advanced_options(
+        let mut source = HttpSource::with_advanced_options(
             self.base_url,
             self.frequency,
             self.sample_rate,
@@ -835,7 +883,9 @@ impl HttpSourceBuilder {
             self.input_name,
             self.rate_reduction,
             self.scale,
-        )
+        )?;
+        source.shared_stats = self.shared_stats;
+        Ok(source)
     }
 }
 
