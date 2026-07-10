@@ -657,11 +657,23 @@ impl Kernel for HttpSource {
 
         if restart_triggered {
             info!("Restarting HTTP stream connection to apply frequency/span configuration...");
-            self.cleanup_stream().await;
-            self.stream_active = false;
-            self.sample_buffer.clear();
-            if let Err(e) = self.start_stream().await {
-                warn!("Failed to restart stream during configuration change: {}", e);
+            let handle = self.tokio_handle.clone();
+            if let Some(h) = handle {
+                let _ = h.block_on(async {
+                    self.cleanup_stream().await;
+                    self.stream_active = false;
+                    self.sample_buffer.clear();
+                    if let Err(e) = self.start_stream().await {
+                        warn!("Failed to restart stream during configuration change: {}", e);
+                    }
+                });
+            } else {
+                self.cleanup_stream().await;
+                self.stream_active = false;
+                self.sample_buffer.clear();
+                if let Err(e) = self.start_stream().await {
+                    warn!("Failed to restart stream during configuration change: {}", e);
+                }
             }
         }
 
