@@ -1977,22 +1977,33 @@ impl NativeSdkSource {
             };
 
             if let Some(packet) = packet_opt {
-                if !packet.fp32.is_null() && packet.num > 0 && packet.stride < 2 {
-                    // stride is "floats from sample to sample"; an IQ pair
-                    // needs at least 2. Anything smaller is a non-IQ layout —
-                    // consume it without mis-reading pairs out of it.
+                // `stride` is "floats from sample to sample". A tightly packed
+                // IQ pair is 2; interleaved multi-channel layouts are a small
+                // multiple. Accept only that range: a stride < 2 is a non-IQ
+                // layout, and an absurdly large stride is a corrupt/garbage
+                // packet — the wide-stride gather below sizes a raw slice from
+                // `stride`, so an unsanitised huge value would read far past
+                // the SDK's buffer (UB). `MAX_IQ_STRIDE` is deliberately loose
+                // (any real interleave is tiny) — it's a corruption backstop,
+                // not a tight spec bound.
+                const MAX_IQ_STRIDE: i64 = 4096;
+                let valid_iq_stride = (2..=MAX_IQ_STRIDE).contains(&packet.stride);
+                if !packet.fp32.is_null() && packet.num > 0 && !valid_iq_stride {
+                    // Consume it without mis-reading pairs out of it.
                     warn!(
-                        "Skipping packet with non-IQ stride {} (need >= 2)",
-                        packet.stride
+                        "Skipping packet with out-of-range IQ stride {} (expected 2..={})",
+                        packet.stride, MAX_IQ_STRIDE
                     );
                 }
                 // Process IQ data from the packet
-                if !packet.fp32.is_null() && packet.num > 0 && packet.stride >= 2 {
+                if !packet.fp32.is_null() && packet.num > 0 && valid_iq_stride {
                     const MAX_SAMPLES: usize = 1 << 24;
-                    if (packet.num * 2) as usize > MAX_SAMPLES {
+                    // Bound-check `packet.num` *before* multiplying so a garbage
+                    // or hostile count can't overflow the `i64` multiply itself.
+                    if packet.num as usize > MAX_SAMPLES / 2 {
                         return Err(Error::Sdk(format!(
                             "Packet sample count {} exceeds maximum allowed {}",
-                            packet.num * 2,
+                            packet.num.saturating_mul(2),
                             MAX_SAMPLES
                         )));
                     }
@@ -2005,32 +2016,39 @@ impl NativeSdkSource {
                     let num_complex_samples = (packet.num as usize).min(max_samples);
                     let stride = packet.stride as usize;
 
-                    if stride == 2 {
-                        // Tightly packed IQ pairs — the common raw-IQ layout.
-                        let complex_slice = std::slice::from_raw_parts(
-                            packet.fp32 as *const Complex32,
-                            num_complex_samples,
-                        );
-                        buffer.extend_from_slice(complex_slice);
-                    } else {
-                        // Per the official header, `stride` is the "offset from
-                        // sample to sample in floats" and is not required to be
-                        // 2 (e.g. multi-channel interleaved layouts). Gather
-                        // sample-by-sample so a wider stride doesn't smear
-                        // neighbouring channels into the IQ data.
-                        // SAFETY: each sample spans floats
-                        // [i*stride, i*stride+1], the last of which is
-                        // (num-1)*stride + 2 floats into the buffer the SDK
-                        // guarantees valid for `num` samples of `stride` floats.
-                        let floats = std::slice::from_raw_parts(
-                            packet.fp32 as *const f32,
-                            (num_complex_samples - 1) * stride + 2,
-                        );
-                        buffer.extend(
-                            (0..num_complex_samples).map(|i| {
+                    // `num_complex_samples == 0` (a caller passing
+                    // `max_samples == 0`) must skip the slice construction: the
+                    // wide-stride branch below computes `(n - 1) * stride`, which
+                    // would underflow `usize` and hand `from_raw_parts` a
+                    // ~usize::MAX length (instant UB). Nothing to copy anyway.
+                    if num_complex_samples > 0 {
+                        if stride == 2 {
+                            // Tightly packed IQ pairs — the common raw-IQ layout.
+                            let complex_slice = std::slice::from_raw_parts(
+                                packet.fp32 as *const Complex32,
+                                num_complex_samples,
+                            );
+                            buffer.extend_from_slice(complex_slice);
+                        } else {
+                            // Per the official header, `stride` is the "offset
+                            // from sample to sample in floats" and is not required
+                            // to be 2 (e.g. multi-channel interleaved layouts).
+                            // Gather sample-by-sample so a wider stride doesn't
+                            // smear neighbouring channels into the IQ data.
+                            // SAFETY: each sample spans floats
+                            // [i*stride, i*stride+1], the last of which is
+                            // (num-1)*stride + 2 floats into the buffer the SDK
+                            // guarantees valid for `num` samples of `stride`
+                            // floats. `num_complex_samples >= 1` here, so the
+                            // `- 1` cannot underflow.
+                            let floats = std::slice::from_raw_parts(
+                                packet.fp32 as *const f32,
+                                (num_complex_samples - 1) * stride + 2,
+                            );
+                            buffer.extend((0..num_complex_samples).map(|i| {
                                 Complex32::new(floats[i * stride], floats[i * stride + 1])
-                            }),
-                        );
+                            }));
+                        }
                     }
                     samples_read = num_complex_samples;
 

@@ -251,6 +251,18 @@ impl Decompressor {
             ));
         }
 
+        // Zero dimensions have no valid transform and would wedge the
+        // inverse wavelet step: `num_rows == 0` spins the `step`-doubling
+        // loop until it overflows, and `num_cols == 0` divides by zero in
+        // `wave_transform_step`. Reject up front (internal callers always
+        // pass >= 1, but this is a `pub` entry point).
+        if num_rows == 0 || num_cols == 0 {
+            return Err(Error::Protocol(format!(
+                "Decompressor::decompress requires non-zero dimensions \
+                 (got num_rows={num_rows}, num_cols={num_cols})"
+            )));
+        }
+
         if num_rows == 1 && num_cols >= 128 {
             // IQ sample data (DSPT_IQ) uses a proprietary Aaronia compression format.
             // Our cleanroom reverse-engineering attempt determined that native Rust
@@ -602,5 +614,22 @@ mod tests {
             .decompress(&[0u8; 4], 0, 1, 1)
             .expect_err("expected error for compression_factor = 0");
         assert!(err.to_string().contains("uncompressed"));
+    }
+
+    #[test]
+    fn test_decompress_rejects_zero_dimensions() {
+        // Zero rows/cols must be rejected before reaching the inverse
+        // wavelet transform, which would otherwise spin forever
+        // (num_rows == 0) or divide by zero (num_cols == 0).
+        let decompressor = Decompressor::new();
+        for (rows, cols) in [(0usize, 4usize), (4, 0), (0, 0)] {
+            let err = decompressor
+                .decompress(&[0u8; 4], 1, rows, cols)
+                .expect_err("expected error for zero dimension");
+            assert!(
+                err.to_string().contains("non-zero dimensions"),
+                "unexpected error for ({rows}, {cols}): {err}"
+            );
+        }
     }
 }

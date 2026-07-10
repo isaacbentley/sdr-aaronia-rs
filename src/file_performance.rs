@@ -110,17 +110,23 @@ impl MmapRtsaReader {
         self.access_stats.cache_misses += 1;
         self.access_stats.total_bytes_read += size as u64;
 
-        if offset as usize + size > self.file_size {
-            return Err(Error::FileFormat {
-                offset,
-                reason: format!(
-                    "Read beyond file bounds: {} + {} > {}",
-                    offset, size, self.file_size
-                ),
-            });
-        }
+        // `checked_add` so a pathological `offset` near `usize::MAX` can't
+        // wrap past the bound check and then panic on the slice index.
+        let start = offset as usize;
+        let end = match start.checked_add(size) {
+            Some(end) if end <= self.file_size => end,
+            _ => {
+                return Err(Error::FileFormat {
+                    offset,
+                    reason: format!(
+                        "Read beyond file bounds: {} + {} > {}",
+                        offset, size, self.file_size
+                    ),
+                });
+            }
+        };
 
-        let data = self.mmap[offset as usize..offset as usize + size].to_vec();
+        let data = self.mmap[start..end].to_vec();
         let chunk_type = self.classify_chunk(&data);
 
         // Cache the chunk with appropriate eviction policy

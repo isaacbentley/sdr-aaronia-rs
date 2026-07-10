@@ -1341,8 +1341,6 @@ impl HttpEndpointsClient {
 /// This walker visits every node in pre-order so the first match
 /// (closest to the root) is preferred when multiple matches exist.
 fn find_config_item_by_name_prefix(items: &[serde_json::Value], prefix: &str) -> Option<String> {
-    // NOTE: written without let-chains. Even though we track stable Rust,
-    // let-chains (RFC 2497) are currently unstable.
     for item in items {
         if let Some(name) = item.get("name").and_then(|n| n.as_str())
             && name.starts_with(prefix)

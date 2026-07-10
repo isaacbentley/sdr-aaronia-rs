@@ -191,6 +191,12 @@ pub struct AaroniaSource {
     http_client: Option<HttpEndpointsClient>,
     file_source: Option<RtsaSource>,
     http_receiver: Option<tokio::sync::mpsc::Receiver<Vec<Complex32>>>,
+    /// Background task draining the HTTP `/stream` connection. Held so it
+    /// can be aborted on `stop_streaming` / drop — otherwise it lingers
+    /// parked on `next().await` (holding the open connection, so the
+    /// device keeps streaming) until a packet happens to arrive and the
+    /// dropped receiver is finally noticed.
+    http_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AaroniaSource {
@@ -210,6 +216,7 @@ impl AaroniaSource {
             http_client: None,
             file_source: None,
             http_receiver: None,
+            http_task: None,
         };
 
         // Determine the best source type
@@ -432,7 +439,7 @@ impl AaroniaSource {
             HttpEndpointsClient::new(base_url.clone(), crate::http_endpoints::AuthMethod::None)?;
 
         // Spawn a task to continuously read from the HTTP stream and send samples
-        let handle = tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             let mut http_stream = match client_for_task.start_stream(stream_params).await {
                 Ok(stream) => stream,
                 Err(e) => {
@@ -484,14 +491,10 @@ impl AaroniaSource {
                 }
             }
         });
-        tokio::spawn(async move {
-            if let Err(e) = handle.await {
-                tracing::error!("Streaming task panicked: {:?}", e);
-            }
-        });
 
         self.http_client = Some(client);
         self.http_receiver = Some(receiver); // Store the receiver
+        self.http_task = Some(reader_task); // Held so stop/drop can abort it
 
         info!("HTTP client initialized for: {}", base_url);
 
@@ -694,10 +697,15 @@ impl AaroniaSource {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
-                // Dropping the receiver will cause the spawned task to exit,
-                // which in turn will drop the HTTP stream.
+                // Abort the background reader so the open `/stream` connection
+                // closes immediately — dropping the receiver alone only stops
+                // the task the next time a packet arrives, so an idle stream
+                // would keep the device streaming. Then drop the receiver.
+                if let Some(task) = self.http_task.take() {
+                    task.abort();
+                }
                 self.http_receiver = None;
-                info!("HTTP streaming stopped by dropping receiver.");
+                info!("HTTP streaming stopped: reader task aborted, receiver dropped.");
             }
             SourceType::File => {
                 // No explicit stop needed for file sources
@@ -861,6 +869,18 @@ impl AaroniaSource {
                 // File sources are always considered "streaming"
                 self.file_source.is_some()
             }
+        }
+    }
+}
+
+impl Drop for AaroniaSource {
+    fn drop(&mut self) {
+        // Abort the background HTTP reader (if any) so a dropped source
+        // doesn't leave a task parked on `next().await` holding the open
+        // `/stream` connection. Aborting is enough — the task owns its
+        // client and stream, both of which drop when it unwinds.
+        if let Some(task) = self.http_task.take() {
+            task.abort();
         }
     }
 }
@@ -1180,6 +1200,7 @@ mod tests {
             http_client: None,
             file_source: None,
             http_receiver: None,
+            http_task: None,
         };
 
         let detected_type = source
@@ -1252,6 +1273,7 @@ mod tests {
             http_client: None,
             file_source: None,
             http_receiver: None,
+            http_task: None,
         };
 
         let result = source.detect_best_source_type().await;
@@ -1276,6 +1298,7 @@ mod tests {
             http_client: None,
             file_source: None,
             http_receiver: None,
+            http_task: None,
         };
 
         let detected_type = source
@@ -1302,6 +1325,7 @@ mod tests {
             http_client: None,
             file_source: None,
             http_receiver: None,
+            http_task: None,
         };
 
         let detected_type = source

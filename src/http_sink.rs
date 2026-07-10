@@ -65,6 +65,16 @@ impl HttpSinkBuilder {
         self
     }
 
+    /// Set the per-push HTTP timeout, in milliseconds. Each transmit batch
+    /// that exceeds this is abandoned and counted in
+    /// [`HttpSink::dropped_samples`] instead of blocking the background
+    /// sender (and back-pressuring the flowgraph).
+    #[must_use]
+    pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
     /// Set the authentication method for the endpoint.
     #[must_use]
     pub fn auth(mut self, auth: AuthMethod) -> Self {
@@ -107,7 +117,7 @@ impl HttpSink {
         frequency: f64,
         sample_rate: f64,
         buffer_size: usize,
-        _timeout_ms: u64,
+        timeout_ms: u64,
         auth_method: AuthMethod,
         streaming_delay: f64,
     ) -> Result<Self> {
@@ -128,8 +138,10 @@ impl HttpSink {
             ))
         })?;
 
+        let push_timeout = std::time::Duration::from_millis(timeout_ms);
         handle.spawn(async move {
             while let Some((samples, start_time, end_time)) = rx.recv().await {
+                let num_complex = samples.len() / 2;
                 let req = TxSampleRequest {
                     start_time,
                     end_time,
@@ -146,11 +158,25 @@ impl HttpSink {
                     samples: &samples,
                 };
 
-                if let Err(e) = endpoints_client.push_samples(&req).await {
-                    let num_complex = samples.len() / 2;
-                    dropped_samples_clone
-                        .fetch_add(num_complex as u64, std::sync::atomic::Ordering::Relaxed);
-                    warn!("Failed to push {} samples to RTSA: {}", num_complex, e);
+                // Bound each push so a stalled TX link can't wedge the sender
+                // task (and back-pressure the flowgraph) indefinitely. A
+                // timed-out or failed batch is counted as dropped.
+                match tokio::time::timeout(push_timeout, endpoints_client.push_samples(&req)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        dropped_samples_clone
+                            .fetch_add(num_complex as u64, std::sync::atomic::Ordering::Relaxed);
+                        warn!("Failed to push {} samples to RTSA: {}", num_complex, e);
+                    }
+                    Err(_elapsed) => {
+                        dropped_samples_clone
+                            .fetch_add(num_complex as u64, std::sync::atomic::Ordering::Relaxed);
+                        warn!(
+                            "Timed out ({} ms) pushing {} samples to RTSA",
+                            timeout_ms, num_complex
+                        );
+                    }
                 }
             }
         });

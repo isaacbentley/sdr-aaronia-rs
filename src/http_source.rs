@@ -9,7 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 // Import our new advanced streaming capabilities
 use crate::http_endpoints::{AuthMethod, HttpEndpointsClient};
-use crate::http_streaming::{StreamFormat, StreamParser, DropDetector};
+use crate::http_streaming::{DropDetector, StreamFormat, StreamParser};
 
 /// Stream statistics for monitoring
 #[derive(Debug, Clone)]
@@ -494,12 +494,12 @@ impl HttpSource {
             }
         }
 
-        if let Some(ref shared) = self.shared_stats {
-            if let Ok(mut stats) = shared.write() {
-                let pending = stats.restart_pending;
-                *stats = self.get_stream_stats();
-                stats.restart_pending = pending;
-            }
+        if let Some(ref shared) = self.shared_stats
+            && let Ok(mut stats) = shared.write()
+        {
+            let pending = stats.restart_pending;
+            *stats = self.get_stream_stats();
+            stats.restart_pending = pending;
         }
 
         Ok(total_samples_added)
@@ -646,25 +646,27 @@ impl Kernel for HttpSource {
         _meta: &mut futuresdr::runtime::BlockMeta,
     ) -> anyhow::Result<()> {
         let mut restart_triggered = false;
-        if let Some(ref shared) = self.shared_stats {
-            if let Ok(mut stats) = shared.write() {
-                if stats.restart_pending {
-                    stats.restart_pending = false;
-                    restart_triggered = true;
-                }
-            }
+        if let Some(ref shared) = self.shared_stats
+            && let Ok(mut stats) = shared.write()
+            && stats.restart_pending
+        {
+            stats.restart_pending = false;
+            restart_triggered = true;
         }
 
         if restart_triggered {
             info!("Restarting HTTP stream connection to apply frequency/span configuration...");
             let handle = self.tokio_handle.clone();
             if let Some(h) = handle {
-                let _ = h.block_on(async {
+                h.block_on(async {
                     self.cleanup_stream().await;
                     self.stream_active = false;
                     self.sample_buffer.clear();
                     if let Err(e) = self.start_stream().await {
-                        warn!("Failed to restart stream during configuration change: {}", e);
+                        warn!(
+                            "Failed to restart stream during configuration change: {}",
+                            e
+                        );
                     }
                 });
             } else {
@@ -672,7 +674,10 @@ impl Kernel for HttpSource {
                 self.stream_active = false;
                 self.sample_buffer.clear();
                 if let Err(e) = self.start_stream().await {
-                    warn!("Failed to restart stream during configuration change: {}", e);
+                    warn!(
+                        "Failed to restart stream during configuration change: {}",
+                        e
+                    );
                 }
             }
         }
@@ -720,6 +725,9 @@ impl Kernel for HttpSource {
                     if let Err(reconnect_err) = reconnect_res {
                         warn!("Failed to reconnect: {}", reconnect_err);
                     }
+                    // Ask to be polled again so the (re)connected stream is
+                    // drained promptly instead of waiting on downstream demand.
+                    io.call_again = true;
                     return Ok(()); // Don't fail the entire flowgraph
                 }
             }
@@ -794,7 +802,7 @@ impl HttpSourceBuilder {
             base_url: base_url.to_string(),
             frequency: 100e6,                   // 100 MHz default
             sample_rate: 1e6,                   // 1 MS/s default
-            reference_level: 20.0,              // 20 dB default
+            reference_level: -20.0,             // -20 dBm default (matches AaroniaConfig)
             buffer_size: 4096,                  // 4k samples default
             timeout_ms: 15000,                  // 15s timeout default
             stream_format: StreamFormat::Int16, // Production default based on reference implementation
@@ -896,7 +904,10 @@ impl HttpSourceBuilder {
     /// streams over HTTP; routing through the native SDK instead lives in
     /// [`crate::sdk_source`] / [`crate::unified_source`].
     #[must_use]
-    pub fn with_shared_stats(mut self, stats: std::sync::Arc<std::sync::RwLock<StreamStats>>) -> Self {
+    pub fn with_shared_stats(
+        mut self,
+        stats: std::sync::Arc<std::sync::RwLock<StreamStats>>,
+    ) -> Self {
         self.shared_stats = Some(stats);
         self
     }
