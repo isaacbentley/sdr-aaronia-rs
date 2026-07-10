@@ -42,6 +42,18 @@ pub enum Error {
     #[error(transparent)]
     SdkLoader(#[from] libloading::Error),
 
+    /// Native SDK operation failed with a specific API error code.
+    #[cfg(feature = "native-sdk")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[error("SDK error during {operation}: {code}")]
+    SdkApi {
+        /// The operation that failed (e.g. "AARTSAAPI_Init").
+        operation: String,
+        /// The underlying granular SDK error code.
+        #[source]
+        code: crate::native_sdk::SdkError,
+    },
+
     /// Native SDK operation failed.
     #[error("SDK error: {0}")]
     Sdk(String),

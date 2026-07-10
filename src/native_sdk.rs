@@ -103,6 +103,94 @@ pub fn result_message(code: u32) -> &'static str {
     }
 }
 
+/// A specific granular error code from the Aaronia native SDK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SdkError {
+    #[error("not initialized")]
+    NotInitialized,
+    #[error("not found")]
+    NotFound,
+    #[error("busy")]
+    Busy,
+    #[error("not open")]
+    NotOpen,
+    #[error("not connected")]
+    NotConnected,
+    #[error("invalid config")]
+    InvalidConfig,
+    #[error("buffer size")]
+    BufferSize,
+    #[error("invalid channel")]
+    InvalidChannel,
+    #[error("invalid parameter")]
+    InvalidParameter,
+    #[error("invalid size")]
+    InvalidSize,
+    #[error("missing paths file")]
+    MissingPathsFile,
+    #[error("value invalid")]
+    ValueInvalid,
+    #[error("value malformed")]
+    ValueMalformed,
+    #[error("generic error")]
+    Generic,
+    #[error("unknown ({0:#010X})")]
+    Unknown(u32),
+}
+
+impl SdkError {
+    /// Maps a raw `AARTSAAPI` u32 error code to an `SdkError`.
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            AARTSAAPI_ERROR => Self::Generic,
+            AARTSAAPI_ERROR_NOT_INITIALIZED => Self::NotInitialized,
+            AARTSAAPI_ERROR_NOT_FOUND => Self::NotFound,
+            AARTSAAPI_ERROR_BUSY => Self::Busy,
+            AARTSAAPI_ERROR_NOT_OPEN => Self::NotOpen,
+            AARTSAAPI_ERROR_NOT_CONNECTED => Self::NotConnected,
+            AARTSAAPI_ERROR_INVALID_CONFIG => Self::InvalidConfig,
+            AARTSAAPI_ERROR_BUFFER_SIZE => Self::BufferSize,
+            AARTSAAPI_ERROR_INVALID_CHANNEL => Self::InvalidChannel,
+            AARTSAAPI_ERROR_INVALID_PARAMETR => Self::InvalidParameter,
+            AARTSAAPI_ERROR_INVALID_SIZE => Self::InvalidSize,
+            AARTSAAPI_ERROR_MISSING_PATHS_FILE => Self::MissingPathsFile,
+            AARTSAAPI_ERROR_VALUE_INVALID => Self::ValueInvalid,
+            AARTSAAPI_ERROR_VALUE_MALFORMED => Self::ValueMalformed,
+            _ => Self::Unknown(code),
+        }
+    }
+}
+
+/// Checks an `AARTSAAPI` result code. If the high bit indicates an error,
+/// returns a corresponding `Error::SdkApi`. Warnings are logged but not returned as errors.
+pub fn check_res(res: u32, operation: &str) -> crate::Result<()> {
+    if res & AARTSAAPI_ERROR != 0 {
+        return Err(crate::Error::SdkApi {
+            operation: operation.to_string(),
+            code: SdkError::from_code(res),
+        });
+    } else if res != AARTSAAPI_OK {
+        // Technically this could be a warning, empty, or retry.
+        // The Java SDK defines `WARNING = 0x40000000`. We can just trace or debug log.
+        if res & 0x40000000 != 0 {
+            warn!(
+                "{} returned warning 0x{:08X}: {}",
+                operation,
+                res,
+                result_message(res)
+            );
+        } else {
+            debug!(
+                "{} returned non-OK 0x{:08X}: {}",
+                operation,
+                res,
+                result_message(res)
+            );
+        }
+    }
+    Ok(())
+}
+
 // Memory levels
 pub const AARTSAAPI_MEMORY_SMALL: u32 = 0;
 pub const AARTSAAPI_MEMORY_MEDIUM: u32 = 1;
@@ -545,34 +633,20 @@ impl NativeSdkClient {
         unsafe {
             let wide_path = string_to_wide(xml_path)?;
             let result = (self.init_with_path)(memory, wide_path.as_ptr());
-            if result == AARTSAAPI_OK {
-                self.initialized
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                info!("SDK initialized successfully");
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_Init_With_Path failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_Init_With_Path")?;
+            self.initialized
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            info!("SDK initialized successfully");
+            Ok(())
         }
     }
 
     pub unsafe fn shutdown(&self) -> Result<()> {
         unsafe {
             let result = (self.shutdown)();
-            if result == AARTSAAPI_OK {
-                info!("SDK shutdown successfully");
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_Shutdown failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_Shutdown")?;
+            info!("SDK shutdown successfully");
+            Ok(())
         }
     }
 
@@ -586,32 +660,18 @@ impl NativeSdkClient {
         unsafe {
             let mut handle = AARTSAAPI_Handle { d: ptr::null_mut() };
             let result = (self.open)(&mut handle);
-            if result == AARTSAAPI_OK {
-                debug!("SDK handle opened successfully");
-                Ok(handle)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_Open failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_Open")?;
+            debug!("SDK handle opened successfully");
+            Ok(handle)
         }
     }
 
     pub unsafe fn close_handle(&self, handle: &mut AARTSAAPI_Handle) -> Result<()> {
         unsafe {
             let result = (self.close)(handle);
-            if result == AARTSAAPI_OK {
-                debug!("SDK handle closed successfully");
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_Close failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_Close")?;
+            debug!("SDK handle closed successfully");
+            Ok(())
         }
     }
 
@@ -645,16 +705,9 @@ impl NativeSdkClient {
                 ));
             }
 
-            if result == AARTSAAPI_OK {
-                info!("Device rescan completed successfully");
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_RescanDevices failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_RescanDevices")?;
+            info!("Device rescan completed successfully");
+            Ok(())
         }
     }
 
@@ -733,80 +786,45 @@ impl NativeSdkClient {
                 serial_number.as_ptr(),
             );
 
-            if result == AARTSAAPI_OK {
-                info!("Device {} opened successfully", device_type);
-                Ok(device)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_OpenDevice failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_OpenDevice")?;
+            info!("Device {} opened successfully", device_type);
+            Ok(device)
         }
     }
 
     pub unsafe fn connect_device(&self, device: &mut AARTSAAPI_Device) -> Result<()> {
         unsafe {
             let result = (self.connect_device)(device);
-            if result == AARTSAAPI_OK {
-                info!("Device connected successfully");
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConnectDevice failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConnectDevice")?;
+            info!("Device connected successfully");
+            Ok(())
         }
     }
 
     pub unsafe fn start_device(&self, device: &mut AARTSAAPI_Device) -> Result<()> {
         unsafe {
             let result = (self.start_device)(device);
-            if result == AARTSAAPI_OK {
-                info!("Device started successfully");
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_StartDevice failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_StartDevice")?;
+            info!("Device started successfully");
+            Ok(())
         }
     }
 
     pub unsafe fn stop_device(&self, device: &mut AARTSAAPI_Device) -> Result<()> {
         unsafe {
             let result = (self.stop_device)(device);
-            if result == AARTSAAPI_OK {
-                info!("Device stopped successfully");
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_StopDevice failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_StopDevice")?;
+            info!("Device stopped successfully");
+            Ok(())
         }
     }
 
     pub unsafe fn disconnect_device(&self, device: &mut AARTSAAPI_Device) -> Result<()> {
         unsafe {
             let result = (self.disconnect_device)(device);
-            if result == AARTSAAPI_OK {
-                info!("Device disconnected successfully");
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_DisconnectDevice failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_DisconnectDevice")?;
+            info!("Device disconnected successfully");
+            Ok(())
         }
     }
 
@@ -817,16 +835,9 @@ impl NativeSdkClient {
     ) -> Result<()> {
         unsafe {
             let result = (self.close_device)(handle, device);
-            if result == AARTSAAPI_OK {
-                info!("Device closed successfully");
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_CloseDevice failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_CloseDevice")?;
+            info!("Device closed successfully");
+            Ok(())
         }
     }
 
@@ -839,15 +850,8 @@ impl NativeSdkClient {
         unsafe {
             let mut config = AARTSAAPI_Config { d: ptr::null_mut() };
             let result = (self.config_root)(device, &mut config);
-            if result == AARTSAAPI_OK {
-                Ok(config)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigRoot failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigRoot")?;
+            Ok(config)
         }
     }
 
@@ -862,15 +866,9 @@ impl NativeSdkClient {
             let wide_path = string_to_wide(path)?;
             let result = (self.config_find)(device, group, &mut config, wide_path.as_ptr());
 
-            if result == AARTSAAPI_OK {
-                debug!("Config {} found successfully", path);
-                Ok(config)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigFind failed for {}: 0x{:08x}",
-                    path, result
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigFind")?;
+            debug!("Config {} found successfully", path);
+            Ok(config)
         }
     }
 
@@ -882,16 +880,9 @@ impl NativeSdkClient {
     ) -> Result<()> {
         unsafe {
             let result = (self.config_set_float)(device, config, value);
-            if result == AARTSAAPI_OK {
-                debug!("Config float value set to: {}", value);
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigSetFloat failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigSetFloat")?;
+            debug!("Config float value set to: {}", value);
+            Ok(())
         }
     }
 
@@ -904,16 +895,9 @@ impl NativeSdkClient {
         unsafe {
             let wide_value = string_to_wide(value)?;
             let result = (self.config_set_string)(device, config, wide_value.as_ptr());
-            if result == AARTSAAPI_OK {
-                debug!("Config string value set to: {}", value);
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigSetString failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigSetString")?;
+            debug!("Config string value set to: {}", value);
+            Ok(())
         }
     }
 
@@ -926,15 +910,8 @@ impl NativeSdkClient {
             let mut size: i64 = 1024;
             let mut buffer = vec![0 as WideChar; size as usize];
             let result = (self.config_get_string)(device, config, buffer.as_mut_ptr(), &mut size);
-            if result == AARTSAAPI_OK {
-                Ok(wide_to_string(&buffer))
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigGetString failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigGetString")?;
+            Ok(wide_to_string(&buffer))
         }
     }
 
@@ -947,15 +924,8 @@ impl NativeSdkClient {
         unsafe {
             let mut value: f64 = 0.0;
             let result = (self.config_get_float)(device, config, &mut value);
-            if result == AARTSAAPI_OK {
-                Ok(value)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigGetFloat failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigGetFloat")?;
+            Ok(value)
         }
     }
 
@@ -982,15 +952,8 @@ impl NativeSdkClient {
                 disabled_options: 0,
             };
             let result = (self.config_get_info)(device, config, &mut info);
-            if result == AARTSAAPI_OK {
-                Ok(info)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigGetInfo failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigGetInfo")?;
+            Ok(info)
         }
     }
 
@@ -1006,15 +969,8 @@ impl NativeSdkClient {
     ) -> Result<()> {
         unsafe {
             let result = (self.config_set_integer)(device, config, value);
-            if result == AARTSAAPI_OK {
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigSetInteger failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigSetInteger")?;
+            Ok(())
         }
     }
 
@@ -1027,15 +983,8 @@ impl NativeSdkClient {
         unsafe {
             let mut value: i64 = 0;
             let result = (self.config_get_integer)(device, config, &mut value);
-            if result == AARTSAAPI_OK {
-                Ok(value)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigGetInteger failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigGetInteger")?;
+            Ok(value)
         }
     }
 
@@ -1049,15 +998,8 @@ impl NativeSdkClient {
         unsafe {
             let mut config = AARTSAAPI_Config { d: ptr::null_mut() };
             let result = (self.config_health)(device, &mut config);
-            if result == AARTSAAPI_OK {
-                Ok(config)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigHealth failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigHealth")?;
+            Ok(config)
         }
     }
 
@@ -1118,15 +1060,8 @@ impl NativeSdkClient {
             // `name` field, so allocate the same.
             let mut buffer = vec![0 as WideChar; 80];
             let result = (self.config_get_name)(device, config, buffer.as_mut_ptr());
-            if result == AARTSAAPI_OK {
-                Ok(wide_to_string(&buffer))
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigGetName failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConfigGetName")?;
+            Ok(wide_to_string(&buffer))
         }
     }
 
@@ -1136,15 +1071,8 @@ impl NativeSdkClient {
     pub unsafe fn reset_devices(&self, handle: &mut AARTSAAPI_Handle) -> Result<()> {
         unsafe {
             let result = (self.reset_devices)(handle);
-            if result == AARTSAAPI_OK {
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ResetDevices failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ResetDevices")?;
+            Ok(())
         }
     }
 
@@ -1157,15 +1085,8 @@ impl NativeSdkClient {
         unsafe {
             let mut num: i32 = 0;
             let result = (self.avail_packets)(device, channel, &mut num);
-            if result == AARTSAAPI_OK {
-                Ok(num)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_AvailPackets failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_AvailPackets")?;
+            Ok(num)
         }
     }
 
@@ -1223,16 +1144,9 @@ impl NativeSdkClient {
     ) -> Result<()> {
         unsafe {
             let result = (self.consume_packets)(device, channel, num_packets);
-            if result == AARTSAAPI_OK {
-                debug!("Consumed {} packets", num_packets);
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConsumePackets failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_ConsumePackets")?;
+            debug!("Consumed {} packets", num_packets);
+            Ok(())
         }
     }
 
@@ -1240,15 +1154,8 @@ impl NativeSdkClient {
         unsafe {
             let mut stime = 0.0;
             let result = (self.get_master_stream_time)(device, &mut stime);
-            if result == AARTSAAPI_OK {
-                Ok(stime)
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_GetMasterStreamTime failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_GetMasterStreamTime")?;
+            Ok(stime)
         }
     }
 
@@ -1260,15 +1167,8 @@ impl NativeSdkClient {
     ) -> Result<()> {
         unsafe {
             let result = (self.send_packet)(device, channel, packet as *const _);
-            if result == AARTSAAPI_OK {
-                Ok(())
-            } else {
-                Err(Error::Sdk(format!(
-                    "AARTSAAPI_SendPacket failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                )))
-            }
+            check_res(result, "AARTSAAPI_SendPacket")?;
+            Ok(())
         }
     }
 }

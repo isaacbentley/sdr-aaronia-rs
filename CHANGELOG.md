@@ -4,11 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [v0.2.5] - 2026-07-10
+## [v0.2.6] - 2026-07-10
 
 ### Added
 - **Native SDK Transmitter (TX):** Added transmit capabilities through the C++ Native SDK (`SdkSink` and `SdkSinkConfig`). This provides TX path parity with the `SdkSource` and includes FutureSDR integration (`SdkSinkBlock`).
 - **Examples:** Added `examples/native_sdk_transmit.rs` to demonstrate programmatic device configuration, master stream time-driven packet pacing, and sending a continuous LoRa-like CSS up-chirp.
+
+### Changed
+- **Granular Errors:** Migrated the opaque `Error::Sdk(String)` to a structured `Error::SdkApi { operation: &'static str, code: SdkError }` to allow programmatic error recovery.
+- **Warning Isolation:** The Native SDK C++ FFI bindings now correctly categorize and log warnings (codes with the `0x40000000` bit set) rather than escalating them to fatal errors, mapping closely to the official Aaronia Java/C++ driver behaviors.
 
 ## [v0.2.4] - 2026-07-10
 
