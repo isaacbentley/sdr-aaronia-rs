@@ -2256,6 +2256,25 @@ pub mod tx_flags {
     pub const SEGMENT_START: u64 = 0x00000004;
     /// Indicates the end of a segment.
     pub const SEGMENT_END: u64 = 0x00000008;
+
+    /// Instructs the device to immediately process/push the packet.
+    pub const PUSH: u64 = 0x00008000;
+
+    // --- Warning Flags ---
+    pub const WARN_OVERFLOW: u64 = 0x00000100;
+    pub const WARN_DROPPED: u64 = 0x00000200;
+    pub const WARN_INACCURATE: u64 = 0x00000400;
+    pub const WARN_RESAMPLED: u64 = 0x00000800;
+
+    /// Indicates a discontinuity in the time sequence.
+    pub const TIME_DISCONTINUITY: u64 = 0x00010000;
+    pub const WARN_DIRECTION: u64 = 0x00020000;
+
+    // --- Condition Flags ---
+    pub const CONDITION_0: u64 = 0x10000000;
+    pub const CONDITION_1: u64 = 0x20000000;
+    pub const CONDITION_2: u64 = 0x40000000;
+    pub const CONDITION_3: u64 = 0x80000000;
 }
 
 /// A burst of IQ samples to be transmitted over the native SDK.
