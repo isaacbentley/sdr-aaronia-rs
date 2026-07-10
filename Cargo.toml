@@ -2,7 +2,7 @@
 name = "sdr-aaronia-rs"
 description = "Unified Rust interface for Aaronia Spectran V6 SDRs: native RTSA SDK, HTTP streaming, and RTSA capture-file sources"
 license = "GPL-3.0-or-later"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
 readme = "README.md"
@@ -23,7 +23,7 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 thiserror = "2.0"
 bytes = { version = "1.0", optional = true }
-tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time"], optional = true }
+tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time", "macros"], optional = true }
 tracing = "0.1"
 url = { version = "2.4", optional = true }
 futuresdr = { version = "0.0.39", default-features = false, features = ["audio"], optional = true }

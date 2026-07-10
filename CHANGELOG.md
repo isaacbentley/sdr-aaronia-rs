@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.2.4] - 2026-07-10
+
 ### Performance
 - **HTTP stream parser:** binary formats (int16/float16/float32) now
   deserialize `PacketMetadata` straight from the header bytes instead of
