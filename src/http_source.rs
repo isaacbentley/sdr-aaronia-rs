@@ -24,6 +24,7 @@ pub struct StreamStats {
     pub input_msps: f64,
     pub dropped_packets: u64,
     pub packet_rate: f64,
+    pub restart_pending: bool,
 }
 
 impl Default for StreamStats {
@@ -39,6 +40,7 @@ impl Default for StreamStats {
             input_msps: 0.0,
             dropped_packets: 0,
             packet_rate: 0.0,
+            restart_pending: false,
         }
     }
 }
@@ -494,7 +496,9 @@ impl HttpSource {
 
         if let Some(ref shared) = self.shared_stats {
             if let Ok(mut stats) = shared.write() {
+                let pending = stats.restart_pending;
                 *stats = self.get_stream_stats();
+                stats.restart_pending = pending;
             }
         }
 
@@ -515,6 +519,7 @@ impl HttpSource {
             input_msps: stats.samples_per_second / 1e6,
             dropped_packets: self.drop_detector.drops(),
             packet_rate: stats.packet_rate,
+            restart_pending: false,
         }
     }
 }
@@ -640,6 +645,26 @@ impl Kernel for HttpSource {
         _mio: &mut futuresdr::runtime::MessageOutputs,
         _meta: &mut futuresdr::runtime::BlockMeta,
     ) -> anyhow::Result<()> {
+        let mut restart_triggered = false;
+        if let Some(ref shared) = self.shared_stats {
+            if let Ok(mut stats) = shared.write() {
+                if stats.restart_pending {
+                    stats.restart_pending = false;
+                    restart_triggered = true;
+                }
+            }
+        }
+
+        if restart_triggered {
+            info!("Restarting HTTP stream connection to apply frequency/span configuration...");
+            self.cleanup_stream().await;
+            self.stream_active = false;
+            self.sample_buffer.clear();
+            if let Err(e) = self.start_stream().await {
+                warn!("Failed to restart stream during configuration change: {}", e);
+            }
+        }
+
         {
             debug!(
                 "HttpSource: work() called, buffer: {} samples",
