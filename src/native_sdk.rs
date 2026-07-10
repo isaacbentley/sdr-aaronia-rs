@@ -22,7 +22,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use widestring::{WideCStr, WideCString, WideChar};
 
 use crate::detection::{get_sdk_library_path, get_xml_config_path};
@@ -2052,7 +2052,10 @@ impl NativeSdkSource {
                     }
                     samples_read = num_complex_samples;
 
-                    info!(
+                    // `trace!`, not `info!`: this runs on every read call
+                    // (thousands/sec at speed), so an enabled info subscriber
+                    // would pay per-read formatting on the hot path.
+                    trace!(
                         "Read {} IQ samples (sample rate: {} Hz, center freq: {} Hz)",
                         samples_read, packet.step_frequency, packet.start_frequency
                     );

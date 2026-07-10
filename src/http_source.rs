@@ -472,9 +472,8 @@ impl HttpSource {
             // if the consumer can't keep up, drop the *oldest* samples so
             // the buffer stays bounded and current.
             let packet_samples = packet.samples.len();
-            for sample in packet.samples {
-                self.sample_buffer.push_back(sample);
-            }
+            // Bulk `extend` (one reserve) rather than per-element `push_back`.
+            self.sample_buffer.extend(packet.samples);
             total_samples_added += packet_samples;
             let capacity = self.buffer_size.saturating_mul(2).max(1);
             if self.sample_buffer.len() > capacity {

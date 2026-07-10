@@ -681,6 +681,53 @@ pub fn rtsa_epoch_seconds(raw: f64) -> f64 {
     if raw >= 1e13 { raw / 1e6 } else { raw }
 }
 
+/// Bulk-read `count` little-endian f32 IQ pairs (`Complex32`) from `reader`.
+///
+/// One `read_exact` into a scratch buffer, then a tight in-memory decode,
+/// instead of two `read_f32` calls per sample — each `read_f32` is a
+/// method call plus a `BufReader` bounds check, which dominates on large
+/// sequential reads.
+fn read_iq_f32<R: Read>(reader: &mut R, count: usize) -> Result<Vec<Complex32>> {
+    let mut bytes = vec![0u8; count * 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| {
+            Complex32::new(
+                f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+            )
+        })
+        .collect())
+}
+
+/// Bulk-read `count` little-endian i16 IQ pairs, each component scaled by
+/// `scale`. See [`read_iq_f32`] for the bulk-read rationale.
+fn read_iq_i16<R: Read>(reader: &mut R, count: usize, scale: f32) -> Result<Vec<Complex32>> {
+    let mut bytes = vec![0u8; count * 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| {
+            Complex32::new(
+                i16::from_le_bytes([c[0], c[1]]) as f32 * scale,
+                i16::from_le_bytes([c[2], c[3]]) as f32 * scale,
+            )
+        })
+        .collect())
+}
+
+/// Bulk-read `count` little-endian f32 scalars. See [`read_iq_f32`] for the
+/// bulk-read rationale.
+fn read_f32_vec<R: Read>(reader: &mut R, count: usize) -> Result<Vec<f32>> {
+    let mut bytes = vec![0u8; count * 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 /// All chunks accumulated during a single pass through an RTSA file.
 ///
 /// This is an internal helper introduced to keep `parse_rtsa_with_tail`
@@ -1599,13 +1646,8 @@ impl RtsaSource {
         // Seek to the position in the raw IQ data
         self.reader.seek(SeekFrom::Start(sample_byte_offset))?;
 
-        // Read the raw float32 IQ data
-        let mut samples = Vec::with_capacity(samples_to_read);
-        for _ in 0..samples_to_read {
-            let i = self.reader.read_f32::<LittleEndian>()?;
-            let q = self.reader.read_f32::<LittleEndian>()?;
-            samples.push(Complex32::new(i, q));
-        }
+        // Read the raw float32 IQ data in one bulk read + decode.
+        let samples = read_iq_f32(&mut self.reader, samples_to_read)?;
 
         // Update current position
         self.current_sample_index += samples_to_read as u64;
@@ -1948,13 +1990,8 @@ impl RtsaSource {
                                                 ),
                                             });
                                         }
-                                        let mut samples = Vec::with_capacity(to_read as usize);
-                                        for _ in 0..to_read {
-                                            samples.push(Complex32::new(
-                                                self.reader.read_f32::<LittleEndian>()?,
-                                                self.reader.read_f32::<LittleEndian>()?,
-                                            ));
-                                        }
+                                        let samples =
+                                            read_iq_f32(&mut self.reader, to_read as usize)?;
                                         Some(SampleData::Iq(samples))
                                     }
                                     DspStreamSampleType::DsStS16
@@ -1968,15 +2005,8 @@ impl RtsaSource {
                                         // ADC-normalised default 1 / 32768.
                                         let scale = self
                                             .int16_scale_for_sub_stream(samp_chunk.sub_stream_id);
-                                        let mut samples = Vec::with_capacity(to_read as usize);
-                                        for _ in 0..to_read {
-                                            let i_raw =
-                                                self.reader.read_i16::<LittleEndian>()? as f32;
-                                            let q_raw =
-                                                self.reader.read_i16::<LittleEndian>()? as f32;
-                                            samples
-                                                .push(Complex32::new(i_raw * scale, q_raw * scale));
-                                        }
+                                        let samples =
+                                            read_iq_i16(&mut self.reader, to_read as usize, scale)?;
                                         Some(SampleData::Iq(samples))
                                     }
                                     _ => None, // Unsupported sample type for IQ
@@ -1986,10 +2016,8 @@ impl RtsaSource {
                                 match samp_chunk.sample_type {
                                     DspStreamSampleType::DsStF32
                                     | DspStreamSampleType::DsStF32N => {
-                                        let mut samples = Vec::with_capacity(to_read as usize);
-                                        for _ in 0..to_read {
-                                            samples.push(self.reader.read_f32::<LittleEndian>()?);
-                                        }
+                                        let samples =
+                                            read_f32_vec(&mut self.reader, to_read as usize)?;
                                         Some(SampleData::Spectra(samples))
                                     }
                                     _ => None, // Unsupported sample type for Spectra

@@ -435,8 +435,11 @@ impl AaroniaSource {
             params_builder = params_builder.scale(scale);
         }
         let stream_params = params_builder.build();
-        let client_for_task =
-            HttpEndpointsClient::new(base_url.clone(), crate::http_endpoints::AuthMethod::None)?;
+        // Reuse the existing client for the reader task rather than building a
+        // second one: `HttpEndpointsClient` clones cheaply (its inner
+        // `reqwest::Client` is `Arc`-backed), so both share one connection
+        // pool instead of standing up a duplicate.
+        let client_for_task = client.clone();
 
         // Spawn a task to continuously read from the HTTP stream and send samples
         let reader_task = tokio::spawn(async move {

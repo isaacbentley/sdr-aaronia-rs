@@ -677,27 +677,29 @@ impl StreamParser {
             // either parses now or never will. Valid JSON cannot contain a
             // raw 0x1E/0x0A byte (control characters must be escaped), so
             // the separator cannot sit inside a still-incomplete document.
-            let parsed = {
-                let json_data = &self.pending()[json_start..json_end];
-                serde_json::from_slice::<serde_json::Value>(json_data)
-                    .ok()
-                    .and_then(|v| PacketMetadata::deserialize(&v).ok().map(|m| (m, v)))
-            };
-            let (metadata, json_value) = match parsed {
-                Some(parsed) => parsed,
-                None => {
-                    // Not a packet header — resync past this `{`. The
-                    // consumption is a cheap offset bump (no memmove), so
-                    // walking byte-by-byte through a corrupt region stays
-                    // linear overall.
-                    self.counters.parse_errors += 1;
-                    self.consume_buffer(json_start + 1);
-                    continue;
-                }
-            };
+            let json_data = &self.pending()[json_start..json_end];
 
-            // Pure JSON streams carry the samples inside the document.
+            // Pure-JSON streams carry the sample values inside the header
+            // document, so that path (and only that path) pays for a full
+            // `serde_json::Value` DOM. Binary streams — the throughput
+            // formats — deserialize `PacketMetadata` straight from the bytes,
+            // avoiding a per-packet DOM allocation + reparse on the hot path.
             if self.format == StreamFormat::Json {
+                let parsed = serde_json::from_slice::<serde_json::Value>(json_data)
+                    .ok()
+                    .and_then(|v| PacketMetadata::deserialize(&v).ok().map(|m| (m, v)));
+                let (metadata, json_value) = match parsed {
+                    Some(parsed) => parsed,
+                    None => {
+                        // Not a packet header — resync past this `{`. The
+                        // consumption is a cheap offset bump (no memmove), so
+                        // walking byte-by-byte through a corrupt region stays
+                        // linear overall.
+                        self.counters.parse_errors += 1;
+                        self.consume_buffer(json_start + 1);
+                        continue;
+                    }
+                };
                 let samples = self.parse_json_samples(&metadata, &json_value)?;
                 let mut metadata = metadata;
                 // The wire `samples` field holds the raw array length; for
@@ -709,6 +711,19 @@ impl StreamParser {
                 self.consume_buffer(binary_start);
                 return Ok(Some(StreamPacket::new(metadata, samples)));
             }
+
+            // Binary formats: deserialize the header straight into
+            // `PacketMetadata` — no throwaway `Value` DOM per packet. A
+            // non-header `{` (mid-stream corruption) fails to parse and we
+            // resync, exactly as the JSON path does.
+            let metadata = match serde_json::from_slice::<PacketMetadata>(json_data) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    self.counters.parse_errors += 1;
+                    self.consume_buffer(json_start + 1);
+                    continue;
+                }
+            };
 
             let expected_bytes = self.calculate_binary_size(&metadata)?;
             if expected_bytes > Self::MAX_BINARY_PAYLOAD {
@@ -861,21 +876,54 @@ impl StreamParser {
         Ok(samples)
     }
 
-    /// Optimized Float32 IQ parsing with bulk operations
+    /// Optimized Float32 IQ parsing.
+    ///
+    /// On a little-endian host the wire payload is byte-identical to a
+    /// `[Complex32]` (`repr(C) { re: f32, im: f32 }`, little-endian), so the
+    /// whole payload is copied in one `memcpy` rather than decoding each
+    /// `f32` individually. Big-endian hosts fall back to the portable
+    /// per-element decode. The input bytes are unaligned (a subslice of the
+    /// parser buffer), so we copy *into* an aligned `Vec<Complex32>` rather
+    /// than reinterpreting the source in place.
     fn parse_iq_float32_optimized(&self, data: &[u8]) -> Result<Vec<Complex32>> {
         let num_samples = data.len() / 8;
-        let mut samples = Vec::with_capacity(num_samples);
 
-        // For Float32, we can potentially use unsafe transmute for maximum speed
-        // But for safety, we'll stick with from_le_bytes for now
-        for chunk in data.chunks_exact(8) {
-            let i_val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            let q_val = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-
-            samples.push(Complex32::new(i_val, q_val));
+        #[cfg(target_endian = "little")]
+        {
+            // `Complex32` is `#[repr(C)] { re: f32, im: f32 }`; pin the layout
+            // assumption at compile time.
+            const _: () =
+                assert!(std::mem::size_of::<Complex32>() == 2 * std::mem::size_of::<f32>());
+            let mut samples = Vec::<Complex32>::with_capacity(num_samples);
+            // SAFETY: `samples` was allocated for `num_samples` Complex32
+            // (= num_samples * 8 bytes), and `data` holds at least that many
+            // bytes (`num_samples == data.len() / 8`). A raw byte copy has no
+            // alignment requirement on either end, and on little-endian the
+            // source bytes are exactly the Complex32 representation, so every
+            // byte of the first `num_samples` elements is initialised before
+            // `set_len`.
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    samples.as_mut_ptr() as *mut u8,
+                    num_samples * 8,
+                );
+                samples.set_len(num_samples);
+            }
+            Ok(samples)
         }
 
-        Ok(samples)
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut samples = Vec::with_capacity(num_samples);
+            for chunk in data.chunks_exact(8) {
+                let i_val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let q_val = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                samples.push(Complex32::new(i_val, q_val));
+            }
+            Ok(samples)
+        }
     }
 
     fn parse_spectrum_samples(

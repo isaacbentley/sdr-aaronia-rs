@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Performance
+- **HTTP stream parser:** binary formats (int16/float16/float32) now
+  deserialize `PacketMetadata` straight from the header bytes instead of
+  building — and discarding — a full `serde_json::Value` DOM per packet.
+  `parse_int16_packet` improves ~41% at 256 samples/packet down to ~6% at
+  64k (the header cost amortizes over larger payloads). The pure-JSON
+  stream still uses the DOM, since it reads sample values from it.
+- **Float32 IQ parse:** on little-endian hosts the payload is bulk-copied
+  in one `memcpy` into an aligned `Vec<Complex32>` instead of decoding each
+  `f32` individually (portable per-element fallback on big-endian).
+- **RTSA file replay:** IQ/spectra sample reads now do one bulk `read_exact`
+  + in-memory decode instead of two `read_f32`/`read_i16` calls per sample.
+- **Native SDK `read_samples`** logs per-read at `trace!` instead of
+  `info!`, so an enabled info subscriber no longer pays formatting cost on
+  the hot path.
+- Minor: `HttpSource` bulk-`extend`s its sample ring buffer rather than
+  pushing element-by-element; the unified HTTP source reuses one
+  connection-pooled client for its reader task instead of building a
+  second.
+
 ### Fixed
 - **Native SDK `read_samples` soundness:** the wide-stride (`stride > 2`) IQ
   gather path underflowed `usize` when `max_samples == 0`, handing
