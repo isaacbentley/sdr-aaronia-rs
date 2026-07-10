@@ -209,10 +209,8 @@ impl Default for SdkSink {
 #[cfg(feature = "futuresdr")]
 pub mod futuresdr_sink {
     use super::*;
-    use futuresdr::anyhow::Result as FutureSdrResult;
-    use futuresdr::runtime::{
-        Block, BlockMetaBuilder, Kernel, MessageIo, MessageIoBuilder, StreamIo, StreamIoBuilder,
-    };
+    use futuresdr::runtime::Kernel;
+    use futuresdr::macros::Block;
     use tracing::error;
 
     /// FutureSDR block that sinks `Complex32` items to the native SDK.
@@ -222,42 +220,43 @@ pub mod futuresdr_sink {
     /// usage, or you must build a pacing mechanism in your graph. Since
     /// we cannot test hardware, the simplest continuous streaming block
     /// is provided.
+    #[derive(Block)]
     pub struct SdkSinkBlock {
         sink: SdkSink,
         channel: i32,
         samples_per_burst: usize,
+        #[input]
+        input: futuresdr::runtime::buffer::DefaultCpuReader<Complex32>,
     }
 
     impl SdkSinkBlock {
-        pub fn new(sink: SdkSink, channel: i32, samples_per_burst: usize) -> Block {
-            Block::new(
-                BlockMetaBuilder::new("SdkSinkBlock").build(),
-                StreamIoBuilder::new().add_input::<Complex32>("in").build(),
-                MessageIoBuilder::new().build(),
-                Self {
-                    sink,
-                    channel,
-                    samples_per_burst,
-                },
-            )
+        pub fn new(sink: SdkSink, channel: i32, samples_per_burst: usize) -> Self {
+            Self {
+                sink,
+                channel,
+                samples_per_burst,
+                input: futuresdr::runtime::buffer::DefaultCpuReader::default(),
+            }
         }
     }
 
-    #[async_trait::async_trait]
     impl Kernel for SdkSinkBlock {
         async fn work(
             &mut self,
-            io: &mut StreamIo,
-            _mio: &mut MessageIo<Self>,
+            io: &mut futuresdr::runtime::WorkIo,
+            _mio: &mut futuresdr::runtime::MessageOutputs,
             _meta: &mut futuresdr::runtime::BlockMeta,
-        ) -> FutureSdrResult<()> {
-            let input = io.input(0).slice::<Complex32>();
+        ) -> anyhow::Result<()> {
+            let i = self.input.slice();
 
-            if input.is_empty() {
+            if i.is_empty() {
+                if self.input.finished() {
+                    io.finished = true;
+                }
                 return Ok(());
             }
 
-            let n = std::cmp::min(input.len(), self.samples_per_burst);
+            let n = std::cmp::min(i.len(), self.samples_per_burst);
 
             // In a real continuous stream, we would calculate start_time and
             // end_time precisely. Here we dispatch "immediate" or un-paced
@@ -271,11 +270,14 @@ pub mod futuresdr_sink {
                     | crate::native_sdk::tx_flags::SEGMENT_END,
             };
 
-            if let Err(e) = self.sink.write_samples(self.channel, burst, &input[..n]) {
+            if let Err(e) = self.sink.write_samples(self.channel, burst, &i[..n]) {
                 error!("Failed to write samples to SDK: {}", e);
             }
 
-            io.input(0).consume(n);
+            self.input.consume(n);
+            if self.input.finished() && n == i.len() {
+                io.finished = true;
+            }
             Ok(())
         }
     }
