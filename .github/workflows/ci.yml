@@ -60,37 +60,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: cargo test
-        run: cargo test --all-features
-
-  clippy_fmt:
-    name: Clippy + Rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          lfs: false
-
-      - name: Install Linux Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt --check
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
 
       - name: cargo clippy
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: Install cargo-llvm-cov
+        if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: cargo test (macOS/Windows)
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo test --all-features
+
+      - name: cargo test + coverage (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        if: matrix.os == 'ubuntu-latest'
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false  # coverage drop != broken build
+
 
   miri:
     name: Miri (decompression + http_streaming + utils)
@@ -206,34 +206,3 @@ jobs:
       - name: cargo semver-checks
         run: cargo semver-checks check-release
 
-  coverage:
-    name: Coverage (llvm-cov)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          lfs: false
-
-      - name: Install Linux Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: llvm-tools-preview
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: cargo llvm-cov
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false  # coverage drop != broken build
