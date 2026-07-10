@@ -1897,6 +1897,56 @@ impl NativeSdkSource {
         }
     }
 
+    /// Configure the device for IQ transmission.
+    ///
+    /// > [!WARNING]
+    /// > Hardware-unverified: the `main/transgain` configuration has not been
+    /// > confirmed against a live TX-capable device.
+    pub unsafe fn configure_iq_transmitter(
+        &mut self,
+        center_freq: f64,
+        span_freq: f64,
+        trans_gain: f64,
+    ) -> Result<()> {
+        unsafe {
+            let device = self
+                .device
+                .as_mut()
+                .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
+
+            let mut root = self.client.get_config_root(device)?;
+
+            if let Ok(mut config) = self
+                .client
+                .find_config(device, &mut root, "main/centerfreq")
+            {
+                self.client
+                    .set_config_float(device, &mut config, center_freq)?;
+                info!("Set TX center frequency to {} Hz", center_freq);
+            } else {
+                warn!("Could not find main/centerfreq config");
+            }
+
+            if let Ok(mut config) = self.client.find_config(device, &mut root, "main/spanfreq") {
+                self.client
+                    .set_config_float(device, &mut config, span_freq)?;
+                info!("Set TX span frequency to {} Hz", span_freq);
+            } else {
+                warn!("Could not find main/spanfreq config");
+            }
+
+            if let Ok(mut config) = self.client.find_config(device, &mut root, "main/transgain") {
+                self.client
+                    .set_config_float(device, &mut config, trans_gain)?;
+                info!("Set TX gain to {} dB", trans_gain);
+            } else {
+                warn!("Could not find main/transgain config");
+            }
+
+            Ok(())
+        }
+    }
+
     pub unsafe fn start_streaming(&mut self) -> Result<()> {
         unsafe {
             let device = self
@@ -2085,6 +2135,19 @@ impl NativeSdkSource {
         }
     }
 
+    /// Read the device's master stream time.
+    ///
+    /// This time is required to correctly schedule `TxBurst` packets.
+    pub fn get_master_stream_time(&mut self) -> Result<f64> {
+        unsafe {
+            let device = self
+                .device
+                .as_mut()
+                .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
+            self.client.get_master_stream_time(device)
+        }
+    }
+
     pub unsafe fn stop_streaming(&mut self) -> Result<()> {
         unsafe {
             if self.stream_active {
@@ -2183,10 +2246,24 @@ impl RxChannel {
     }
 }
 
-/// Timing and frequency parameters for one burst handed to
-/// [`TxStream::write_samples`].
+/// Transmit packet flags defining stream and segment boundaries.
+pub mod tx_flags {
+    /// Indicates the start of a stream (first packet).
+    pub const STREAM_START: u64 = 0x00000001;
+    /// Indicates the end of a stream (last packet).
+    pub const STREAM_END: u64 = 0x00000002;
+    /// Indicates the start of a segment.
+    pub const SEGMENT_START: u64 = 0x00000004;
+    /// Indicates the end of a segment.
+    pub const SEGMENT_END: u64 = 0x00000008;
+}
+
+/// A burst of IQ samples to be transmitted over the native SDK.
 ///
-/// The official header documents `AARTSAAPI_Packet::startTime`/`endTime`
+/// The SDK relies on precise timestamps (not zeroes) and packet flags
+/// to correctly pace and demarcate transmissions.
+///
+/// Note: The Aaronia SDK typically expects timestamps represented
 /// as "seconds since start of the unix epoch" — an SDK-supplied wall
 /// clock, not zero. Real timestamps matter for TX: they're how the
 /// device schedules the burst against its own master stream time (see
@@ -2204,6 +2281,8 @@ pub struct TxBurst {
     pub center_frequency_hz: f64,
     /// IQ sample rate of the burst, in Hz.
     pub sample_rate_hz: f64,
+    /// Packet boundaries flags (e.g., `tx_flags::STREAM_START`).
+    pub flags: u64,
 }
 
 /// Unverified hardware transmit path using `AARTSAAPI_SendPacket`.
@@ -2252,7 +2331,7 @@ impl<'a> TxStream<'a> {
             let packet = AARTSAAPI_Packet {
                 cbsize: std::mem::size_of::<AARTSAAPI_Packet>() as i64,
                 stream_id: 0,
-                flags: 0,
+                flags: burst.flags,
                 start_time: burst.start_time,
                 end_time: burst.end_time,
                 start_frequency: burst.center_frequency_hz - half_span,

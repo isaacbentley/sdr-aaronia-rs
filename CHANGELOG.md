@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.2.5] - 2026-07-10
+
+### Added
+- **Native SDK Transmitter (TX):** Added transmit capabilities through the C++ Native SDK (`SdkSink` and `SdkSinkConfig`). This provides TX path parity with the `SdkSource` and includes FutureSDR integration (`SdkSinkBlock`).
+- **Examples:** Added `examples/native_sdk_transmit.rs` to demonstrate programmatic device configuration, master stream time-driven packet pacing, and sending a continuous LoRa-like CSS up-chirp.
+
 ## [v0.2.4] - 2026-07-10
 
 ### Performance

@@ -78,6 +78,7 @@ We provide ready-to-run examples in the `examples/` directory demonstrating each
 * **[http_iq_quickstart.rs](examples/http_iq_quickstart.rs)**: Connect to an RTSA HTTP server and stream live IQ data natively.
 * **[noaa_scanner.rs](examples/noaa_scanner.rs)**: Scan NOAA weather channels and demodulate FM audio in real-time using `FutureSDR`.
 * **[native_sdk_basic.rs](examples/native_sdk_basic.rs)**: Access hardware directly with zero-copy C++ Native SDK integration.
+* **[native_sdk_transmit.rs](examples/native_sdk_transmit.rs)**: Stream IQ bursts (e.g. LoRa chirps) over the Native SDK to standard Spectran V6 devices.
 * **[channel_hopping.rs](examples/channel_hopping.rs)**: Perform automatic frequency hopping using the native `sdr-source` feature.
 * **[read_rtsa_file.rs](examples/read_rtsa_file.rs)**: Open a local RTSA capture, parse the metadata headers, and read samples efficiently.
 * **[dump_metadata.rs](examples/dump_metadata.rs)**: Inspect the DSFH metadata tree inside `.rtsa` captures for debugging.
