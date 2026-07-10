@@ -209,8 +209,8 @@ impl Default for SdkSink {
 #[cfg(feature = "futuresdr")]
 pub mod futuresdr_sink {
     use super::*;
-    use futuresdr::runtime::Kernel;
     use futuresdr::macros::Block;
+    use futuresdr::runtime::Kernel;
     use tracing::error;
 
     /// FutureSDR block that sinks `Complex32` items to the native SDK.
