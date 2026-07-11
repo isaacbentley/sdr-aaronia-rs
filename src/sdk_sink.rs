@@ -209,7 +209,14 @@ impl Default for SdkSink {
 #[cfg(feature = "futuresdr")]
 pub mod futuresdr_sink {
     use super::*;
+    // `BufferReader`/`CpuBufferReader` provide the `init`/`validate`/
+    // `finish`/`notify_finished`/`slice`/`finished`/`consume` methods that
+    // the `#[derive(Block)]` expansion below calls on the `#[input]`
+    // field. The traits are implemented for `circular::Reader<D>` (the
+    // concrete type behind `DefaultCpuReader`) but must be explicitly in
+    // scope for the derive-generated code to see them.
     use futuresdr::macros::Block;
+    use futuresdr::prelude::{BufferReader, CpuBufferReader};
     use futuresdr::runtime::Kernel;
     use tracing::error;
 
@@ -229,6 +236,28 @@ pub mod futuresdr_sink {
         input: futuresdr::runtime::buffer::DefaultCpuReader<Complex32>,
     }
 
+    // SAFETY: `SdkSink` owns a `NativeSdkSource`, which in turn owns
+    // `AARTSAAPI_Handle`/`AARTSAAPI_Device`/`AARTSAAPI_Config` — thin
+    // wrappers around a raw `*mut c_void` into the vendor SDK's internal
+    // state — so `Send`/`Sync` are not auto-derived. `futuresdr::runtime::
+    // Kernel: Send` requires the whole block to be `Send` because the
+    // executor may move a block to a different worker thread between
+    // polls; `Kernel::work` takes `&mut self`, so the block is never
+    // accessed concurrently from two threads at once (the same reasoning
+    // `TxStream` above uses for its own `unsafe impl Send`). `Sync` is
+    // deliberately not implemented, since nothing here takes `&self`
+    // concurrently.
+    //
+    // What this does NOT verify: whether the Aaronia vendor SDK's C API
+    // tolerates a device handle being *used* from a different OS thread
+    // than the one that opened/connected it (some USB-backed SDKs pin
+    // handle state to their opening thread). That is undocumented and
+    // hardware-unverified — consistent with this crate's existing
+    // caveats on other unverified hardware paths (`RxChannel::Rx2`/
+    // `Rx1And2`, the TX burst path, `configure_sweepsa`). Revisit if a
+    // real device exhibits cross-thread handle issues.
+    unsafe impl Send for SdkSinkBlock {}
+
     impl SdkSinkBlock {
         pub fn new(sink: SdkSink, channel: i32, samples_per_burst: usize) -> Self {
             Self {
@@ -247,16 +276,22 @@ pub mod futuresdr_sink {
             _mio: &mut futuresdr::runtime::MessageOutputs,
             _meta: &mut futuresdr::runtime::BlockMeta,
         ) -> anyhow::Result<()> {
-            let i = self.input.slice();
+            // `input_len` is captured as a plain `usize` (not a held slice
+            // reference) so nothing borrows `self.input` across the later
+            // `self.input.consume(n)` call below — the same shape
+            // `HttpSink::work` uses for this exact `slice()`/`consume()`
+            // pairing. Holding the slice past `consume()` would double-
+            // borrow `self.input` (E0499/E0502).
+            let input_len = self.input.slice().len();
 
-            if i.is_empty() {
+            if input_len == 0 {
                 if self.input.finished() {
                     io.finished = true;
                 }
                 return Ok(());
             }
 
-            let n = std::cmp::min(i.len(), self.samples_per_burst);
+            let n = std::cmp::min(input_len, self.samples_per_burst);
 
             // In a real continuous stream, we would calculate start_time and
             // end_time precisely. Here we dispatch "immediate" or un-paced
@@ -270,12 +305,18 @@ pub mod futuresdr_sink {
                     | crate::native_sdk::tx_flags::SEGMENT_END,
             };
 
-            if let Err(e) = self.sink.write_samples(self.channel, burst, &i[..n]) {
+            // Scoped: the slice borrow of `self.input` must end before
+            // `self.input.consume(n)` runs.
+            let write_result = {
+                let i = self.input.slice();
+                self.sink.write_samples(self.channel, burst, &i[..n])
+            };
+            if let Err(e) = write_result {
                 error!("Failed to write samples to SDK: {}", e);
             }
 
             self.input.consume(n);
-            if self.input.finished() && n == i.len() {
+            if self.input.finished() && n == input_len {
                 io.finished = true;
             }
             Ok(())
