@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let duration_per_burst = SAMPLES_PER_BURST as f64 / config.span_frequency;
 
     for i in 0..NUM_BURSTS {
-        for j in 0..SAMPLES_PER_BURST {
+        for sample in iq_buffer.iter_mut() {
             // Normalized time within the symbol [0.0, 1.0)
             let t_sym = (symbol_sample_idx as f64) / (symbol_length as f64);
 
@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
             phase = (phase + phase_inc) % std::f64::consts::TAU;
 
             // Full scale is roughly 1.0 depending on transgain
-            iq_buffer[j] = Complex32::new(phase.cos() as f32, phase.sin() as f32);
+            *sample = Complex32::new(phase.cos() as f32, phase.sin() as f32);
 
             symbol_sample_idx = (symbol_sample_idx + 1) % symbol_length;
         }
