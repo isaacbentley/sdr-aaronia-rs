@@ -68,20 +68,13 @@ impl Default for SdkConfig {
 impl SdkConfig {
     /// Bare device family for `AARTSAAPI_EnumDevice` (strips any `/mode`).
     pub fn device_family(&self) -> &str {
-        self.device_type
-            .split('/')
-            .next()
-            .unwrap_or(&self.device_type)
+        crate::native_sdk::split_device_type(&self.device_type, "raw").0
     }
 
     /// Mode-qualified open string for `AARTSAAPI_OpenDevice`. Uses the
     /// configured mode when present, otherwise `<family>/raw`.
     pub fn device_open_mode(&self) -> String {
-        if self.device_type.contains('/') {
-            self.device_type.clone()
-        } else {
-            format!("{}/raw", self.device_family())
-        }
+        crate::native_sdk::split_device_type(&self.device_type, "raw").1
     }
 }
 

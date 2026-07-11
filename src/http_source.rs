@@ -899,9 +899,17 @@ impl HttpSourceBuilder {
         self
     }
 
-    /// No-op kept for backward API compatibility. `HttpSource` always
-    /// streams over HTTP; routing through the native SDK instead lives in
-    /// [`crate::sdk_source`] / [`crate::unified_source`].
+    /// Share a `StreamStats` handle with an external caller.
+    ///
+    /// The built `HttpSource` refreshes this handle with its current
+    /// [`StreamStats`] after every processed chunk (see
+    /// `process_advanced_stream_data`), so callers can observe live
+    /// throughput/format/frequency state without polling the block
+    /// directly. It is also the write side of the retune mechanism: an
+    /// external caller sets `restart_pending = true` on the shared
+    /// `StreamStats`, and the next `work()` call notices it, tears down
+    /// the current `/stream` connection, and reconnects to pick up
+    /// whatever frequency/span configuration was applied in between.
     #[must_use]
     pub fn with_shared_stats(
         mut self,
@@ -911,6 +919,9 @@ impl HttpSourceBuilder {
         self
     }
 
+    /// No-op kept for backward API compatibility. `HttpSource` always
+    /// streams over HTTP; routing through the native SDK instead lives in
+    /// [`crate::sdk_source`] / [`crate::unified_source`].
     #[must_use]
     pub fn with_native_sdk(self, _enable: bool) -> Self {
         self

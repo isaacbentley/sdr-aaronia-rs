@@ -106,6 +106,10 @@ pub struct HttpSink {
     streaming_delay: f64,
     tx: tokio::sync::mpsc::Sender<(Vec<f32>, f64, f64)>, // (samples, start_time, end_time)
     dropped_samples: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Handle to the background task that drains `tx` and performs the
+    /// HTTP pushes. Held so `Drop` can abort it explicitly rather than
+    /// relying on the task noticing a dropped `tx` on its next `recv()`.
+    sender_task: tokio::task::JoinHandle<()>,
     #[input]
     input: futuresdr::runtime::buffer::DefaultCpuReader<Complex32>,
 }
@@ -139,7 +143,7 @@ impl HttpSink {
         })?;
 
         let push_timeout = std::time::Duration::from_millis(timeout_ms);
-        handle.spawn(async move {
+        let sender_task = handle.spawn(async move {
             while let Some((samples, start_time, end_time)) = rx.recv().await {
                 let num_complex = samples.len() / 2;
                 let req = TxSampleRequest {
@@ -189,6 +193,7 @@ impl HttpSink {
             streaming_delay,
             tx,
             dropped_samples,
+            sender_task,
             input: futuresdr::runtime::buffer::DefaultCpuReader::default(),
         })
     }
@@ -235,11 +240,32 @@ impl HttpSink {
             .await
             .is_err()
         {
-            warn!("Failed to send samples to background HTTP task (channel closed)");
+            // The background sender task is gone (e.g. it panicked), so
+            // this batch will never reach the device. Count it the same
+            // way a failed/timed-out push is counted — otherwise
+            // `dropped_samples()`, documented as "the way to detect a
+            // persistently broken link", would silently miss this failure
+            // mode entirely.
+            self.dropped_samples
+                .fetch_add(num_complex as u64, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                "Failed to send {} samples to background HTTP task (channel closed)",
+                num_complex
+            );
         }
 
         self.sample_buffer.clear();
         Ok(())
+    }
+}
+
+impl Drop for HttpSink {
+    fn drop(&mut self) {
+        // Explicit abort rather than relying on `tx`'s drop to close the
+        // channel and have the task notice on its next `recv()` — mirrors
+        // `AaroniaSource`'s `http_task` handling for the same reason: a
+        // background task should not linger past its owner's lifetime.
+        self.sender_task.abort();
     }
 }
 
@@ -292,5 +318,47 @@ impl Kernel for HttpSink {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: if the background sender task is gone (aborted or
+    /// panicked), `push_batch` must still count the batch as dropped
+    /// instead of silently discarding it — otherwise `dropped_samples()`,
+    /// documented as "the way to detect a persistently broken link", would
+    /// miss this failure mode entirely.
+    #[tokio::test]
+    async fn push_batch_counts_drop_when_sender_task_gone() {
+        let mut sink = HttpSinkBuilder::new("http://localhost:54664")
+            .buffer_size(4)
+            .build()
+            .expect("HttpSink should build inside a tokio runtime");
+
+        // Kill the background sender task and give the abort a moment to
+        // take effect, so the channel is genuinely closed before we push.
+        sink.sender_task.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(sink.dropped_samples(), 0);
+
+        // Populate the private sample buffer directly (in-module access)
+        // rather than driving it through a full flowgraph.
+        sink.sample_buffer = vec![Complex32::new(1.0, -1.0); 3];
+        sink.push_batch()
+            .await
+            .expect("push_batch itself must not error on a closed channel");
+
+        assert_eq!(
+            sink.dropped_samples(),
+            3,
+            "closed-channel send failure must count as dropped samples"
+        );
+        assert!(
+            sink.sample_buffer.is_empty(),
+            "buffer must still be cleared after the failed push"
+        );
     }
 }

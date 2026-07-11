@@ -745,28 +745,20 @@ impl NativeSdkClient {
             let wide_type = string_to_wide(device_type)?;
             let result = (self.enum_device)(handle, wide_type.as_ptr(), index, &mut device_info);
 
-            match result {
-                AARTSAAPI_OK => {
-                    debug!(
-                        "Found device at index {}: ready={}, boost={}, superspeed={}, active={}",
-                        index,
-                        device_info.ready(),
-                        device_info.boost(),
-                        device_info.superspeed(),
-                        device_info.active()
-                    );
-                    Ok(Some(device_info))
-                }
-                AARTSAAPI_EMPTY => {
-                    debug!("No more devices at index {}", index);
-                    Ok(None)
-                }
-                _ => Err(Error::Sdk(format!(
-                    "AARTSAAPI_EnumDevice failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                ))),
+            if result == AARTSAAPI_EMPTY {
+                debug!("No more devices at index {}", index);
+                return Ok(None);
             }
+            check_res(result, "AARTSAAPI_EnumDevice")?;
+            debug!(
+                "Found device at index {}: ready={}, boost={}, superspeed={}, active={}",
+                index,
+                device_info.ready(),
+                device_info.boost(),
+                device_info.superspeed(),
+                device_info.active()
+            );
+            Ok(Some(device_info))
         }
     }
 
@@ -1013,15 +1005,11 @@ impl NativeSdkClient {
         unsafe {
             let mut config = AARTSAAPI_Config { d: ptr::null_mut() };
             let result = (self.config_first)(device, group, &mut config);
-            match result {
-                AARTSAAPI_OK => Ok(Some(config)),
-                AARTSAAPI_EMPTY => Ok(None),
-                _ => Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigFirst failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                ))),
+            if result == AARTSAAPI_EMPTY {
+                return Ok(None);
             }
+            check_res(result, "AARTSAAPI_ConfigFirst")?;
+            Ok(Some(config))
         }
     }
 
@@ -1035,15 +1023,11 @@ impl NativeSdkClient {
     ) -> Result<bool> {
         unsafe {
             let result = (self.config_next)(device, group, config);
-            match result {
-                AARTSAAPI_OK => Ok(true),
-                AARTSAAPI_EMPTY => Ok(false),
-                _ => Err(Error::Sdk(format!(
-                    "AARTSAAPI_ConfigNext failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                ))),
+            if result == AARTSAAPI_EMPTY {
+                return Ok(false);
             }
+            check_res(result, "AARTSAAPI_ConfigNext")?;
+            Ok(true)
         }
     }
 
@@ -1118,21 +1102,13 @@ impl NativeSdkClient {
             };
 
             let result = (self.get_packet)(device, channel, index, &mut packet);
-            match result {
-                AARTSAAPI_OK => {
-                    debug!("Got packet with {} samples", packet.num);
-                    Ok(Some(packet))
-                }
-                AARTSAAPI_EMPTY => {
-                    debug!("No packet available");
-                    Ok(None)
-                }
-                _ => Err(Error::Sdk(format!(
-                    "AARTSAAPI_GetPacket failed: 0x{:08x} ({})",
-                    result,
-                    result_message(result)
-                ))),
+            if result == AARTSAAPI_EMPTY {
+                debug!("No packet available");
+                return Ok(None);
             }
+            check_res(result, "AARTSAAPI_GetPacket")?;
+            debug!("Got packet with {} samples", packet.num);
+            Ok(Some(packet))
         }
     }
 
@@ -1195,6 +1171,24 @@ fn wide_to_string(wide: &[WideChar]) -> String {
     let null_pos = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     let wstr = widestring::WideString::from_vec(wide[..null_pos].to_vec());
     wstr.to_string_lossy()
+}
+
+/// Splits a possibly mode-qualified device-type string (e.g. `"spectranv6"`
+/// or `"spectranv6/raw"`) into its bare family — for `AARTSAAPI_EnumDevice`,
+/// which only accepts the family, not a mode-qualified string — and its
+/// mode-qualified open string for `AARTSAAPI_OpenDevice`. When `device_type`
+/// carries no `/mode` suffix, `default_mode` is appended to form the open
+/// string (`SdkConfig` defaults to `"raw"`, `SdkSinkConfig` to
+/// `"iqtransmitter"` — the two other high-level SDK config wrappers that
+/// otherwise duplicated this exact split).
+pub(crate) fn split_device_type<'a>(device_type: &'a str, default_mode: &str) -> (&'a str, String) {
+    let family = device_type.split('/').next().unwrap_or(device_type);
+    let open_mode = if device_type.contains('/') {
+        device_type.to_string()
+    } else {
+        format!("{family}/{default_mode}")
+    };
+    (family, open_mode)
 }
 
 // === High-Level Stream Manager ===
@@ -2308,6 +2302,26 @@ impl From<AARTSAAPI_DeviceInfo> for DeviceInfo {
 mod tests {
     use super::*;
     use std::ptr;
+
+    /// `split_device_type` backs both `SdkConfig::device_family`/
+    /// `device_open_mode` (default `"raw"`) and `SdkSinkConfig`'s
+    /// equivalents (default `"iqtransmitter"`) — covers the bare-family,
+    /// already-mode-qualified, and per-caller-default-suffix cases.
+    #[test]
+    fn split_device_type_applies_default_mode_or_preserves_qualified_string() {
+        assert_eq!(
+            split_device_type("spectranv6", "raw"),
+            ("spectranv6", "spectranv6/raw".to_string())
+        );
+        assert_eq!(
+            split_device_type("spectranv6", "iqtransmitter"),
+            ("spectranv6", "spectranv6/iqtransmitter".to_string())
+        );
+        assert_eq!(
+            split_device_type("spectranv6eco/sweepsa", "raw"),
+            ("spectranv6eco", "spectranv6eco/sweepsa".to_string())
+        );
+    }
 
     #[test]
     fn device_open_mode_classifies_official_strings() {
