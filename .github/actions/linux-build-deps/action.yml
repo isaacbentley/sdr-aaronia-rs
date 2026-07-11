@@ -1,0 +1,17 @@
+name: Install Linux build dependencies
+description: >
+  Installs the system libraries required to compile sdr-aaronia-rs (and its
+  dev-dependencies) on Linux: `cmake` for `aws-lc-sys` (pulled in
+  transitively via reqwest -> rustls), and `pkg-config` + `libasound2-dev`
+  for `cpal`/`alsa-sys` (pulled in via the `futuresdr` optional dependency's
+  fixed `audio` feature). Centralised here so every job that needs it stays
+  in sync — this crate has no USRP (UHD) or PlutoSDR (iio) dependency, so
+  those packages are deliberately not installed.
+runs:
+  using: composite
+  steps:
+    - name: apt-get install
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends cmake pkg-config libasound2-dev

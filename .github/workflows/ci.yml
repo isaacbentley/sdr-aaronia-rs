@@ -1,17 +1,20 @@
 name: CI
 
-# Six-job pipeline for the standalone aaronia-rs crate. Designed to
+# Five-job pipeline for the standalone aaronia-rs crate. Designed to
 # move cleanly when the crate is extracted from the orecchiette
 # monorepo: this workflow stays alongside `Cargo.toml`, so a
 # `git subtree split` or directory copy carries it intact.
 #
 # Job overview:
-#   test         — cargo test on Linux/macOS/Windows × stable
-#   clippy_fmt   — clippy -D warnings + fmt --check on Linux stable
-#   msrv         — cargo build only, pinned to the documented MSRV
-#   miri         — cargo miri test on the FFI-free modules (Linux nightly)
-#   deny         — cargo-deny advisories check (RUSTSEC vulnerabilities)
-#   coverage     — cargo llvm-cov, uploaded to Codecov (Linux stable)
+#   test     — cargo fmt/clippy + test + coverage on Linux/macOS/Windows x stable
+#   miri     — cargo miri test on the FFI-free modules (Linux nightly)
+#   deny     — cargo-deny advisories check (RUSTSEC vulnerabilities)
+#   hack     — cargo hack check --each-feature (per-feature build isolation)
+#   machete  — cargo machete (unused dependency check)
+#
+# `cargo semver-checks` runs at release time (see release.yml), not here:
+# with `continue-on-error: true` it could never gate a merge, so running it
+# on every push/PR only cost CI minutes without catching anything early.
 #
 # `workflow_dispatch` is enabled so the user can manually rebuild any
 # job without pushing.
@@ -53,9 +56,7 @@ jobs:
 
       - name: Install Linux Dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
+        uses: ./.github/actions/linux-build-deps
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -101,9 +102,7 @@ jobs:
           lfs: false
 
       - name: Install Linux Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
+        uses: ./.github/actions/linux-build-deps
 
       # Pinned: current nightlies changed the unstable `fadd_fast`
       # intrinsic signature (new `FloatPrimitive` bound), which breaks the
@@ -150,9 +149,7 @@ jobs:
           lfs: false
 
       - name: Install Linux Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
+        uses: ./.github/actions/linux-build-deps
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -179,30 +176,3 @@ jobs:
 
       - name: cargo machete
         run: cargo machete
-
-  semver_checks:
-    name: cargo-semver-checks
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          lfs: false
-
-      - name: Install Linux Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@cargo-semver-checks
-
-      - name: cargo semver-checks
-        run: cargo semver-checks check-release
-
