@@ -2,7 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [v0.3.0] - 2026-07-11
+
+### Removed
+- **BREAKING: `file_performance` module removed** (`MmapRtsaReader`,
+  `AdaptiveChunkReader`, `AccessStats`, `CacheStats`, `ChunkType`, and the
+  `memmap2` dependency). This tiered-cache, adaptive-read-ahead
+  memory-mapped reader was never wired into the crate's actual file-reading
+  path — `RtsaSource` (the real hot path, used by every file-source
+  consumer) has always read via buffered `std::io` and never touched this
+  module. It had zero callers anywhere in the crate outside its own tests.
+  If you were depending on these types directly, buffered access through
+  `RtsaSource` covers the same file-reading needs; there is no drop-in
+  replacement for the standalone mmap/cache API itself.
+
+### Fixed
+- **`HttpSourceBuilder` doc comment misplacement:** the "no-op kept for
+  backward compatibility" doc comment was attached to `with_shared_stats`
+  (which is not a no-op — it wires up the retune/stats-sharing mechanism)
+  instead of `with_native_sdk` (the actual no-op immediately below it).
+  Moved to the correct method and gave `with_shared_stats` an accurate doc.
+- **`HttpSink` dropped-sample accounting:** `push_batch` now counts a batch
+  as dropped when the background sender task's channel is closed (e.g. the
+  task panicked), not just on a failed/timed-out HTTP push. Previously this
+  failure mode silently discarded samples without incrementing
+  `dropped_samples()` — the documented way to detect a persistently broken
+  TX link. `HttpSink` also now aborts its background sender task on drop
+  instead of relying on the channel closing to signal it.
+
+### Changed
+- **Native SDK error handling finished:** the last four `NativeSdkClient`
+  methods that still hand-rolled their own `AARTSAAPI_Result` check
+  (`enum_device`, `config_first`, `config_next`, `get_packet`) now route
+  through the `check_res`/`Error::SdkApi` path introduced in v0.2.6,
+  matching every other method in the client. Behavior is unchanged for
+  callers (`AARTSAAPI_EMPTY` still maps to `Ok(None)`/`Ok(false)`); failures
+  now carry a structured `SdkError` instead of a formatted string.
+- **De-duplicated `device_family`/`device_open_mode`:** `SdkConfig` and
+  `SdkSinkConfig` shared byte-for-byte identical device-type-splitting
+  logic (differing only in the default open-mode suffix, `raw` vs.
+  `iqtransmitter`). Extracted into `native_sdk::split_device_type`; both
+  public methods keep their existing signatures.
 
 ## [v0.2.6] - 2026-07-10
 

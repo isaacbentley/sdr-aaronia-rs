@@ -2,7 +2,7 @@
 name = "sdr-aaronia-rs"
 description = "Unified Rust interface for Aaronia Spectran V6 SDRs: native RTSA SDK, HTTP streaming, and RTSA capture-file sources"
 license = "GPL-3.0-or-later"
-version = "0.2.7"
+version = "0.3.0"
 edition = "2024"
 repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
 readme = "README.md"
@@ -32,7 +32,6 @@ byteorder = { version = "1.5", optional = true }
 bitflags = { version = "2.0", optional = true }
 half = { version = "2.3", optional = true }
 futures-timer = { version = "3.0", optional = true }
-memmap2 = { version = "0.9", optional = true }
 
 num-complex = "0.4"
 tempfile = { version = "3.8", optional = true }
@@ -69,8 +68,7 @@ harness = false
 default    = ["http", "file", "sdr-source", "ffi"]
 http       = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json",
               "dep:url", "dep:bytes", "dep:futures", "dep:half"]
-file       = ["dep:byteorder", "dep:bitflags", "dep:memmap2",
-              "dep:tempfile"]
+file       = ["dep:byteorder", "dep:bitflags", "dep:tempfile"]
 futuresdr  = ["http", "dep:futuresdr", "dep:futures-timer", "dep:anyhow"]
 sdr-source = ["http", "file", "dep:crossbeam-channel", "dep:anyhow", "dep:orecchiette-sdr-source-rs"]
 ffi        = ["http", "file"]

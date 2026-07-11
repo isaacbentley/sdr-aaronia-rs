@@ -16,7 +16,7 @@ A comprehensive Rust library for interfacing with Aaronia Spectran SDR devices.
 Interfacing with SDR hardware typically requires choosing between proprietary native SDKs, HTTP streaming protocols, or file-based playback. Each approach demands a different API and configuration lifecycle.
 
 `sdr-aaronia-rs` solves this by offering a unified `AaroniaSource` that automatically selects the optimal transport based on your configuration:
-1. **File Path** → Utilizes the memory-mapped file source.
+1. **File Path** → Utilizes the buffered RTSA file source.
 2. **HTTP URL** → Utilizes the HTTP streaming source.
 3. **No Target** → Defaults to the native SDK, falling back to `localhost:54664`.
 4. **Explicit Force** → Locks the source to a specific backend.
@@ -25,7 +25,7 @@ Interfacing with SDR hardware typically requires choosing between proprietary na
 
 - **Native SDK Integration:** Direct hardware access via Aaronia RTSA-Suite PRO with zero-copy sample processing, real-time IQ data, and automatic platform library detection. Enforces hardware constraints (e.g., `span * 1.5 ≤ receiverclock`) prior to streaming.
 - **Advanced HTTP Streaming (RX & TX):** Supports JSON, Int16, Float16, and Float32 streaming formats over chunked HTTP connections. Implements the complete RTSA HTTP specification with Basic Auth and token-based enterprise authentication, including a dynamic HTTP TX sink for transmitting IQ data.
-- **RTSA File Processing:** Full RTSA specification implementation for reading memory-mapped captures, including metadata extraction and multi-stream support.
+- **RTSA File Processing:** Full RTSA specification implementation for reading capture files via buffered I/O, including metadata extraction and multi-stream support.
 - **Device Management:** Real-time control of streaming parameters, device health monitoring, input stream enumeration, and hierarchical configuration.
 - **FutureSDR Integration:** Provides seamless integration with FutureSDR flowgraphs via native blocks.
 
@@ -381,7 +381,7 @@ Read access to `/remoteconfig` works without a license, so a read-only check can
 | Feature | Description | Default |
 |---|---|---|
 | `http` | HTTP streaming via `reqwest` and `tokio`. | **Yes** |
-| `file` | Memory-mapped RTSA file parsing. | **Yes** |
+| `file` | Buffered RTSA file parsing. | **Yes** |
 | `native-sdk` | Links the proprietary Aaronia C++ SDK. | No |
 | `futuresdr` | Integrates `HttpSource` as a FutureSDR source block. | No |
 | `sdr-source` | Integrates `AaroniaSdrSource` implementing the native `SdrSource` traits. | **Yes** |

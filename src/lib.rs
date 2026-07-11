@@ -15,9 +15,6 @@ pub mod detection;
 pub mod error;
 #[cfg(feature = "file")]
 #[cfg_attr(docsrs, doc(cfg(feature = "file")))]
-pub mod file_performance;
-#[cfg(feature = "file")]
-#[cfg_attr(docsrs, doc(cfg(feature = "file")))]
 pub mod file_source;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
@@ -82,11 +79,6 @@ pub use c_api::{
     aaronia_string_free,
 };
 pub use detection::{get_sdk_library_path, get_sdk_path, get_xml_config_path, is_sdk_installed};
-#[cfg(feature = "file")]
-#[cfg_attr(docsrs, doc(cfg(feature = "file")))]
-pub use file_performance::{
-    AccessStats, AdaptiveChunkReader, CacheStats, ChunkType, MmapRtsaReader,
-};
 #[cfg(feature = "file")]
 #[cfg_attr(docsrs, doc(cfg(feature = "file")))]
 pub use file_source::{RtsaMetadata, RtsaSource, SampleData};
