@@ -250,6 +250,20 @@ impl Decompressor {
                     .to_string(),
             ));
         }
+        // Per docs/FILESPEC.md, `mCompression` is documented as "1 to 31
+        // for lossy factor" — this value can originate from a parsed
+        // network packet (HTTP streaming metadata) or file header, so it
+        // must be validated here rather than trusted by `dequantize`,
+        // which shifts `1i32 << (compression_factor - 1)`: at 32 that
+        // overflows the sign bit (producing a negative, corrupt
+        // quantizer) and at 33+ it's an arithmetic-overflow panic in
+        // debug builds.
+        if compression_factor > 31 {
+            return Err(Error::Protocol(format!(
+                "Decompressor::decompress: compression_factor {compression_factor} is out of \
+                 the documented range (1-31)"
+            )));
+        }
 
         // Zero dimensions have no valid transform and would wedge the
         // inverse wavelet step: `num_rows == 0` spins the `step`-doubling
@@ -284,6 +298,19 @@ impl Decompressor {
                 expected_len
             );
             dequantized.resize(expected_len, 0.0);
+        } else if dequantized.len() > expected_len {
+            // `wave_transform_step` derives its own row count from
+            // `data.len() / num_cols` rather than trusting `num_rows`, so
+            // an over-long buffer would make it operate on more rows
+            // than the caller asked for instead of erroring or ignoring
+            // the excess. Truncate to the caller's declared dimensions.
+            tracing::warn!(
+                "decompress: coefficient stream produced {} of {} expected values \
+                 (extra trailing data); truncating",
+                dequantized.len(),
+                expected_len
+            );
+            dequantized.truncate(expected_len);
         }
         self.inverse_wavelet_transform(&mut dequantized, num_rows, num_cols);
         Ok(dequantized)
@@ -545,6 +572,32 @@ mod tests {
     }
 
     #[test]
+    fn decompress_rejects_compression_factor_above_documented_range() {
+        // docs/FILESPEC.md documents mCompression as "1 to 31 for lossy
+        // factor". A malformed/malicious header claiming 32+ must be
+        // rejected here rather than reaching `dequantize`'s
+        // `1i32 << (compression_factor - 1)`, which overflows the sign
+        // bit at 32 and panics on overflow (debug builds) at 33+.
+        let decompressor = Decompressor::new();
+        let data = [0xAD];
+        for bad_factor in [32, 33, 255, u32::MAX] {
+            let result = decompressor.decompress(&data, bad_factor, 1, 2);
+            assert!(
+                result.is_err(),
+                "compression_factor={bad_factor} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decompress_accepts_compression_factor_at_documented_ceiling() {
+        let decompressor = Decompressor::new();
+        let data = [0xAD];
+        // 31 is the top of the documented 1-31 range and must still work.
+        assert!(decompressor.decompress(&data, 31, 1, 2).is_ok());
+    }
+
+    #[test]
     fn test_empty_data_handling() {
         let decompressor = Decompressor::new();
         let empty_data = [];
@@ -631,5 +684,21 @@ mod tests {
                 "unexpected error for ({rows}, {cols}): {err}"
             );
         }
+    }
+
+    #[test]
+    fn decompress_truncates_over_produced_coefficients() {
+        // `test_decompression_exact_oracle` decodes the byte 0xAD into
+        // exactly 2 coefficients for a 1x2 request. Requesting 1x1
+        // instead (fewer expected values than the stream actually
+        // decodes) exercises the over-long branch: the result must be
+        // truncated to the requested length, not left at the raw
+        // decoded length.
+        let decompressor = Decompressor::new();
+        let data = [0xAD];
+        let result = decompressor
+            .decompress(&data, 2, 1, 1)
+            .expect("decompression should succeed with truncation, not error");
+        assert_eq!(result.len(), 1);
     }
 }
