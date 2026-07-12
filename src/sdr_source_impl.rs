@@ -123,13 +123,15 @@ impl SdrSource for AaroniaSdrSource {
         };
 
         let capture_thread = thread::spawn(move || {
-            if let Err(e) = (move || -> Result<(), Error> {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_name("sdr-aaronia-pump")
-                    .build()?;
+            let panic_res =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    if let Err(e) = (move || -> Result<(), Error> {
+                        let runtime = tokio::runtime::Builder::new_multi_thread()
+                            .enable_all()
+                            .thread_name("sdr-aaronia-pump")
+                            .build()?;
 
-                runtime.block_on(async move {
+                        runtime.block_on(async move {
                     let mut builder = AaroniaSourceBuilder::new();
                     builder
                         .center_frequency(center_frequency_hz)
@@ -273,9 +275,13 @@ impl SdrSource for AaroniaSdrSource {
                     let _ = source.stop_streaming().await;
                     Ok::<_, Error>(())
                 })?;
-                Ok(())
-            })() {
-                tracing::error!("[aaronia] Capture thread failed: {:?}", e);
+                        Ok(())
+                    })() {
+                        tracing::error!("[aaronia] Capture thread failed: {:?}", e);
+                    }
+                }));
+            if let Err(e) = panic_res {
+                tracing::error!("[aaronia] Capture thread panicked: {:?}", e);
             }
         });
 
@@ -336,7 +342,7 @@ async fn single_channel_pump(
             samples: crate::sdr_source::PooledIqBuffer::new_pooled(raw_buffer, pool_tx.clone()),
             center_frequency_hz,
             sample_rate_hz: sample_rate_f32,
-            overrun: false,
+            overrun: source.take_overrun(),
         };
         if tx.send(pkt).is_err() {
             break; // consumer dropped
@@ -456,7 +462,7 @@ async fn hop_pump(
                 samples: crate::sdr_source::PooledIqBuffer::new_pooled(raw_buffer, pool_tx.clone()),
                 center_frequency_hz: channel,
                 sample_rate_hz: sample_rate_f32,
-                overrun: false,
+                overrun: source.take_overrun(),
             };
             if tx.send(pkt).is_err() {
                 return Ok(()); // consumer dropped

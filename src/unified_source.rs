@@ -190,13 +190,26 @@ pub struct AaroniaSource {
 
     http_client: Option<HttpEndpointsClient>,
     file_source: Option<RtsaSource>,
-    http_receiver: Option<tokio::sync::mpsc::Receiver<Vec<Complex32>>>,
+    /// Each item pairs a chunk of samples with whether the HTTP reader
+    /// task's `DropDetector` observed a timestamp gap ending at (or
+    /// before) that chunk — see `pending_overrun`.
+    http_receiver: Option<tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool)>>,
     /// Background task draining the HTTP `/stream` connection. Held so it
     /// can be aborted on `stop_streaming` / drop — otherwise it lingers
     /// parked on `next().await` (holding the open connection, so the
     /// device keeps streaming) until a packet happens to arrive and the
     /// dropped receiver is finally noticed.
     http_task: Option<tokio::task::JoinHandle<()>>,
+    /// Latches `true` when a received HTTP chunk carried a detected
+    /// drop, until [`Self::take_overrun`] reads and clears it. A flat
+    /// per-call drop signal rather than a precise per-sample one: once
+    /// chunks are merged into `sample_buffer`, the exact boundary a
+    /// drop occurred at is no longer recoverable, so any drop observed
+    /// since the last check is reported on the next `read_samples`
+    /// call. Only the HTTP backend populates this today; the native
+    /// SDK and file backends always report `false` (see
+    /// [`Self::take_overrun`]).
+    pending_overrun: bool,
 }
 
 impl AaroniaSource {
@@ -217,6 +230,7 @@ impl AaroniaSource {
             file_source: None,
             http_receiver: None,
             http_task: None,
+            pending_overrun: false,
         };
 
         // Determine the best source type
@@ -420,8 +434,11 @@ impl AaroniaSource {
             })
             .await?;
 
-        // Create a channel for sending samples from the async task to AaroniaSource
-        let (sender, receiver) = tokio::sync::mpsc::channel(100); // Buffer up to 100 Vec<Complex32>
+        // Create a channel for sending samples from the async task to
+        // AaroniaSource. Each item also carries whether the reader
+        // task's DropDetector flagged a gap ending at this packet, so
+        // `read_samples` can surface it as `IqPacket::overrun`.
+        let (sender, receiver) = tokio::sync::mpsc::channel(100); // Buffer up to 100 chunks
 
         // Honour the caller's requested wire format; default to Float32
         // (binary, lossless) rather than JSON, which is the slowest format
@@ -457,6 +474,7 @@ impl AaroniaSource {
             // indicates the transport itself is broken.
             const MAX_CONSECUTIVE_STREAM_ERRORS: u32 = 5;
             let mut consecutive_errors = 0u32;
+            let mut drop_detector = crate::http_streaming::DropDetector::default();
 
             loop {
                 match http_stream.next().await {
@@ -464,7 +482,11 @@ impl AaroniaSource {
                         consecutive_errors = 0;
                         // The HTTP stream already returns parsed StreamPacket objects
                         if packet.metadata.payload == crate::http_streaming::PayloadType::Iq {
-                            if sender.send(packet.samples).await.is_err() {
+                            let dropped = matches!(
+                                drop_detector.observe(&packet),
+                                crate::http_streaming::DropResult::Drop { .. }
+                            );
+                            if sender.send((packet.samples, dropped)).await.is_err() {
                                 // Receiver dropped, task can exit
                                 info!("Receiver dropped, HTTP streaming task exiting.");
                                 return;
@@ -626,7 +648,10 @@ impl AaroniaSource {
                 while collected < max_samples {
                     // If buffer is empty, try to receive more samples from the channel
                     match tokio::time::timeout(Duration::from_secs(30), receiver.recv()).await {
-                        Ok(Some(mut new_samples)) => {
+                        Ok(Some((mut new_samples, dropped))) => {
+                            if dropped {
+                                self.pending_overrun = true;
+                            }
                             let needed = max_samples - collected;
                             if new_samples.len() <= needed {
                                 collected += new_samples.len();
@@ -676,6 +701,16 @@ impl AaroniaSource {
                 }
             }
         }
+    }
+
+    /// Read and clear whether a drop was detected since the last call.
+    /// Currently only the HTTP backend populates this (via the reader
+    /// task's `DropDetector`, watching for timestamp gaps between
+    /// packets); file and native-SDK backends always return `false`.
+    /// Callers (e.g. `SdrSource` implementations) call this once per
+    /// `read_samples` to tag the resulting `IqPacket::overrun`.
+    pub fn take_overrun(&mut self) -> bool {
+        std::mem::take(&mut self.pending_overrun)
     }
 
     /// Stop streaming
@@ -1204,6 +1239,7 @@ mod tests {
             file_source: None,
             http_receiver: None,
             http_task: None,
+            pending_overrun: false,
         };
 
         let detected_type = source
@@ -1277,6 +1313,7 @@ mod tests {
             file_source: None,
             http_receiver: None,
             http_task: None,
+            pending_overrun: false,
         };
 
         let result = source.detect_best_source_type().await;
@@ -1302,6 +1339,7 @@ mod tests {
             file_source: None,
             http_receiver: None,
             http_task: None,
+            pending_overrun: false,
         };
 
         let detected_type = source
@@ -1329,6 +1367,7 @@ mod tests {
             file_source: None,
             http_receiver: None,
             http_task: None,
+            pending_overrun: false,
         };
 
         let detected_type = source
@@ -1480,5 +1519,56 @@ mod tests {
         let debug_str = format!("{:?}", original_config);
         assert!(debug_str.contains("http://test.com"));
         assert!(debug_str.contains("TEST123"));
+    }
+
+    #[tokio::test]
+    async fn take_overrun_reflects_a_dropped_http_chunk() {
+        // Regression test for overrun wiring: a chunk arriving from the
+        // HTTP reader task flagged as dropped must surface via
+        // `take_overrun()` on the next call, and clear after being read.
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
+        let mut source = AaroniaSource {
+            config: AaroniaConfig::default(),
+            source_type: SourceType::Http,
+            sample_buffer: VecDeque::new(),
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            native_source: None,
+            http_client: None,
+            file_source: None,
+            http_receiver: Some(chunk_rx),
+            http_task: None,
+            pending_overrun: false,
+        };
+
+        assert!(!source.take_overrun(), "no chunk received yet");
+
+        chunk_tx
+            .send((vec![Complex32::new(1.0, 0.0)], false))
+            .await
+            .expect("channel open");
+        chunk_tx
+            .send((vec![Complex32::new(2.0, 0.0)], true))
+            .await
+            .expect("channel open");
+        drop(chunk_tx);
+
+        let mut buffer = Vec::new();
+        let n = source
+            .read_samples(&mut buffer, 2)
+            .await
+            .expect("read_samples should drain both queued chunks");
+        assert_eq!(n, 2);
+
+        assert!(
+            source.take_overrun(),
+            "a dropped chunk was received during read_samples"
+        );
+        assert!(
+            !source.take_overrun(),
+            "take_overrun must clear the flag after reading it"
+        );
     }
 }
