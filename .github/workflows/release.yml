@@ -12,7 +12,14 @@ jobs:
   # Real gate (no continue-on-error): a breaking API change must be caught
   # here, before it's published, not merely reported per-PR where it can
   # never actually block anything. Runs against the tagged commit, so it
-  # compares the exact code about to ship against the last crates.io release.
+  # compares the exact code about to ship against a known-good baseline.
+  #
+  # Pinned to v0.2.4 rather than the default (latest crates.io release)
+  # because 0.2.6 and 0.2.7, as published, fail to build rustdoc under
+  # --all-features (missing BufferReader/CpuBufferReader imports and a
+  # Send impl in sdk_sink.rs, only fixed post-release) -- cargo-semver-checks
+  # can't diff against a baseline it can't compile. v0.2.4 predates
+  # SdkSinkBlock/the futuresdr 0.0.39 migration and builds cleanly.
   semver_checks:
     name: cargo-semver-checks
     runs-on: ubuntu-latest
@@ -20,6 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           lfs: false
+          fetch-depth: 0
 
       - name: Install Linux Dependencies
         uses: ./.github/actions/linux-build-deps
@@ -32,7 +40,7 @@ jobs:
         uses: taiki-e/install-action@cargo-semver-checks
 
       - name: cargo semver-checks
-        run: cargo semver-checks check-release
+        run: cargo semver-checks check-release --baseline-rev v0.2.4
 
   publish:
     name: Publish to crates.io
