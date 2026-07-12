@@ -76,6 +76,25 @@ Automatic mid-stream retuning via `SourceConfig.channels_hz` is supported native
 
 Per-hop pacing utilizes the integrated `sdr_source::DwellController`, inserting a ~75 ms settle after every retune to ride out the RTSA's apply-config latency and flush stale samples from the pipeline.
 
+### **Overrun Detection (HTTP)**
+
+The HTTP reader task (`connect_http` in `unified_source.rs`) runs a
+`DropDetector` over each packet's `start_time`/`end_time` metadata. A
+timestamp gap larger than tolerance latches `AaroniaSource::pending_overrun`,
+which `take_overrun()` reads and clears. `single_channel_pump` and
+`hop_pump` (`sdr_source_impl.rs`) call `take_overrun()` once per emitted
+`IqPacket`, so a drop detected anywhere since the last read surfaces as
+`IqPacket::overrun = true` on the next packet — a per-call signal, not a
+precise per-sample one, since drop timing is lost once chunks merge into
+the flat `sample_buffer`. The native-SDK and file backends don't populate
+this yet (`overrun` is always `false` for them); native-SDK overrun
+detection would need to read `native_sdk.rs`'s `WARN_OVERFLOW`/
+`WARN_DROPPED` packet flags, which is Windows/Linux-only code.
+
+The Aaronia capture thread (`AaroniaSdrSource::start`) is wrapped in
+`catch_unwind`, matching the USRP/HackRF/Pluto backends — a panic inside
+the pump loop is logged rather than silently unwinding the thread.
+
 ## 🏗️ **Architecture**
 ### **Deterministic Source Selection Rules**
 

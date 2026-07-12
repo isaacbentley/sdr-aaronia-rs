@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.1] - 2026-07-11
+
+### Fixed
+- **Decompression: out-of-range `compression_factor` rejected up front.**
+  `Decompressor::decompress` now rejects `compression_factor > 31` (the
+  documented range per `docs/FILESPEC.md`, "1 to 31 for lossy factor")
+  instead of letting it reach `dequantize`'s `1i32 << (compression_factor -
+  1)`, which overflows the sign bit at 32 (silently producing a negative
+  quantizer) and panics on overflow at 33+ in debug builds. This value can
+  originate from a parsed HTTP-stream packet, so a malformed/corrupt header
+  could previously reach the panic.
+- **Decompression: over-produced coefficients truncated, not just
+  under-produced ones.** `decompress` already zero-padded a coefficient
+  stream shorter than `num_rows * num_cols`; it now also truncates a longer
+  one, since `wave_transform_step` derives its own row count from the raw
+  buffer length rather than the caller's declared dimensions and would
+  otherwise silently operate on more rows than requested.
+- **Aaronia capture thread now panic-guarded**, matching the driver crates
+  (USRP/HackRF/Pluto): the `AaroniaSdrSource::start` capture thread body is
+  wrapped in `catch_unwind`, so a panic inside it is logged instead of
+  silently unwinding the thread with no diagnostic.
+- **HTTP overrun detection wired to `IqPacket::overrun`.** The HTTP reader
+  task now runs a `DropDetector` over each packet's timing metadata; a
+  detected gap latches a flag that `AaroniaSource::take_overrun()` surfaces
+  on the next `read_samples` call. `single_channel_pump`/`hop_pump` in
+  `sdr_source_impl.rs` now report real overrun status instead of
+  hardcoding `false`. The native-SDK and file backends still report `false`
+  (unchanged).
+- **`aaronia_source_read_samples` (C API) copy bound hardened.** The FFI
+  sample-copy now clamps to `temp_samples.len()` in addition to the
+  caller-supplied capacity, so a hypothetical future miscount from
+  `read_samples` can't cause an out-of-bounds read; added a compile-time
+  size assertion between `FfiComplex` and `Complex32` guarding the
+  reinterpret cast.
+- **`orecchiette-sdr-source-rs` dependency floor** bumped from `0.1.0` to
+  `0.1.2` to match every sibling crate's declared floor.
+
 ## [v0.3.0] - 2026-07-11
 
 ### Removed
