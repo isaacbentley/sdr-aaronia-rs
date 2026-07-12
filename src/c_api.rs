@@ -1,5 +1,6 @@
 use crate::http_endpoints::HttpEndpointsClient;
 use crate::unified_source::{AaroniaSource, AaroniaSourceBuilder, SourceType};
+use num_complex::Complex32;
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_void};
 use std::os::raw::c_char;
@@ -394,8 +395,19 @@ pub unsafe extern "C" fn aaronia_source_read_samples(
 
     match samples_result {
         Ok(Ok(samples_to_copy)) => {
-            let samples_to_copy = samples_to_copy.min(len);
+            // Clamp to both the caller's requested capacity (`len`) and
+            // the actual number of samples `read_samples` populated
+            // (`temp_samples.len()`) — trusting `samples_to_copy` alone
+            // would let a future miscounting bug in any `read_samples`
+            // implementation read past `temp_samples`'s real allocation.
+            let samples_to_copy = samples_to_copy.min(len).min(temp_samples.len());
             // SAFETY: buffer is verified non-null above and caller guarantees it points to at least `len` FfiComplex elements.
+            // `Complex32` (`num_complex::Complex<f32>`) and `FfiComplex`
+            // are both `{re: f32, im: f32}` in memory, so this
+            // reinterpret cast is sound; the assert guards against a
+            // future representation change silently breaking it.
+            const _: () =
+                assert!(std::mem::size_of::<FfiComplex>() == std::mem::size_of::<Complex32>());
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     temp_samples.as_ptr() as *const FfiComplex,
