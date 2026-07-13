@@ -2045,9 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "orecchiette-sdr-source-rs"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a803cdeb17785bb7914df4c8459f5b6f6881161516aec940a7610054bca12471"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "crossbeam",
@@ -2742,7 +2740,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdr-aaronia-rs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",

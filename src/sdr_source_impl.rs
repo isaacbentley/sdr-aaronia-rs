@@ -122,16 +122,17 @@ impl SdrSource for AaroniaSdrSource {
             extension: config.dwell_extension,
         };
 
-        let capture_thread = thread::spawn(move || {
-            let panic_res =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    if let Err(e) = (move || -> Result<(), Error> {
-                        let runtime = tokio::runtime::Builder::new_multi_thread()
-                            .enable_all()
-                            .thread_name("sdr-aaronia-pump")
-                            .build()?;
+        let capture_thread =
+            thread::spawn(move || {
+                let panic_res =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        if let Err(e) = (move || -> Result<(), Error> {
+                            let runtime = tokio::runtime::Builder::new_multi_thread()
+                                .enable_all()
+                                .thread_name("sdr-aaronia-pump")
+                                .build()?;
 
-                        runtime.block_on(async move {
+                            runtime.block_on(async move {
                     let mut builder = AaroniaSourceBuilder::new();
                     builder
                         .center_frequency(center_frequency_hz)
@@ -192,43 +193,23 @@ impl SdrSource for AaroniaSdrSource {
                     // `set_center_frequency`. Other backends hop if and
                     // only if the orchestrator handed us a non-empty
                     // channel list (USRP-style hop config).
-                    let mut hopping =
+                    //
+                    // Retuning (both hop-mode and the WS-B live-view
+                    // override) always goes through `set_center_frequency`,
+                    // which on HTTP backends is `configure_capture` on the
+                    // free `/control` endpoint — never the licensed
+                    // `/remoteconfig` write path. We deliberately don't
+                    // probe for the "Remote Config" license before hopping:
+                    // that probe itself reads the `/remoteconfig` tree,
+                    // which is the endpoint we're avoiding, and gating
+                    // hopping on it meant a server the probe couldn't
+                    // positively confirm fell back to single-channel even
+                    // though `/control` retunes work. `probe_remote_config_license`
+                    // is still available on `AaroniaSource` for callers who
+                    // want it for their own purposes; this orchestrator no
+                    // longer calls it.
+                    let hopping =
                         !channels_hz.is_empty() && !matches!(backend, AaroniaBackend::File(_));
-
-                    // Mid-stream `configure_capture` only takes effect
-                    // server-side with the RTSA-Suite "Remote Config"
-                    // license. Without it the PUT returns 200 OK and is
-                    // silently ignored — downstream packets would be
-                    // mis-tagged with the wrong channel. Probe the
-                    // licence up front; if missing, fall back to single-
-                    // channel mode and warn loudly rather than hop into
-                    // garbage.
-                    // NOTE: on HTTP backends this probe temporarily adjusts
-                    // the device reference level by +1 dB (restored
-                    // best-effort) — the only way to positively confirm
-                    // write capability before hopping.
-                    if hopping && matches!(backend, AaroniaBackend::Http(_)) {
-                        match source.probe_remote_config_license().await {
-                            Ok(status) if status.is_available() => { /* proceed */ }
-                            Ok(other) => {
-                                warn!(
-                                    "Aaronia HTTP source lacks the Remote Config licence ({}); \
-                                     falling back to single-channel mode at the initial centre \
-                                     frequency. Mid-stream retunes would silently no-op \
-                                     server-side and corrupt downstream packets.",
-                                    other.description()
-                                );
-                                hopping = false;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Aaronia HTTP licence probe failed: {e}; \
-                                     falling back to single-channel mode to be safe."
-                                );
-                                hopping = false;
-                            }
-                        }
-                    }
 
                     let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(256);
                     for _ in 0..256 {
@@ -261,6 +242,7 @@ impl SdrSource for AaroniaSdrSource {
                         single_channel_pump(
                             &mut source,
                             effective_center_hz,
+                            advice.as_ref(),
                             &tx,
                             &stop_thread,
                             block_size,
@@ -275,15 +257,15 @@ impl SdrSource for AaroniaSdrSource {
                     let _ = source.stop_streaming().await;
                     Ok::<_, Error>(())
                 })?;
-                        Ok(())
-                    })() {
-                        tracing::error!("[aaronia] Capture thread failed: {:?}", e);
-                    }
-                }));
-            if let Err(e) = panic_res {
-                tracing::error!("[aaronia] Capture thread panicked: {:?}", e);
-            }
-        });
+                            Ok(())
+                        })() {
+                            tracing::error!("[aaronia] Capture thread failed: {:?}", e);
+                        }
+                    }));
+                if let Err(e) = panic_res {
+                    tracing::error!("[aaronia] Capture thread panicked: {:?}", e);
+                }
+            });
 
         let stop_handle = stop_flag.clone();
         let stop = Box::new(move || stop_handle.store(true, Ordering::SeqCst));
@@ -300,13 +282,26 @@ impl SdrSource for AaroniaSdrSource {
     }
 }
 
-/// Pump samples on a single fixed centre frequency. Pre-A37 behaviour
-/// — used for file replay and for direct callers of `AaroniaSdrSource`
-/// that build with an empty `channels_hz` list.
+/// Pump samples on a single centre frequency. Pre-A37 behaviour — used
+/// for file replay and for direct callers of `AaroniaSdrSource` that
+/// build with an empty `channels_hz` list (including hop configs that
+/// fell back here after `probe_remote_config_license` failed).
+///
+/// **Live-view override**: while [`DwellAdvice::channel_override`]
+/// returns `Some`, retunes there and holds, independent of the hop
+/// license gate above — a single park-and-hold retune (as opposed to
+/// rapid mid-stream hopping) is the light case `configure_capture` on
+/// `/control` always handles, licensed or not. Returns to
+/// `center_frequency_hz` once the override clears. On a file-backed
+/// source `set_center_frequency` is already a documented no-op (RTSA
+/// files carry their own frequency — Phase A's wideband replay covers
+/// the requested channel without any retune), so this degrades safely
+/// there.
 #[allow(clippy::too_many_arguments)]
 async fn single_channel_pump(
     source: &mut crate::AaroniaSource,
     center_frequency_hz: f64,
+    advice: &dyn DwellAdvice,
     tx: &channel::Sender<IqPacket>,
     stop_thread: &AtomicBool,
     block_size: usize,
@@ -315,7 +310,19 @@ async fn single_channel_pump(
     pool_tx: &channel::Sender<Vec<Complex32>>,
 ) -> Result<()> {
     let mut empty_reads = 0u32;
+    let mut current_freq = center_frequency_hz;
     while !stop_thread.load(Ordering::SeqCst) {
+        let target = advice.channel_override().unwrap_or(center_frequency_hz);
+        if (target - current_freq).abs() > 1.0 {
+            if let Err(e) = source.set_center_frequency(target).await {
+                warn!("Aaronia retune to {:.3} MHz failed: {e}", target / 1e6);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            current_freq = target;
+            drain_during_settle(source, block_size, RETUNE_SETTLE).await;
+        }
+
         let mut raw_buffer = pool_rx
             .try_recv()
             .unwrap_or_else(|_| Vec::with_capacity(block_size));
@@ -340,7 +347,7 @@ async fn single_channel_pump(
         empty_reads = 0;
         let pkt = IqPacket {
             samples: crate::sdr_source::PooledIqBuffer::new_pooled(raw_buffer, pool_tx.clone()),
-            center_frequency_hz,
+            center_frequency_hz: current_freq,
             sample_rate_hz: sample_rate_f32,
             overrun: source.take_overrun(),
         };
@@ -389,8 +396,16 @@ async fn hop_pump(
     // dead source, and hopping is the cure.
     let mut read_errors = 0u32;
     while !stop_thread.load(Ordering::SeqCst) {
-        let channel = channels_hz[channel_idx];
-        channel_idx = (channel_idx + 1) % channels_hz.len();
+        // A live `/video` viewer wants a specific channel: park there,
+        // bypassing the hop list, until the override changes or clears.
+        // `channel_idx` only advances on a genuine hop below, so hopping
+        // resumes exactly where it left off once the viewer disconnects.
+        let override_freq = advice.channel_override();
+        let channel = override_freq.unwrap_or_else(|| {
+            let c = channels_hz[channel_idx];
+            channel_idx = (channel_idx + 1) % channels_hz.len();
+            c
+        });
 
         // Short-circuit retune+settle when the hop target equals
         // the current channel — otherwise a one-channel hop list
@@ -423,7 +438,29 @@ async fn hop_pump(
         let mut deadline = dwell_ctrl.deadline(hop_start, advice.latest_signal_at(freq_key));
         let mut empty_reads = 0u32;
 
-        while Instant::now() < deadline && !stop_thread.load(Ordering::SeqCst) {
+        loop {
+            if stop_thread.load(Ordering::SeqCst) {
+                break;
+            }
+            let still_overridden = advice.channel_override() == Some(channel);
+            if override_freq.is_some() {
+                // Parked here for live view: hold regardless of the dwell
+                // deadline, but break out the moment the viewer's channel
+                // changes or they disconnect so the outer loop can retune
+                // or resume hopping.
+                if !still_overridden {
+                    break;
+                }
+            } else if still_overridden {
+                // A viewer just requested this exact channel while we were
+                // still mid-hop-dwell here — break out now (rather than
+                // waiting for the normal dwell deadline) so the next outer
+                // iteration parks on it promptly.
+                break;
+            } else if Instant::now() >= deadline {
+                break;
+            }
+
             let mut raw_buffer = pool_rx
                 .try_recv()
                 .unwrap_or_else(|_| Vec::with_capacity(block_size));
