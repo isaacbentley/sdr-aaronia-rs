@@ -2,6 +2,75 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.4] - 2026-07-31
+
+### Fixed
+- **Native SDK: the tail of every oversized IQ packet was discarded.**
+  `NativeSdkSource::read_samples` copied `min(packet.num, max_samples)`
+  samples and then consumed the *whole* packet via
+  `AARTSAAPI_ConsumePackets`. The SDK picks its own packet size, unrelated
+  to the caller's `max_samples`, so anything past the request was lost
+  permanently — consuming returns the buffer to the SDK. `block_size` is
+  caller-set with only a 1024 floor, so a modest block size against
+  `AARTSAAPI_MEMORY_MEDIUM` packets left the IQ stream full of holes, which
+  breaks the phase continuity downstream ZC correlation and CFO tracking
+  depend on. Excess samples are now retained in the (previously dead)
+  `sample_buffer` and returned by subsequent calls, mirroring the HTTP
+  path's remainder handling. See `read_samples`' new "Carry-over" section;
+  `get_sample_buffer_size()` now reports something real.
+- **Native SDK: `read_samples(.., 0)` destroyed a packet.** A zero-sized
+  request used to fetch a packet, copy nothing out of it, and consume it.
+  It now returns early without polling.
+- **`sdk_sink`: TX bursts were scheduled at the Unix epoch.** The FutureSDR
+  sink block built every `TxBurst` with `start_time: 0.0`, contradicting
+  `TxBurst`'s own documentation that the device schedules against its
+  master stream clock. Timestamps are now derived from
+  `AARTSAAPI_GetMasterStreamTime` with a 10 ms lead, falling back to the
+  documented `PUSH` immediate-dispatch flag when the clock is unreadable.
+  Hardware-unverified, like the rest of the TX path.
+- **`http_source`: reported buffer capacity disagreed with the enforced
+  one.** The cap was written twice — `saturating_mul(2).max(1)` where it
+  was enforced, a bare `* 2` where `StreamStats` reported it. With
+  `buffer_size: 0` (which the builder accepts) `buffer_level` could exceed
+  `buffer_capacity`, and a consumer computing a fill ratio divided by zero.
+- **Diagnostic previews truncated on byte offsets, not char boundaries.**
+  `&text[..n]` panics when `n` lands inside a multi-byte UTF-8 character,
+  and these previews print raw RTSA responses carrying device/mission/
+  antenna names straight from user configuration — one non-ASCII character
+  in a mission title was enough to panic a diagnostic run.
+
+### Changed
+- **`cargo clippy --all-targets` now compiles on a default checkout.**
+  `tests/http_sink_test.rs` needs the `futuresdr` feature but declared no
+  `required-features`, so the documented lint command failed with `cannot
+  find module or crate futuresdr`.
+- **`SdkConfig::timeout` and `SdkSinkConfig::timeout` documented as
+  inert.** Neither is read by any code path; the only timeout in force on
+  the read path is the fixed 500 ms `NativeSdkSource::READ_POLL_DEADLINE`.
+  Both fields are kept — they are `pub` on a published crate — but now say
+  so. Honouring them would change `read_samples`' signature, so that is
+  left as a deliberate decision for a future major.
+
+## [v0.3.3] - 2026-07-31
+
+### Fixed
+- **`broad_search_for_chunk` could loop forever.** The RTSA chunk scan did
+  not terminate at EOF, so a file whose signature was absent and whose
+  search bound exceeded its length spun indefinitely — reachable from
+  `RtsaSource::open` on an untrusted file.
+- **`verify_config_changes` leaked probed device state.** A failed
+  read-back returned early without restoring the parameter it had just
+  offset, leaving the device 1 dB from where it started. The restore now
+  runs on every path out, and logs when both the read-back and the restore
+  fail.
+
+## [v0.3.2] - 2026-07-13
+
+### Added
+- **`DwellAdvice::channel_override` is now honored**, and the Remote Config
+  license gate was dropped from hop mode — channel hopping works on
+  unlicensed devices via the free `/control` endpoint.
+
 ## [v0.3.1] - 2026-07-11
 
 ### Fixed
