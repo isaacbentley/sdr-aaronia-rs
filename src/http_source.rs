@@ -1099,22 +1099,65 @@ mod tests {
 
     #[test]
     fn test_stream_statistics() {
-        // Create a mock HttpSource to test statistics
+        // This module lives inside `http_source.rs`, so it can read the
+        // block's private fields directly — no need to stop at "the builder
+        // returned Ok", which is all this test used to check.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
 
-        let _block = HttpSourceBuilder::new("http://localhost:54664")
+        let block = HttpSourceBuilder::new("http://localhost:54664")
             .frequency(915e6)
             .sample_rate(2.048e6)
             .format(StreamFormat::Float32)
             .input("main")
             .rate_reduction(2)
+            .buffer_size(4096)
             .build()
             .expect("Should create HttpSource");
 
-        // Test that the block was created successfully
-        // Note: Direct kernel access is challenging in unit tests due to FutureSDR's threading model
-        // We validate creation and configuration through the builder API success
+        let stats = block.get_stream_stats();
+        assert!(!stats.active, "a freshly built source is not streaming yet");
+        assert_eq!(stats.format, StreamFormat::Float32);
+        assert_eq!(stats.current_frequency, 915e6);
+        assert_eq!(stats.current_sample_rate, 2.048e6);
+        assert_eq!(stats.input_name.as_deref(), Some("main"));
+        assert_eq!(stats.buffer_level, 0, "nothing buffered before streaming");
+        assert_eq!(stats.buffer_capacity, 8192, "2x the configured buffer_size");
+        assert!(!stats.restart_pending);
+    }
+
+    /// `buffer_capacity` must equal the cap actually enforced when trimming
+    /// `sample_buffer`, for every `buffer_size` the builder accepts —
+    /// including 0, which `test_buffer_configuration` explicitly allows.
+    ///
+    /// These were two separately-written expressions:
+    /// `saturating_mul(2).max(1)` at the enforcement site and a bare `* 2`
+    /// in the reported stats. At `buffer_size: 0` they disagreed — capacity
+    /// was reported as 0 while 1 was enforced, so `buffer_level` could
+    /// exceed `buffer_capacity` and a consumer computing a fill ratio
+    /// divided by zero.
+    #[test]
+    fn stream_stats_capacity_matches_the_enforced_cap() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        for buffer_size in [0usize, 1, 1024, 4096] {
+            let block = HttpSourceBuilder::new("http://localhost:54664")
+                .buffer_size(buffer_size)
+                .build()
+                .expect("Should create HttpSource");
+
+            let reported = block.get_stream_stats().buffer_capacity;
+            assert_eq!(
+                reported,
+                block.buffer_capacity(),
+                "reported capacity must be the enforced one (buffer_size={buffer_size})"
+            );
+            assert!(
+                reported > 0,
+                "capacity must never be 0 — consumers divide by it (buffer_size={buffer_size})"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1194,36 +1237,52 @@ mod tests {
         assert!(source.build().is_ok());
     }
 
-    // Mock server response structures for testing data processing
+    /// The `/stream` query string is assembled in `start_stream` from these
+    /// four fields, which needs a live server to exercise end-to-end. What
+    /// is checkable here is that every one of them survives the builder —
+    /// a dropped field would silently produce a URL missing that parameter.
     #[test]
     fn test_stream_url_construction() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
 
-        // Test URL construction with various parameters
-        let _block = HttpSourceBuilder::new("http://localhost:54664")
+        let block = HttpSourceBuilder::new("http://localhost:54664")
             .format(StreamFormat::Float32)
             .input("main")
             .rate_reduction(4)
+            .scale(1_000_000.0)
             .build()
             .expect("Should create HttpSource");
 
-        // The URL construction happens internally during start_stream()
-        // We can verify this by checking that the block was created successfully
-        // with the expected configuration
-        // Test that the block was created successfully
-        // Configuration validation occurs during the build process
+        assert_eq!(block.base_url, "http://localhost:54664");
+        assert_eq!(block.stream_format, StreamFormat::Float32);
+        assert_eq!(block.input_name.as_deref(), Some("main"));
+        assert_eq!(block.rate_reduction, Some(4));
+        assert_eq!(block.scale, Some(1_000_000.0));
+        // `as_str()` is what lands in the query string.
+        assert_eq!(block.stream_format.as_str(), "float32");
     }
 
     #[tokio::test]
     async fn test_default_configuration() {
-        // Test that defaults are sensible
-        let source = HttpSourceBuilder::new("http://localhost:54664");
-        let _built = source.build().expect("Should build with defaults");
+        // Pins the documented defaults on `HttpSourceBuilder::new`
+        // (100 MHz / 1 MS/s / Int16 / no auth), so changing one is a
+        // deliberate act rather than a silent behaviour change. Previously
+        // this only checked that `build()` returned Ok.
+        let built = HttpSourceBuilder::new("http://localhost:54664")
+            .build()
+            .expect("Should build with defaults");
 
-        // Verify the block was created successfully
-        // Test that the block was created successfully
-        // Default configuration validation occurs during the build process
+        assert_eq!(built.current_frequency, 100e6);
+        assert_eq!(built.current_sample_rate, 1e6);
+        assert_eq!(built.reference_level, -20.0);
+        assert_eq!(built.buffer_size, 4096);
+        assert_eq!(built.stream_format, StreamFormat::Int16);
+        assert!(matches!(built.auth_method, AuthMethod::None));
+        assert_eq!(built.input_name, None, "input is auto-selected by default");
+        assert_eq!(built.rate_reduction, None);
+        assert_eq!(built.scale, None);
+        assert!(!built.stream_active);
     }
 
     #[tokio::test]
@@ -1263,13 +1322,15 @@ mod tests {
         assert!(source.build().is_err());
     }
 
-    // Integration test structure for when mock server is available
+    /// A source that has never streamed must report zeroed counters rather
+    /// than stale or uninitialised ones — this is the shape an external
+    /// dashboard reads before the first packet arrives.
     #[test]
     fn test_stream_stats_structure() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
 
-        let _block = HttpSourceBuilder::new("http://localhost:54664")
+        let block = HttpSourceBuilder::new("http://localhost:54664")
             .frequency(146.52e6)
             .sample_rate(2.048e6)
             .format(StreamFormat::Int16)
@@ -1279,8 +1340,15 @@ mod tests {
             .build()
             .expect("Should create HttpSource");
 
-        // Test that the block was created successfully with complex configuration
-        // Note: Configuration validation happens during the build process
+        let stats = block.get_stream_stats();
+        assert_eq!(stats.current_frequency, 146.52e6);
+        assert_eq!(stats.current_sample_rate, 2.048e6);
+        assert_eq!(stats.format, StreamFormat::Int16);
+        assert_eq!(stats.input_name.as_deref(), Some("test_input"));
+        assert_eq!(stats.dropped_packets, 0, "no packets seen yet");
+        assert_eq!(stats.input_msps, 0.0);
+        assert_eq!(stats.packet_rate, 0.0);
+        assert!(stats.buffer_level <= stats.buffer_capacity);
     }
 
     #[tokio::test]

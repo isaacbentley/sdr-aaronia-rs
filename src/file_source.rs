@@ -4474,16 +4474,22 @@ mod tests {
         }
         assert_eq!(source.current_position(), 5);
 
-        // Read 10 samples (should cross the DUMY chunk into the second SAMP chunk)
+        // Ask for 10, but only 5 remain in the first SAMP chunk. A read
+        // never spans a chunk boundary — it stops there and returns a short
+        // read rather than transparently continuing into the next SAMP
+        // (which the intervening DUMY chunk would require skipping). Callers
+        // must loop; `UnifiedSource`'s File branch propagates the short read
+        // straight up as its return value.
         let res2 = source.read_samples(10, None).unwrap().unwrap();
         if let SampleData::Iq(samples) = res2 {
-            assert_eq!(samples.len(), 5);
+            assert_eq!(samples.len(), 5, "short read at the chunk boundary");
         } else {
             panic!("Expected IQ samples");
         }
         assert_eq!(source.current_position(), 10);
 
-        // Next read gets the second chunk
+        // The next read resumes in the second SAMP chunk, having skipped the
+        // DUMY chunk in between.
         let res3 = source.read_samples(10, None).unwrap().unwrap();
         if let SampleData::Iq(samples) = res3 {
             assert_eq!(samples.len(), 10);
