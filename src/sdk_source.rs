@@ -48,6 +48,18 @@ pub struct SdkConfig {
     /// Reference level in dBm.
     pub reference_level: f64,
     /// Device operation timeout.
+    ///
+    /// **Currently not applied.** Nothing in this wrapper or in
+    /// [`crate::native_sdk`] reads this value — the only timeout actually
+    /// in force on the read path is
+    /// [`NativeSdkSource::READ_POLL_DEADLINE`](crate::native_sdk::NativeSdkSource::READ_POLL_DEADLINE),
+    /// a fixed 500 ms poll deadline. Setting this field therefore has no
+    /// effect on device behaviour today.
+    ///
+    /// It is kept (rather than removed) because the field is `pub` on a
+    /// published crate, and honouring it would mean changing
+    /// `NativeSdkSource::read_samples`' signature — both breaking changes.
+    /// Documented here so callers don't set it expecting a behaviour change.
     pub timeout: Duration,
 }
 
