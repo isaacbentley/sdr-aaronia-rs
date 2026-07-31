@@ -1162,15 +1162,42 @@ impl HttpEndpointsClient {
             .apply_parameter_change(test_parameter, test_value)
             .await;
 
-        // Step 4: Read back to verify
-        let verification_config = self.get_config().await?;
-        let current_value =
-            self.extract_parameter_value(&verification_config.config, test_parameter)?;
+        // Step 4: Read back to verify.
+        //
+        // Deliberately *not* `?`. Once step 3 has written to the device we
+        // own a side effect on the user's hardware, and the restore in
+        // step 5 is the only thing that undoes it. Propagating a read-back
+        // failure here would skip the restore and leave the reference
+        // level permanently offset by `safe_delta` — this function's own
+        // doc promises it "automatically restores the original value", and
+        // a transient network blip between the write and the read-back is
+        // exactly when that promise matters most. Capture the outcome,
+        // always restore, then surface the error.
+        let readback = async {
+            let verification_config = self.get_config().await?;
+            self.extract_parameter_value(&verification_config.config, test_parameter)
+        }
+        .await;
 
-        // Step 5: Restore original value (best effort)
+        // Step 5: Restore original value (best effort) — unconditionally,
+        // on every path out of step 4.
         let restore_result = self
             .apply_parameter_change(test_parameter, original_value)
             .await;
+
+        let current_value = match readback {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(restore_err) = restore_result {
+                    warn!(
+                        "verify_config_changes: read-back failed ({e}) AND the restore of \
+                         {test_parameter} to {original_value} also failed ({restore_err}) — \
+                         the device may still be offset by {safe_delta}"
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         let applied = (current_value - test_value).abs() < 0.001; // Allow small floating point errors
 

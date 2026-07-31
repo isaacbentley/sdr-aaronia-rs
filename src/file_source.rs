@@ -1368,6 +1368,27 @@ impl RtsaSource {
             if let Some(i) = buffer[..bytes_read].windows(4).position(|w| w == signature) {
                 return Ok(position + i as u64);
             }
+            // Stop once the remaining tail is shorter than the signature.
+            // Two reasons, one correctness and one liveness:
+            //
+            // * A run of fewer than 4 bytes cannot contain a 4-byte
+            //   signature (`windows(4)` yields nothing), so there is
+            //   genuinely nothing left to find.
+            // * `bytes_read - 3` is the deliberate 3-byte overlap that lets
+            //   a signature straddling two reads still match — but at
+            //   `bytes_read <= 3` it saturates to **zero**, so `position`
+            //   stops advancing and the loop spins forever. That is not a
+            //   corner case: `file_size` here is a search *bound*, not the
+            //   real length (`find_dsfh_chunk` is called with
+            //   `stream_area_offset * 2`), while `read` is bounded by the
+            //   actual file. Whenever the bound exceeds the file — the
+            //   normal case for an IQ recording, where the stream area is
+            //   more than half the file — the scan walks to `len - 3`, reads
+            //   exactly 3 bytes, and wedges. Any file missing the searched
+            //   signature would hang `RtsaSource::open` outright.
+            if bytes_read < signature.len() {
+                break;
+            }
             position += bytes_read.saturating_sub(3) as u64;
         }
         Err(Error::FileFormat {
@@ -2846,6 +2867,51 @@ impl DsftChunk {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// `broad_search_for_chunk` must terminate when the signature is
+    /// absent, even though its `file_size` argument is a search *bound*
+    /// rather than the real length — `find_dsfh_chunk` passes
+    /// `stream_area_offset * 2`, which for an IQ recording (stream area
+    /// > half the file) exceeds the actual file.
+    ///
+    /// The scan overlaps reads by 3 bytes so a signature straddling two
+    /// reads still matches, but `bytes_read - 3` saturates to zero once
+    /// the tail is <= 3 bytes: `position` stopped advancing and the loop
+    /// spun forever, hanging `RtsaSource::open` on any file missing the
+    /// searched chunk.
+    ///
+    /// Run on a worker thread with a timeout so a regression fails the
+    /// suite promptly instead of wedging CI forever.
+    #[test]
+    fn broad_search_terminates_when_signature_absent_and_bound_exceeds_file() {
+        use std::io::Write as _;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+            // No "DSFH" anywhere, and a length that leaves a <4-byte tail
+            // once the 3-byte-overlap walk reaches the end.
+            tmp.write_all(&vec![0xABu8; 5_000_003]).expect("write");
+            tmp.flush().expect("flush");
+            let file = std::fs::File::open(tmp.path()).expect("open");
+            let mut reader = std::io::BufReader::new(file);
+            // Bound deliberately larger than the real file, mirroring
+            // `find_dsfh_chunk(reader, stream_area_offset * 2)`.
+            let res = RtsaSource::broad_search_for_chunk(&mut reader, 8_000_000, b"DSFH");
+            let _ = tx.send(res.is_err());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(is_err) => assert!(
+                is_err,
+                "absent signature should report an error, not a match"
+            ),
+            Err(_) => panic!(
+                "broad_search_for_chunk did not terminate within 30s — \
+                 the 3-byte-overlap advance wedged at the end of the file"
+            ),
+        }
+    }
 
     // Test RTSA chunk header parsing
     #[test]
