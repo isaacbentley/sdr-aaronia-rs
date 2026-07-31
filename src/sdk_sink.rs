@@ -31,6 +31,17 @@ pub struct SdkSinkConfig {
     /// Transmission gain in dB (0.0 to -120.0 typically).
     pub trans_gain: f64,
     /// Device operation timeout.
+    ///
+    /// **Currently not applied.** Nothing in this wrapper or in
+    /// [`crate::native_sdk`] reads this value; the transmit path
+    /// ([`SdkSink::write_samples`] → `AARTSAAPI_SendPacket`) is a
+    /// synchronous vendor call with no timeout parameter to pass it to.
+    /// Setting it changes no behaviour.
+    ///
+    /// Kept rather than removed because the field is `pub` on a published
+    /// crate, so dropping it would break struct-literal construction
+    /// downstream for a knob nobody can be relying on. Mirrors
+    /// [`crate::sdk_source::SdkConfig::timeout`].
     pub timeout: Duration,
 }
 
@@ -211,15 +222,37 @@ pub mod futuresdr_sink {
     use futuresdr::macros::Block;
     use futuresdr::prelude::{BufferReader, CpuBufferReader};
     use futuresdr::runtime::Kernel;
-    use tracing::error;
+    use tracing::{error, warn};
+
+    /// How far ahead of the device's master stream time a burst is
+    /// scheduled. The packet has to reach the device before its scheduled
+    /// start or the scheduler has already passed it, so "now" exactly is
+    /// always too late; this is the slack that covers the SendPacket call
+    /// and the USB hop.
+    ///
+    /// Hardware-unverified — 10 ms is a conservative guess, not a measured
+    /// figure. Too small and bursts arrive late; too large and they sit in
+    /// the device queue adding latency.
+    const TX_SCHEDULE_LEAD_S: f64 = 0.010;
 
     /// FutureSDR block that sinks `Complex32` items to the native SDK.
     ///
-    /// Note: This block currently buffers incoming samples and drops them
-    /// if the buffer exceeds a simple threshold to prevent unbound memory
-    /// usage, or you must build a pacing mechanism in your graph. Since
-    /// we cannot test hardware, the simplest continuous streaming block
-    /// is provided.
+    /// Each `work()` call forwards up to `samples_per_burst` items as one
+    /// `TxBurst` and consumes them. The block holds no queue of its own —
+    /// back-pressure is whatever the upstream `DefaultCpuReader` provides.
+    ///
+    /// > [!WARNING]
+    /// > Hardware-unverified, like the rest of the TX path — the
+    /// > developer's V6 ECO has no transmitter. In particular the burst
+    /// > scheduling below (lead time, one burst per `work()`) has never
+    /// > been checked against a real device.
+    ///
+    /// **Samples are dropped if `AARTSAAPI_SendPacket` fails.** The error
+    /// is logged and the input is consumed anyway: leaving it unconsumed
+    /// would re-present the same failing samples on the next `work()` call
+    /// and livelock the flowgraph on a persistently failing device. Callers
+    /// needing guaranteed delivery should drive [`SdkSink::write_samples`]
+    /// directly and handle the error.
     #[derive(Block)]
     pub struct SdkSinkBlock {
         sink: SdkSink,
@@ -286,16 +319,40 @@ pub mod futuresdr_sink {
 
             let n = std::cmp::min(input_len, self.samples_per_burst);
 
-            // In a real continuous stream, we would calculate start_time and
-            // end_time precisely. Here we dispatch "immediate" or un-paced
-            // packets for testing.
+            // `TxBurst` documents that the device schedules a burst against
+            // its own master stream clock and that zero timestamps are
+            // wrong — `start_time: 0.0` asks the device to transmit at the
+            // Unix epoch, decades in the past. Derive a real window from the
+            // device clock instead.
+            let sample_rate_hz = self.sink.get_config().span_frequency;
+            let duration_s = if sample_rate_hz > 0.0 {
+                n as f64 / sample_rate_hz
+            } else {
+                0.0
+            };
+            let mut flags = crate::native_sdk::tx_flags::SEGMENT_START
+                | crate::native_sdk::tx_flags::SEGMENT_END;
+            let (start_time, end_time) = match self.sink.get_master_stream_time() {
+                Ok(now) => {
+                    let start = now + TX_SCHEDULE_LEAD_S;
+                    (start, start + duration_s)
+                }
+                Err(e) => {
+                    // No usable clock: fall back to the SDK's documented
+                    // "process this packet now" escape hatch rather than
+                    // handing the scheduler an epoch-zero window.
+                    warn!("Master stream time unavailable ({e}); dispatching burst with PUSH");
+                    flags |= crate::native_sdk::tx_flags::PUSH;
+                    (0.0, 0.0)
+                }
+            };
+
             let burst = crate::native_sdk::TxBurst {
-                start_time: 0.0,
-                end_time: 0.0,
+                start_time,
+                end_time,
                 center_frequency_hz: self.sink.get_config().center_frequency,
-                sample_rate_hz: self.sink.get_config().span_frequency,
-                flags: crate::native_sdk::tx_flags::SEGMENT_START
-                    | crate::native_sdk::tx_flags::SEGMENT_END,
+                sample_rate_hz,
+                flags,
             };
 
             // Scoped: the slice borrow of `self.input` must end before

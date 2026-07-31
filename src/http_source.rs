@@ -475,7 +475,7 @@ impl HttpSource {
             // Bulk `extend` (one reserve) rather than per-element `push_back`.
             self.sample_buffer.extend(packet.samples);
             total_samples_added += packet_samples;
-            let capacity = self.buffer_size.saturating_mul(2).max(1);
+            let capacity = self.buffer_capacity();
             if self.sample_buffer.len() > capacity {
                 let overflow = self.sample_buffer.len() - capacity;
                 self.sample_buffer.drain(0..overflow);
@@ -504,6 +504,21 @@ impl HttpSource {
         Ok(total_samples_added)
     }
 
+    /// Hard cap on `sample_buffer`, above which the oldest samples are
+    /// dropped to keep the buffer bounded and current.
+    ///
+    /// Single source of truth for both the enforcement in
+    /// [`Self::fetch_samples`] and the figure reported by
+    /// [`Self::get_stream_stats`]; these were separately-written
+    /// expressions (`saturating_mul(2).max(1)` vs a bare `* 2`) that
+    /// disagreed whenever `buffer_size` was 0 — reporting capacity 0 while
+    /// enforcing 1, so `buffer_level` could exceed `buffer_capacity` and a
+    /// consumer computing a fill ratio divided by zero. The bare `* 2` was
+    /// also the only unguarded one on overflow.
+    fn buffer_capacity(&self) -> usize {
+        self.buffer_size.saturating_mul(2).max(1)
+    }
+
     /// Get current stream statistics for monitoring
     pub fn get_stream_stats(&self) -> StreamStats {
         let stats = self.stream_parser.stats();
@@ -513,7 +528,7 @@ impl HttpSource {
             current_frequency: self.current_frequency,
             current_sample_rate: self.current_sample_rate,
             buffer_level: self.sample_buffer.len(),
-            buffer_capacity: self.buffer_size * 2,
+            buffer_capacity: self.buffer_capacity(),
             input_name: self.input_name.clone(),
             input_msps: stats.samples_per_second / 1e6,
             dropped_packets: self.drop_detector.drops(),

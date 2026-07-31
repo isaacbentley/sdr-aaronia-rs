@@ -1191,6 +1191,41 @@ pub(crate) fn split_device_type<'a>(device_type: &'a str, default_mode: &str) ->
     (family, open_mode)
 }
 
+/// How one [`NativeSdkSource::read_samples`] call divides its work between
+/// the carry-over buffer and a freshly-polled packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadPlan {
+    /// Samples to drain from carry-over into the caller's buffer.
+    pub from_carry: usize,
+    /// Samples still wanted from the device. `0` means "don't poll" — the
+    /// caller is already satisfied, so spending a `READ_POLL_DEADLINE` on a
+    /// packet we'd have to carry over anyway is pure latency.
+    pub remaining: usize,
+}
+
+/// Plan a read against `carry_len` buffered samples.
+///
+/// Split out from [`NativeSdkSource::read_samples`] purely so the accounting
+/// is unit-testable: constructing a `NativeSdkSource` needs a real loaded
+/// SDK library, so the arithmetic is otherwise only exercisable on hardware.
+pub(crate) fn plan_read(carry_len: usize, max_samples: usize) -> ReadPlan {
+    let from_carry = carry_len.min(max_samples);
+    ReadPlan {
+        from_carry,
+        remaining: max_samples - from_carry,
+    }
+}
+
+/// Divide a packet of `packet_samples` into `(to_caller, to_carry_over)`.
+///
+/// `to_carry_over` **must** be retained: `AARTSAAPI_ConsumePackets` hands the
+/// packet back to the SDK, so a tail that isn't copied out is an
+/// unrecoverable hole in the IQ stream.
+pub(crate) fn split_packet(packet_samples: usize, remaining: usize) -> (usize, usize) {
+    let to_caller = packet_samples.min(remaining);
+    (to_caller, packet_samples - to_caller)
+}
+
 // === High-Level Stream Manager ===
 
 /// The open-mode supplied to `AARTSAAPI_OpenDevice`. Tracking which family /
@@ -1885,6 +1920,26 @@ impl NativeSdkSource {
     /// physically-meaningful magnitudes must consult the open mode (see
     /// [`Self::open_mode`]); SDR applications's DJI detector is amplitude-
     /// relative so this is informational here.
+    ///
+    /// # Carry-over
+    ///
+    /// The SDK chooses its own packet size, which is unrelated to
+    /// `max_samples`. When a packet holds more than the caller asked for,
+    /// the excess is retained internally and returned by subsequent calls
+    /// rather than dropped — `AARTSAAPI_ConsumePackets` releases the packet
+    /// back to the SDK before the next call, so an uncopied tail would be an
+    /// unrecoverable gap in the IQ stream. [`Self::get_sample_buffer_size`]
+    /// reports how much is pending.
+    ///
+    /// Consequences for callers:
+    /// - A call is served from carry-over first, and polls the device only
+    ///   when carry-over alone cannot satisfy `max_samples`. A caller
+    ///   draining a backlog therefore never waits on
+    ///   [`Self::READ_POLL_DEADLINE`].
+    /// - The return value counts samples appended to `buffer` by this call,
+    ///   not samples taken from the device.
+    /// - A short read still means "no more data right now" — at most one
+    ///   packet is fetched per call, as before.
     pub unsafe fn read_samples(
         &mut self,
         buffer: &mut Vec<Complex32>,
@@ -1895,12 +1950,34 @@ impl NativeSdkSource {
                 return Err(Error::Sdk("Streaming not active".to_string()));
             }
 
+            // Serve from the carry-over buffer first. The SDK hands back
+            // whole packets whose size it chooses; when one is larger than
+            // the caller's `max_samples` the tail is retained here rather
+            // than discarded, so the IQ stream stays gap-free across calls.
+            // (This mirrors the HTTP path's remainder handling in
+            // `UnifiedSource::read_samples`.)
+            let ReadPlan {
+                from_carry,
+                remaining,
+            } = plan_read(self.sample_buffer.len(), max_samples);
+            if from_carry > 0 {
+                buffer.extend(self.sample_buffer.drain(0..from_carry));
+            }
+            if remaining == 0 {
+                // Fully satisfied from carry-over (or `max_samples == 0`).
+                // Return without polling so a caller draining a backlog never
+                // eats a `READ_POLL_DEADLINE` stall for samples it already
+                // has — and so a zero-sized request can't consume, and
+                // destroy, a packet it copies nothing out of.
+                return Ok(from_carry);
+            }
+
             let device = self
                 .device
                 .as_mut()
                 .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
 
-            let mut samples_read = 0;
+            let mut samples_read = from_carry;
 
             // Poll for a packet matching the canonical sample loop:
             //   while ((res = AARTSAAPI_GetPacket(...)) == AARTSAAPI_EMPTY)
@@ -1957,44 +2034,51 @@ impl NativeSdkSource {
                     // a future change to that representation.
                     const _: () =
                         assert!(std::mem::size_of::<Complex32>() == 2 * std::mem::size_of::<f32>());
-                    let num_complex_samples = (packet.num as usize).min(max_samples);
+                    // Take the *whole* packet: the first `to_caller` samples
+                    // satisfy this call and any excess is carried over for the
+                    // next one. `consume_packets` below hands the packet back
+                    // to the SDK, so anything not copied out here is gone —
+                    // truncating to `max_samples` silently punched a hole in
+                    // the IQ stream on every oversized packet.
+                    let packet_samples = packet.num as usize;
                     let stride = packet.stride as usize;
+                    let (to_caller, _to_carry) = split_packet(packet_samples, remaining);
 
-                    // `num_complex_samples == 0` (a caller passing
-                    // `max_samples == 0`) must skip the slice construction: the
-                    // wide-stride branch below computes `(n - 1) * stride`, which
-                    // would underflow `usize` and hand `from_raw_parts` a
-                    // ~usize::MAX length (instant UB). Nothing to copy anyway.
-                    if num_complex_samples > 0 {
-                        if stride == 2 {
-                            // Tightly packed IQ pairs — the common raw-IQ layout.
-                            let complex_slice = std::slice::from_raw_parts(
-                                packet.fp32 as *const Complex32,
-                                num_complex_samples,
-                            );
-                            buffer.extend_from_slice(complex_slice);
-                        } else {
-                            // Per the official header, `stride` is the "offset
-                            // from sample to sample in floats" and is not required
-                            // to be 2 (e.g. multi-channel interleaved layouts).
-                            // Gather sample-by-sample so a wider stride doesn't
-                            // smear neighbouring channels into the IQ data.
-                            // SAFETY: each sample spans floats
-                            // [i*stride, i*stride+1], the last of which is
-                            // (num-1)*stride + 2 floats into the buffer the SDK
-                            // guarantees valid for `num` samples of `stride`
-                            // floats. `num_complex_samples >= 1` here, so the
-                            // `- 1` cannot underflow.
-                            let floats = std::slice::from_raw_parts(
-                                packet.fp32 as *const f32,
-                                (num_complex_samples - 1) * stride + 2,
-                            );
-                            buffer.extend((0..num_complex_samples).map(|i| {
-                                Complex32::new(floats[i * stride], floats[i * stride + 1])
-                            }));
-                        }
+                    // `packet_samples >= 1` (guarded by `packet.num > 0`
+                    // above) and `remaining >= 1` (a fully-satisfied caller
+                    // returned before polling), so neither the `- 1` below nor
+                    // the slice splits can underflow.
+                    if stride == 2 {
+                        // Tightly packed IQ pairs — the common raw-IQ layout.
+                        let complex_slice = std::slice::from_raw_parts(
+                            packet.fp32 as *const Complex32,
+                            packet_samples,
+                        );
+                        buffer.extend_from_slice(&complex_slice[..to_caller]);
+                        self.sample_buffer
+                            .extend(complex_slice[to_caller..].iter().copied());
+                    } else {
+                        // Per the official header, `stride` is the "offset
+                        // from sample to sample in floats" and is not required
+                        // to be 2 (e.g. multi-channel interleaved layouts).
+                        // Gather sample-by-sample so a wider stride doesn't
+                        // smear neighbouring channels into the IQ data.
+                        // SAFETY: each sample spans floats
+                        // [i*stride, i*stride+1], the last of which is
+                        // (num-1)*stride + 2 floats into the buffer the SDK
+                        // guarantees valid for `num` samples of `stride`
+                        // floats.
+                        let floats = std::slice::from_raw_parts(
+                            packet.fp32 as *const f32,
+                            (packet_samples - 1) * stride + 2,
+                        );
+                        let sample_at =
+                            |i: usize| Complex32::new(floats[i * stride], floats[i * stride + 1]);
+                        buffer.extend((0..to_caller).map(sample_at));
+                        self.sample_buffer
+                            .extend((to_caller..packet_samples).map(sample_at));
                     }
-                    samples_read = num_complex_samples;
+                    samples_read += to_caller;
 
                     // `trace!`, not `info!`: this runs on every read call
                     // (thousands/sec at speed), so an enabled info subscriber
@@ -2084,6 +2168,10 @@ impl NativeSdkSource {
         self.stream_active
     }
 
+    /// Samples held over from a packet larger than the last
+    /// [`Self::read_samples`] request. These are returned by the next call
+    /// (before any new packet is polled); see that method's "Carry-over"
+    /// section. Zero means the last packet was fully delivered.
     pub fn get_sample_buffer_size(&self) -> usize {
         self.sample_buffer.len()
     }
@@ -2302,6 +2390,112 @@ impl From<AARTSAAPI_DeviceInfo> for DeviceInfo {
 mod tests {
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn plan_read_serves_carry_over_before_polling() {
+        // Carry-over covers the whole request: don't poll the device.
+        assert_eq!(
+            plan_read(4096, 1024),
+            ReadPlan {
+                from_carry: 1024,
+                remaining: 0
+            }
+        );
+        // Carry-over covers it exactly: still no reason to poll.
+        assert_eq!(
+            plan_read(1024, 1024),
+            ReadPlan {
+                from_carry: 1024,
+                remaining: 0
+            }
+        );
+        // Partial carry-over: drain it, then ask the device for the rest.
+        assert_eq!(
+            plan_read(400, 1024),
+            ReadPlan {
+                from_carry: 400,
+                remaining: 624
+            }
+        );
+        // Nothing buffered: straight to the device.
+        assert_eq!(
+            plan_read(0, 1024),
+            ReadPlan {
+                from_carry: 0,
+                remaining: 1024
+            }
+        );
+    }
+
+    #[test]
+    fn plan_read_zero_request_never_polls() {
+        // A `max_samples == 0` read must not fetch a packet: it would be
+        // consumed (returned to the SDK) after copying nothing out of it,
+        // destroying those samples.
+        assert_eq!(
+            plan_read(0, 0),
+            ReadPlan {
+                from_carry: 0,
+                remaining: 0
+            }
+        );
+        assert_eq!(
+            plan_read(9999, 0),
+            ReadPlan {
+                from_carry: 0,
+                remaining: 0
+            }
+        );
+    }
+
+    #[test]
+    fn split_packet_retains_the_tail() {
+        // Oversized packet: caller gets what it asked for, the rest is kept.
+        assert_eq!(split_packet(65536, 1024), (1024, 64512));
+        // Exact fit: nothing carried.
+        assert_eq!(split_packet(1024, 1024), (1024, 0));
+        // Undersized packet: short read, nothing carried.
+        assert_eq!(split_packet(300, 1024), (300, 0));
+    }
+
+    proptest::proptest! {
+        /// The invariant the old code violated: every sample the SDK hands
+        /// us is either delivered to the caller or retained for the next
+        /// call. Nothing is dropped. Previously `read_samples` copied
+        /// `min(packet.num, max_samples)` and then consumed the whole
+        /// packet, silently losing the tail of every oversized packet.
+        #[test]
+        fn no_sample_is_ever_dropped(
+            carry_len in 0usize..100_000,
+            max_samples in 0usize..100_000,
+            packet_samples in 1usize..100_000,
+        ) {
+            let plan = plan_read(carry_len, max_samples);
+
+            // Draining carry-over can't take more than exists, or more than
+            // was asked for.
+            proptest::prop_assert!(plan.from_carry <= carry_len);
+            proptest::prop_assert!(plan.from_carry <= max_samples);
+            proptest::prop_assert_eq!(plan.from_carry + plan.remaining, max_samples);
+
+            let carry_left = carry_len - plan.from_carry;
+            // Carry-over is only ever left behind when the caller is full.
+            proptest::prop_assert!(carry_left == 0 || plan.remaining == 0);
+
+            if plan.remaining == 0 {
+                // No packet is fetched, so nothing can be lost.
+                proptest::prop_assert_eq!(plan.from_carry + carry_left, carry_len);
+            } else {
+                let (to_caller, to_carry) = split_packet(packet_samples, plan.remaining);
+                // Conservation: the packet is fully accounted for.
+                proptest::prop_assert_eq!(to_caller + to_carry, packet_samples);
+                // The caller never receives more than it asked for...
+                proptest::prop_assert!(plan.from_carry + to_caller <= max_samples);
+                // ...and a tail is only held back once the caller is full.
+                proptest::prop_assert!(to_carry == 0 || plan.from_carry + to_caller == max_samples);
+            }
+        }
+    }
 
     /// `split_device_type` backs both `SdkConfig::device_family`/
     /// `device_open_mode` (default `"raw"`) and `SdkSinkConfig`'s

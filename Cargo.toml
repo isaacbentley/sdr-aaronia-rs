@@ -64,6 +64,16 @@ harness = false
 name = "rtsa_open_and_read"
 harness = false
 
+# `http_sink_test` drives a FutureSDR flowgraph and imports
+# `sdr_aaronia_rs::http_sink`, both of which only exist under the
+# `futuresdr` feature. Without this guard `cargo clippy --all-targets` and
+# `cargo test --all-targets` fail to compile on a default checkout with
+# `cannot find module or crate futuresdr`. (`tests/native_sdk_load.rs`
+# needs no entry — it guards itself with an inner `#![cfg(...)]`.)
+[[test]]
+name = "http_sink_test"
+required-features = ["futuresdr"]
+
 [features]
 default    = ["http", "file", "sdr-source", "ffi"]
 http       = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json",
