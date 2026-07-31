@@ -1390,6 +1390,55 @@ fn find_config_item_by_name_prefix(items: &[serde_json::Value], prefix: &str) ->
 mod tests {
     use super::*;
 
+    /// Truncate `text` to at most `max_chars` **characters** for a
+    /// diagnostic preview.
+    ///
+    /// `&text[..max]` slices by *byte* index and panics outright when that
+    /// index lands inside a multi-byte UTF-8 character — and these previews
+    /// print raw RTSA responses, which carry device/mission/antenna names
+    /// straight from user configuration. A single non-ASCII character in a
+    /// mission title was enough to turn a diagnostic run into a panic.
+    fn preview(text: &str, max_chars: usize) -> String {
+        // `char_indices().nth(max_chars)` stops after `max_chars` steps and
+        // hands back a byte offset that is a valid boundary by
+        // construction. Counting characters instead (`chars().count()`)
+        // would traverse the *whole* body just to decide whether to append
+        // the marker — and these bodies are raw HTTP responses that can run
+        // to megabytes.
+        match text.char_indices().nth(max_chars) {
+            Some((byte_idx, _)) => format!("{}...", &text[..byte_idx]),
+            None => text.to_string(),
+        }
+    }
+
+    /// `&text[..n]` panics when byte `n` lands inside a multi-byte UTF-8
+    /// character. These previews print raw RTSA responses, which carry
+    /// mission/antenna/device names straight from user configuration — a
+    /// single non-ASCII character was enough to panic the diagnostic.
+    #[test]
+    fn preview_truncates_on_char_boundaries_not_bytes() {
+        // 'é' is 2 bytes, so a 500-char string is 1000 bytes and byte 500
+        // lands mid-character — the exact case that panicked.
+        let multibyte = "é".repeat(500);
+        assert_eq!(multibyte.len(), 1000, "precondition: bytes != chars");
+        let out = preview(&multibyte, 500);
+        assert_eq!(out.chars().count(), 500, "no truncation marker expected");
+
+        let longer = "é".repeat(600);
+        let out = preview(&longer, 500);
+        assert!(out.ends_with("..."), "truncated preview must be marked");
+        assert_eq!(out.chars().count(), 503, "500 chars + the marker");
+
+        // A 4-byte character (emoji) straddling the limit must also be safe.
+        let emoji = "🛸".repeat(600);
+        let out = preview(&emoji, 500);
+        assert!(out.starts_with('🛸'));
+        assert!(out.ends_with("..."));
+
+        // Short input is returned whole, unmarked.
+        assert_eq!(preview("short", 500), "short");
+    }
+
     /// Regression (field report from fpv-viewer): the params-builder
     /// default must be a binary format. A JSON default meant any call
     /// site that forgot `.format(..)` streamed high-rate IQ as ASCII —
@@ -1509,11 +1558,7 @@ mod tests {
                     match response.text().await {
                         Ok(raw_text) => {
                             println!("   📋 Raw healthstatus response (first 500 chars):");
-                            let preview = if raw_text.len() > 500 {
-                                format!("{}...", &raw_text[..500])
-                            } else {
-                                raw_text.clone()
-                            };
+                            let preview = preview(&raw_text, 500);
                             println!("      {}", preview);
 
                             // Try to parse as JSON to see the structure
@@ -1621,11 +1666,7 @@ mod tests {
                     match response.text().await {
                         Ok(raw_text) => {
                             println!("   📋 Raw response (first 800 chars):");
-                            let preview = if raw_text.len() > 800 {
-                                format!("{}...", &raw_text[..800])
-                            } else {
-                                raw_text.clone()
-                            };
+                            let preview = preview(&raw_text, 800);
                             println!("      {}", preview);
 
                             // Try to parse as JSON
