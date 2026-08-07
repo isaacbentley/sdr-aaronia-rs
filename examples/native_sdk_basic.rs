@@ -1,7 +1,7 @@
 //! Basic example of using the Aaronia Native SDK integration.
 //!
 //! This example demonstrates:
-//! - SDK initialization (`Init_With_Path` → `Open` → `RescanDevices`)
+//! - SDK initialization (`Init_With_Path` `Open` `RescanDevices`)
 //! - Device **family** enumeration vs. mode-qualified open
 //!   (per the official RTSA-API-Samples: `EnumDevice("spectranv6")` then
 //!   `OpenDevice("spectranv6/raw", serial)`)
@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     unsafe {
-        info!("🚀 Starting Aaronia Native SDK Example");
+        info!("Starting Aaronia Native SDK Example");
 
         // Create and initialize the SDK source
         let mut sdk_source = NativeSdkSource::new()?;
@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         let devices = sdk_source.find_devices(device_family)?;
 
         if devices.is_empty() {
-            println!("❌ No Spectran V6 devices found. Please connect a device and try again.");
+            println!("No Spectran V6 devices found. Please connect a device and try again.");
             return Ok(());
         }
 
@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         let device_info = &devices[0];
 
         info!(
-            "📡 Opening device: {}",
+            "Opening device: {}",
             NativeSdkSource::get_device_serial(device_info)
         );
         sdk_source.open_device(open_mode, &device_info.serial_number)?;
@@ -63,28 +63,28 @@ fn main() -> anyhow::Result<()> {
         // (`span * 1.5 <= clock`) before returning.
         let (center_freq, span_freq, ref_level) = (446.0e6, 10.0e6, -30.0);
         info!(
-            "⚙️  Configuring IQ receiver: {} Hz center, {} Hz span, {} dBm ref level",
+            "Configuring IQ receiver: {} Hz center, {} Hz span, {} dBm ref level",
             center_freq, span_freq, ref_level
         );
         sdk_source.configure_iq_receiver(center_freq, span_freq, ref_level)?;
 
-        // Optional: drop the sample rate to 1/4 of the receiver clock by
-        // setting `main/decimation` to factor 4 (RawIQ.cpp:142 documents
-        // factors 1, 2, 4, …, 64). Skip this on eco devices — the helper
-        // only operates on `spectranv6/raw`.
+        // Optional: `set_decimation_factor` accepts powers of two in
+        // [1, 512]; factor 1 (`Full`) keeps the native rate. The helper
+        // only operates on `spectranv6/raw`, so eco devices report it as
+        // not applicable.
         if let Err(e) = sdk_source.set_decimation_factor(1) {
             info!("Decimation not applicable on this device: {}", e);
         }
 
         // Start streaming
-        info!("🎵 Starting IQ sample streaming");
+        info!("Starting IQ sample streaming");
         sdk_source.start_streaming()?;
 
         // Collect some samples. `read_samples` itself polls `GetPacket`
         // every 5 ms up to a 500 ms deadline, matching the canonical
         // sample loop, so the outer 100 ms sleep is just for pacing the
         // logs.
-        info!("📊 Collecting sample data...");
+        info!("Collecting sample data...");
 
         // Pre-allocate a reusable buffer. `read_samples` appends into
         // this vector and returns the number of samples written, so we
@@ -112,10 +112,10 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Stop streaming
-        info!("🛑 Stopping streaming");
+        info!("Stopping streaming");
         sdk_source.stop_streaming()?;
 
-        info!("✅ Example completed successfully");
+        info!("Example completed successfully");
         Ok(())
     }
 }

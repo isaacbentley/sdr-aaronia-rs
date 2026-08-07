@@ -1,8 +1,8 @@
 //! Native-SDK library-loading smoke test.
 //!
 //! Verifies the FFI layer against the real `libAaroniaRTSAAPI` binary
-//! without hardware: loading the shared library resolves every one of the
-//! 32 bound symbols (a missing or renamed export fails here), and calling
+//! without hardware: loading the shared library resolves every bound
+//! symbol (a missing or renamed export fails here), and calling
 //! `AARTSAAPI_Version()` proves calls actually go through a resolved
 //! function pointer with the right ABI.
 //!
@@ -30,7 +30,7 @@ fn native_sdk_library_loads_and_resolves_all_symbols() {
          sdk/libAaroniaRTSAAPI.so"
     );
 
-    // `new` dlopens the library and resolves all 32 function pointers;
+    // `new` dlopens the library and resolves every function pointer;
     // any ABI-name drift fails right here.
     let client =
         unsafe { NativeSdkClient::new() }.expect("library must load and all symbols must resolve");

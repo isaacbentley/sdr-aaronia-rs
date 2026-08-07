@@ -11,24 +11,25 @@ This specification focuses on how external applications can interface with the v
 ## Table of Contents
 
 - [Features and Purpose](#features-and-purpose)
-- [Typical Architecture](#typical-architecture)
+- [Verified Architecture](#verified-architecture)
 - [Core API Components](#core-api-components)
   - [Initialization and Shutdown](#initialization-and-shutdown)
   - [Device Management API](#device-management-api)
   - [Configuration API](#configuration-api)
   - [Data Acquisition API](#data-acquisition-api)
+  - [File I/O API](#file-io-api)
   - [Data Structures and Enums](#data-structures-and-enums)
   - [Return Codes and States](#return-codes-and-states)
+- [Rust Binding Notes](#rust-binding-notes)
 - [Integration Patterns](#integration-patterns)
   - [Device Connection and Control](#device-connection-and-control)
   - [Real-time Data Streaming (RAW Mode)](#real-time-data-streaming-raw-mode)
-  - [Real-time Data Streaming (IQ Mode)](#real-time-data-streaming-iq-mode)
+  - [Real-time Data Streaming (IQ Receiver Mode)](#real-time-data-streaming-iq-receiver-mode)
   - [Exploring Device Configuration](#exploring-device-configuration)
 - [Error Handling](#error-handling)
 - [Performance Considerations](#performance-considerations)
 - [Integration Guidelines](#integration-guidelines)
 - [Licensing Considerations](#licensing-considerations)
-- [Revision History](#revision-history)
 - [Related Specifications](#related-specifications)
 - [Sources and Attribution](#sources-and-attribution)
 
@@ -47,13 +48,13 @@ The Aaronia RTSA Vendor SDK provides low-level, high-performance access to Aaron
     *   Decimation settings (`main/decimation`)
 *   **Real-time Data Access**: Packet-based streaming of IQ samples and spectrum data with configurable decimation
 *   **Device Modes**: Verified support for multiple operational modes:
-    *   **SpectranV6**: `spectranv6/raw`, `spectranv6/iqreceiver`, `spectranv6/iqtransceiver`, `spectranv6/iqtransmitter`, `spectranv6/spertsa`
-    *   **SpectranV6 ECO**: `spectranv6eco/raw`, `spectranv6eco/iqreceiver`, `spectranv6eco/iqtransceiver`, `spectranv6eco/iqtransmitter`, `spectranv6eco/spertsa`
+    *   **SpectranV6**: `spectranv6/raw`, `spectranv6/iqreceiver`, `spectranv6/iqtransceiver`, `spectranv6/iqtransmitter`, `spectranv6/sweepsa`
+    *   **SpectranV6 ECO**: `spectranv6eco/raw`, `spectranv6eco/iqreceiver`, `spectranv6eco/iqtransceiver`, `spectranv6eco/iqtransmitter`, `spectranv6eco/sweepsa`
 *   **Configuration Tree**: Hierarchical configuration system with verified parameters:
-    *   **Clock Rates** (V6): 46MHz (46.08), 61MHz (61.44), 76MHz (76.80), 92MHz (92.16), 122MHz (122.88), 245MHz (245.76)
+    *   **Clock Rates** (V6): 46MHz (46.08), 61MHz (61.44), 76MHz (76.80), 92MHz (92.16), 122MHz (122.88), 184MHz (184.32), 245MHz (245.76), 492MHz (491.52) — see the full label table under [Rust Binding Notes](#rust-binding-notes)
     *   **Clock Rates** (V6 ECO): Fixed at 61.44 MHz
     *   **Decimation**: Full, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, 1/128, 1/256, 1/512
-    *   **IQ Mode Sample Rate**: `spanfreq * 1.5` (constraint: `spanfreq ≤ receiverclock / 1.5`)
+    *   **IQ Mode Sample Rate**: equal to `spanfreq` (constraint: `spanfreq ≤ receiverclock / 1.5`)
 *   **Health Monitoring**: Real-time device status including temperatures, sample rates, power levels, USB statistics, GPS data
 
 The SDK is designed for building custom spectrum analysis applications, SDR integration, and specialized RF measurement tools.
@@ -162,7 +163,7 @@ The Aaronia RTSA SDK (`aaroniartsaapi.h`) exposes a C-style API for maximum comp
     *   `cbsize` (`int64_t`): **Must be set to `sizeof(AARTSAAPI_Packet)`**
     *   `streamID` (`uint64_t`), `flags` (`uint64_t`): Stream identification and control flags
     *   **Timing**: `startTime`, `endTime` (seconds since Unix epoch)
-    *   **Frequency Info**: `startFrequency` (center freq), `stepFrequency` (sample rate), `spanFrequency`, `rbwFrequency`
+    *   **Frequency Info**: `startFrequency` (lower edge of the packet's frequency span; for IQ packets `center − span/2`), `stepFrequency` (sample rate), `spanFrequency`, `rbwFrequency`
     *   **Sample Data**: `num` (samples in packet), `total` (total samples), `size`, `stride`
     *   **Data Pointer**: `fp32` (float* - IQ pairs as I,Q,I,Q... or spectrum data)
     *   `interleave` (`int64_t`): Channel interleaving information
@@ -175,7 +176,7 @@ The Aaronia RTSA SDK (`aaroniartsaapi.h`) exposes a C-style API for maximum comp
 *   **`AARTSAAPI_AvailPackets(AARTSAAPI_Device * dhandle, int32_t channel, int32_t * num)`**: Gets the number of available packets in a specified data `channel`.
 *   **`AARTSAAPI_GetPacket(AARTSAAPI_Device * dhandle, int32_t channel, int32_t index, AARTSAAPI_Packet * packet)`**: Retrieves a specific packet from the output queue.
 *   **`AARTSAAPI_ConsumePackets(AARTSAAPI_Device * dhandle, int32_t channel, int32_t num)`**: Consumes (removes) a number of packets from the data channel. Essential to prevent blocking and data drops.
-*   **`AARTSAAPI_GetMasterStreamTime(AARTSAAPI_Device * dhandle, double & stime)`**: Gets the current master stream time.
+*   **`AARTSAAPI_GetMasterStreamTime(AARTSAAPI_Device * dhandle, double * stime)`**: Gets the current master stream time.
 *   **`AARTSAAPI_SendPacket(AARTSAAPI_Device * dhandle, int32_t channel, const AARTSAAPI_Packet * packet)`**: Sends a packet to an inbound channel (for transmission modes).
 
 ### File I/O API
@@ -250,17 +251,17 @@ let devices = source.find_devices("spectranv6")?;
 source.open_device("spectranv6/raw", &serial_wide)?;
 ```
 
-### IQ-mode receiver clock constraint (SDKSPEC §53)
+### IQ-mode receiver clock constraint
 
 `NativeSdkSource::configure_iq_receiver` calls
-`unified_source::validate_iq_mode(span, clock)` after applying the config,
+`utils::validate_iq_mode(span, clock)` after applying the config,
 where `clock` is read live from `device/receiverclock` via
 `AARTSAAPI_ConfigGetString` (or 61.44 MHz on eco devices, which expose no
 such key and run at a fixed clock). The check enforces
 `span * 1.5 <= clock` and returns a typed error before the device starts.
 
 The ConfigItem labels the SDK exposes are *rounded* — `"92MHz"` is
-actually 92.16 MHz, etc. Use [`receiver_clock_for_label`] to convert.
+actually 92.16 MHz, etc. Use `receiver_clock_for_label` to convert.
 
 | Label    | Actual rate    | Source              |
 |----------|----------------|---------------------|
@@ -276,7 +277,7 @@ actually 92.16 MHz, etc. Use [`receiver_clock_for_label`] to convert.
 
 The eco family runs at a fixed `61.44 MHz` clock and does not expose the
 `device/receiverclock` config key — `configure_iq_receiver` skips the
-write on that family (see [`DeviceOpenMode::EcoIqReceiver`]).
+write on that family (see `DeviceOpenMode::EcoIqReceiver`).
 
 ### `read_samples` polling cadence
 
@@ -285,16 +286,18 @@ The official IQReceiverEco / RawIQ / SweepSpectrumEco samples poll
 `NativeSdkSource::read_samples` does the same and additionally caps the
 total wait at 500 ms (`READ_POLL_INTERVAL` / `READ_POLL_DEADLINE`
 constants), so a stalled device can't deadlock the caller. For
-non-blocking liveness checks, prefer `client.avail_packets(&device, 0)`.
+non-blocking liveness checks, prefer `avail_packets` (an `unsafe` call
+taking `&mut` device and the channel index).
 
 ### Open-mode-aware config writes
 
-`configure_iq_receiver` skips the four `device/*` and `main/decimation`
-keys that only exist on `spectranv6/raw`. The mode is recorded in
-`NativeSdkSource::open_mode()` (`DeviceOpenMode::Raw`,
-`EcoIqReceiver`, or `Other(...)`); the typed
-`set_decimation_factor(factor)` helper requires `Raw` and validates that
-`factor` is a power of two in `[1, 512]`.
+`configure_iq_receiver` gates the three `device/*` keys
+(`device/receiverchannel`, `device/outputformat`, `device/receiverclock`)
+on modes that support them; `main/decimation` is written only by the
+typed `set_decimation_factor(factor)` helper, which requires `Raw` mode
+and validates that `factor` is a power of two in `[1, 512]`. The open
+mode is recorded in `NativeSdkSource::open_mode()` (`DeviceOpenMode::Raw`,
+`EcoIqReceiver`, `Sweepsa`, `EcoSweepsa`, or `Other(...)`).
 
 The valid decimation enum is documented in the official samples README:
 `Full`, `1 / 2`, `1 / 4`, `1 / 8`, `1 / 16`, `1 / 32`, `1 / 64`,
@@ -331,11 +334,13 @@ block at `/stream?format=int16` instead of the native SDK.
 
 ### Result codes have human-readable names
 
-Every `Err` we surface from the native SDK now includes the symbolic
-name from the official `AARTSAAPI_Result` enum (e.g. `0x80000007`
-becomes `"error: buffer size"`). The full table is exposed via
-`unified_source::result_message(code)` and matches the third-party
-`g3gg0/rx-fft` C# binding which provides the canonical reference.
+Every `Err` we surface from the native SDK includes the symbolic name
+from the official `AARTSAAPI_Result` enum: errors are wrapped as
+`Error::SdkApi { operation, code }`, which renders as e.g.
+`"SDK error during ConfigSetFloat: buffer size"` for `0x80000007`. The
+full code table is exposed via `native_sdk::result_message(code)` and
+matches the third-party `g3gg0/rx-fft` C# binding which provides the
+canonical reference.
 
 ### Two HTTP control endpoints — RTSA app vs HTTP server block
 
@@ -345,7 +350,7 @@ Per the forum thread "Close RTSA application with an api" (resolved
 1. The RTSA application's own HTTP control port — accepts
    `PUT /app/process` with `{"running": false}` to gracefully shut
    the application down. Exposed via
-   [`HttpEndpointsClient::shutdown_application`].
+   `HttpEndpointsClient::shutdown_application`.
 2. The HTTP server *block* embedded in a mission's block graph —
    listens on a separate port and accepts the streaming/recording
    control endpoints documented elsewhere in this spec.
@@ -415,8 +420,8 @@ spec form:
 `receiverName` must match the actual block name in the running mission
 (it varies — sometimes `Block_Spectran_0`, sometimes `Block_IQDemodulator_0`,
 etc.). The Rust binding exposes
-[`HttpEndpointsClient::simple_remote_config`] for this shape and
-[`HttpEndpointsClient::find_iq_demodulator_block_name`] to auto-discover
+`HttpEndpointsClient::simple_remote_config` for this shape and
+`HttpEndpointsClient::find_iq_demodulator_block_name` to auto-discover
 the block name by parsing the current mission's `/remoteconfig`
 response.
 
@@ -584,7 +589,8 @@ void acquire_raw_data(AARTSAAPI_Device& device)
 
                 // Process I/Q sample pair
                 // packet.stepFrequency contains actual sample rate
-                // packet.startFrequency contains center frequency
+                // packet.startFrequency contains the lower edge of the
+                // packet's frequency span (center - span/2)
             }
 
             // Essential: consume packet to prevent buffer overflow
@@ -646,7 +652,7 @@ void acquire_iq_data(AARTSAAPI_Device& device)
                 float Q = packet.fp32[2 * j + 1];     // Quadrature
 
                 // Sample rate is available in packet.stepFrequency
-                // Center frequency in packet.startFrequency
+                // Lower band edge in packet.startFrequency (center - span/2)
                 // Span bandwidth in packet.spanFrequency
             }
 
@@ -700,6 +706,16 @@ void print_config_item(AARTSAAPI_Device& device, const std::wstring& prefix, AAR
         print_config_tree(device, prefix + L". ", config);
     }
 }
+```
+
+> **Note on `AARTSAAPI_ConfigGetString`'s `size` parameter.** The vendor
+> sample above passes `sizeof(str)` (a byte count), while the Rust
+> binding passes the buffer's element count (1024 wide characters). The
+> unit is not documented by Aaronia; the two interpretations differ on
+> Linux, where `wchar_t` is 4 bytes. Long option strings may truncate
+> under the smaller interpretation.
+
+```c++
 
 void print_config_tree(AARTSAAPI_Device& device, const std::wstring& prefix, AARTSAAPI_Config& group)
 {

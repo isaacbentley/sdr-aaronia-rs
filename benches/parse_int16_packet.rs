@@ -21,9 +21,10 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use sdr_aaronia_rs::http_streaming::{StreamFormat, StreamParser};
 
 /// Build one int16 packet: JSON header + 0x1E + `samples` IQ pairs.
-/// Each IQ pair is 4 bytes (2 × i16). `scale` ends up in `StreamParser`
-/// rather than the JSON, matching how the server-side `?scale=` URL
-/// parameter actually arrives.
+/// Each IQ pair is 4 bytes (2 × i16). The encode scale is handed to
+/// `StreamParser` rather than the JSON, matching how the server-side
+/// `?scale=` URL parameter actually arrives (an encode multiplier that
+/// the parser inverts when decoding).
 fn build_int16_packet(samples: usize) -> Bytes {
     let json = format!(
         r#"{{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":{},"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":1}}"#,
@@ -60,8 +61,7 @@ fn bench_parse_int16(c: &mut Criterion) {
                     // single allocation cost across many runs (more
                     // representative of "open connection, parse first
                     // packet" than "warmed-up stream").
-                    let mut parser =
-                        StreamParser::new(StreamFormat::Int16, Some(1.0 / 32768.0)).unwrap();
+                    let mut parser = StreamParser::new(StreamFormat::Int16, Some(32768.0)).unwrap();
                     let result = parser.process_data(black_box(packet)).unwrap();
                     black_box(result);
                 });

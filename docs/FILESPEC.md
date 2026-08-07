@@ -12,11 +12,13 @@ This document outlines the complete structure of the Aaronia RTSA file format, b
 
 - [File Structure](#file-structure)
 - [Chunk Hierarchy](#chunk-hierarchy)
-- [File Format Variants](#file-format-variants)
 - [Chunk Definitions](#chunk-definitions)
-- [Data Types and Enums](#data-types-and-enums)
+- [Additional Elements](#additional-elements)
+- [Implementation Details and Examples](#implementation-details-and-examples)
+- [File Format Variants](#file-format-variants)
 - [Implementation Guidelines](#implementation-guidelines)
-- [Compression and Decompression](#compression-and-decompression)
+- [Revision History](#revision-history)
+- [Related Specifications](#related-specifications)
 - [Sources and Attribution](#sources-and-attribution)
 
 ## File Structure
@@ -125,6 +127,7 @@ RTSA File
 *   **Stream:** A `STRM` / `STRT` pair encloses a logical stream of data. A segment can contain multiple streams.
 *   **Linked Lists:** Metadata chunks like `ANTA` and `SSTR` are not necessarily stored sequentially. They form backward-linked lists, where each chunk contains an offset pointing to the previous one. You typically find the last one via the `STRT` and follow the chain backward.
 *   **Data Association:** A `SAMP` (Sample) chunk is logically associated with a parent `STRM` (Stream) and `SSTR` (Sub Stream) via the `mStreamID` and `mSubStreamID` fields within it.
+*   **Crate limitation:** this crate's reader currently parses a single segment and stream (the one reachable from the trailing `DSFT`) and does not follow the backward `STRM` chain to earlier streams in appended files. The `SSTR`/`ANTA`/`MDTT` backward chains *are* walked, with cycle guards.
 
 ---
 
@@ -141,6 +144,11 @@ All chunks start with this common header.
 | `mChunkFlags` | `quint32` | Miscellaneous flags for the chunk. |
 | `mVersion` | `quint16` | Version number for the chunk's data structure. |
 | `mHeaderSize` | `quint16` | The size of this specific chunk's header (can be larger than the base). |
+
+> Note: this crate preserves the on-disk `mHeaderSize` only for `SAMP`
+> chunks, where it is used to locate the payload; the other chunk
+> readers consume their fields sequentially and synthesize a
+> payload-size value instead.
 
 ---
 
@@ -304,11 +312,11 @@ Contains the actual measurement data.
 | `mSampleType` | `enum:8` | Data type of individual data elements (`DSST_*`). |
 | `mSampleUnit` | `enum:8` | Unit used for the samples (`DSSU_*`). |
 | `mPayloadType` | `enum:8` | High-level sample data structure (`DSPT_*`). |
-| `mCompression` | `qint32:8` | Compression type (0 for lossless, 1-31 for lossy factor). |
+| `mCompression` | `qint32:8` | Compression type (0 for uncompressed, 1-31 for lossy factor). |
 | `mPacketStartTime` | `double` | Start time of this chunk relative to stream start. |
 | `mPacketEndTime` | `double` | End time of this chunk relative to stream start. |
 | `mPacketFlags` | `quint32` | Packet flags (`DSPPF_*`). |
-| `mSampleSize` | `quint32` | Size of an individual sample. |
+| `mSampleSize` | `quint32` | Size of an individual sample. This crate treats it as the byte stride of one sample when seeking within IQ payloads (8 for float32 IQ); for spectra the vendor dump annotates it as the bin count — the two interpretations have not been reconciled against vendor documentation. |
 | `mSampleDepth` | `quint32` | Depth of a sample. |
 | `mNumSamples` | `quint32` | Number of samples in this packet. |
 | **Payload** | `binary` | The payload contains the actual sample data, formatted as specified by the header fields. |
@@ -331,13 +339,13 @@ These flags are used in the `mPacketFlags` field of the `SAMP` chunk to provide 
 | `DSPPF_WARN_OVERFLOW` | `0x00000100` | Data overflow, and most likely clipped. |
 | `DSPPF_WARN_DROPPED` | `0x00000200` | Data missing due to packet drop. |
 | `DSPPF_WARN_INACCURATE` | `0x00000400` | Data is inaccurate (e.g., due to missing calibration or unstable clock). |
-| `DSPPF_WARN_RESAMPLED` | `0x00000800` | (No description provided in image for this specific flag, but it's a warning). |
+| `DSPPF_WARN_RESAMPLED` | `0x00000800` | The data has been resampled. |
 | `DSPPF_REPLAY` | `0x00001000` | The media sample is the start of a replay. |
 | `DSPPF_IMMEDIATE` | `0x00002000` | The media sample is supposed to be processed immediately and displayed as a single update. |
 | `DSPPF_TIME_OVERLAP` | `0x00004000` | Start time of this sample may be before end time of previous sample. |
 | `DSPPF_PUSH` | `0x00008000` | Push the packet through the chain to the display; do not delay or combine. |
 | `DSPPF_TIME_DISCONTINUITY` | `0x00010000` | There is a time discontinuity between this and the previous packet. |
-| `DSPPF_WARN_DIRECTION` | `0x00020000` | There is a time discontinuity between this and the previous packet. |
+| `DSPPF_WARN_DIRECTION` | `0x00020000` | The direction of the stream has changed (e.g. for direction-finding antennas). |
 | `DSPPF_REJECTED` | `0x00100000` | Eliminated by filter 0. |
 | `DSPPF_USER_0` | `0x01000000` | User-defined flag 0. |
 | `DSPPF_USER_1` | `0x02000000` | User-defined flag 1. |
@@ -358,7 +366,7 @@ Across all chunks, the file format adheres to these conventions:
 
 *   **Endianness:** All data is stored in **little-endian** format.
 *   **Time:** Timestamps are stored as 64-bit floating-point `double` values, representing seconds relative to the Unix epoch (January 1st, 1970, 12:00 AM) or the start of the stream.
-*   **Offsets:** All file offsets are 64-bit unsigned integers (`quint64`) representing an absolute position from the start of the file (byte 0).
+*   **Offsets:** All file offsets are 64-bit integers (declared `qint64` in the chunk tables above) representing an absolute position from the start of the file (byte 0). A zero or negative offset terminates a backward chain.
 *   **Strings:** Strings are stored as standard UTF-8 and are padded with trailing zeros to fill their fixed-size character arrays.
 
 #### Time-unit caveat (community-reported)
@@ -372,12 +380,15 @@ field in the same captures stays in seconds. `SAMP::mPacketStartTime` and
 start" but the original poster could not fully verify that.
 
 The Rust binding accommodates this with a value-range heuristic:
-[`file_source::rtsa_epoch_seconds`] divides any input ≥ 10¹³ by 10⁶ before
-returning it as seconds-since-epoch. The cutoff sits well above any
-realistic Unix-seconds timestamp this century (2025 ≈ 1.7×10⁹) and well
-below any plausible Unix-microseconds timestamp from the same era
-(2025 ≈ 1.7×10¹⁵). All `RtsaMetadata` time-related fields the binding
-publishes pass through that helper, so callers always see seconds.
+`file_source::rtsa_epoch_seconds` divides any input ≥ 10¹³ by 10⁶ before
+returning it as seconds-since-epoch (non-finite or non-positive inputs
+pass through unchanged). The cutoff sits well above any realistic
+Unix-seconds timestamp this century (2025 ≈ 1.7×10⁹) and well below any
+plausible Unix-microseconds timestamp from the same era (2025 ≈ 1.7×10¹⁵).
+The binding's `creation_time`, stream end-time, and DSFH-derived
+start-time fields pass through that helper; `stream_start_time` (STRM's
+`mStartTime`) is published raw, consistent with the report above that it
+stays in seconds.
 
 ---
 
@@ -388,12 +399,16 @@ Several chunks use enums or flags to specify data types or features. The most im
 #### `SAMP` Chunk: `mSampleType`
 Specifies the data type of individual data elements.
 
-| Enum Value (`DPSStreamSampleType`) | Description |
-| :--- | :--- |
-| `DSST_U8`, `DSST_U16`, `DSST_U32` | Unsigned integer of 8, 16, or 32 bits. |
-| `DSST_S16`, `DSST_S32` | Signed integer of 16 or 32 bits. |
-| `DSST_F32` | 32-bit float. |
-| `DSST_U8N`, `U16N`, `S16N`, etc. | "Packet storage" format, where elements are not stored on 16-byte boundaries. |
+| Value | Enum (`DSPStreamSampleType`) | Description |
+| :--- | :--- | :--- |
+| 0–2 | `DSST_U8`, `DSST_U16`, `DSST_U32` | Unsigned integer of 8, 16, or 32 bits. |
+| 3–4 | `DSST_S16`, `DSST_S32` | Signed integer of 16 or 32 bits. |
+| 5 | `DSST_F32` | 32-bit float. |
+| 6–8, 10, 11 | `DSST_U8N`, `U16N`, `S16N`, `S32N`, `F32N` | "Packet storage" format, where elements are not stored on 16-byte boundaries. |
+
+The numeric values above are what this crate's parser accepts; value 9
+(presumably `DSST_U32N`) is currently unmapped and causes the file to be
+rejected.
 
 #### `SAMP` Chunk: `mSampleUnit`
 Specifies the physical unit for the sample data.
@@ -409,6 +424,10 @@ Specifies the physical unit for the sample data.
 | `DSSU_VOLT` | Volts. |
 | `DSSU_TIME` | Floating-point seconds. |
 | `DSSU_DATE_TIME` | Floating-point seconds since the Unix epoch. |
+
+Values 0–8 map in table order. This crate additionally accepts the
+undocumented value 19 (observed in captures), mapping it to an
+`Unknown` unit.
 
 #### `SAMP` Chunk: `mPayloadType`
 Specifies the high-level structure of the sample data.
@@ -434,7 +453,7 @@ The `MDTT` chunk allows for defining complex, hierarchical data structures. This
 *   **Type Constructors:** These base types can be combined using three constructors:
     *   `MT_VECTOR`: A fixed-size array of elements.
     *   `MT_ARRAY`: A variable-size array of elements.
-    *   `MT_OBJECT`: A structure with up to 32 named child elements (fields).
+    *   `MT_OBJECT`: A structure with named child elements (fields). (This crate caps nesting depth at 32 levels and accepts up to 4096 fields per object.)
 *   **Storage:**
     *   **Objects** are stored with a 32-bit mask indicating which fields are present, followed by the data for the non-zero elements.
     *   **Arrays** are stored with a 32-bit size, followed by the sequence of elements.
@@ -452,17 +471,15 @@ When `SAMP` chunks contain spectra and `mCompression` is non-zero, a three-step 
 
 Decompression is performed in the inverse order: Unpacking -> Dequantization -> Inverse Wavelet Transform.
 
+This crate implements the spectra decoder in `decompression.rs`, but currently applies it only on the HTTP streaming path. The file reader reads spectra `SAMP` payloads as raw `f32` without checking `mCompression` — compressed spectra in a file are not yet decoded.
+
 ### Compression of IQ Data (`DSPT_IQ`)
 
 **Note:** According to Aaronia representatives on their official forums, the specifics of the IQ compression algorithm are considered internal and proprietary, and have not been published in the official file format specification.
 
-However, based on empirical testing (specifically with CW signals), compressed IQ datasets can be partially recovered using a fallback strategy:
+Empirical testing (specifically with CW signals) showed that compressed IQ datasets can sometimes be partially recovered by treating the payload as a flat Rice-coded bitstream, zero-padding the coefficient matrix, and applying a 2D inverse Haar wavelet transform. That fallback perfectly reconstructs sparse signals, but broadband captures decoded this way contain significant artifacts due to undocumented proprietary padding or block framing.
 
-1.  **Flat Bitstream Decoding:** The payload is treated as a continuous flat bitstream using the standard Rice decoding variant (the exact same decoder used for `DSPT_SPECTRA`). 
-2.  **Zero Padding:** Because the proprietary encoder truncates the file once all remaining wavelet coefficients are mathematically zero, the decoder will run out of bits before filling the entire expected `num_rows × num_cols` matrix. The remaining coefficients in the matrix are simply padded with zeroes.
-3.  **2D Wavelet Transform:** A 2D Inverse Haar Wavelet Transform is then applied to the zero-padded matrix. 
-
-*Warning: This fallback strategy perfectly reconstructs sparse signals (like a clean CW tone), but due to undocumented proprietary padding or block framing present in more complex signals (like broadband LTE), broadband data decoded this way may contain significant artifacts.*
+**This crate does not implement that fallback.** `Decompressor::decompress` rejects `DSPT_IQ`-shaped inputs with an error, and the in-band read path likewise refuses compressed IQ chunks. Instead, `RtsaSource::open` shells out to Aaronia's own `RTSAFileTool repair -compress=0` (located via the RTSA-Suite installation directory or `AARONIA_SDK_PATH`) to rewrite the capture uncompressed into a temporary file, which is then reopened. Opening a compressed-IQ capture without `RTSAFileTool` installed fails with an actionable error.
 
 ---
 
@@ -496,6 +513,8 @@ This section provides specific constants, tables, and examples from the PDF that
 | `Segments` | 16 | Number of segments in a preview chunk. |
 | `Samples` | 4096 | Number of samples referenced by a leaf preview chunk. |
 
+(This crate currently parses only the 16-slot offset/time/sample-index arrays of `SPRV` chunks; the histogram/waterfall payload these constants describe is not consumed.)
+
 ### Compression Bit-Packing Codes
 
 This table maps the variable-length codes to integer values in the bit-packing stage of compression.
@@ -517,19 +536,20 @@ This table maps the variable-length codes to integer values in the bit-packing s
 #### Example 1: Array of 16-bit Signed Integers
 This example shows the binary layout for a metadata type that defines an array of `int16`.
 
+All multi-byte values are little-endian. There is no explicit element-count field: `MT_OBJECT` reads `mCount` elements, while `MT_ARRAY` and `MT_VECTOR` read exactly one element (the element type). Each element is a 128-byte zero-padded name, a `quint32` flags word, and a nested type definition.
+
 ```
-// MetaType {id=1, type=MT_ARRAY, flags=0, count=0, elements=[...]}
+// MetaType {id=1, type=MT_ARRAY, flags=0, count=0}
 01 00 00 00 00 00 00 00  // mID = 1
 06                       // mType = MT_ARRAY (6)
 00 00 00 00              // mFlags = 0
 00 00 00 00              // mCount = 0
-00 00 00 01              // mElements size = 1
 
-// Element {name="", flags=0, type={...}}
-00 00 00 00              // mName = "" (empty string)
+// Element (MT_ARRAY has exactly one element: its element type)
+00 00 ... (128 bytes)    // mName = "" (empty, zero-padded char[128])
 00 00 00 00              // mFlags = 0
 
-// Type {id=2, type=MT_INTEGER, flags=16bit|signed, count=0}
+// Nested type {id=2, type=MT_INTEGER, flags=16bit|signed, count=0}
 02 00 00 00 00 00 00 00  // mID = 2
 02                       // mType = MT_INTEGER (2)
 12 00 00 00              // mFlags = DSSMTF_16BIT | DSSMTF_SIGNED
@@ -601,6 +621,15 @@ E0 96 2A ED 3A 1C 15 43 mCreationTime
 00 00 00 00 00 00 00 00 mStreamOffset (terminating, no prior stream)
 ```
 
+> **Known divergence:** this crate's reader dispatches on the STRM chunk
+> size and treats a **40-byte** chunk (`mChunkSize = 0x28`, as in this
+> dump) as a non-standard "proximity" layout (u32 stream ID, stream
+> type, sample rate, center frequency, device name) observed in some
+> captures; the standard layout above is parsed for other sizes (e.g.
+> 32). A standard 40-byte STRM matching this dump would therefore be
+> misparsed. The two layouts have not been reconciled against vendor
+> documentation.
+
 #### Sample Packet (SAMP)
 ```
 53 41 4D 50      mChunkID
@@ -609,8 +638,8 @@ E0 96 2A ED 3A 1C 15 43 mCreationTime
 07 00...         mStreamID
 03 00 00 00      mSubStreamID
 05               mSampleType (DSST_F32)
-01               mSampleUnit (DSSU_DBU)
-03               mPayloadType (DSPT_SPECRTA)
+01               mSampleUnit (DSSU_DBM)
+03               mPayloadType (DSPT_SPECTRA)
 00               mCompression (uncompressed)
 D9 39...         mPacketStartTime
 1D E7...         mPacketEndTime
@@ -634,6 +663,13 @@ D9 39...         mPacketStartTime
 06 00 00 00      mNumPreviews (6 chunks)
 ...
 ```
+
+> **Size caveat:** the field table for STRT sums to 76 payload bytes,
+> while this dump's `mChunkSize` (0x58 = 88) implies 72 and C-struct
+> alignment would imply 80 (the same 4-byte padding hazard documented
+> for SSTR applies before the 8-byte-aligned `mEndTime`). This crate
+> currently reads the fields packed, with no alignment skip. The
+> discrepancy is unresolved against vendor documentation.
 
 ---
 
@@ -664,13 +700,15 @@ For HTTP streaming protocol and real-time data access, see [HTTPSPEC.md](HTTPSPE
 
 ### Parser Architecture
 
-1. **Format Detection**
+1. **Format Detection** (pseudocode — in this crate the corresponding
+   paths are `RtsaSource::scan_for_samp_chunks`, `read_raw_iq_samples`,
+   and `parse_rtsa_with_tail`)
    ```rust
-   if file.find_samp_chunks().is_empty() {
-       // Reverse-order format
-       parse_raw_iq_data();
+   if samp_chunks.is_empty() {
+       // Reverse-order format: raw IQ from file start
+       read_raw_iq_samples();
    } else {
-       // Standard format
+       // Standard format: walk the chunk structure
        parse_structured_chunks();
    }
    ```
@@ -691,6 +729,11 @@ For HTTP streaming protocol and real-time data access, see [HTTPSPEC.md](HTTPSPE
    - Implement chunk caching for random access
 
 ### Sample Processing
+
+Illustrative decoders (this crate's file path implements the equivalents
+as `read_iq_f32` / `read_iq_i16` over a buffered reader; the int16
+`scale` is derived from the SSTR `mValueMinimum`/`mValueMaximum` range,
+falling back to `1.0 / 32768.0`):
 
 ```rust
 // Float32 IQ samples (most common)
@@ -720,15 +763,25 @@ fn parse_iq_int16(data: &[u8], scale: f32) -> Vec<Complex32> {
 ### Memory Management
 
 - Use buffer pools for high-throughput scenarios
-- Implement streaming readers for large files
-- Consider memory-mapped file access for random access patterns
+- Implement streaming readers for large files (this crate uses buffered I/O via `BufReader`; memory-mapped access is a possible alternative for random-access-heavy workloads)
+
+### Parser Limits (this crate)
+
+Defensive caps enforced by this crate's parser — a conforming file should never hit them, but a reader implemented from this spec alone would:
+
+| Limit | Value |
+| :--- | :--- |
+| Maximum chunk size | 1 GB |
+| Maximum MDTT payload | 16 MiB |
+| MDTT nesting depth / fields per object | 32 / 4096 |
+| DSFT trailer search window | last 1024 bytes of the file |
+| STRT/DSFH proximity search windows | 4096 bytes |
+| Proximity SAMP scan span | 100 MB |
+| Maximum decompressed samples per block | 2²⁴ |
 
 ### Compression Support
 
-RTSA files support various compression algorithms:
-- Compression level -1: No compression
-- Compression level 0-9: Standard compression levels
-- Custom decompression may be required for specific devices
+See [Compression of Spectrum Data](#compression-of-spectrum-data-dspt_spectra) and [Compression of IQ Data](#compression-of-iq-data-dspt_iq): `mCompression` 0 means uncompressed, 1–31 is the lossy wavelet factor, and IQ decompression is proprietary (handled by delegating to `RTSAFileTool`).
 
 ---
 
@@ -739,6 +792,7 @@ RTSA files support various compression algorithms:
 | 1.0 | 2025-01-11 | Initial specification from official PDF documentation |
 | 2.0 | 2025-01-11 | Enhanced with comprehensive file format specification |
 | 2.1 | 2025-01-11 | Separated HTTP streaming to HTTPSPEC.md |
+| 2.2 | 2026-08-06 | Corrected against the Rust implementation: `RTSAFileTool` delegation for compressed IQ, enum numeric values, MDTT element layout, STRM/STRT size caveats, parser limits, and time-normalization scope |
 
 ---
 
@@ -754,7 +808,7 @@ consult:
 
 The content here is derived from the above plus empirical analysis of capture
 files produced by RTSA-Suite PRO. The IQ compression format in particular is
-undocumented and proprietary (see [Compression and Decompression](#compression-and-decompression)).
+undocumented and proprietary (see [Compression of IQ Data](#compression-of-iq-data-dspt_iq)).
 "Aaronia", "RTSA", "Spectran", and the file formats they describe are the
 property of Aaronia AG.
 

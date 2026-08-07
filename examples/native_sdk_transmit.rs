@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
-    info!("🚀 Starting Aaronia Native SDK Transmit Example");
+    info!("Starting Aaronia Native SDK Transmit Example");
 
     // Configure the sink
     let config = SdkSinkConfig {
@@ -40,17 +40,17 @@ async fn main() -> anyhow::Result<()> {
     // Initialize the SDK and discover devices
     sdk_sink.initialize().await?;
 
-    info!("📡 Opening device and starting stream...");
+    info!("Opening device and starting stream...");
 
     // This connects, configures, and starts the device in TX mode
     // (If the device does not have TX capability, or is disconnected, this will fail here).
     if let Err(e) = sdk_sink.start_streaming().await {
-        println!("❌ Failed to start streaming: {}", e);
+        println!("Failed to start streaming: {}", e);
         println!("Please ensure a TX-capable Spectran V6 is connected.");
         return Ok(());
     }
 
-    info!("✅ Stream started. Generating test signal...");
+    info!("Stream started. Generating test signal...");
 
     // Generate a LoRa-like up-chirp signal
     const SAMPLES_PER_BURST: usize = 16384;
@@ -128,10 +128,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("🛑 Stopping streaming");
+    info!("Stopping streaming");
     sdk_sink.stop_streaming().await?;
 
-    info!("✅ Example completed successfully");
+    info!("Example completed successfully");
     Ok(())
 }
 
