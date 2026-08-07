@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.5] - 2026-08-06
+
+Documentation-and-polish release: every Markdown doc was audited against
+the implementation and corrected. No library API changes (the only `src/`
+edits are doc comments).
+
+### Changed
+- DESIGN.md restructured and de-duplicated; verified claim-by-claim
+  against the code (external `sdr-source` crate not "vendored", settle
+  timing attribution, real module/function names, HTTP format defaults,
+  feature-gating and platform caveats).
+- README corrected: install snippet version, builder capabilities,
+  `futuresdr` feature-gating of `HttpSource`/`HttpSink`, Windows/Linux-only
+  `native-sdk` note, `AARONIA_SDK_PATH` macOS scope, links to the `docs/`
+  specifications and changelog.
+- CONTRIBUTING now matches CI: pinned Miri nightly, the `cargo-deny` /
+  `cargo-hack` / `cargo-machete` gates, mutants/ASAN cron schedules,
+  toolchain floor (edition 2024), and the full test-suite inventory.
+- docs/HTTPSPEC, docs/SDKSPEC, docs/FILESPEC corrected against the
+  implementation (wire-format details, endpoint coverage including
+  `GET /samples` and the `POST /sample` TX push, `sweepsa` open strings,
+  real API paths, enum numeric values, parser limits) with explicit
+  "known divergence" notes where only hardware can settle the truth.
+- Clarified that HTTP retuning uses the license-free `/control` endpoint;
+  the "Remote Config" license gates only `/remoteconfig` writes
+  (stale doc comment on `set_center_frequency` fixed to match).
+- Examples cleaned up: emoji removed, `noaa_scanner` doc header rewritten,
+  `http_iq_quickstart` now takes the server URL as an argument instead of
+  hardcoding a private hostname.
+- Five assertion-free tests now actually assert.
+
+### Fixed
+- Stale comments: `native_sdk_load` symbol count, `spec_coverage` row
+  pointing at a renamed property test, bench comments describing mmap and
+  inverted `?scale=` semantics (the `parse_int16_packet` bench now passes
+  an encode-side scale, matching live-verified server behavior).
+
 ## [v0.3.4] - 2026-07-31
 
 ### Fixed
