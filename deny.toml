@@ -14,6 +14,9 @@ yanked = "deny"
 [licenses]
 version = 2
 # The crate itself is GPL-3.0-or-later.
+# No stale entries: `cargo deny check` warns on an allowance no crate in
+# the lockfile uses ("Zlib" and "MPL-2.0" allowances used to sit here
+# after their last users left the tree).
 allow = [
     "MIT",
     "Apache-2.0",
@@ -24,8 +27,16 @@ allow = [
     "CDLA-Permissive-2.0",
     "GPL-3.0-or-later",
     "CC0-1.0",
-    "MPL-2.0",
-    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+skip = [
+    # system-configuration 0.7 (hyper-util → reqwest) still pins
+    # core-foundation 0.9 while rustls-platform-verifier /
+    # security-framework moved to 0.10. Converges once hyper-util's
+    # system-configuration dependency catches up; drop this skip then.
+    { crate = "core-foundation@0.9", reason = "transitive pin via system-configuration 0.7" },
 ]
 
 [sources]
