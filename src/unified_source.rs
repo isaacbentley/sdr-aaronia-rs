@@ -756,11 +756,11 @@ impl AaroniaSource {
 
     /// Retune the source to a new centre frequency without rebuilding it.
     ///
-    /// - **HTTP**: wraps `HttpEndpointsClient::configure_capture(frequency_center=freq)`.
-    ///   Note this requires the RTSA-Suite "Remote Config" license; on
-    ///   licenseless installs the PUT returns success but is silently ignored
-    ///   server-side. Callers that need a license check should call
-    ///   [`Self::probe_remote_config_license`] separately.
+    /// - **HTTP**: wraps `HttpEndpointsClient::configure_capture(frequency_center=freq)`,
+    ///   a `PUT` to the license-free `/control` endpoint. The RTSA-Suite
+    ///   "Remote Config" license gates the `/remoteconfig` write path, not
+    ///   this one; callers that need a `/remoteconfig` write-license check
+    ///   should call [`Self::probe_remote_config_license`] separately.
     /// - **Native SDK**: re-issues `configure_iq_receiver` with the new
     ///   centre frequency, the existing span, and the existing reference
     ///   level. The SDK config system applies the change to the open device

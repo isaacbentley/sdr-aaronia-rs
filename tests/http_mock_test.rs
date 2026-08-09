@@ -1,6 +1,7 @@
+use sdr_aaronia_rs::Error;
 use sdr_aaronia_rs::http_endpoints::{AuthMethod, HttpEndpointsClient};
 use std::time::Duration;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{basic_auth, body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -72,27 +73,46 @@ async fn test_get_info_timeout() {
 async fn test_control_streaming_server_error() {
     let mock_server = MockServer::start().await;
 
-    // Simulate an Internal Server Error
-    Mock::given(method("POST"))
-        .and(path("/control/stream"))
+    // Simulate an Internal Server Error on the real request the client
+    // issues: PUT /control with a StreamingControl body.
+    Mock::given(method("PUT"))
+        .and(path("/control"))
+        .and(body_json(serde_json::json!({
+            "start": true,
+            "type": "streaming"
+        })))
         .respond_with(ResponseTemplate::new(500))
+        .expect(1)
         .mount(&mock_server)
         .await;
 
     let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
 
-    let result = client.control_streaming(true).await;
-    assert!(result.is_err(), "Expected error on 500 response");
+    let err = client
+        .control_streaming(true)
+        .await
+        .expect_err("Expected error on 500 response");
+    match err {
+        Error::Http { status, .. } => assert_eq!(status.as_u16(), 500),
+        other => panic!("Expected HTTP status error, got: {other:?}"),
+    }
 }
 
 #[tokio::test]
 async fn test_streaming_invalid_auth() {
     let mock_server = MockServer::start().await;
 
-    // Simulate 401 Unauthorized
-    Mock::given(method("POST"))
-        .and(path("/control/stream"))
+    // Simulate 401 Unauthorized on PUT /control, requiring that the client
+    // actually attached the Basic auth credentials it was configured with.
+    Mock::given(method("PUT"))
+        .and(path("/control"))
+        .and(basic_auth("user", "bad_pass"))
+        .and(body_json(serde_json::json!({
+            "start": true,
+            "type": "streaming"
+        })))
         .respond_with(ResponseTemplate::new(401))
+        .expect(1)
         .mount(&mock_server)
         .await;
 
@@ -106,8 +126,14 @@ async fn test_streaming_invalid_auth() {
     )
     .unwrap();
 
-    let result = client.control_streaming(true).await;
-    assert!(result.is_err(), "Expected error on 401 response");
+    let err = client
+        .control_streaming(true)
+        .await
+        .expect_err("Expected error on 401 response");
+    match err {
+        Error::Http { status, .. } => assert_eq!(status.as_u16(), 401),
+        other => panic!("Expected HTTP status error, got: {other:?}"),
+    }
 }
 
 #[tokio::test]

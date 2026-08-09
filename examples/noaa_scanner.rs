@@ -1,23 +1,19 @@
-//! # NOAA Weather Radio Scanner - A Perfect sdr-aaronia-rs Example
+//! # NOAA Weather Radio Scanner
 //!
-//! This example demonstrates elegant SDR programming with sdr-aaronia-rs.
-//! In just ~70 lines of core code, you get a complete weather radio scanner:
+//! A complete weather-radio scanner built on sdr-aaronia-rs:
 //!
-//! - **Zero Configuration** - Automatically finds your Spectran device
-//! - **Wideband Scanning** - Captures all 7 NOAA frequencies simultaneously
-//! - **Smart Analysis** - Uses efficient signal processing to find the strongest station
-//! - **Real-time Audio** - Clean FutureSDR pipeline for FM demodulation
+//! - Automatically finds your Spectran device (no configuration needed)
+//! - Captures all 7 NOAA frequencies in one wideband sweep
+//! - Selects the strongest station from the spectrum
+//! - Demodulates FM audio in real time via a FutureSDR pipeline
 //!
-//! ## The Code Flow
+//! ## Code flow
 //!
 //! ```text
-//! AaroniaSource::build()     → One line creates a wideband SDR source
-//!     ↓
-//! .read_samples()           → Captures all NOAA frequencies at once
-//!     ↓
-//! .find_strongest()         → Analyzes spectrum with functional programming
-//!     ↓
-//! FutureSDR pipeline        → Real-time FM demodulation to audio
+//! AaroniaSource::build()   creates a wideband SDR source
+//! .read_samples()          captures all NOAA frequencies at once
+//! .find_strongest()        picks the strongest station from the spectrum
+//! FutureSDR pipeline       real-time FM demodulation to audio
 //! ```
 //!
 //! ## Usage
@@ -28,7 +24,6 @@
 //! NOAA_DEVICE=http://192.168.1.100:54664 cargo run --example noaa_scanner
 //! ```
 
-//! Clean, minimal imports showcasing the power of sdr-aaronia-rs
 use anyhow::{Context, Result};
 use futuresdr::blocks::{Apply, FirBuilder, VectorSource, audio::AudioSink};
 use futuresdr::runtime::{Flowgraph, Runtime};
@@ -149,9 +144,9 @@ impl NoaaScanner {
     ///
     /// Uses a single wideband capture to analyze all 7 NOAA frequencies at once.
     async fn scan_and_find_strongest(&self) -> Result<NoaaChannel> {
-        println!("\n🔍 Scanning all 7 NOAA channels simultaneously...");
+        println!("\nScanning all 7 NOAA channels simultaneously...");
         println!(
-            "   📡 Wideband capture: {:.1} MHz span at {:.3} MHz",
+            "   Wideband capture: {:.1} MHz span at {:.3} MHz",
             self.config.wideband_rate / 1e6,
             self.config.center_frequency / 1e6
         );
@@ -185,13 +180,13 @@ impl NoaaScanner {
 
         if strongest.1 < self.config.min_power_threshold {
             anyhow::bail!(
-                "🚫 No NOAA stations found above {:.1} dBm threshold. Check your antenna!",
+                "No NOAA stations found above {:.1} dBm threshold. Check your antenna!",
                 self.config.min_power_threshold
             );
         }
 
         println!(
-            "\n🏆 Strongest Station: {} ({:.3} MHz) at {:.1} dBm",
+            "\nStrongest Station: {} ({:.3} MHz) at {:.1} dBm",
             strongest.0.name,
             strongest.0.frequency / 1e6,
             strongest.1
@@ -210,7 +205,7 @@ impl NoaaScanner {
 
     /// Display survey results
     fn print_survey_results(&self, powers: &[f64]) {
-        println!("\n📊 NOAA Channel Survey:");
+        println!("\nNOAA Channel Survey:");
         for (channel, &power) in NOAA_CHANNELS.iter().zip(powers) {
             println!(
                 "   {} ({:.3} MHz): {:.1} dBm",
@@ -224,7 +219,7 @@ impl NoaaScanner {
             .iter()
             .filter(|&&p| p > self.config.min_power_threshold)
             .count();
-        println!("   📻 Found {} active weather stations", active_count);
+        println!("   Found {} active weather stations", active_count);
     }
 
     /// Power estimation for a specific frequency
@@ -253,15 +248,15 @@ impl NoaaScanner {
     /// Listen to weather radio audio - showcasing aaronia-rs + FutureSDR integration
     ///
     /// Creates an real-time FM demodulation pipeline:
-    /// AaroniaSource → FM Demod → Audio Output
+    /// AaroniaSource FM Demod Audio Output
     async fn listen_to_audio(&self, channel: &NoaaChannel) -> Result<()> {
         println!(
-            "\n🎧 Tuning to {} weather station: {:.3} MHz",
+            "\nTuning to {} weather station: {:.3} MHz",
             channel.name,
             channel.frequency / 1e6
         );
-        println!("   🔊 Building real-time FM demodulation pipeline...");
-        println!("   📻 You should hear NOAA weather radio.");
+        println!("   Building real-time FM demodulation pipeline...");
+        println!("   You should hear NOAA weather radio.");
         println!("   Press Ctrl+C to stop\n");
 
         // Create optimized audio source - narrow bandwidth for FM reception
@@ -278,7 +273,7 @@ impl NoaaScanner {
         // Build and run the FM demodulation pipeline
         let audio_pipeline = self.build_fm_pipeline(iq_samples)?;
 
-        println!("▶️  Audio pipeline running...");
+        println!("Audio pipeline running...");
         Runtime::new()
             .run(audio_pipeline)
             .context("Audio pipeline error")?;
@@ -288,7 +283,7 @@ impl NoaaScanner {
 
     /// Build an FM demodulation pipeline using FutureSDR
     ///
-    /// Demonstrates clean signal processing: IQ → FM Demod → Resampler → Audio
+    /// Demonstrates clean signal processing: IQ FM Demod Resampler Audio
     fn build_fm_pipeline(&self, iq_samples: Vec<Complex32>) -> Result<Flowgraph> {
         let mut flowgraph = Flowgraph::new();
 
@@ -304,7 +299,7 @@ impl NoaaScanner {
         });
 
         // Resampling for audio output
-        let resample_ratio = 5; // 240 kHz → 48 kHz
+        let resample_ratio = 5; // 240 kHz 48 kHz
         let resampler = FirBuilder::resampling::<f32, f32>(1, resample_ratio);
 
         // Audio output
@@ -325,9 +320,9 @@ impl NoaaScanner {
 
 /// Startup banner and configuration summary
 fn print_banner() {
-    println!("📡 NOAA Weather Radio Scanner");
+    println!("NOAA Weather Radio Scanner");
     println!("============================");
-    println!("🎯 sdr-aaronia-rs Example");
+    println!("sdr-aaronia-rs Example");
     println!();
     println!(
         "Scanning {} NOAA channels ({:.3} - {:.3} MHz)",

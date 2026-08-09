@@ -53,7 +53,7 @@ const ENFORCED: &[InvariantRow] = &[
     InvariantRow {
         area: Area::HttpProtocol,
         invariant: "framing accepts both 0x1E (RS) and 0x0A (LF) separators",
-        test_fn: "prop_http_framing_rs_and_lf",
+        test_fn: "prop_http_framing_separators",
         test_file: "tests/properties.rs",
     },
     InvariantRow {

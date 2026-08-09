@@ -5,7 +5,7 @@
 [![CI](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/sdr-aaronia-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
-A comprehensive Rust library for interfacing with Aaronia Spectran SDR devices. 
+A Rust library for interfacing with Aaronia Spectran SDR devices.
 
 *Disclaimer: This project is not affiliated with Aaronia AG. Aaronia, SPECTRAN, and RTSA-Suite PRO are trademarks of Aaronia AG.*
 
@@ -23,13 +23,13 @@ Interfacing with SDR hardware typically requires choosing between proprietary na
 
 ## Key Features
 
-- **Native SDK Integration:** Direct hardware access via Aaronia RTSA-Suite PRO with zero-copy sample processing, real-time IQ data, and automatic platform library detection. Enforces hardware constraints (e.g., `span * 1.5 ≤ receiverclock`) prior to streaming.
-- **Advanced HTTP Streaming (RX & TX):** Supports JSON, Int16, Float16, and Float32 streaming formats over chunked HTTP connections. Implements the complete RTSA HTTP specification with Basic Auth and token-based enterprise authentication, including a dynamic HTTP TX sink for transmitting IQ data.
-- **RTSA File Processing:** Full RTSA specification implementation for reading capture files via buffered I/O, including metadata extraction and multi-stream support.
+- **Native SDK Integration:** Direct hardware access via Aaronia RTSA-Suite PRO with zero-copy sample processing, real-time IQ data, and automatic platform library detection. Enforces hardware constraints (e.g., `span * 1.5 ≤ receiverclock`) prior to streaming. Windows and Linux only (`native-sdk` feature); Aaronia does not ship a macOS SDK.
+- **HTTP Streaming (RX & TX):** Supports JSON, Int16, Float16, and Float32 streaming formats over chunked HTTP connections, with Basic Auth and token-based authentication. An HTTP TX sink for transmitting IQ data is available under the `futuresdr` feature.
+- **RTSA File Processing:** Reads RTSA capture files via buffered I/O, including metadata extraction and multi-stream support.
 - **Device Management:** Real-time control of streaming parameters, device health monitoring, input stream enumeration, and hierarchical configuration.
-- **FutureSDR Integration:** Provides seamless integration with FutureSDR flowgraphs via native blocks.
+- **FutureSDR Integration:** Optional `HttpSource` and `HttpSink` flowgraph blocks under the `futuresdr` feature.
 
-*Note: Device configuration via the HTTP endpoint requires a separate Aaronia "Remote Config" license.*
+*Note: writes to the HTTP `/remoteconfig` endpoint require a separate Aaronia "Remote Config" license; capture control via `/control` (including retuning) does not.*
 
 ## Installation
 
@@ -38,14 +38,14 @@ Add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
 # By default, includes HTTP, File, native sdr-source trait, and C FFI backend support
-sdr-aaronia-rs = "0.2"
+sdr-aaronia-rs = "0.3"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
 # To enable additional backends, opt into their features (e.g. native-sdk, futuresdr)
-# sdr-aaronia-rs = { version = "0.2", features = ["native-sdk", "futuresdr"] }
+# sdr-aaronia-rs = { version = "0.3", features = ["native-sdk", "futuresdr"] }
 ```
 
-## 60-Second Quickstart
+## Quickstart
 
 Specify your RF parameters and `sdr-aaronia-rs` will auto-detect the optimal backend (Native SDK, HTTP Streaming, or RTSA File):
 
@@ -60,10 +60,10 @@ async fn main() -> Result<()> {
         .center_frequency(446.0e6)     // 446 MHz
         .span_frequency(10.0e6)        // 10 MHz span
         .reference_level(-30.0);       // -30 dBm
-        
+
     let mut source = AaroniaSource::new(config).await?;
-    
-    // Read IQ samples seamlessly!
+
+    // Read IQ samples through the unified interface
     let mut buffer = Vec::with_capacity(1024);
     let n = source.read_samples(&mut buffer, 1024).await?;
     println!("Received {} IQ samples", n);
@@ -74,15 +74,16 @@ async fn main() -> Result<()> {
 
 ## Usage Examples
 
-We provide ready-to-run examples in the `examples/` directory demonstrating each subsystem:
-* **[http_iq_quickstart.rs](examples/http_iq_quickstart.rs)**: Connect to an RTSA HTTP server and stream live IQ data natively.
-* **[noaa_scanner.rs](examples/noaa_scanner.rs)**: Scan NOAA weather channels and demodulate FM audio in real-time using `FutureSDR`.
-* **[native_sdk_basic.rs](examples/native_sdk_basic.rs)**: Access hardware directly with zero-copy C++ Native SDK integration.
-* **[native_sdk_transmit.rs](examples/native_sdk_transmit.rs)**: Stream IQ bursts (e.g. LoRa chirps) over the Native SDK to standard Spectran V6 devices.
-* **[channel_hopping.rs](examples/channel_hopping.rs)**: Perform automatic frequency hopping using the native `sdr-source` feature.
-* **[read_rtsa_file.rs](examples/read_rtsa_file.rs)**: Open a local RTSA capture, parse the metadata headers, and read samples efficiently.
-* **[dump_metadata.rs](examples/dump_metadata.rs)**: Inspect the DSFH metadata tree inside `.rtsa` captures for debugging.
-* **[device_control.rs](examples/device_control.rs)**: Perform device health checks, list available inputs, and safely interact with Aaronia HTTP endpoints.
+The `examples/` directory contains runnable examples for each subsystem:
+
+- **[http_iq_quickstart.rs](examples/http_iq_quickstart.rs)**: Connect to an RTSA HTTP server and stream live IQ data natively.
+- **[noaa_scanner.rs](examples/noaa_scanner.rs)**: Scan NOAA weather channels and demodulate FM audio in real-time using `FutureSDR`.
+- **[native_sdk_basic.rs](examples/native_sdk_basic.rs)**: Access hardware directly with zero-copy C++ Native SDK integration.
+- **[native_sdk_transmit.rs](examples/native_sdk_transmit.rs)**: Stream IQ bursts (e.g. LoRa chirps) over the Native SDK to standard Spectran V6 devices.
+- **[channel_hopping.rs](examples/channel_hopping.rs)**: Perform automatic frequency hopping using the native `sdr-source` feature.
+- **[read_rtsa_file.rs](examples/read_rtsa_file.rs)**: Open a local RTSA capture, parse the metadata headers, and read samples efficiently.
+- **[dump_metadata.rs](examples/dump_metadata.rs)**: Inspect the DSFH metadata tree inside `.rtsa` captures for debugging.
+- **[device_control.rs](examples/device_control.rs)**: Perform device health checks, list available inputs, and safely interact with Aaronia HTTP endpoints.
 
 ### Unified API (Auto-Detection)
 
@@ -99,7 +100,7 @@ async fn main() -> Result<()> {
         .center_frequency(446.0e6)     // 446 MHz UHF amateur
         .span_frequency(10.0e6)        // 10 MHz span
         .reference_level(-30.0);       // -30 dBm
-        
+
     let mut source = AaroniaSource::new(config).await?;
     println!("Selected Source: {:?}", source.get_source_info());
 
@@ -114,7 +115,7 @@ async fn main() -> Result<()> {
 
 ### Builder Pattern with Auto-Detection
 
-`AaroniaSourceBuilder` is the high-level unified builder. It does *not* take a URL — connection details are auto-detected, and IQ-mode parameters are expressed cleanly.
+`AaroniaSourceBuilder` is the high-level unified builder. By default the backend is auto-detected, but it can be pinned explicitly with `http_source(url)`, `file_source(path)`, or `force_source_type(...)`; additional knobs include `device_serial(...)`, `stream_format(...)`, and `stream_scale(...)`.
 
 ```rust,no_run
 use sdr_aaronia_rs::AaroniaSourceBuilder;
@@ -127,10 +128,10 @@ async fn main() -> Result<()> {
         .center_frequency(2.44e9)     // 2.4 GHz ISM band
         .span_frequency(20.0e6)       // 20 MHz span
         .reference_level(-25.0);      // -25 dBm
-    
+
     let mut source = builder.build().await?;
 
-    // API is identical regardless of which backend was selected!
+    // The API is identical regardless of which backend was selected
     let mut samples = Vec::with_capacity(1024);
     source.read_samples(&mut samples, 1024).await?;
 
@@ -220,16 +221,16 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     client.configure_capture(config).await?;
-    
+
     Ok(())
 }
 ```
 
 ### FutureSDR Integration (Advanced)
 
-For existing [FutureSDR](https://github.com/FutureSDR/FutureSDR) users, the low-level block API seamlessly integrates high-throughput streams (both RX and TX) into a flowgraph:
+For existing [FutureSDR](https://github.com/FutureSDR/FutureSDR) users, the low-level block API integrates high-throughput streams (both RX and TX) into a flowgraph. `HttpSourceBuilder`, `HttpSinkBuilder`, and the corresponding blocks require the `futuresdr` feature:
 
-```rust,ignore,no_run
+```rust,ignore
 use sdr_aaronia_rs::{HttpSourceBuilder, HttpSinkBuilder};
 use futuresdr::runtime::Flowgraph;
 use anyhow::Result;
@@ -240,7 +241,7 @@ fn main() -> Result<()> {
         .frequency(146.52e6)
         .sample_rate(25e3)
         .build()?;
-        
+
     let sink = HttpSinkBuilder::new("http://127.0.0.1:54664")
         .frequency(433.0e6)
         .sample_rate(1e6)
@@ -258,9 +259,9 @@ fn main() -> Result<()> {
 
 ### Advanced Streaming with Authentication
 
-The low-level `HttpSourceBuilder` offers advanced properties (e.g., `buffer_size`, `timeout_ms`, `rate_reduction`) and authentication settings:
+The low-level `HttpSourceBuilder` (also part of the `futuresdr` feature) offers advanced properties (e.g., `buffer_size`, `timeout_ms`, `rate_reduction`) and authentication settings:
 
-```rust,ignore,no_run
+```rust,ignore
 use sdr_aaronia_rs::{AuthMethod, HttpSourceBuilder, StreamFormat};
 use anyhow::Result;
 
@@ -364,7 +365,7 @@ async fn main() -> Result<()> {
 
 | Variable | Effect |
 |---|---|
-| `AARONIA_SDK_PATH` | Overrides the RTSA-Suite installation directory used for SDK / `RTSAFileTool` detection. Works on every platform (it is the only way to point at an install on macOS, where there is no default path). |
+| `AARONIA_SDK_PATH` | Overrides the RTSA-Suite installation directory used for SDK / `RTSAFileTool` detection. Works on every platform. On macOS — which has no default install path and no native SDK build — it only affects `RTSAFileTool` and XML-config detection. |
 | `AARONIA_USER_AGENT` | Overrides the HTTP `User-Agent` string sent by every outbound request (default: `sdr-aaronia-rs/<version>`). |
 
 ## Remote Config License Detection
@@ -372,18 +373,20 @@ async fn main() -> Result<()> {
 Read access to `/remoteconfig` works without a license, so a read-only check cannot prove write capability. `HttpEndpointsClient` exposes both options:
 
 - `detect_remote_config_license()` — read-only, never touches device state; returns `Unknown` when reads succeed.
-- `probe_remote_config_write_license()` — **actively verifies** writes by temporarily adjusting `reflevel` by +1 dB (restored best-effort). `AaroniaSource::probe_remote_config_license()` uses this before frequency hopping, because an unlicensed retune returns HTTP 200 and is silently ignored server-side.
+- `probe_remote_config_write_license()` — **actively verifies** writes by temporarily adjusting `reflevel` by +1 dB (restored best-effort). `AaroniaSource::probe_remote_config_license()` delegates to it for HTTP sources.
+
+The hopping orchestrator itself retunes through the license-free `/control` endpoint and does not gate on this probe; the license only affects `/remoteconfig` writes.
 
 ## Feature Flags
 
-`sdr-aaronia-rs` uses a modular feature matrix to minimize its dependency footprint:
+Functionality is grouped behind Cargo features so unused dependencies stay out of your build:
 
 | Feature | Description | Default |
 |---|---|---|
 | `http` | HTTP streaming via `reqwest` and `tokio`. | **Yes** |
 | `file` | Buffered RTSA file parsing. | **Yes** |
-| `native-sdk` | Links the proprietary Aaronia C++ SDK. | No |
-| `futuresdr` | Integrates `HttpSource` as a FutureSDR source block. | No |
+| `native-sdk` | Links the proprietary Aaronia C++ SDK. Windows/Linux only. | No |
+| `futuresdr` | Enables the FutureSDR block API: `HttpSource`, `HttpSink`, and their builders. Implies `http`. | No |
 | `sdr-source` | Integrates `AaroniaSdrSource` implementing the native `SdrSource` traits. | **Yes** |
 | `ffi` | Builds the C-API export layer. | **Yes** |
 
@@ -394,13 +397,17 @@ Read access to `/remoteconfig` works without a license, so a read-only check can
 
 ## Testing & Contributing
 
-We maintain a layered test pyramid consisting of unit tests, integration tests against LFS captures, and property tests enforcing specification invariants. 
+The test suite consists of unit tests, integration tests against LFS captures, and property tests enforcing specification invariants.
 
 Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on running the test suite, generating coverage reports, and formatting your code before submitting a Pull Request.
 
 ## Documentation
 
 - [Architecture & Design](DESIGN.md) — Internal architecture and execution flow.
+- [RTSA File Format Specification](docs/FILESPEC.md) — On-disk `.rtsa` capture-file format and how this crate parses it.
+- [HTTP API Specification](docs/HTTPSPEC.md) — The RTSA HTTP streaming and control API.
+- [Native SDK Specification](docs/SDKSPEC.md) — The Aaronia RTSA-Suite PRO SDK surface and the Rust binding notes.
+- [Changelog](CHANGELOG.md) — Release history.
 
 ## License
 

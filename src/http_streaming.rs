@@ -843,7 +843,8 @@ impl StreamParser {
     }
 
     /// Optimized Int16 IQ parsing with bulk operations and pre-allocation.
-    /// `scale` is `metadata.scale` (`f32 = scale * raw_i16`).
+    /// `scale` is the decode multiplier — `1 / metadata.scale`, see
+    /// [`int16_decode_scale`] — so `f32 = scale * raw_i16`.
     fn parse_iq_int16_optimized(&self, data: &[u8], scale: f32) -> Result<Vec<Complex32>> {
         let num_samples = data.len() / 4;
         let mut samples = Vec::with_capacity(num_samples);

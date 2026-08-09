@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("🚀 Starting Aaronia Channel Hopping Example");
+    println!("Starting Aaronia Channel Hopping Example");
 
     // Configure the source hopping plan
     let source_config = SourceConfig {
@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
         dwell_extension: Duration::ZERO,
     };
 
-    println!("📡 Initializing Aaronia SDR Source with 3 channels...");
+    println!("Initializing Aaronia SDR Source with 3 channels...");
     // AaroniaSdrSource implements `SdrSource` providing a synchronized, hopping stream
     let source = Box::new(AaroniaSdrSource {
         backend: AaroniaBackend::Http("http://localhost:54664".to_string()),
@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     let advice = Arc::new(DummyAdvice);
     let handle = source.start(source_config, advice)?;
 
-    println!("🎵 Streaming IQ data and hopping channels...");
+    println!("Streaming IQ data and hopping channels...");
     let start_time = Instant::now();
     let mut total_samples = 0;
     let mut hops = 0;
@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
         if let Ok(packet) = handle.receiver.recv_timeout(Duration::from_millis(100)) {
             total_samples += packet.samples.len();
             println!(
-                "📦 Received packet with {} samples at frequency {:.1} MHz",
+                "Received packet with {} samples at frequency {:.1} MHz",
                 packet.samples.len(),
                 packet.center_frequency_hz / 1e6
             );
@@ -64,12 +64,12 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("🛑 Stopping stream...");
+    println!("Stopping stream...");
     (handle.stop)();
     (handle.wait)();
 
     println!(
-        "✅ Streamed {} samples over {} received packets.",
+        "Streamed {} samples over {} received packets.",
         total_samples, hops
     );
     Ok(())

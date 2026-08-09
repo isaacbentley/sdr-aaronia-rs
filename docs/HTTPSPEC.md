@@ -13,9 +13,10 @@ The Aaronia Real-Time Spectrum Analyzer (RTSA) HTTP streaming protocol provides 
 - [Data Formats](#data-formats)
 - [HTTP Endpoints](#http-endpoints)
 - [Payload Types](#payload-types)
-- [Authorization](#authorization)
+- [Authorization & Licensing](#authorization--licensing)
 - [Performance Optimization](#performance-optimization)
 - [Implementation Guidelines](#implementation-guidelines)
+- [Revision History](#revision-history)
 - [Sources and Attribution](#sources-and-attribution)
 
 ## Features and Purpose
@@ -77,6 +78,8 @@ The stream server supports multiple data formats for high-performance streaming:
 {
   "startTime": 1501163970.1396854,
   "endTime": 1501163970.140799,
+  "startTimeDay": 17372,
+  "endTimeDay": 17372,
   "startFrequency": 2400000000.0,
   "endFrequency": 2500000000.0,
   "sampleFrequency": 100000000.0,
@@ -111,10 +114,13 @@ The stream server supports multiple data formats for high-performance streaming:
 | :--- | :--- | :--- |
 | `startTime` | Start time of the packet in seconds since the Unix epoch | `double` (e.g., `1501163970.1396854`) |
 | `endTime` | End time of the packet in seconds since the Unix epoch | `double` (e.g., `1501163970.140799`) |
+| `startTimeDay` / `endTimeDay` | Day component of the packet timestamps, present in live-device headers | `integer` |
 | `unit` | Unit of the sample values | `string` (e.g., `"dbm"`, `"generic"`, `"percentage"`) |
 | `payload` | Payload type of the packet | `string` (e.g., `"spectra"`, `"iq"`, `"histogram"`) |
-| `minPower` | Minimum power in dBm | `double` (e.g., `-95`, `-2`, `-165`) |
-| `maxPower` | Maximum power in dBm | `double` (e.g., `5`, `2`) |
+| `minPower` | Minimum power in dBm | `integer` (e.g., `-95`, `-2`, `-165`); this crate parses it as `i32` |
+| `maxPower` | Maximum power in dBm | `integer` (e.g., `5`, `2`); this crate parses it as `i32` |
+| `sampleFrequency` | Sample rate in Hz | `double` (e.g., `100000000.0`) |
+| `compression` | Compression scheme of the binary payload; drives the wavelet decompression path when present | `integer` |
 | `startFrequency` | Start of a frequency range | `double` (e.g., `2400250000`, `2402250128`) |
 | `endFrequency` | End of a frequency range | `double` (e.g., `2487750000`, `2489750128`) |
 | `sampleDepth` | Number of sample sets per sample, e.g., bins in a histogram | `integer` (e.g., `1`, `2`, `256`) |
@@ -133,7 +139,7 @@ The stream server supports multiple data formats for high-performance streaming:
 
 **Parameters**:
 - `format`: Output format (`json`, `int16`, `float16`, `float32`)
-- `limit`: Maximum number of samples to stream
+- `limit`: Maximum number of **packets** to stream before the server closes the connection (live-verified: `?limit=N` delivers exactly N packets)
 - `rate_reduction=n`: Reduce sample rate by factor of n
 - `rate_adaption=0`: Disable automatic rate adaptation
 - `scale`: Server-side scale factor for integer formats. **Distinct from
@@ -146,7 +152,7 @@ The stream server supports multiple data formats for high-performance streaming:
 will start dropping data when the outbound TCP buffer exceeds 8 Mbytes.
 A loss of data can be determined by comparing the timestamps of two
 adjacent data packets." The Rust binding exposes
-[`http_streaming::DropDetector`] for that timestamp-gap check.
+`http_streaming::DropDetector` for that timestamp-gap check.
 
 **Examples**:
 ```
@@ -170,12 +176,13 @@ block has no effect.
 ```
 
 The Rust binding exposes this via
-[`HttpEndpointsClient::shutdown_application`]. Source: official forum
+`HttpEndpointsClient::shutdown_application`. Source: official forum
 thread "Close RTSA application with an api" (resolved 2025-05-14).
 
 ### Single Sample Endpoint
 **URL**: `/sample`  
 **Method**: GET  
+**Parameters**: `input` — select an input other than `main` (optional)  
 **Description**: Polling single samples from the server block input
 **Response**: Contains one or no samples in JSON format
 
@@ -187,6 +194,10 @@ thread "Close RTSA application with an api" (resolved 2025-05-14).
   "startFrequency": 2402250128,
   "endFrequency": 2487750128,
   "unit": "dbm",
+  "payload": "spectra",
+  "minPower": -165,
+  "maxPower": 5,
+  "sampleSize": 448,
   "antenna": {
     "name": "IsoLOG 3D",
     "latitude": 50.13608551,
@@ -200,6 +211,43 @@ thread "Close RTSA application with an api" (resolved 2025-05-14).
   ]
 }
 ```
+
+Note: this crate's `get_sample()` deserializes the response as a full
+packet-metadata object, so `payload`, `minPower`, `maxPower`, and
+`sampleSize` must be present (they are in live-device responses).
+
+### Multiple Samples Endpoint
+**URL**: `/samples`  
+**Method**: GET  
+**Parameters**: `limit` — maximum number of samples to return; `input` — select an input other than `main`. Both optional.  
+**Description**: Polling a batch of samples from the server block input. The response is a JSON array of the same packet-metadata objects returned by `/sample`. Exposed via `HttpEndpointsClient::get_samples`.
+
+### Sample Push Endpoint (TX)
+**URL**: `/sample`  
+**Method**: POST  
+**Content-Type**: application/json  
+**Description**: Pushes IQ samples *to* the server block for transmission. This is the TX path used by `HttpEndpointsClient::push_samples` (and the `HttpSink` FutureSDR block).
+
+**Payload** (camelCase; `samples` is a flat array of interleaved I/Q floats):
+```json
+{
+  "startTime": 1509964956.39194,
+  "endTime": 1509964956.394119,
+  "startFrequency": 432500000.0,
+  "endFrequency": 433500000.0,
+  "stepFrequency": 1000000.0,
+  "minPower": -1.0,
+  "maxPower": 1.0,
+  "sampleSize": 2,
+  "sampleDepth": 1,
+  "unit": "generic",
+  "payload": "iq",
+  "push": true,
+  "samples": [0.01, -0.02, 0.03, 0.04]
+}
+```
+
+`stepFrequency` (the sample rate) is optional; `push: true` marks the packet for immediate transmission.
 
 ### Control Endpoint
 **URL**: `/control`  
@@ -291,10 +339,12 @@ thread "Close RTSA application with an api" (resolved 2025-05-14).
 **Payload**:
 ```json
 {
-  "Input": "main",
+  "input": "main",
   "type": "average"
 }
 ```
+
+(Upstream forum material shows the first key capitalized as `"Input"`; this crate sends lowercase `"input"`, which is what its mock-server tests pin.)
 
 **Available processing types**:
 - `average`: Average of a series of samples
@@ -328,6 +378,17 @@ thread "Close RTSA application with an api" (resolved 2025-05-14).
 }
 ```
 
+**Simplified PUT form**: in addition to the full `{request, config}` shape, the server accepts a shorter per-block write (used by the SDR++ and SDRangel Aaronia plugins), exposed via `HttpEndpointsClient::simple_remote_config`:
+```json
+{
+  "receiverName": "Block_IQDemodulator_0",
+  "simpleconfig": {
+    "main": { "centerfreq": 100000000.0, "samplerate": 10000000.0, "spanfreq": 10000000.0 }
+  }
+}
+```
+`receiverName` must match a block in the running mission; `HttpEndpointsClient::find_iq_demodulator_block_name` auto-discovers it.
+
 **Configuration Item Fields**:
 | Field | Description |
 | :--- | :--- |
@@ -344,6 +405,11 @@ thread "Close RTSA application with an api" (resolved 2025-05-14).
 **URL**: `/healthstatus`  
 **Method**: GET  
 **Description**: Block health status and performance statistics
+
+Note: this crate's `get_health_status()` parses the response as a generic
+configuration tree (`HealthStatus` is an alias for `ConfigItem`) rather
+than the typed shape below, which describes the upstream block-health
+fields.
 
 **Health Status Fields**:
 | Field | Description |
@@ -430,11 +496,11 @@ Histogram data transfers percentages of bin usage. Sample size is like spectrum 
   "minPower": -165,
   "sampleDepth": 256,
   "sampleSize": 896,
-  "samples": [
-    [0.074, 0.0787, 0.0893]
-  ]
+  "samples": [0.074, 0.0787, 0.0893]
 }
 ```
+
+Note: unlike `spectra` (one nested array per frame), histogram samples are a flat number array; that is what this crate's JSON parser accepts.
 
 ### Channel Power / Category Data
 The samples in a category ordered packet have one measurement per category.
@@ -449,11 +515,11 @@ The samples in a category ordered packet have one measurement per category.
       "endFrequency": 2423000000
     }
   ],
-  "samples": [
-    [-45.2, -67.8, -52.1]
-  ]
+  "samples": [-45.2, -67.8, -52.1]
 }
 ```
+
+As with histograms, category samples are a flat number array (one value per category).
 
 ### Antenna Data
 Data captured using antennas with location or directional information.
@@ -470,27 +536,27 @@ Data captured using antennas with location or directional information.
 
 ### HTTP Streaming vs Remote Configuration
 
-**📡 Basic HTTP Streaming** (No additional license required):
+**Basic HTTP Streaming** (No additional license required):
 - `/stream` - Real-time data streaming
 - `/sample` - Sample retrieval
 - `/info` - Device information
 - `/healthstatus` - Device health monitoring
 
-**🔧 Remote Configuration** (Requires separate license):
+**Remote Configuration** (Requires separate license):
 - `/remoteconfig` - Device parameter configuration
 - **License Required**: "Remote Config" license from Aaronia
 - **Alternative**: Use Native SDK for configuration without HTTP licensing restrictions
 
-**🔍 License Detection Methods**:
+**License Detection Methods**:
 
-**⚠️ Important**: Read access to `/remoteconfig` is available WITHOUT license, but write operations require the license. Because reads are license-free, a read-only check cannot distinguish "licensed" from "unlicensed" — only a write test can.
+**Important**: Read access to `/remoteconfig` is available WITHOUT license, but write operations require the license. Because reads are license-free, a read-only check cannot distinguish "licensed" from "unlicensed" — only a write test can.
 
 The client therefore exposes two methods:
 
 - `detect_remote_config_license()` — **read-only**. Never touches device state. Classifies 401/403 responses; on read success it returns `Unknown` (write capability unproven).
 - `probe_remote_config_write_license()` — **active probe**. Performs a read-modify-restore cycle on `reflevel` (+1 dB, restored best-effort) to positively verify write capability. Use only when you need proof — e.g. before frequency hopping, where an unlicensed retune silently no-ops server-side.
 
-**📊 Practical Detection (Active Probe)**:
+**Practical Detection (Active Probe)**:
 ```rust
 use sdr_aaronia_rs::http_endpoints::RemoteConfigStatus;
 
@@ -512,10 +578,12 @@ match client.probe_remote_config_write_license().await {
     RemoteConfigStatus::Unknown(err) => {
         println!("Detection failed: {}", err);
     },
+    // `RemoteConfigStatus` is #[non_exhaustive]; a wildcard arm is required.
+    status => println!("Unrecognized status: {status:?}"),
 }
 ```
 
-**🔬 Technical Details**:
+**Technical Details**:
 - Detection uses `verify_config_changes()` with safe parameter testing
 - Tests actual write capability, not just HTTP response codes
 - Automatically restores original values after testing
@@ -534,7 +602,7 @@ The server supports two types of HTTP authorization:
 
 ### High Data Rate Considerations
 - Use binary formats (`int16`, `float16`, `float32`) for maximum throughput
-- TCP loopback fast path on Windows: Enable `SIO_LOOPBACK_FAST_PATH`
+- TCP loopback fast path on Windows: custom clients can enable the `SIO_LOOPBACK_FAST_PATH` socket option (an OS-level tweak; not set by this crate)
 - Buffer management with chunked transfer encoding
 - Automatic rate adaptation available via `rate_adaption` parameter
 
@@ -579,12 +647,15 @@ fn parse_iq_float32(data: &[u8]) -> Vec<Complex32> {
         .collect()
 }
 
-// Int16 with scaling
-fn parse_iq_int16(data: &[u8], scale: f32) -> Vec<Complex32> {
+// Int16 with scaling. The metadata `scale` field is the ENCODE multiplier
+// (int16 = round(value * scale)), so decoding must invert it first —
+// applying `scale` directly is a classic bug.
+fn parse_iq_int16(data: &[u8], metadata_scale: f32) -> Vec<Complex32> {
+    let decode_scale = 1.0 / metadata_scale;
     data.chunks_exact(4)
         .map(|chunk| {
-            let i = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 * scale;
-            let q = i16::from_le_bytes([chunk[2], chunk[3]]) as f32 * scale;
+            let i = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 * decode_scale;
+            let q = i16::from_le_bytes([chunk[2], chunk[3]]) as f32 * decode_scale;
             Complex32::new(i, q)
         })
         .collect()
@@ -613,6 +684,7 @@ fn parse_iq_int16(data: &[u8], scale: f32) -> Vec<Complex32> {
 |---------|------|---------|
 | 1.0 | 2025-01-11 | Initial HTTP specification from original documentation |
 | 2.0 | 2025-01-11 | Enhanced with comprehensive streaming protocol specification and implementation guidelines |
+| 2.1 | 2026-08-06 | Live-hardware corrections folded in (two-byte separator, spectra frame counting, `scale` inversion); documented `/samples`, the `/sample` TX push, and the `simpleconfig` PUT form; corrected `limit` semantics, field types, and flat histogram/categories sample arrays; removed decorative icons |
 
 ---
 

@@ -1,6 +1,8 @@
 # Contributing to sdr-aaronia-rs
 
-First off, thank you for considering contributing to `sdr-aaronia-rs`! It's people like you that make the open-source SDR community thrive. This document explains how the test suite is organized, which tools you'll need, and how to verify your changes locally before opening a pull request.
+First off, thank you for considering contributing to `sdr-aaronia-rs`! This document explains how the test suite is organized, which tools you'll need, and how to verify your changes locally before opening a pull request.
+
+**Toolchain:** the crate uses the 2024 edition, so you need Rust 1.85 or newer. There is no pinned `rust-toolchain.toml`; CI tracks the latest `stable`.
 
 ## Quick Start
 
@@ -9,13 +11,15 @@ git clone https://github.com/isaacbentley/sdr-aaronia-rs.git
 cd sdr-aaronia-rs
 
 # Run the standard validation suite
-cargo test                                        # unit + integration + properties
+cargo test                                        # unit + integration + properties (default features)
 cargo test --test spec_coverage -- --nocapture    # spec inventory report
 cargo clippy --all-features --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-Everything below this line is optional but recommended if your pull request touches the parser, decompressor, or FFI surface.
+Note that a plain `cargo test` builds with the default features; suites gated on non-default features (e.g. `http_sink_test`, which needs `futuresdr`) are skipped. CI runs `cargo test --all-features`.
+
+Tiers 1–4 below are the core of the suite; the later tiers are optional but recommended if your pull request touches the parser, decompressor, or FFI surface.
 
 ## Test Pyramid
 
@@ -36,6 +40,8 @@ git lfs pull
 cargo test --test integration_test
 ```
 
+Beyond the tiers named here, `tests/` also contains focused suites for the HTTP mock server (`http_mock_test.rs`), the HTTP sink (`http_sink_test.rs`, requires `futuresdr`), the C API (`c_api_test.rs`), the `sdr-source` implementation (`sdr_source_impl_test.rs`), RTSA negative cases (`rtsa_negative_test.rs`), CW fixtures (`test_cw_mag.rs`, `test_cw_meta.rs`), SDK library loading (`native_sdk_load.rs`), and opt-in live-hardware smoke tests (`live_smoke.rs`). All of these run as part of `cargo test` where their features and environment allow.
+
 ### 3. Property Tests (`tests/properties.rs`)
 
 We use `proptest` to verify invariants of the parser, decompressor, and validator surfaces.
@@ -55,23 +61,23 @@ Run: `cargo test --test spec_coverage -- --nocapture`
 
 ### 5. Miri (Nightly)
 
-Catches undefined behavior in safe Rust code. Because Miri refuses to interpret FFI, we only run it on the pure-Rust modules.
+Catches undefined behavior in safe Rust code. Because Miri refuses to interpret FFI, we only run it on the pure-Rust modules. CI pins `nightly-2026-01-01` because newer nightlies changed the `fadd_fast` intrinsic signature, which breaks the `futuredsp` dependency's build — use the same pin locally:
 
 ```bash
-rustup +nightly component add miri
-cargo +nightly miri test --lib decompression
-cargo +nightly miri test --lib http_streaming
-cargo +nightly miri test --lib utils
+rustup toolchain install nightly-2026-01-01 --component miri
+cargo +nightly-2026-01-01 miri test --lib decompression
+cargo +nightly-2026-01-01 miri test --lib http_streaming
+cargo +nightly-2026-01-01 miri test --lib utils
 ```
 
 ### 6. Code Coverage
 
-Code coverage is automatically reported to Codecov on every PR. Coverage is informational only and will not fail your build. To check coverage locally:
+Code coverage is reported to Codecov on PRs targeting `main` (uploaded from the Linux CI leg). Coverage is informational only and will not fail your build. To check coverage locally:
 
 ```bash
 cargo install cargo-llvm-cov
 cargo llvm-cov --html
-open target/llvm-cov/html/index.html
+open target/llvm-cov/html/index.html   # xdg-open on Linux, start on Windows
 ```
 
 ### 7. Criterion Benchmarks (`benches/`)
@@ -85,7 +91,7 @@ cargo bench --bench parse_int16_packet            # Run a specific harness
 
 ### 8. Mutation Testing
 
-We occasionally run `cargo mutants` to rewrite mutable expressions and ensure our test suite catches the changes.
+`cargo mutants` runs in CI on a weekly cron (Mondays) and on manual dispatch, advisory-only. To run it locally:
 
 ```bash
 cargo install cargo-mutants
@@ -94,14 +100,27 @@ cargo mutants --no-shuffle --in-place=false --timeout=180
 
 ### 9. ASAN / UBSAN
 
-The C FFI boundary is exercised under AddressSanitizer and UndefinedBehaviorSanitizer via `tests/asan/c_smoke.c`.
+The C FFI boundary is exercised under AddressSanitizer and UndefinedBehaviorSanitizer via `tests/asan/c_smoke.c`. CI runs this on a weekly cron (Tuesdays).
 
 ```bash
 rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
+# On Debian/Ubuntu, the sanitizer runtimes are also needed:
+sudo apt-get install llvm libubsan1
 bash tests/asan/run_asan.sh
 ```
 *(Note: ASAN scripts currently require a Linux environment.)*
+
+### 10. Dependency Hygiene (CI-enforced)
+
+Three additional CI jobs gate every PR; run their tools locally if your change touches dependencies or features:
+
+```bash
+cargo install cargo-deny cargo-hack cargo-machete
+cargo deny check                                  # licenses/advisories/bans, driven by deny.toml
+cargo hack check --each-feature --no-dev-deps     # every feature combination compiles
+cargo machete                                     # no unused dependencies
+```
 
 ## Adding a New Spec Invariant
 
@@ -115,12 +134,12 @@ When you encounter a documented invariant in `docs/*.md` that the test suite doe
 
 We use standard `rustfmt` defaults. Please run `cargo fmt --all` before pushing.
 
-Clippy is run with `-D warnings` in CI. If a lint is genuinely wrong for the situation, allow it with a `// SAFETY:` or `// ALLOW:` justification comment explaining why.
+Clippy is run with `-D warnings` in CI. If a lint is genuinely wrong for the situation, use a targeted `#[allow(...)]` with a brief comment explaining why. `unsafe` blocks carry the usual `// SAFETY:` invariant comments.
 
 ## Pull Requests
 
 - **Commit messages:** Conventional-commits style is preferred but not required. Describe *why* the change is needed and *what* it changes.
-- **Templates:** Please fill out the Pull Request template when opening a PR. Checkboxes are provided for CI validations.
+- **Templates:** Please fill out the Pull Request template when opening a PR. It includes checkboxes for the CI validations and a mandatory AI-usage disclosure section.
 
 ## License
 

@@ -183,8 +183,11 @@ impl HttpSource {
             .user_agent(crate::utils::user_agent())
             .build()?;
 
-        // Initialize stream parser for chosen format
-        let stream_parser = StreamParser::new(stream_format, None)?;
+        // Initialize stream parser for chosen format. The parser must know
+        // the server-side `?scale=N` encode multiplier requested for the
+        // stream, or int16 decoding falls back to the full-scale default
+        // and every sample is off by a factor of 32768/N.
+        let stream_parser = StreamParser::new(stream_format, scale)?;
 
         let tokio_handle = tokio::runtime::Handle::try_current().ok();
 
@@ -1261,6 +1264,70 @@ mod tests {
         assert_eq!(block.scale, Some(1_000_000.0));
         // `as_str()` is what lands in the query string.
         assert_eq!(block.stream_format.as_str(), "float32");
+    }
+
+    /// The builder's `.scale(N)` must reach the block's internal
+    /// `StreamParser`, not just the `/stream` query string. The block used
+    /// to construct `StreamParser::new(stream_format, None)`, so while the
+    /// server was asked to encode with `?scale=N`, decoding fell back to
+    /// the full-scale default (32768) and every int16 sample whose packet
+    /// carried no per-packet `scale` field came out wrong by a factor of
+    /// 32768/N.
+    #[tokio::test]
+    async fn configured_scale_reaches_the_stream_parser() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let scale = 1000.0_f64;
+
+        // Wire bytes: JSON header (deliberately *without* a per-packet
+        // `scale` field, as sent by servers honouring `?scale=N`), a record
+        // separator, then one IQ pair as little-endian i16 at ±raw 1000.
+        let header = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":100.0,"endFrequency":200.0,"samples":1,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
+        let mut body = header.as_bytes().to_vec();
+        body.push(30u8); // ASCII record separator
+        for v in [1000i16, -1000] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let server = MockServer::start().await;
+        // Matching on the query param also pins the request side: if
+        // `?scale=N` stopped being sent, the mock would 404 and
+        // `start_stream` would fail. The other endpoints `start_stream`
+        // probes (/info, /config, /control/stream) 404 harmlessly.
+        Mock::given(method("GET"))
+            .and(path("/stream"))
+            .and(query_param("scale", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let mut source = HttpSourceBuilder::new(&server.uri())
+            .format(StreamFormat::Int16)
+            .input("main") // skip input auto-discovery
+            .scale(scale)
+            .build()
+            .expect("Should create HttpSource");
+
+        source
+            .start_stream()
+            .await
+            .expect("mock /stream must accept the request");
+        let added = source
+            .fetch_samples()
+            .await
+            .expect("the packet should decode");
+        assert_eq!(added, 1, "one IQ pair in the payload");
+
+        let s = source.sample_buffer[0];
+        assert!(
+            (s.re - 1.0).abs() < 1e-6,
+            "raw 1000 with ?scale=1000 must decode to 1.0, got {} \
+             (0.0305… = 1000/32768 means the configured scale never \
+             reached the parser)",
+            s.re,
+        );
+        assert!((s.im - -1.0).abs() < 1e-6);
     }
 
     #[tokio::test]

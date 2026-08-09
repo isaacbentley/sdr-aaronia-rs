@@ -38,26 +38,28 @@ graph TB
 |---|---|---|---|
 | `AaroniaConfig::from_file("recording.rtsa")` | File | None — fails if the file is missing | All |
 | `AaroniaConfig::from_http("http://192.168.1.100")` | HTTP | None — fails if unreachable | All |
-| `AaroniaConfig::default()` (nothing specified) | Native SDK | Polls the default HTTP endpoint (`localhost:54664`) if the SDK library is not found | All (SDK itself is Windows/Linux only) |
+| `AaroniaConfig::default()` (nothing specified) | Native SDK, when the `native-sdk` feature is enabled and the SDK library is found | Connects to the default HTTP endpoint (`http://localhost:54664`) otherwise. Since `native-sdk` is not a default feature, a stock build always resolves to HTTP. | All (SDK itself is Windows/Linux only) |
 | Force option, e.g. `config.force_native_sdk()` | Forced type | None — fails if unavailable | Depends on forced type |
 
 ## 4. Backend Implementations
 
 ### 4.1 Native SDK
 
-- Uses direct FFI calls into the Aaronia RTSA-Suite PRO shared libraries (`spectranv6` or `spectranv6eco`).
+Available on Windows and Linux only, behind the non-default `native-sdk` feature.
+
+- Uses direct FFI calls into the Aaronia RTSA-Suite PRO shared library (`AaroniaRTSAAPI.dll` / `libAaroniaRTSAAPI.so`). The `spectranv6` and `spectranv6eco` strings are device-family identifiers passed when enumerating and opening devices, not library names.
 - **IQ mode constraint**: enforces `span * 1.5 <= receiverclock` by reading the live device clock before streaming.
-- **Data path (RX)**: polls `GetPacket` on the C++ side every 5 ms and converts the raw pointer arrays to `Complex32` slices, zero-copy where structurally possible.
+- **Data path (RX)**: polls `GetPacket` on the C++ side every 5 ms. Where the packet stride allows, the raw sample buffer is reinterpreted in place as `Complex32` (no per-sample conversion) before being copied into the caller's buffer.
 - **Data path (TX)**: provides an experimental `TxStream` API built on `SendPacket`. This path is hardware-unverified pending full V6 testing, as the ECO model lacks TX.
-- **Sweep-spectra mode**: configures non-IQ sweeping via `SweepsaConfig` by modifying `"main/startfreq"`, `"main/stopfreq"`, `"main/rbw"`, and related keys. Supports the `"spectranv6/sweepsa"` and `"spectranv6eco/sweepsa"` open strings.
-- **Health and GPS telemetry**: exposes `HealthState` and `GpsState` structs populated by a recursive configuration tree-walker (`walk_health_tree`) that fetches device diagnostics dynamically.
+- **Sweep-spectra mode**: configures non-IQ sweeping via `SweepsaConfig` by modifying `"main/startfreq"`, `"main/stopfreq"`, `"main/rbw"`, and related keys (these config paths are inferred from the SDK naming convention and are hardware-unverified). Supports the `"spectranv6/sweepsa"` and `"spectranv6eco/sweepsa"` open strings.
+- **Health and GPS telemetry**: exposes `HealthState` and `GpsState` structs populated by a recursive configuration tree-walker (`walk_health_tree`) that fetches device diagnostics dynamically. Not yet exercised against live hardware.
 
 ### 4.2 HTTP Streaming
 
 - Implements the V9 RTSA HTTP specification.
 - Supports Basic Auth and token-based authentication.
-- **Formats**: requests and parses the `Int16` binary stream for maximum throughput, maintaining a persistent chunked-transfer buffer.
-- Beyond streaming, `HttpEndpointsClient` exposes health telemetry, stream statistics, and device temperature, mirroring the desktop RTSA suite within a headless Rust process.
+- **Formats**: supports the `Json`, `Int16`, `Float16`, and `Float32` wire formats, maintaining a persistent chunked-transfer buffer across packet boundaries. The default is `Float32` (binary, lossless); `Int16` is opt-in via `AaroniaConfig::stream_format()` / `stream_scale()`.
+- Beyond streaming, `HttpEndpointsClient` exposes device control and health telemetry (as a generic configuration tree) within a headless Rust process.
 
 ### 4.3 RTSA Files
 
@@ -67,21 +69,21 @@ graph TB
 
 ## 5. Channel Hopping and Dwell Control
 
-The `sdr-source` trait implementation (`AaroniaSdrSource`) and its channel-hopping and dwell controllers are vendored and integrated natively into the crate. Automatic mid-stream retuning via `SourceConfig.channels_hz` is supported per backend:
+Under the `sdr-source` feature, `AaroniaSdrSource` (in `sdr_source_impl.rs`) implements the `SdrSource` trait from the external `orecchiette-sdr-source-rs` crate, which the crate re-exports as `sdr_source`. Automatic mid-stream retuning via `SourceConfig.channels_hz` is supported per backend:
 
 - **Native SDK**: re-issues `configure_iq_receiver` with the new center frequency, applying the change to the open device handle via the `main/centerfreq` configuration key. No stream restart is required.
-- **HTTP**: `AaroniaSource::set_center_frequency` wraps `HttpEndpointsClient::configure_capture(frequency_center=...)` as a `PUT` request. This requires the RTSA-Suite "Remote Config" license server-side; without it, the `PUT` returns success but is ignored.
+- **HTTP**: `AaroniaSource::set_center_frequency` wraps `HttpEndpointsClient::configure_capture(frequency_center=...)` as a `PUT` to the license-free `/control` endpoint. The RTSA-Suite "Remote Config" license gates the separate `/remoteconfig` write path, which the hopping code deliberately avoids — hopping is not gated on the license probe.
 - **File**: not supported.
 
-Per-hop pacing uses the integrated `sdr_source::DwellController`, which inserts a ~75 ms settle after every retune to ride out the RTSA's apply-config latency and flush stale samples from the pipeline.
+Hop dwell deadlines come from `sdr_source::DwellController`; per-hop pacing additionally inserts a ~75 ms settle after every retune (`RETUNE_SETTLE` in `sdr_source_impl.rs`) to ride out the RTSA's apply-config latency and flush stale samples from the pipeline.
 
 ## 6. Overrun Detection and Fault Handling
 
-The HTTP reader task (`connect_http` in `unified_source.rs`) runs a `DropDetector` over each packet's `start_time`/`end_time` metadata. A timestamp gap larger than the tolerance latches `AaroniaSource::pending_overrun`, which `take_overrun()` reads and clears. `single_channel_pump` and `hop_pump` (`sdr_source_impl.rs`) call `take_overrun()` once per emitted `IqPacket`, so a drop detected anywhere since the last read surfaces as `IqPacket::overrun = true` on the next packet. This is a per-call signal, not a precise per-sample one, since drop timing is lost once chunks merge into the flat `sample_buffer`.
+The HTTP reader task (spawned by `init_http_source` in `unified_source.rs`) runs a `DropDetector` over each packet's `start_time`/`end_time` metadata. A timestamp gap larger than the tolerance latches `AaroniaSource::pending_overrun`, which `take_overrun()` reads and clears. `single_channel_pump` and `hop_pump` (`sdr_source_impl.rs`) call `take_overrun()` once per emitted `IqPacket`, so a drop detected anywhere since the last read surfaces as `IqPacket::overrun = true` on the next packet. This is a per-call signal, not a precise per-sample one, since drop timing is lost once chunks merge into the flat `sample_buffer`.
 
-The native-SDK and file backends do not populate this yet (`overrun` is always `false` for them). Native-SDK overrun detection would need to read the `WARN_OVERFLOW`/`WARN_DROPPED` packet flags in `native_sdk.rs`, which is Windows/Linux-only code.
+The native-SDK and file backends do not populate this yet (`overrun` is always `false` for them). Native-SDK overrun detection would need to read the overflow/dropped warning bits from the packet `flags` field, which the RX path currently ignores.
 
-The Aaronia capture thread (`AaroniaSdrSource::start`) is wrapped in `catch_unwind`, matching the USRP/HackRF/Pluto backends: a panic inside the pump loop is logged rather than silently unwinding the thread.
+The Aaronia capture thread (`AaroniaSdrSource::start`) is wrapped in `catch_unwind`: a panic inside the pump loop is logged rather than silently unwinding the thread.
 
 ## 7. FutureSDR Integration
 
@@ -93,7 +95,7 @@ FutureSDR integration is available under the `futuresdr` feature gate. The crate
 │   Flowgraph     │    │    (Source API)    │
 ├─────────────────┤    ├────────────────────┤
 │ HttpSource      │◄──►│ HttpSourceBuilder  │
-│ (Block)         │    │ StreamingFormats   │
+│ (Block)         │    │ StreamFormat       │
 │                 │    │ StreamParser       │
 └─────────────────┘    └────────────────────┘
 ```

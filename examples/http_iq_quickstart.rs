@@ -12,7 +12,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(2)
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(10_000_000.0);
-    let url = "http://atc.local:54664";
+    let url = args
+        .get(3)
+        .map(String::as_str)
+        .unwrap_or("http://localhost:54664");
 
     let config = AaroniaConfig::from_http(url)
         .center_frequency(freq)

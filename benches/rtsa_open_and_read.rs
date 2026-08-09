@@ -74,7 +74,7 @@ fn bench_open_and_read(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("rtsa_open_and_read");
     // Reduce sample count — opening + reading a 4.4 MB file is
-    // expensive (mmap + chunk walk + slice copy). Default 100 samples
+    // expensive (buffered read + chunk walk + slice copy). Default 100 samples
     // per iteration would make the bench take minutes.
     group.sample_size(20);
 
