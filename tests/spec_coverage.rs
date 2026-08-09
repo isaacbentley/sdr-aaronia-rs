@@ -176,6 +176,36 @@ const ENFORCED: &[InvariantRow] = &[
         test_fn: "test_ffi_error_message_mapping",
         test_file: "src/c_api.rs",
     },
+    InvariantRow {
+        area: Area::FileFormat,
+        invariant: "STRT has 4 bytes of alignment padding before the 8-byte-aligned mEndTime",
+        test_fn: "test_strt_chunk_parsing",
+        test_file: "src/file_source.rs",
+    },
+    InvariantRow {
+        area: Area::FileFormat,
+        invariant: "STRT tail offsets are size-versioned; absent offsets default to 0",
+        test_fn: "test_strt_chunk_parsing_88_byte_no_metadata_offset",
+        test_file: "src/file_source.rs",
+    },
+    InvariantRow {
+        area: Area::FileFormat,
+        invariant: "STRM uses the standard layout at every chunk size, including 40 bytes",
+        test_fn: "test_strm_chunk_40_byte_standard_format",
+        test_file: "src/file_source.rs",
+    },
+    InvariantRow {
+        area: Area::FileFormat,
+        invariant: "DSST numbering matches the official enum (S16=2, U32=3, U32N=9)",
+        test_fn: "test_dsp_stream_sample_type_conversion",
+        test_file: "src/file_source.rs",
+    },
+    InvariantRow {
+        area: Area::FileFormat,
+        invariant: "out-of-range SAMP enum values degrade to Unknown instead of failing the open",
+        test_fn: "test_invalid_chunk_handling",
+        test_file: "src/file_source.rs",
+    },
 ];
 
 /// Print a per-area coverage summary. Intentionally has no assertions

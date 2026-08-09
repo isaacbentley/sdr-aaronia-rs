@@ -173,10 +173,47 @@ Indicates the start of a new stream.
 | `mStartTime` | `double` | Start time of the stream, relative to the Unix epoch. |
 | `mStreamOffset` | `qint64` | Offset of the tail chunk (`STRT`) of the *previous* stream in the file. |
 
+> **Layout verified against captures** — this standard layout is the
+> *only* STRM layout, at every chunk size. The official spec's worked
+> example is a 40-byte STRM (16-byte chunk header + the 24 bytes above);
+> real RTSA-Suite captures write 48-byte STRM chunks that carry the same
+> three fields plus 8 undocumented trailing bytes (a `double`, observed
+> in both LFS test captures to equal the stream-relative start time of
+> the first preview segment). The Rust reader
+> (`StrmChunk::read_from` in `file_source.rs`) parses the standard
+> triplet and skips any trailing bytes. An earlier revision dispatched
+> 40-byte chunks into a fabricated alternate "proximity" layout
+> (u32 id / stream type / f32 rate / f32 frequency / device name);
+> no spec revision, capture, or writer produces that layout, and it
+> misparsed exactly the minimal spec-conformant chunks — it has been
+> removed.
+
 ---
 
 ### 4. Stream Tail (`STRT`)
 Marks the end of a stream and contains offsets to its metadata.
+
+> **Wire-format alignment (verified)** — like SSTR, the recorded STRT
+> payload follows standard C-struct alignment: the three `quint32`
+> preview counters leave the stream 4-byte aligned, so the compiler
+> inserts **4 bytes of padding** before the 8-byte-aligned `mEndTime`
+> double. The official spec's worked example shows the padding
+> explicitly (`xx xx xx xx - padding` between `mNumPreviewSegments`
+> and `mEndTime`), and in both LFS test captures the padding bytes are
+> uninitialised garbage (`ff 7f 00 00`) while the padded decode yields
+> an `mEndTime` exactly matching the last preview time. A reader that
+> skips the padding gets the correct duration; one that doesn't gets a
+> garbage end time *and* a garbage antenna offset assembled from the
+> two halves of the double. `StrtChunk::read_from` in `file_source.rs`
+> seeks past the 4 bytes and uses `HEADER_SIZE = 80` for the fixed
+> fields.
+>
+> **Size-versioned tail (verified)** — the trailing offsets are only
+> present when the chunk is large enough. The official example is an
+> 88-byte STRT ending at `mAntennaOffset` (no `mMetaDataOffset`);
+> RTSA-Suite captures write 104-byte STRTs carrying both offsets plus
+> 8 trailing bytes (two undocumented `quint32` values) that readers
+> should skip. The Rust reader defaults absent tail offsets to 0.
 
 | Field | Data Type | Description |
 | :--- | :--- | :--- |
@@ -188,9 +225,10 @@ Marks the end of a stream and contains offsets to its metadata.
 | `mPreviewLevels` | `quint32` | Number of levels in the preview hierarchy tree. |
 | `mNumPreviews` | `quint32` | Total number of preview elements. |
 | `mNumPreviewSegments` | `quint32` | Total number of preview segments. |
-| `mEndTime` | `double` | End time of the stream (stream duration). |
-| `mAntennaOffset` | `qint64` | Offset of the last antenna chunk (`ANTA`). |
-| `mMetaDataOffset` | `qint64` | Offset of the last metadata type chunk (`MDTT`). |
+| *(padding)* | 4 bytes | Alignment padding before the 8-byte-aligned `mEndTime`. |
+| `mEndTime` | `double` | End time of the stream, relative to the stream start time (i.e. the stream duration). |
+| `mAntennaOffset` | `qint64` | Offset of the last antenna chunk (`ANTA`). Present when the chunk is ≥ 88 bytes. |
+| `mMetaDataOffset` | `qint64` | Offset of the last metadata type chunk (`MDTT`). Present when the chunk is ≥ 96 bytes. |
 
 ---
 
@@ -244,6 +282,11 @@ A named scalar measurement within a category sub-stream (e.g., channel power).
 ### 7. Antenna (`ANTA`)
 Combines physical, logical, and geographical properties of an antenna.
 
+> **Size note** — the fixed fields below total exactly **248 bytes**
+> (8 + 8 + 128 + 8 + 8 + 4 + 4 + 64 + 16), which is the value
+> `AntaChunk::read_from` uses when seeking past the segment payload to
+> the end of the chunk.
+
 | Field | Data Type | Description |
 | :--- | :--- | :--- |
 | `mAntennaID` | `quint64` | Unique ID of the antenna. |
@@ -283,10 +326,20 @@ Defines the structure for structured data.
 ### 10. Preview (`SPRV`)
 Contains a histogram and preview spectra for fast seeking and visualization.
 
+> **Wire-format alignment / size note (verified)** — the two `quint8`
+> fields are followed by **6 bytes of alignment padding** before the
+> 8-byte-aligned `mPreviewOffsets` array, so the fixed fields total
+> exactly **392 bytes** (2 + 6 + 3 × 128). Both LFS test captures
+> confirm this: preview offsets/times/samples decode correctly at that
+> layout, and the padding bytes are uninitialised garbage in some
+> chunks. `SprvChunk::read_from` uses `HEADER_SIZE = 392` when seeking
+> past the histogram/waterfall payload to the end of the chunk.
+
 | Field | Data Type | Description |
 | :--- | :--- | :--- |
 | `mPreviewLevel` | `quint8` | Level of this chunk in the preview tree (0 for leaf nodes). |
 | `mPreviewCount` | `quint8` | Number of preview elements in this chunk. |
+| *(padding)* | 6 bytes | Alignment padding before the 8-byte-aligned `mPreviewOffsets`. |
 | `mPreviewOffsets` | `qint64[16]` | Offsets of child preview chunks or sample chunks. |
 | `mPreviewTimes` | `double[16]` | Start times of the child preview chunks. |
 | `mPreviewSamples` | `quint64[16]` | Start sample index numbers of the child preview chunks. |
@@ -376,8 +429,12 @@ The Rust binding accommodates this with a value-range heuristic:
 returning it as seconds-since-epoch. The cutoff sits well above any
 realistic Unix-seconds timestamp this century (2025 ≈ 1.7×10⁹) and well
 below any plausible Unix-microseconds timestamp from the same era
-(2025 ≈ 1.7×10¹⁵). All `RtsaMetadata` time-related fields the binding
-publishes pass through that helper, so callers always see seconds.
+(2025 ≈ 1.7×10¹⁵). All *epoch-anchored* `RtsaMetadata` time fields the
+binding publishes pass through that helper, so callers always see
+seconds. `StreamTailInfo::end_time` is exempt: `STRT::mEndTime` is a
+stream-relative duration, not an epoch timestamp, and is published
+as-is (the binding anchors it to the STRM start time when deriving the
+absolute `end_time_ns`).
 
 ---
 
@@ -385,44 +442,73 @@ publishes pass through that helper, so callers always see seconds.
 
 Several chunks use enums or flags to specify data types or features. The most important ones are for the `SAMP` chunk.
 
+> **Numbering (verified against the official spec)** — the numeric
+> values below are transcribed from the enum declarations in Aaronia's
+> official file-format document (rev. 4). Note the sample-type
+> ordering: at each width the *signed* variant precedes the *unsigned*
+> one (`U8, U16, S16, U32, S32, F32`) — an earlier revision of the
+> Rust reader had `S16`/`U32` swapped and omitted `DSST_U32N` (9)
+> entirely, so a file using value 9 failed to open. The reader now
+> maps any value outside the specified range of these three `SAMP`
+> enums to an `Unknown` variant and skips chunks it cannot decode,
+> instead of rejecting the whole file.
+
 #### `SAMP` Chunk: `mSampleType`
 Specifies the data type of individual data elements.
 
-| Enum Value (`DPSStreamSampleType`) | Description |
-| :--- | :--- |
-| `DSST_U8`, `DSST_U16`, `DSST_U32` | Unsigned integer of 8, 16, or 32 bits. |
-| `DSST_S16`, `DSST_S32` | Signed integer of 16 or 32 bits. |
-| `DSST_F32` | 32-bit float. |
-| `DSST_U8N`, `U16N`, `S16N`, etc. | "Packet storage" format, where elements are not stored on 16-byte boundaries. |
+| Value | Enum (`DPSStreamSampleType`) | Description |
+| :--- | :--- | :--- |
+| 0 | `DSST_U8` | Unsigned 8-bit integer. |
+| 1 | `DSST_U16` | Unsigned 16-bit integer. |
+| 2 | `DSST_S16` | Signed 16-bit integer. |
+| 3 | `DSST_U32` | Unsigned 32-bit integer. |
+| 4 | `DSST_S32` | Signed 32-bit integer. |
+| 5 | `DSST_F32` | 32-bit float. |
+| 6–11 | `DSST_U8N` … `DSST_F32N` | "Packet storage" variants of 0–5 in the same order (`U8N`, `U16N`, `S16N`, `U32N`, `S32N`, `F32N`), where elements are not stored on 16-byte boundaries. |
 
 #### `SAMP` Chunk: `mSampleUnit`
 Specifies the physical unit for the sample data.
 
-| Enum Value (`DSPStreamSampleUnit`) | Description |
-| :--- | :--- |
-| `DSSU_GENERIC` | Generic floating-point value. |
-| `DSSU_DBM` | Decibel-milliwatts. |
-| `DSSU_DBM_HZ` | Decibel-milliwatts per Hertz. |
-| `DSSU_PERCENTAGE` | Percentage (0 to 1). |
-| `DSSU_HZ` | Hertz. |
-| `DSSU_WATT` | Watts. |
-| `DSSU_VOLT` | Volts. |
-| `DSSU_TIME` | Floating-point seconds. |
-| `DSSU_DATE_TIME` | Floating-point seconds since the Unix epoch. |
+| Value | Enum (`DSPStreamSampleUnit`) | Description |
+| :--- | :--- | :--- |
+| 0 | `DSSU_GENERIC` | Generic floating-point value. |
+| 1 | `DSSU_DBM` | Decibel-milliwatts. |
+| 2 | `DSSU_PERCENTAGE` | Percentage (0 to 1). |
+| 3 | `DSSU_DBM_HZ` | Decibel-milliwatts per Hertz. |
+| 4 | `DSSU_DBM_M2` | Decibel-milliwatts per square meter. |
+| 5 | `DSSU_INDEX` | Integer index. |
+| 6 | `DSSU_PHASE` | Phase from -π to +π. |
+| 7 | `DSSU_SIGNED_1` | Signed floating point in the range -1 to 1. |
+| 8 | `DSSU_UNSIGNED_1` | Unsigned floating point in the range 0 to 1. |
+| 9 | `DSSU_TIME` | Floating-point seconds. |
+| 10 | `DSSU_DATE_TIME` | Floating-point seconds since the Unix epoch. |
+| 11 | `DSSU_HZ` | Hertz. |
+| 12 | `DSSU_HZ_LOG` | Logarithmic Hertz. |
+| 13 | `DSSU_WATT` | Watts. |
+| 14 | `DSSU_SECTOR` | Sector index. |
+| 15 | `DSSU_SYMBOL` | Symbol vector. |
+| 16 | `DSSU_DB` | Decibels. |
+| 17 | `DSSU_NUMERIC` | No unit. |
+| 18 | `DSSU_HZ_LOG_CENTER` | Logarithmic Hertz relative to the center frequency. |
+| 19 | `DSSU_VOLT` | Volts. |
+| 20 | `DSSU_LOG_PERCENTAGE` | Logarithmic percentage (0 to 1). |
 
 #### `SAMP` Chunk: `mPayloadType`
 Specifies the high-level structure of the sample data.
 
-| Enum Value (`DSPStreamPayloadType`) | Description |
-| :--- | :--- |
-| `DSPT_GENERIC` | Generic numeric data. |
-| `DSPT_AUDIO` | Audio samples. |
-| `DSPT_IQ` | IQ samples (two values per sample). |
-| `DSPT_SPECTRA` | Power spectra. |
-| `DSPT_DETECTION` | Detection probability. |
-| `DSPT_HISTOGRAM` | Histogram data. |
-| `DSPT_STRUCTURED` | Structured data using meta-data types. |
-| `DSPT_IMAGE` | Grayscale image. |
+| Value | Enum (`DSPStreamPayloadType`) | Description |
+| :--- | :--- | :--- |
+| 0 | `DSPT_GENERIC` | Generic numeric data. |
+| 1 | `DSPT_AUDIO` | Audio samples. |
+| 2 | `DSPT_IQ` | IQ samples (two values per sample). |
+| 3 | `DSPT_SPECTRA` | Power spectra. |
+| 4 | `DSPT_DETECTION` | Detection probability. |
+| 5 | `DSPT_HISTOGRAM` | Histogram data. |
+| 6 | `DSPT_ENERGY` | Energy. |
+| 7 | `DSPT_VECTOR3` | 3D vectors. |
+| 8 | `DSPT_STRUCTURED` | Structured data using meta-data types. |
+| 9 | `DSPT_IQ_SLICE` | Slices of IQ samples. |
+| 10 | `DSPT_IMAGE` | Grayscale image. |
 
 ---
 
@@ -632,6 +718,10 @@ D9 39...         mPacketStartTime
 ...
 01 00 00 00      mPreviewLevels (1 level)
 06 00 00 00      mNumPreviews (6 chunks)
+58 00 00 00      mNumPreviewSegments
+xx xx xx xx      (alignment padding before mEndTime)
+78 F8...         mEndTime
+40 00...         mAntennaOffset
 ...
 ```
 

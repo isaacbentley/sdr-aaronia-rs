@@ -16,7 +16,6 @@ fn main() -> anyhow::Result<()> {
 
     println!("== RTSA metadata for {path} ==");
     println!("file_format_version : {}", m.file_format_version);
-    println!("device_name         : {:?}", m.device_name);
     println!("num_streams         : {}", m.num_streams);
     println!("primary_stream_id   : {}", m.primary_stream_id);
     println!("stream_type         : {:?}", m.stream_type);
@@ -37,17 +36,6 @@ fn main() -> anyhow::Result<()> {
         "bandwidth           : {} Hz ({:.6} MHz)",
         m.bandwidth,
         m.bandwidth / 1e6
-    );
-    println!(
-        "stream_sample_rate  : {:?}",
-        m.stream_sample_rate.map(|f| format!("{} Hz", f))
-    );
-    println!(
-        "stream_center_freq  : {:?} ({})",
-        m.stream_center_frequency,
-        m.stream_center_frequency
-            .map(|f| format!("{:.6} MHz", f as f64 / 1e6))
-            .unwrap_or_else(|| "None".into())
     );
     println!("total_samples       : {}", m.total_samples);
     println!("total_sample_chunks : {}", m.total_sample_chunks);

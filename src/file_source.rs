@@ -160,124 +160,168 @@ bitflags! {
 
 /// SAMP Chunk: mSampleType
 /// Specifies the data type of individual data elements.
+///
+/// Discriminants follow the official `DPSStreamSampleType` enum from
+/// Aaronia's RTSA file-format specification (rev. 4): sizes ascend with
+/// the signed variant *before* the unsigned one at each width
+/// (`U8, U16, S16, U32, S32, F32`), and the `..N` packet-storage
+/// variants repeat that order from 6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
 pub enum DspStreamSampleType {
-    DsStU8,
-    DsStU16,
-    DsStU32,
-    DsStS16,
-    DsStS32,
-    DsStF32,
-    DsStU8N,
-    DsStU16N,
-    DsStS16N,
-    DsStS32N,
-    DsStF32N,
-    Unknown,
+    DsStU8 = 0,
+    DsStU16 = 1,
+    DsStS16 = 2,
+    DsStU32 = 3,
+    DsStS32 = 4,
+    DsStF32 = 5,
+    DsStU8N = 6,
+    DsStU16N = 7,
+    DsStS16N = 8,
+    DsStU32N = 9,
+    DsStS32N = 10,
+    DsStF32N = 11,
+    Unknown = 255,
 }
 
 impl TryFrom<u8> for DspStreamSampleType {
     type Error = crate::Error;
 
+    /// Values outside the specified range map to [`Self::Unknown`]
+    /// rather than erroring: a SAMP chunk with an unrecognised sample
+    /// type must not make the whole file unreadable — the sample reader
+    /// skips chunks it cannot decode.
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(DspStreamSampleType::DsStU8),
-            1 => Ok(DspStreamSampleType::DsStU16),
-            2 => Ok(DspStreamSampleType::DsStU32),
-            3 => Ok(DspStreamSampleType::DsStS16),
-            4 => Ok(DspStreamSampleType::DsStS32),
-            5 => Ok(DspStreamSampleType::DsStF32),
-            6 => Ok(DspStreamSampleType::DsStU8N),
-            7 => Ok(DspStreamSampleType::DsStU16N),
-            8 => Ok(DspStreamSampleType::DsStS16N),
-            10 => Ok(DspStreamSampleType::DsStS32N),
-            11 => Ok(DspStreamSampleType::DsStF32N),
-            _ => Err(Error::FileFormat {
-                offset: 0,
-                reason: format!("Invalid DspStreamSampleType value: {}", value),
-            }),
-        }
+        Ok(match value {
+            0 => DspStreamSampleType::DsStU8,
+            1 => DspStreamSampleType::DsStU16,
+            2 => DspStreamSampleType::DsStS16,
+            3 => DspStreamSampleType::DsStU32,
+            4 => DspStreamSampleType::DsStS32,
+            5 => DspStreamSampleType::DsStF32,
+            6 => DspStreamSampleType::DsStU8N,
+            7 => DspStreamSampleType::DsStU16N,
+            8 => DspStreamSampleType::DsStS16N,
+            9 => DspStreamSampleType::DsStU32N,
+            10 => DspStreamSampleType::DsStS32N,
+            11 => DspStreamSampleType::DsStF32N,
+            _ => DspStreamSampleType::Unknown,
+        })
     }
 }
 
 /// SAMP Chunk: mSampleUnit
 /// Specifies the physical unit for the sample data.
+///
+/// Discriminants follow the official `DSPStreamSampleUnit` enum from
+/// Aaronia's RTSA file-format specification (rev. 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
 pub enum DspStreamSampleUnit {
-    DssuGeneric,
-    DssuDbm,
-    DssuDbmHz,
-    DssuPercentage,
-    DssuHz,
-    DssuWatt,
-    DssuVolt,
-    DssuTime,
-    DssuDateTime,
-    Unknown,
+    DssuGeneric = 0,
+    DssuDbm = 1,
+    DssuPercentage = 2,
+    DssuDbmHz = 3,
+    DssuDbmM2 = 4,
+    DssuIndex = 5,
+    DssuPhase = 6,
+    DssuSigned1 = 7,
+    DssuUnsigned1 = 8,
+    DssuTime = 9,
+    DssuDateTime = 10,
+    DssuHz = 11,
+    DssuHzLog = 12,
+    DssuWatt = 13,
+    DssuSector = 14,
+    DssuSymbol = 15,
+    DssuDb = 16,
+    DssuNumeric = 17,
+    DssuHzLogCenter = 18,
+    DssuVolt = 19,
+    DssuLogPercentage = 20,
+    Unknown = 255,
 }
 
 impl TryFrom<u8> for DspStreamSampleUnit {
     type Error = crate::Error;
 
+    /// Values outside the specified range map to [`Self::Unknown`]
+    /// rather than erroring — see
+    /// [`DspStreamSampleType::try_from`] for the rationale.
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(DspStreamSampleUnit::DssuGeneric),
-            1 => Ok(DspStreamSampleUnit::DssuDbm),
-            2 => Ok(DspStreamSampleUnit::DssuDbmHz),
-            3 => Ok(DspStreamSampleUnit::DssuPercentage),
-            4 => Ok(DspStreamSampleUnit::DssuHz),
-            5 => Ok(DspStreamSampleUnit::DssuWatt),
-            6 => Ok(DspStreamSampleUnit::DssuVolt),
-            7 => Ok(DspStreamSampleUnit::DssuTime),
-            8 => Ok(DspStreamSampleUnit::DssuDateTime),
-            19 => Ok(DspStreamSampleUnit::Unknown),
-            _ => Err(Error::FileFormat {
-                offset: 0,
-                reason: format!("Invalid DspStreamSampleUnit value: {}", value),
-            }),
-        }
+        Ok(match value {
+            0 => DspStreamSampleUnit::DssuGeneric,
+            1 => DspStreamSampleUnit::DssuDbm,
+            2 => DspStreamSampleUnit::DssuPercentage,
+            3 => DspStreamSampleUnit::DssuDbmHz,
+            4 => DspStreamSampleUnit::DssuDbmM2,
+            5 => DspStreamSampleUnit::DssuIndex,
+            6 => DspStreamSampleUnit::DssuPhase,
+            7 => DspStreamSampleUnit::DssuSigned1,
+            8 => DspStreamSampleUnit::DssuUnsigned1,
+            9 => DspStreamSampleUnit::DssuTime,
+            10 => DspStreamSampleUnit::DssuDateTime,
+            11 => DspStreamSampleUnit::DssuHz,
+            12 => DspStreamSampleUnit::DssuHzLog,
+            13 => DspStreamSampleUnit::DssuWatt,
+            14 => DspStreamSampleUnit::DssuSector,
+            15 => DspStreamSampleUnit::DssuSymbol,
+            16 => DspStreamSampleUnit::DssuDb,
+            17 => DspStreamSampleUnit::DssuNumeric,
+            18 => DspStreamSampleUnit::DssuHzLogCenter,
+            19 => DspStreamSampleUnit::DssuVolt,
+            20 => DspStreamSampleUnit::DssuLogPercentage,
+            _ => DspStreamSampleUnit::Unknown,
+        })
     }
 }
 
 /// SAMP Chunk: mPayloadType
 /// Specifies the high-level structure of the sample data.
+///
+/// Discriminants follow the official `DSPStreamPayloadType` enum from
+/// Aaronia's RTSA file-format specification (rev. 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
 pub enum DspStreamPayloadType {
-    DsptGeneric,
-    DsptAudio,
-    DsptIq,
-    DsptSpectra,
-    DsptDetection,
-    DsptHistogram,
-    DsptStructured,
-    DsptImage,
-    Unknown,
+    DsptGeneric = 0,
+    DsptAudio = 1,
+    DsptIq = 2,
+    DsptSpectra = 3,
+    DsptDetection = 4,
+    DsptHistogram = 5,
+    DsptEnergy = 6,
+    DsptVector3 = 7,
+    DsptStructured = 8,
+    DsptIqSlice = 9,
+    DsptImage = 10,
+    Unknown = 255,
 }
 
 impl TryFrom<u8> for DspStreamPayloadType {
     type Error = crate::Error;
 
+    /// Values outside the specified range map to [`Self::Unknown`]
+    /// rather than erroring — see
+    /// [`DspStreamSampleType::try_from`] for the rationale.
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(DspStreamPayloadType::DsptGeneric),
-            1 => Ok(DspStreamPayloadType::DsptAudio),
-            2 => Ok(DspStreamPayloadType::DsptIq),
-            3 => Ok(DspStreamPayloadType::DsptSpectra),
-            4 => Ok(DspStreamPayloadType::DsptDetection),
-            5 => Ok(DspStreamPayloadType::DsptHistogram),
-            6 => Ok(DspStreamPayloadType::DsptStructured),
-            7 => Ok(DspStreamPayloadType::DsptImage),
-            _ => Err(Error::FileFormat {
-                offset: 0,
-                reason: format!("Invalid DspStreamPayloadType value: {}", value),
-            }),
-        }
+        Ok(match value {
+            0 => DspStreamPayloadType::DsptGeneric,
+            1 => DspStreamPayloadType::DsptAudio,
+            2 => DspStreamPayloadType::DsptIq,
+            3 => DspStreamPayloadType::DsptSpectra,
+            4 => DspStreamPayloadType::DsptDetection,
+            5 => DspStreamPayloadType::DsptHistogram,
+            6 => DspStreamPayloadType::DsptEnergy,
+            7 => DspStreamPayloadType::DsptVector3,
+            8 => DspStreamPayloadType::DsptStructured,
+            9 => DspStreamPayloadType::DsptIqSlice,
+            10 => DspStreamPayloadType::DsptImage,
+            _ => DspStreamPayloadType::Unknown,
+        })
     }
 }
 
@@ -314,20 +358,21 @@ pub struct DsftChunk {
     pub num_streams: u32,
 }
 
-/// STRM (Stream Head) Chunk - Supports both official and proximity-based formats.
+/// STRM (Stream Head) Chunk
+///
+/// Always uses the standard layout from the official specification
+/// (`quint64 mStreamID`, `double mStartTime`, `qint64 mStreamOffset`).
+/// The spec's own worked example is a 40-byte STRM chunk in exactly this
+/// layout; real RTSA-Suite captures write 48-byte chunks whose 8
+/// trailing bytes (an undocumented `double`, observed to equal the
+/// stream-relative time of the first sample) are skipped.
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct StrmChunk {
     pub header: RtsaChunkHeader,
-    // Standard fields from RTSA spec
     pub stream_id: u64,
     pub start_time: f64,
     pub stream_offset: i64,
-    // Proximity-based fields
-    pub stream_type: Option<u32>,
-    pub sample_rate: Option<f32>,
-    pub center_frequency: Option<f32>,
-    pub device_name: Option<[u8; 8]>,
 }
 
 /// SSTR (Sub Stream) Chunk
@@ -561,6 +606,8 @@ pub struct StreamTailInfo {
     pub preview_levels: u32,
     pub num_previews: u32,
     pub num_preview_segments: u32,
+    /// Stream duration in seconds, relative to the stream start time
+    /// (`STRT::mEndTime` as recorded — not an epoch timestamp).
     pub end_time: f64,
     pub antenna_offset: i64,
     pub metadata_offset: i64,
@@ -613,10 +660,7 @@ pub struct RtsaMetadata {
     // Stream information
     pub primary_stream_id: u64,
     pub stream_type: Option<String>,
-    pub stream_sample_rate: Option<f32>,
-    pub stream_center_frequency: Option<f32>,
     pub stream_start_time: f64,
-    pub device_name: Option<String>,
 
     // Sub-stream information (for spectral data)
     pub sub_streams: Vec<SubStreamInfo>,
@@ -992,9 +1036,10 @@ impl RtsaSource {
             })
             .collect();
 
-        // Extract stream tail information. STRT.end_time is normalised the
-        // same way DSFH.creation_time and DSFT.completion_time are — see
-        // [`rtsa_epoch_seconds`] for the µs-vs-seconds heuristic.
+        // Extract stream tail information. STRT.end_time is the stream
+        // duration (seconds relative to the stream start), stored here
+        // as-is — unlike DSFH.creation_time / DSFT.completion_time it
+        // is not an epoch timestamp, so no µs-vs-seconds normalisation.
         let stream_tail = strt_chunk.as_ref().map(|strt| StreamTailInfo {
             stream_offset: strt.stream_offset,
             sub_stream_offset: strt.sub_stream_offset,
@@ -1004,7 +1049,7 @@ impl RtsaSource {
             preview_levels: strt.preview_levels,
             num_previews: strt.num_previews,
             num_preview_segments: strt.num_preview_segments,
-            end_time: rtsa_epoch_seconds(strt.end_time),
+            end_time: strt.end_time,
             antenna_offset: strt.antenna_offset,
             metadata_offset: strt.metadata_offset,
         });
@@ -1038,24 +1083,22 @@ impl RtsaSource {
             // Standard RTSA format with SAMP chunks
             if let Some(sstr_chunk) = sstr_chunks.get(&samp_chunk.sub_stream_id) {
                 let total_samples = strt_chunk.as_ref().map(|s| s.num_samples).unwrap_or(0);
+                let start_time_ns = (primary_strm_chunk.start_time * 1_000_000_000.0) as u64;
+                // STRT.end_time is the stream *duration* (seconds
+                // relative to the stream start), so anchor it to the
+                // STRM start time to get the absolute end this field
+                // promises. Saturate: the duration is file-controlled.
                 let end_time_ns = strt_chunk
                     .as_ref()
-                    .map(|s| (rtsa_epoch_seconds(s.end_time) * 1_000_000_000.0) as u64)
+                    .filter(|s| s.end_time > 0.0)
+                    .map(|s| start_time_ns.saturating_add((s.end_time * 1_000_000_000.0) as u64))
                     .unwrap_or(0);
                 (
-                    primary_strm_chunk
-                        .sample_rate
-                        .map(|s| s as f64)
-                        .unwrap_or(sstr_chunk.frequency_step),
-                    primary_strm_chunk
-                        .center_frequency
-                        .map(|f| f as f64)
-                        .or_else(|| {
-                            Some(sstr_chunk.frequency_start + sstr_chunk.frequency_span / 2.0)
-                        }),
+                    sstr_chunk.frequency_step,
+                    Some(sstr_chunk.frequency_start + sstr_chunk.frequency_span / 2.0),
                     sstr_chunk.frequency_span,
                     total_samples,
-                    (primary_strm_chunk.start_time * 1_000_000_000.0) as u64,
+                    start_time_ns,
                     end_time_ns,
                 )
             } else {
@@ -1064,19 +1107,6 @@ impl RtsaSource {
                     reason: "Missing SSTR chunk for IQ stream".to_string(),
                 });
             }
-        } else if let (Some(sample_rate), Some(center_frequency)) = (
-            primary_strm_chunk.sample_rate,
-            primary_strm_chunk.center_frequency,
-        ) {
-            // Direct stream metadata available (fallback)
-            (
-                sample_rate as f64,
-                Some(center_frequency as f64),
-                0.0,
-                0,
-                (primary_strm_chunk.start_time * 1_000_000_000.0) as u64,
-                0,
-            )
         } else if strt_chunk.is_some() || samp_chunk_offsets.is_empty() {
             // Reverse-order RTSA format or missing SAMP chunks
             let raw_iq_bytes = stream_offset.unwrap_or(0u64);
@@ -1096,57 +1126,17 @@ impl RtsaSource {
             });
         };
 
-        // Helper: deterministic iteration over `strm_chunks` for the
-        // tail-end fallbacks. `HashMap::values()` has nondeterministic
-        // order, so if multiple non-IQ streams (e.g. audio, GPS) have
-        // their own sample-rate / centre-frequency fields, picking
-        // randomly between them would make the resolved metadata flip
-        // run-to-run for the same input file. Sort by `stream_id` so
-        // we always pick the same chunk on a given file.
-        let sorted_strm_chunks: Vec<&StrmChunk> = {
-            let mut v: Vec<&StrmChunk> = strm_chunks.values().collect();
-            v.sort_by_key(|s| s.stream_id);
-            v
-        };
-
         // Fallback sample rate and center frequency logic
-        if sample_rate <= 0.0 {
-            if let Some(ssr) = sub_streams.iter().find(|s| s.frequency_step > 0.0) {
-                sample_rate = ssr.frequency_step;
-            } else if let Some(ssr_freq) = primary_strm_chunk.sample_rate {
-                sample_rate = ssr_freq as f64;
-            } else {
-                // Fallback to any other stream chunk's sample rate if
-                // available, iterating in deterministic stream_id order.
-                for strm in &sorted_strm_chunks {
-                    if let Some(sr) = strm.sample_rate
-                        && sr > 0.0
-                    {
-                        sample_rate = sr as f64;
-                        break;
-                    }
-                }
-            }
+        if sample_rate <= 0.0
+            && let Some(ssr) = sub_streams.iter().find(|s| s.frequency_step > 0.0)
+        {
+            sample_rate = ssr.frequency_step;
         }
 
-        if center_frequency.is_none() {
-            if let Some(scf) = primary_strm_chunk.center_frequency {
-                center_frequency = Some(scf as f64);
-            } else if let Some(ssr) = sub_streams.first() {
-                center_frequency = Some(ssr.frequency_start + ssr.frequency_span / 2.0);
-            } else {
-                // Fallback to any other stream chunk's center
-                // frequency, iterating in deterministic stream_id
-                // order.
-                for strm in &sorted_strm_chunks {
-                    if let Some(cf) = strm.center_frequency
-                        && cf > 0.0
-                    {
-                        center_frequency = Some(cf as f64);
-                        break;
-                    }
-                }
-            }
+        if center_frequency.is_none()
+            && let Some(ssr) = sub_streams.first()
+        {
+            center_frequency = Some(ssr.frequency_start + ssr.frequency_span / 2.0);
         }
 
         // Fallback for total_samples: sum samples from parsed SAMP chunks if STRT was missing/reported 0
@@ -1186,29 +1176,6 @@ impl RtsaSource {
             Some("RAW_IQ".to_string())
         };
 
-        // Extract device name with fallbacks. Uses the
-        // `sorted_strm_chunks` we computed above so the device-name
-        // selection is deterministic across runs (same rationale as
-        // the sample-rate / centre-frequency fallbacks).
-        let device_name = primary_strm_chunk
-            .device_name
-            .map(|name| {
-                String::from_utf8_lossy(&name)
-                    .trim_end_matches('\0')
-                    .trim()
-                    .to_string()
-            })
-            .or_else(|| {
-                sorted_strm_chunks.iter().find_map(|strm| {
-                    strm.device_name.map(|name| {
-                        String::from_utf8_lossy(&name)
-                            .trim_end_matches('\0')
-                            .trim()
-                            .to_string()
-                    })
-                })
-            });
-
         Ok(RtsaMetadata {
             // Core timing and frequency information
             sample_rate,
@@ -1229,10 +1196,7 @@ impl RtsaSource {
             // Stream information
             primary_stream_id: iq_stream_id,
             stream_type,
-            stream_sample_rate: primary_strm_chunk.sample_rate,
-            stream_center_frequency: primary_strm_chunk.center_frequency,
             stream_start_time: primary_strm_chunk.start_time,
-            device_name,
 
             // Comprehensive chunk information
             sub_streams,
@@ -1722,12 +1686,10 @@ impl RtsaSource {
     }
 
     /// Get detailed stream information
-    pub fn stream_info(&self) -> (u64, Option<&str>, Option<f32>, Option<f32>, f64) {
+    pub fn stream_info(&self) -> (u64, Option<&str>, f64) {
         (
             self.metadata.primary_stream_id,
             self.metadata.stream_type.as_deref(),
-            self.metadata.stream_sample_rate,
-            self.metadata.stream_center_frequency,
             self.metadata.stream_start_time,
         )
     }
@@ -1850,8 +1812,10 @@ impl RtsaSource {
             if tail.num_samples > 0 && tail.payload_size == 0 {
                 warnings.push("Stream tail indicates samples but zero payload size".to_string());
             }
-            if tail.end_time <= self.metadata.stream_start_time {
-                errors.push("Stream tail end time is not after start time".to_string());
+            // end_time is the stream duration, so "ends after it
+            // starts" simply means the duration is positive.
+            if tail.end_time <= 0.0 {
+                errors.push("Stream tail reports a non-positive stream duration".to_string());
             }
         }
 
@@ -1892,15 +1856,9 @@ impl RtsaSource {
             score += 7;
         }
 
-        // Stream information (weight: 15)
-        total += 15;
+        // Stream information (weight: 5)
+        total += 5;
         if self.metadata.stream_type.is_some() {
-            score += 5;
-        }
-        if self.metadata.stream_sample_rate.is_some() {
-            score += 5;
-        }
-        if self.metadata.stream_center_frequency.is_some() {
             score += 5;
         }
 
@@ -2388,50 +2346,28 @@ impl DsfhChunk {
 
 impl StrmChunk {
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32) -> Result<Self> {
-        if _size == 40 {
-            let stream_id = reader.read_u32::<LittleEndian>()? as u64;
-            let stream_type = reader.read_u32::<LittleEndian>()?;
-            let _reserved1 = reader.read_u32::<LittleEndian>()?;
-            let sample_rate = reader.read_f32::<LittleEndian>()?;
-            let mut reserved2 = [0u8; 8];
-            reader.read_exact(&mut reserved2)?;
-            let center_frequency = reader.read_f32::<LittleEndian>()?;
-            let mut device_name = [0u8; 8];
-            reader.read_exact(&mut device_name)?;
-            Ok(StrmChunk {
-                header: RtsaChunkHeader {
-                    id: *b"STRM",
-                    size: _size,
-                    flags: 0,
-                    version: 1,
-                    header_size: 40,
-                },
-                stream_id,
-                start_time: 0.0,
-                stream_offset: 0,
-                stream_type: Some(stream_type),
-                sample_rate: Some(sample_rate),
-                center_frequency: Some(center_frequency),
-                device_name: Some(device_name),
-            })
-        } else {
-            Ok(StrmChunk {
-                header: RtsaChunkHeader {
-                    id: *b"STRM",
-                    size: _size,
-                    flags: 0,
-                    version: 1,
-                    header_size: 24,
-                },
-                stream_id: reader.read_u64::<LittleEndian>()?,
-                start_time: reader.read_f64::<LittleEndian>()?,
-                stream_offset: reader.read_i64::<LittleEndian>()?,
-                stream_type: None,
-                sample_rate: None,
-                center_frequency: None,
-                device_name: None,
-            })
+        const HEADER_SIZE: u32 = 24;
+        let stream_id = reader.read_u64::<LittleEndian>()?;
+        let start_time = reader.read_f64::<LittleEndian>()?;
+        let stream_offset = reader.read_i64::<LittleEndian>()?;
+
+        let remaining = _size as i64 - HEADER_SIZE as i64 - 16;
+        if remaining > 0 {
+            reader.seek(SeekFrom::Current(remaining))?;
         }
+
+        Ok(StrmChunk {
+            header: RtsaChunkHeader {
+                id: *b"STRM",
+                size: _size,
+                flags: 0,
+                version: 1,
+                header_size: HEADER_SIZE as u16,
+            },
+            stream_id,
+            start_time,
+            stream_offset,
+        })
     }
 }
 
@@ -2566,7 +2502,8 @@ impl SscaChunk {
 
 impl AntaChunk {
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32) -> Result<Self> {
-        const HEADER_SIZE: u32 = 244;
+        // Fixed fields: 8 + 8 + 128 + 8 + 8 + 4 + 4 + 64 + 16 = 248.
+        const HEADER_SIZE: u32 = 248;
         let antenna_id = reader.read_u64::<LittleEndian>()?;
         let antenna_offset = reader.read_i64::<LittleEndian>()?;
         let mut name = [0u8; 128];
@@ -2782,7 +2719,9 @@ impl MdttChunk {
 
 impl SprvChunk {
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32) -> Result<Self> {
-        const HEADER_SIZE: u32 = 390;
+        // Fixed fields: 2 x u8, 6 bytes alignment padding, then three
+        // 16-element 8-byte arrays (2 + 6 + 3*128 = 392).
+        const HEADER_SIZE: u32 = 392;
         let preview_level = reader.read_u8()?;
         let preview_count = reader.read_u8()?;
         reader.seek(SeekFrom::Current(6))?;
@@ -2823,25 +2762,68 @@ impl SprvChunk {
 
 impl StrtChunk {
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32) -> Result<Self> {
+        // Fixed fields incl. the 4-byte alignment padding before
+        // mEndTime: 3*8 + 2*8 + 3*4 + 4 + 8 + 8 + 8 = 80.
+        const HEADER_SIZE: u32 = 80;
+        let stream_offset = reader.read_i64::<LittleEndian>()?;
+        let sub_stream_offset = reader.read_i64::<LittleEndian>()?;
+        let preview_offset = reader.read_i64::<LittleEndian>()?;
+        let num_samples = reader.read_u64::<LittleEndian>()?;
+        let payload_size = reader.read_u64::<LittleEndian>()?;
+        let preview_levels = reader.read_u32::<LittleEndian>()?;
+        let num_previews = reader.read_u32::<LittleEndian>()?;
+        let num_preview_segments = reader.read_u32::<LittleEndian>()?;
+        // The three u32 fields above leave the stream 4-byte aligned;
+        // the on-disk struct inserts 4 bytes of compiler padding before
+        // the 8-byte-aligned mEndTime double (same hazard SSTR has
+        // between mSubStreamID and mSubStreamOffset). Reading straight
+        // through instead yields a garbage end time and a garbage
+        // antenna offset assembled from the two halves of the double.
+        reader.seek(SeekFrom::Current(4))?;
+        let end_time = reader.read_f64::<LittleEndian>()?;
+        let mut consumed: i64 = 64;
+        // The tail offsets are size-versioned: the official spec's own
+        // worked example is an 88-byte STRT that ends at
+        // mAntennaOffset, with no mMetaDataOffset. Read each only if
+        // the declared chunk size says it is present.
+        let payload = _size as i64 - 16;
+        let antenna_offset = if payload >= consumed + 8 {
+            consumed += 8;
+            reader.read_i64::<LittleEndian>()?
+        } else {
+            0
+        };
+        let metadata_offset = if payload >= consumed + 8 {
+            consumed += 8;
+            reader.read_i64::<LittleEndian>()?
+        } else {
+            0
+        };
+
+        let remaining = payload - consumed;
+        if remaining > 0 {
+            reader.seek(SeekFrom::Current(remaining))?;
+        }
+
         Ok(StrtChunk {
             header: RtsaChunkHeader {
                 id: *b"STRT",
                 size: _size,
                 flags: 0,
                 version: 1,
-                header_size: 80,
+                header_size: HEADER_SIZE as u16,
             },
-            stream_offset: reader.read_i64::<LittleEndian>()?,
-            sub_stream_offset: reader.read_i64::<LittleEndian>()?,
-            preview_offset: reader.read_i64::<LittleEndian>()?,
-            num_samples: reader.read_u64::<LittleEndian>()?,
-            payload_size: reader.read_u64::<LittleEndian>()?,
-            preview_levels: reader.read_u32::<LittleEndian>()?,
-            num_previews: reader.read_u32::<LittleEndian>()?,
-            num_preview_segments: reader.read_u32::<LittleEndian>()?,
-            end_time: reader.read_f64::<LittleEndian>()?,
-            antenna_offset: reader.read_i64::<LittleEndian>()?,
-            metadata_offset: reader.read_i64::<LittleEndian>()?,
+            stream_offset,
+            sub_stream_offset,
+            preview_offset,
+            num_samples,
+            payload_size,
+            preview_levels,
+            num_previews,
+            num_preview_segments,
+            end_time,
+            antenna_offset,
+            metadata_offset,
         })
     }
 }
@@ -2935,126 +2917,100 @@ mod tests {
         assert_eq!(header.header_size, 16);
     }
 
-    // Test DspStreamSampleType enum conversion
+    // Test DspStreamSampleType enum conversion. Values follow the
+    // official DPSStreamSampleType enum: the signed variant precedes
+    // the unsigned one at each width (U8, U16, S16, U32, S32, F32),
+    // and the packet-storage variants repeat that order from 6.
     #[test]
     fn test_dsp_stream_sample_type_conversion() {
+        let expected = [
+            (0u8, DspStreamSampleType::DsStU8),
+            (1, DspStreamSampleType::DsStU16),
+            (2, DspStreamSampleType::DsStS16),
+            (3, DspStreamSampleType::DsStU32),
+            (4, DspStreamSampleType::DsStS32),
+            (5, DspStreamSampleType::DsStF32),
+            (6, DspStreamSampleType::DsStU8N),
+            (7, DspStreamSampleType::DsStU16N),
+            (8, DspStreamSampleType::DsStS16N),
+            (9, DspStreamSampleType::DsStU32N),
+            (10, DspStreamSampleType::DsStS32N),
+            (11, DspStreamSampleType::DsStF32N),
+        ];
+        for (value, variant) in expected {
+            assert_eq!(DspStreamSampleType::try_from(value).unwrap(), variant);
+            assert_eq!(variant as u8, value);
+        }
+        // Out-of-range values degrade to Unknown instead of failing
+        // the whole file open.
         assert_eq!(
-            DspStreamSampleType::try_from(0).unwrap(),
-            DspStreamSampleType::DsStU8
+            DspStreamSampleType::try_from(255).unwrap(),
+            DspStreamSampleType::Unknown
         );
-        assert_eq!(
-            DspStreamSampleType::try_from(1).unwrap(),
-            DspStreamSampleType::DsStU16
-        );
-        assert_eq!(
-            DspStreamSampleType::try_from(2).unwrap(),
-            DspStreamSampleType::DsStU32
-        );
-        assert_eq!(
-            DspStreamSampleType::try_from(3).unwrap(),
-            DspStreamSampleType::DsStS16
-        );
-        assert_eq!(
-            DspStreamSampleType::try_from(4).unwrap(),
-            DspStreamSampleType::DsStS32
-        );
-        assert_eq!(
-            DspStreamSampleType::try_from(5).unwrap(),
-            DspStreamSampleType::DsStF32
-        );
-        assert_eq!(
-            DspStreamSampleType::try_from(6).unwrap(),
-            DspStreamSampleType::DsStU8N
-        );
-        assert_eq!(
-            DspStreamSampleType::try_from(7).unwrap(),
-            DspStreamSampleType::DsStU16N
-        );
-        assert_eq!(
-            DspStreamSampleType::try_from(8).unwrap(),
-            DspStreamSampleType::DsStS16N
-        );
-        assert!(DspStreamSampleType::try_from(255).is_err());
     }
 
-    // Test DspStreamSampleUnit enum conversion
+    // Test DspStreamSampleUnit enum conversion (official
+    // DSPStreamSampleUnit ordering)
     #[test]
     fn test_dsp_stream_sample_unit_conversion() {
+        let expected = [
+            (0u8, DspStreamSampleUnit::DssuGeneric),
+            (1, DspStreamSampleUnit::DssuDbm),
+            (2, DspStreamSampleUnit::DssuPercentage),
+            (3, DspStreamSampleUnit::DssuDbmHz),
+            (4, DspStreamSampleUnit::DssuDbmM2),
+            (5, DspStreamSampleUnit::DssuIndex),
+            (6, DspStreamSampleUnit::DssuPhase),
+            (7, DspStreamSampleUnit::DssuSigned1),
+            (8, DspStreamSampleUnit::DssuUnsigned1),
+            (9, DspStreamSampleUnit::DssuTime),
+            (10, DspStreamSampleUnit::DssuDateTime),
+            (11, DspStreamSampleUnit::DssuHz),
+            (12, DspStreamSampleUnit::DssuHzLog),
+            (13, DspStreamSampleUnit::DssuWatt),
+            (14, DspStreamSampleUnit::DssuSector),
+            (15, DspStreamSampleUnit::DssuSymbol),
+            (16, DspStreamSampleUnit::DssuDb),
+            (17, DspStreamSampleUnit::DssuNumeric),
+            (18, DspStreamSampleUnit::DssuHzLogCenter),
+            (19, DspStreamSampleUnit::DssuVolt),
+            (20, DspStreamSampleUnit::DssuLogPercentage),
+        ];
+        for (value, variant) in expected {
+            assert_eq!(DspStreamSampleUnit::try_from(value).unwrap(), variant);
+            assert_eq!(variant as u8, value);
+        }
         assert_eq!(
-            DspStreamSampleUnit::try_from(0).unwrap(),
-            DspStreamSampleUnit::DssuGeneric
+            DspStreamSampleUnit::try_from(255).unwrap(),
+            DspStreamSampleUnit::Unknown
         );
-        assert_eq!(
-            DspStreamSampleUnit::try_from(1).unwrap(),
-            DspStreamSampleUnit::DssuDbm
-        );
-        assert_eq!(
-            DspStreamSampleUnit::try_from(2).unwrap(),
-            DspStreamSampleUnit::DssuDbmHz
-        );
-        assert_eq!(
-            DspStreamSampleUnit::try_from(3).unwrap(),
-            DspStreamSampleUnit::DssuPercentage
-        );
-        assert_eq!(
-            DspStreamSampleUnit::try_from(4).unwrap(),
-            DspStreamSampleUnit::DssuHz
-        );
-        assert_eq!(
-            DspStreamSampleUnit::try_from(5).unwrap(),
-            DspStreamSampleUnit::DssuWatt
-        );
-        assert_eq!(
-            DspStreamSampleUnit::try_from(6).unwrap(),
-            DspStreamSampleUnit::DssuVolt
-        );
-        assert_eq!(
-            DspStreamSampleUnit::try_from(7).unwrap(),
-            DspStreamSampleUnit::DssuTime
-        );
-        assert_eq!(
-            DspStreamSampleUnit::try_from(8).unwrap(),
-            DspStreamSampleUnit::DssuDateTime
-        );
-        assert!(DspStreamSampleUnit::try_from(255).is_err());
     }
 
-    // Test DspStreamPayloadType enum conversion
+    // Test DspStreamPayloadType enum conversion (official
+    // DSPStreamPayloadType ordering)
     #[test]
     fn test_dsp_stream_payload_type_conversion() {
+        let expected = [
+            (0u8, DspStreamPayloadType::DsptGeneric),
+            (1, DspStreamPayloadType::DsptAudio),
+            (2, DspStreamPayloadType::DsptIq),
+            (3, DspStreamPayloadType::DsptSpectra),
+            (4, DspStreamPayloadType::DsptDetection),
+            (5, DspStreamPayloadType::DsptHistogram),
+            (6, DspStreamPayloadType::DsptEnergy),
+            (7, DspStreamPayloadType::DsptVector3),
+            (8, DspStreamPayloadType::DsptStructured),
+            (9, DspStreamPayloadType::DsptIqSlice),
+            (10, DspStreamPayloadType::DsptImage),
+        ];
+        for (value, variant) in expected {
+            assert_eq!(DspStreamPayloadType::try_from(value).unwrap(), variant);
+            assert_eq!(variant as u8, value);
+        }
         assert_eq!(
-            DspStreamPayloadType::try_from(0).unwrap(),
-            DspStreamPayloadType::DsptGeneric
+            DspStreamPayloadType::try_from(255).unwrap(),
+            DspStreamPayloadType::Unknown
         );
-        assert_eq!(
-            DspStreamPayloadType::try_from(1).unwrap(),
-            DspStreamPayloadType::DsptAudio
-        );
-        assert_eq!(
-            DspStreamPayloadType::try_from(2).unwrap(),
-            DspStreamPayloadType::DsptIq
-        );
-        assert_eq!(
-            DspStreamPayloadType::try_from(3).unwrap(),
-            DspStreamPayloadType::DsptSpectra
-        );
-        assert_eq!(
-            DspStreamPayloadType::try_from(4).unwrap(),
-            DspStreamPayloadType::DsptDetection
-        );
-        assert_eq!(
-            DspStreamPayloadType::try_from(5).unwrap(),
-            DspStreamPayloadType::DsptHistogram
-        );
-        assert_eq!(
-            DspStreamPayloadType::try_from(6).unwrap(),
-            DspStreamPayloadType::DsptStructured
-        );
-        assert_eq!(
-            DspStreamPayloadType::try_from(7).unwrap(),
-            DspStreamPayloadType::DsptImage
-        );
-        assert!(DspStreamPayloadType::try_from(255).is_err());
     }
 
     // Test MetaType enum conversion
@@ -3100,19 +3056,16 @@ mod tests {
         assert!((dsfh.creation_time - 1609459200.0).abs() < 1.0); // Allow small floating point error
     }
 
-    // Test STRM chunk parsing (proximity-based format)
+    // Test STRM chunk parsing (minimal spec-conformant 40-byte chunk,
+    // matching the worked example in the official file-format PDF)
     #[test]
-    fn test_strm_chunk_proximity_format() {
+    fn test_strm_chunk_40_byte_standard_format() {
         let data = vec![
-            // Stream ID as u32 (little-endian): 12345
-            0x39, 0x30, 0x00, 0x00, // Stream type: 1
-            0x01, 0x00, 0x00, 0x00, // Reserved1: 0
-            0x00, 0x00, 0x00, 0x00, // Sample rate as f32: 2048000.0 Hz
-            0x00, 0x00, 0xfa, 0x49, // Reserved2: 8 bytes of zeros
+            // Stream ID as u64 (little-endian): 12345
+            0x39, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // Start time as f64: 1609459200.0
+            0x00, 0x00, 0x00, 0x80, 0x99, 0xfb, 0xd7, 0x41, // Stream offset as i64: 0
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            // Center frequency as f32: 915000000.0 Hz
-            0x2b, 0x27, 0x5a, 0x4e, // Device name: "TESTDEV" + null byte
-            b'T', b'E', b'S', b'T', b'D', b'E', b'V', 0x00,
         ];
 
         let mut cursor = Cursor::new(data);
@@ -3120,34 +3073,34 @@ mod tests {
 
         assert_eq!(&strm.header.id, b"STRM");
         assert_eq!(strm.stream_id, 12345);
-        assert_eq!(strm.stream_type, Some(1));
-        assert!((strm.sample_rate.unwrap() - 2048000.0).abs() < 1.0);
-        assert!((strm.center_frequency.unwrap() - 915000000.0).abs() < 1000.0);
-        assert_eq!(strm.device_name.unwrap()[0..7], b"TESTDEV"[..]);
+        assert!((strm.start_time - 1609459200.0).abs() < 1.0);
+        assert_eq!(strm.stream_offset, 0);
     }
 
-    // Test STRM chunk parsing (standard format)
+    // Test STRM chunk parsing (48-byte chunk as written by RTSA Suite:
+    // standard fields plus 8 trailing bytes the reader must skip)
     #[test]
-    fn test_strm_chunk_standard_format() {
+    fn test_strm_chunk_standard_format_with_trailing_bytes() {
         let data = vec![
             // Stream ID as u64 (little-endian): 98765
             0xCD, 0x81, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
             // Start time as f64: 1609459200.0
             0x00, 0x00, 0x00, 0x80, 0x99, 0xfb, 0xd7, 0x41, // Stream offset as i64: 4096
             0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // 8 trailing bytes (undocumented double in real captures)
+            0x87, 0x2d, 0x9b, 0x17, 0xcc, 0xac, 0x6f, 0x40,
         ];
 
         let mut cursor = Cursor::new(data);
-        let strm = StrmChunk::read_from(&mut cursor, 32).unwrap();
+        let strm = StrmChunk::read_from(&mut cursor, 48).unwrap();
 
         assert_eq!(&strm.header.id, b"STRM");
         assert_eq!(strm.stream_id, 98765);
         assert!((strm.start_time - 1609459200.0).abs() < 1.0);
         assert_eq!(strm.stream_offset, 4096);
-        assert_eq!(strm.stream_type, None);
-        assert_eq!(strm.sample_rate, None);
-        assert_eq!(strm.center_frequency, None);
-        assert_eq!(strm.device_name, None);
+        // The trailing bytes must be consumed so the reader is
+        // positioned at the end of the chunk.
+        assert_eq!(cursor.position(), 32);
     }
 
     // Test SAMP chunk parsing
@@ -3266,7 +3219,10 @@ mod tests {
             0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, // Preview levels as u32: 4
             0x04, 0x00, 0x00, 0x00, // Num previews as u32: 16
             0x10, 0x00, 0x00, 0x00, // Num preview segments as u32: 256
-            0x00, 0x01, 0x00, 0x00, // End time as f64: 1609459201.0
+            0x00, 0x01, 0x00, 0x00,
+            // 4 bytes of alignment padding before the 8-byte-aligned
+            // mEndTime (uninitialised garbage in real captures)
+            0xff, 0x7f, 0x00, 0x00, // End time as f64: 1609459201.0
             0x00, 0x00, 0x40, 0x80, 0x99, 0xfb, 0xd7, 0x41,
             // Antenna offset as i64: 32768
             0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -3275,7 +3231,7 @@ mod tests {
         ];
 
         let mut cursor = Cursor::new(data);
-        let strt = StrtChunk::read_from(&mut cursor, 80).unwrap();
+        let strt = StrtChunk::read_from(&mut cursor, 96).unwrap();
 
         assert_eq!(&strt.header.id, b"STRT");
         assert_eq!(strt.stream_offset, 8192);
@@ -3289,6 +3245,41 @@ mod tests {
         assert!((strt.end_time - 1609459201.0).abs() < 1.0);
         assert_eq!(strt.antenna_offset, 32768);
         assert_eq!(strt.metadata_offset, 65536);
+    }
+
+    // Test STRT chunk parsing for the 88-byte layout used in the
+    // official spec's worked example, which ends at mAntennaOffset and
+    // carries no mMetaDataOffset.
+    #[test]
+    fn test_strt_chunk_parsing_88_byte_no_metadata_offset() {
+        let data = vec![
+            // Stream offset as i64: 0x18
+            0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // Sub stream offset as i64: 0x138
+            0x38, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Preview offset as i64: 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Num samples as u64: 4880
+            0x10, 0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Payload size as u64: 0x10ae000
+            0x00, 0xe0, 0x0a, 0x01, 0x00, 0x00, 0x00, 0x00, // Preview levels as u32: 1
+            0x01, 0x00, 0x00, 0x00, // Num previews as u32: 6
+            0x06, 0x00, 0x00, 0x00, // Num preview segments as u32: 88
+            0x58, 0x00, 0x00, 0x00, // Alignment padding
+            0x00, 0x00, 0x00, 0x00, // End time as f64: 68.13
+            0x78, 0xf8, 0xd9, 0x3d, 0x29, 0x08, 0x51, 0x40,
+            // Antenna offset as i64: 0x40 — last field of this layout
+            0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let mut cursor = Cursor::new(data);
+        let strt = StrtChunk::read_from(&mut cursor, 88).unwrap();
+
+        assert_eq!(strt.stream_offset, 0x18);
+        assert_eq!(strt.num_preview_segments, 88);
+        assert!((strt.end_time - 68.127).abs() < 0.01);
+        assert_eq!(strt.antenna_offset, 0x40);
+        // Absent from this layout: must default to 0, not read past
+        // the chunk end.
+        assert_eq!(strt.metadata_offset, 0);
+        assert_eq!(cursor.position(), 72);
     }
 
     // Test DSFT chunk parsing
@@ -3509,10 +3500,7 @@ mod tests {
             file_format_version: "RTSA".to_string(),
             primary_stream_id: 1,
             stream_type: Some("IQ_SAMPLES".to_string()),
-            stream_sample_rate: Some(2048000.0),
-            stream_center_frequency: Some(915000000.0),
             stream_start_time: 1609459200.0,
-            device_name: None,
             sub_streams: Vec::new(),
             antennas: Vec::new(),
             previews: Vec::new(),
@@ -3550,9 +3538,15 @@ mod tests {
         let mut cursor = Cursor::new(short_data);
         assert!(RtsaChunkHeader::read_from(&mut cursor).is_err());
 
-        // Test invalid enum conversion
-        assert!(DspStreamSampleType::try_from(200).is_err());
-        assert!(MetaType::try_from(200).is_err()); // Should error for truly invalid values
+        // Out-of-range SAMP enums degrade to Unknown so a single odd
+        // chunk cannot make the whole file unreadable...
+        assert_eq!(
+            DspStreamSampleType::try_from(200).unwrap(),
+            DspStreamSampleType::Unknown
+        );
+        // ...but MetaType stays strict: a bad type code means the MDTT
+        // definition cannot be parsed at all.
+        assert!(MetaType::try_from(200).is_err());
     }
 
     // Test chunk size validation logic
@@ -3605,10 +3599,6 @@ mod tests {
             stream_id: 1,
             start_time: 1640995200.0,
             stream_offset: 0,
-            stream_type: Some(1), // IQ signal type
-            sample_rate: Some(2_000_000.0),
-            center_frequency: Some(100_000_000.0),
-            device_name: Some(*b"TESTDEV\0"),
         };
 
         let sstr_chunk = SstrChunk {
@@ -3623,7 +3613,9 @@ mod tests {
             sub_stream_id: 1,
             sub_stream_offset: 0,
             frequency_start: 99_000_000.0,
-            frequency_step: 1_000_000.0,
+            // For IQ sub-streams the sample rate (frequency_step) and
+            // span coincide, as in real RTSA-Suite captures.
+            frequency_step: 2_000_000.0,
             frequency_span: 2_000_000.0,
             value_minimum: -100.0,
             value_maximum: 0.0,
@@ -3680,7 +3672,9 @@ mod tests {
             preview_levels: 0,
             num_previews: 0,
             num_preview_segments: 0,
-            end_time: 1640995201.0,
+            // Stream duration in seconds (mEndTime is relative to the
+            // stream start), matching a 1 Msample capture at 2 Msps.
+            end_time: 0.5,
             antenna_offset: 0,
             metadata_offset: 0,
         };
@@ -3758,12 +3752,16 @@ mod tests {
         assert_eq!(metadata.sub_streams[0].frequency_start, 99_000_000.0);
         assert_eq!(metadata.sub_streams[0].frequency_span, 2_000_000.0);
 
-        // Validate stream tail
+        // Validate stream tail: end_time is the raw stream duration
         assert!(metadata.stream_tail.is_some());
         let tail = metadata.stream_tail.as_ref().unwrap();
         assert_eq!(tail.num_samples, 1_000_000);
         assert_eq!(tail.payload_size, 8_000_000);
-        assert_eq!(tail.end_time, 1640995201.0);
+        assert_eq!(tail.end_time, 0.5);
+
+        // The absolute end is the STRM start plus the STRT duration
+        assert_eq!(metadata.start_time_ns, 1_640_995_200_000_000_000);
+        assert_eq!(metadata.end_time_ns, 1_640_995_200_500_000_000);
     }
 
     #[test]
@@ -3781,10 +3779,7 @@ mod tests {
             file_format_version: "RTSA".to_string(),
             primary_stream_id: 1,
             stream_type: Some("IQ_SAMPLES".to_string()),
-            stream_sample_rate: Some(2_000_000.0),
-            stream_center_frequency: Some(100_000_000.0),
             stream_start_time: 1640995200.0,
-            device_name: None,
             sub_streams: vec![SubStreamInfo {
                 stream_id: 1,
                 sub_stream_id: 1,
@@ -3854,10 +3849,7 @@ mod tests {
             file_format_version: "RTSA".to_string(),
             primary_stream_id: 1,
             stream_type: None,
-            stream_sample_rate: None,
-            stream_center_frequency: None,
             stream_start_time: 0.0,
-            device_name: None,
             sub_streams,
             antennas: Vec::new(),
             previews: Vec::new(),
@@ -3992,10 +3984,7 @@ mod tests {
             file_format_version: "RTSA".to_string(),
             primary_stream_id: 1,
             stream_type: Some("IQ_SAMPLES".to_string()),
-            stream_sample_rate: Some(2_000_000.0),
-            stream_center_frequency: Some(100_000_000.0),
             stream_start_time: 1640995200.0,
-            device_name: None,
             sub_streams: Vec::new(),
             antennas: vec![antenna_info],
             previews: Vec::new(),
@@ -4425,7 +4414,7 @@ mod tests {
         data.write_u32::<LittleEndian>(96).unwrap(); // size = 96
         data.write_u32::<LittleEndian>(0).unwrap(); // flags = 0
         data.write_u16::<LittleEndian>(1).unwrap(); // version = 1
-        data.write_u16::<LittleEndian>(72).unwrap(); // header_size = 72
+        data.write_u16::<LittleEndian>(96).unwrap(); // header_size = 96
         // STRT fields
         data.write_i64::<LittleEndian>(24).unwrap(); // stream_offset = 24 (points to STRM)
         data.write_i64::<LittleEndian>(64).unwrap(); // sub_stream_offset = 64 (points to SSTR)
@@ -4435,10 +4424,10 @@ mod tests {
         data.write_u32::<LittleEndian>(0).unwrap(); // preview_levels
         data.write_u32::<LittleEndian>(0).unwrap(); // num_previews
         data.write_u32::<LittleEndian>(0).unwrap(); // num_preview_segments
+        data.write_u32::<LittleEndian>(0).unwrap(); // alignment padding before end_time
         data.write_f64::<LittleEndian>(1609459201.0).unwrap(); // end_time
         data.write_i64::<LittleEndian>(0).unwrap(); // antenna_offset
         data.write_i64::<LittleEndian>(0).unwrap(); // metadata_offset
-        data.write_u32::<LittleEndian>(0).unwrap(); // padding to align to size 96
 
         // 5. Write first SAMP chunk: stream=123, sub=1, 10 samples
         // size = 144 (64 header + 80 data), header_size = 64
