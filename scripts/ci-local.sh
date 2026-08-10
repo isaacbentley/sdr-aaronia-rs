@@ -139,12 +139,28 @@ fi
 # (~/Documents ⇒ EDEADLK), hence the rsync to /private/tmp first.
 if ! skipped vm; then
     if container system status >/dev/null 2>&1; then
-        step "cargo test --features native-sdk --lib (Linux VM via container)"
-        vm_dir=/private/tmp/aaronia-linux-vm
-        rsync -a --delete --exclude target --exclude target-linux --exclude .git \
-            ./ "$vm_dir/"
-        container run --rm -v "$vm_dir":/w -w /w rust:slim \
-            sh -c 'cargo test --features native-sdk --lib'
+        step "CI ubuntu leg in Linux VM: clippy --all-features --all-targets + cargo test --all-features"
+        # Dedicated directory: nothing else may write here (a shared
+        # scratch copy once had another tool rsync over it mid-run).
+        vm_dir=/private/tmp/aaronia-ci-vm
+        rsync -a --delete --exclude target --exclude target-linux \
+            --exclude .git --exclude .claude ./ "$vm_dir/"
+        # The full --all-targets matters: an OS-gated *example* with a
+        # stale call signature shipped red to CI past a --lib-only VM
+        # run. This mirrors CI's ubuntu leg command-for-command.
+        # rust:slim lacks what the GitHub ubuntu runner image ships
+        # preinstalled: clippy, pkg-config, and ALSA headers (futuresdr's
+        # audio feature -> alsa-sys). Install per run; the persistent
+        # target/ under $vm_dir keeps rebuilds incremental.
+        # --memory 8g: the all-features lib-test link OOM-kills the
+        # container CLI's default allocation (ld dies with SIGKILL).
+        container run --rm --memory 8g --cpus 4 \
+            -v "$vm_dir":/w -w /w -e PROPTEST_CASES="$PROPTEST_CASES" rust:slim \
+            sh -c 'rustup component add clippy >/dev/null 2>&1; \
+                   apt-get update -qq >/dev/null && \
+                   apt-get install -y -qq pkg-config libasound2-dev >/dev/null; \
+                   cargo clippy --all-features --all-targets -- -D warnings \
+                   && cargo test --all-features'
     else
         echo "vm step: 'container system start' not running — skipping" \
              "(gated-module tests only compile on CI's linux/windows legs)" >&2

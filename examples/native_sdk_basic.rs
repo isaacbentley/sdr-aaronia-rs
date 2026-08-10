@@ -66,7 +66,9 @@ fn main() -> anyhow::Result<()> {
             "Configuring IQ receiver: {} Hz center, {} Hz span, {} dBm ref level",
             center_freq, span_freq, ref_level
         );
-        sdk_source.configure_iq_receiver(center_freq, span_freq, ref_level)?;
+        // `None` keeps the Rx1 default; pass Some(RxChannel::Rx2) or
+        // Some(RxChannel::Rx1And2) on a full V6 to select inputs.
+        sdk_source.configure_iq_receiver(center_freq, span_freq, ref_level, None)?;
 
         // Optional: `set_decimation_factor` accepts powers of two in
         // [1, 512]; factor 1 (`Full`) keeps the native rate. The helper

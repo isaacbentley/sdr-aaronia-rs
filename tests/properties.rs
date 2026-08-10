@@ -333,3 +333,75 @@ proptest! {
         let _ = parser.process_data(&Bytes::from(data));
     }
 }
+
+// ---- RTSA file parser robustness -----------------------------------
+
+/// Write `bytes` to a fresh temp file, run `RtsaSource::open`, and let
+/// the result (Ok or Err) drop. The property is purely "no panic, no
+/// hang": arbitrary bytes must read as a malformed file, never crash
+/// the process. (`tempfile` is not a dev-dependency, so this builds
+/// unique std temp paths by pid + counter.)
+fn open_arbitrary_file(bytes: &[u8]) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "rtsa-prop-{}-{}.rtsa",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut f = std::fs::File::create(&path).expect("create temp file");
+        f.write_all(bytes).expect("write temp file");
+    }
+    let _ = sdr_aaronia_rs::file_source::RtsaSource::open(&path);
+    let _ = std::fs::remove_file(&path);
+}
+
+proptest! {
+    // Each case costs real file IO plus a full open scan; 64 cases per
+    // property keeps the pair under a second while still sweeping the
+    // header/size/offset space. Explicit config: this must not scale
+    // with PROPTEST_CASES=4096 nightly runs.
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// Pure fuzz: any byte soup up to 4 KiB.
+    #[test]
+    fn prop_rtsa_open_arbitrary_bytes_never_panics(
+        data in proptest::collection::vec(any::<u8>(), 0..4096)
+    ) {
+        open_arbitrary_file(&data);
+    }
+
+    /// Structured fuzz: a valid DSFH header and DSFT trailer around an
+    /// arbitrary chunk soup, with an arbitrary DSFT stream offset —
+    /// drives the STRT discovery, chain walkers, and proximity search
+    /// past the entry checks that plain byte soup rarely survives.
+    #[test]
+    fn prop_rtsa_open_chunk_soup_never_panics(
+        middle in proptest::collection::vec(any::<u8>(), 0..2048),
+        stream_offset in any::<u64>(),
+    ) {
+        let mut f = Vec::new();
+        // DSFH: id, size=24, flags, version, header_size, creation_time
+        f.extend_from_slice(b"DSFH");
+        f.extend_from_slice(&24u32.to_le_bytes());
+        f.extend_from_slice(&0u32.to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&24u16.to_le_bytes());
+        f.extend_from_slice(&1.6e9f64.to_le_bytes());
+        f.extend_from_slice(&middle);
+        // DSFT: id, size=40, flags, version, header_size,
+        // completion_time, stream_offset (arbitrary!), num_streams, pad
+        f.extend_from_slice(b"DSFT");
+        f.extend_from_slice(&40u32.to_le_bytes());
+        f.extend_from_slice(&0u32.to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&40u16.to_le_bytes());
+        f.extend_from_slice(&1.6e9f64.to_le_bytes());
+        f.extend_from_slice(&stream_offset.to_le_bytes());
+        f.extend_from_slice(&1u32.to_le_bytes());
+        f.extend_from_slice(&0u32.to_le_bytes());
+        open_arbitrary_file(&f);
+    }
+}

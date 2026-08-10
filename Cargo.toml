@@ -49,11 +49,16 @@ wiremock = "0.6" # For HTTP endpoint resiliency testing
 
 # Each `[[bench]]` declares one criterion harness binary. Run with
 # `cargo bench --bench <name>`. Coverage:
-#   parse_int16_packet  — HTTP int16 packet parse throughput
-#   decompress_block    — Rice + wavelet decode throughput
-#   rtsa_open_and_read  — RTSA file open + sample read (LFS fixture)
+#   parse_int16_packet    — HTTP int16 packet parse throughput
+#   decompress_block      — Rice + wavelet decode throughput
+#   rtsa_open_and_read    — RTSA file open + sample read (LFS fixture)
+#   deinterleave_dual_iq  — dual-channel IQ demux (native-SDK hot path)
 [[bench]]
 name = "parse_int16_packet"
+harness = false
+
+[[bench]]
+name = "deinterleave_dual_iq"
 harness = false
 
 [[bench]]

@@ -28,7 +28,12 @@ All notable changes to this project will be documented in this file.
   `start_time_ns` is now anchored with it so reported spans match the
   recorded data.
 - `scripts/ci-local.sh`: local CI-parity gate incl. cross-target and
-  Linux-VM coverage of the OS-gated native-SDK modules.
+  Linux-VM coverage of the OS-gated native-SDK modules (the VM step
+  runs CI's exact ubuntu-leg commands).
+- `benches/deinterleave_dual_iq`: criterion bench pinning the
+  dual-channel demux hot path (~1.5 Gsamples/s per core baseline).
+- Parser-robustness property tests: `RtsaSource::open` on arbitrary
+  byte soup and on structured DSFH/DSFT chunk soup must never panic.
 
 ### Fixed
 - RTSA chunk parsing verified against the vendor spec and real
