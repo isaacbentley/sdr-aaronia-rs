@@ -314,7 +314,21 @@ impl Kernel for HttpSink {
         self.input.consume(consumed);
 
         if self.input.finished() && consumed == input_len {
-            // Next call will handle io.finished
+            // Finish *now*, in this call. The previous code left this
+            // branch empty ("next call will handle io.finished"), which
+            // silently assumed the runtime would invoke work() once more
+            // after the upstream's finish notification. When the finish
+            // flag arrived together with the final samples — the normal
+            // case for a short VectorSource graph — no further callback
+            // is guaranteed, and the flowgraph hung forever awaiting a
+            // work() call that never came. That is the intermittent
+            // wedge that stalled a windows-latest CI runner for ~2 hours
+            // and reproduced under the constrained Linux VM: timing
+            // determined whether an extra callback happened to arrive.
+            if !self.sample_buffer.is_empty() {
+                let _ = self.push_batch().await;
+            }
+            io.finished = true;
         }
 
         Ok(())
