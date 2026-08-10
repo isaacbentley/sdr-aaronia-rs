@@ -5,8 +5,31 @@ use futuresdr::runtime::Runtime;
 use num_complex::Complex32;
 use sdr_aaronia_rs::http_endpoints::AuthMethod;
 use sdr_aaronia_rs::http_sink::HttpSinkBuilder;
+use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Hard deadline for a flowgraph run. These graphs process a handful of
+/// samples and normally finish in milliseconds; the guard exists because
+/// an intermittent Windows-only hang in this suite once wedged a CI
+/// runner for ~2 hours (run 31352924497) with no output past "running 3
+/// tests". A hang should be a fast, attributable failure, not a stuck
+/// runner.
+const FLOWGRAPH_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Run `fg` to completion under [`FLOWGRAPH_DEADLINE`].
+///
+/// The callers use a multi-thread tokio runtime so this timer (and the
+/// wiremock server the sink talks to) keeps running even if polling the
+/// FutureSDR future ever blocks its worker thread — the suspected shape
+/// of the CI hang, which a timeout on a single-threaded runtime could
+/// not interrupt.
+async fn run_flowgraph_with_deadline(fg: Flowgraph) {
+    tokio::time::timeout(FLOWGRAPH_DEADLINE, Runtime::new().run_async(fg))
+        .await
+        .expect("flowgraph did not terminate within the hang-guard deadline")
+        .expect("Flowgraph execution failed");
+}
 
 #[tokio::test]
 async fn test_http_sink_builder() {
@@ -21,7 +44,7 @@ async fn test_http_sink_builder() {
     assert_eq!(sink.dropped_samples(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_http_sink_builder_and_flowgraph() -> anyhow::Result<()> {
     let mock_server = MockServer::start().await;
 
@@ -45,14 +68,11 @@ async fn test_http_sink_builder_and_flowgraph() -> anyhow::Result<()> {
     let mut fg = Flowgraph::new();
     connect!(fg, src > sink);
 
-    Runtime::new()
-        .run_async(fg)
-        .await
-        .expect("Flowgraph execution failed");
+    run_flowgraph_with_deadline(fg).await;
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_http_sink_work_server_error() -> anyhow::Result<()> {
     let mock_server = MockServer::start().await;
 
@@ -75,9 +95,6 @@ async fn test_http_sink_work_server_error() -> anyhow::Result<()> {
     let mut fg = Flowgraph::new();
     connect!(fg, src > sink);
 
-    Runtime::new()
-        .run_async(fg)
-        .await
-        .expect("Flowgraph execution failed");
+    run_flowgraph_with_deadline(fg).await;
     Ok(())
 }
