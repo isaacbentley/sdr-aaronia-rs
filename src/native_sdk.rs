@@ -1281,9 +1281,24 @@ pub struct NativeSdkSource {
     /// sample pairs not yet handed to the caller. Kept separate from
     /// `sample_buffer` — the two read paths must not share a carry
     /// stream, since a mono read of a dual carry would drop every Rx2
-    /// sample. Don't interleave `read_samples` and `read_samples_dual`
-    /// calls on one stream; each drains only its own carry.
+    /// sample. The `read_mode` latch enforces that a stream uses one
+    /// path or the other, never both.
     dual_sample_buffer: VecDeque<(Complex32, Complex32)>,
+    /// Which read path this streaming session uses, latched on the
+    /// first successful read call and cleared by
+    /// [`Self::stop_streaming`]. Mixing `read_samples` and
+    /// `read_samples_dual` on one stream would silently punch
+    /// time-gaps into both outputs (each call consumes whole packets
+    /// the other path never sees), so the second path errors instead.
+    read_mode: Option<ReadMode>,
+}
+
+/// Which of the two packet-consuming read paths a streaming session
+/// has committed to. See `NativeSdkSource::read_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadMode {
+    Mono,
+    Dual,
 }
 
 /// Device health telemetry from the SDK's `AARTSAAPI_ConfigHealth` tree.
@@ -1369,6 +1384,7 @@ impl NativeSdkSource {
                 device_connected: false,
                 sample_buffer: VecDeque::new(),
                 dual_sample_buffer: VecDeque::new(),
+                read_mode: None,
             })
         }
     }
@@ -1707,11 +1723,24 @@ impl NativeSdkSource {
         }
     }
 
+    /// Configure the IQ receiver pipeline: tuning, level, and — on raw
+    /// mode — the receiver channel.
+    ///
+    /// `channel` threads the caller's receiver-channel selection through
+    /// every (re)configuration, `None` meaning the `Rx1` default. It is
+    /// a parameter rather than a follow-up [`Self::set_receiver_channel`]
+    /// call so that *retunes cannot silently revert the channel*: this
+    /// function used to write `"Rx1"` unconditionally, which meant a
+    /// mid-stream `set_center_frequency` switched an `Rx2`/`Rx1And2`
+    /// capture back to the Rx1 antenna with no error. On non-raw open
+    /// modes an explicit `Some(channel)` is a hard error — the eco
+    /// pipeline has no `device/receiverchannel` key to honour it with.
     pub unsafe fn configure_iq_receiver(
         &mut self,
         center_freq: f64,
         span_freq: f64,
         ref_level: f64,
+        channel: Option<RxChannel>,
     ) -> Result<()> {
         unsafe {
             let device = self
@@ -1764,13 +1793,25 @@ impl NativeSdkSource {
                 .unwrap_or(true); // Unknown mode: try anyway.
 
             if writes_raw_only_keys {
-                // Configure receiver channel
+                // Configure receiver channel (caller's selection, Rx1
+                // default — see the doc comment on this function).
+                let rx = channel.unwrap_or(RxChannel::Rx1);
                 if let Ok(mut config) =
                     self.client
                         .find_config(device, &mut root, "device/receiverchannel")
                 {
-                    self.client.set_config_string(device, &mut config, "Rx1")?;
-                    info!("Set receiver channel to Rx1");
+                    self.client
+                        .set_config_string(device, &mut config, rx.as_config_str())?;
+                    info!("Set receiver channel to {}", rx.as_config_str());
+                } else if channel.is_some() {
+                    // An explicit selection that cannot be applied is an
+                    // error, not a warning: the caller would otherwise
+                    // stream from the wrong antenna.
+                    return Err(Error::Sdk(format!(
+                        "receiver channel {} requested but device/receiverchannel \
+                         config not found on this device",
+                        rx.as_config_str()
+                    )));
                 } else {
                     warn!("Could not find device/receiverchannel config");
                 }
@@ -1798,6 +1839,13 @@ impl NativeSdkSource {
                     debug!("device/receiverclock not found (may be V6 ECO with fixed clock)");
                 }
             } else {
+                if channel.is_some() {
+                    return Err(Error::Sdk(format!(
+                        "device/receiverchannel is only available on spectranv6/raw; \
+                         current open mode: {:?}",
+                        self.open_mode
+                    )));
+                }
                 debug!(
                     "Open mode {:?}: skipping device/receiverchannel, device/outputformat, \
                  device/receiverclock (raw-only keys)",
@@ -1963,6 +2011,19 @@ impl NativeSdkSource {
             // than discarded, so the IQ stream stays gap-free across calls.
             // (This mirrors the HTTP path's remainder handling in
             // `UnifiedSource::read_samples`.)
+            match self.read_mode {
+                None => self.read_mode = Some(ReadMode::Mono),
+                Some(ReadMode::Mono) => {}
+                Some(ReadMode::Dual) => {
+                    return Err(Error::Sdk(
+                        "this stream is being read with read_samples_dual; mixing the two \
+                         read paths would silently punch time-gaps into both outputs — \
+                         stop and restart streaming to switch"
+                            .to_string(),
+                    ));
+                }
+            }
+
             let ReadPlan {
                 from_carry,
                 remaining,
@@ -2029,6 +2090,11 @@ impl NativeSdkSource {
                     // Bound-check `packet.num` *before* multiplying so a garbage
                     // or hostile count can't overflow the `i64` multiply itself.
                     if packet.num as usize > MAX_SAMPLES / 2 {
+                        // Consume before erroring: get_packet always
+                        // returns the head of the queue, so a leaked
+                        // packet would make every subsequent call
+                        // re-fetch it and re-error forever.
+                        self.client.consume_packets(device, 0, 1)?;
                         return Err(Error::Sdk(format!(
                             "Packet sample count {} exceeds maximum allowed {}",
                             packet.num.saturating_mul(2),
@@ -2111,9 +2177,11 @@ impl NativeSdkSource {
 
     /// Read up to `max_samples` *pairs* of samples from a dual-channel
     /// (`Rx1+Rx2`) stream, appending channel 1 to `rx1` and channel 2 to
-    /// `rx2`. Returns the number of pairs appended; both vectors always
-    /// grow by exactly that amount, so `rx1`/`rx2` stay index-aligned in
-    /// time.
+    /// `rx2`. On `Ok(n)` both vectors grew by exactly `n`, so
+    /// `rx1`/`rx2` stay index-aligned in time. On `Err` the vectors may
+    /// have grown by the carry-over that was drained before the failure
+    /// (equally on both, preserving alignment) — treat their post-error
+    /// lengths, not the absent return value, as authoritative.
     ///
     /// Requires the stream to have been configured with
     /// [`RxChannel::Rx1And2`] (see [`Self::set_receiver_channel`]): the
@@ -2145,6 +2213,19 @@ impl NativeSdkSource {
         unsafe {
             if !self.stream_active {
                 return Err(Error::Sdk("Streaming not active".to_string()));
+            }
+
+            match self.read_mode {
+                None => self.read_mode = Some(ReadMode::Dual),
+                Some(ReadMode::Dual) => {}
+                Some(ReadMode::Mono) => {
+                    return Err(Error::Sdk(
+                        "this stream is being read with read_samples; mixing the two \
+                         read paths would silently punch time-gaps into both outputs — \
+                         stop and restart streaming to switch"
+                            .to_string(),
+                    ));
+                }
             }
 
             let ReadPlan {
@@ -2197,6 +2278,11 @@ impl NativeSdkSource {
                     }
                     const MAX_SAMPLES: usize = 1 << 24;
                     if packet.num as usize > MAX_SAMPLES / 4 {
+                        // Consume before erroring: get_packet always
+                        // returns the head of the queue, so a leaked
+                        // packet would make every subsequent call
+                        // re-fetch it and re-error forever.
+                        self.client.consume_packets(device, 0, 1)?;
                         return Err(Error::Sdk(format!(
                             "Packet sample count {} exceeds maximum allowed {}",
                             packet.num,
@@ -2312,6 +2398,12 @@ impl NativeSdkSource {
                 }
                 self.stream_active = false;
             }
+            // A new streaming session must not serve samples captured
+            // under the previous configuration, and gets a fresh choice
+            // of read path.
+            self.sample_buffer.clear();
+            self.dual_sample_buffer.clear();
+            self.read_mode = None;
 
             if self.device_connected {
                 if let Some(device) = self.device.as_mut() {
@@ -2349,6 +2441,13 @@ impl NativeSdkSource {
     /// section. Zero means the last packet was fully delivered.
     pub fn get_sample_buffer_size(&self) -> usize {
         self.sample_buffer.len()
+    }
+
+    /// Dual-path sibling of [`Self::get_sample_buffer_size`]: (Rx1, Rx2)
+    /// sample pairs held over from a packet larger than the last
+    /// [`Self::read_samples_dual`] request.
+    pub fn get_dual_sample_buffer_size(&self) -> usize {
+        self.dual_sample_buffer.len()
     }
 }
 
@@ -3011,6 +3110,8 @@ mod tests {
             stream_active: false,
             device_connected: false,
             sample_buffer: VecDeque::new(),
+            dual_sample_buffer: VecDeque::new(),
+            read_mode: None,
         };
 
         assert!(!source.is_streaming());

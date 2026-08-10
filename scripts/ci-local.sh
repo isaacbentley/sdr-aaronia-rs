@@ -112,4 +112,43 @@ if ! skipped miri; then
     PATH="$(miri_bin):$PATH" cargo miri test --lib utils
 fi
 
+# ---- OS-gated native-sdk code (compiled only on CI's linux/windows) -
+# On macOS, `--all-features` silently skips src/native_sdk.rs and
+# friends (cfg windows/linux), so the steps above never see them; CI's
+# ubuntu/windows legs do. Cross-clippy the lib for both targets. This
+# cannot cover *test* code in the gated modules (`--all-targets` pulls
+# dev-deps whose C build scripts need a cross C toolchain); the vm step
+# below closes that remainder.
+if ! skipped cross; then
+    step "cross-clippy native-sdk lib (x86_64 linux + windows, rustup stable)"
+    # Same PATH pinning rationale as miri_bin: a non-rustup cargo on
+    # PATH has no cross std for these targets.
+    rustup_bin="$(dirname "$(rustup which --toolchain stable cargo)")"
+    PATH="$rustup_bin:$PATH" cargo clippy --target x86_64-unknown-linux-gnu \
+        --no-default-features --features native-sdk -- -D warnings
+    PATH="$rustup_bin:$PATH" cargo clippy --target x86_64-pc-windows-msvc \
+        --no-default-features --features native-sdk -- -D warnings
+fi
+
+# ---- gated tests in a real Linux VM (Apple `container` CLI) --------
+# Compiles AND runs the unit tests inside the OS-gated modules — the
+# one class of breakage nothing above can reach (a missed struct field
+# in a native_sdk #[cfg(test)] literal shipped red to CI exactly this
+# way). Skipped automatically when the container tooling isn't running.
+# NOTE: the VM's virtiofs mount chokes on iCloud-synced paths
+# (~/Documents ⇒ EDEADLK), hence the rsync to /private/tmp first.
+if ! skipped vm; then
+    if container system status >/dev/null 2>&1; then
+        step "cargo test --features native-sdk --lib (Linux VM via container)"
+        vm_dir=/private/tmp/aaronia-linux-vm
+        rsync -a --delete --exclude target --exclude target-linux --exclude .git \
+            ./ "$vm_dir/"
+        container run --rm -v "$vm_dir":/w -w /w rust:slim \
+            sh -c 'cargo test --features native-sdk --lib'
+    else
+        echo "vm step: 'container system start' not running — skipping" \
+             "(gated-module tests only compile on CI's linux/windows legs)" >&2
+    fi
+fi
+
 printf '\n\033[1;32mci-local: all steps passed.\033[0m\n'

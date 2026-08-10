@@ -41,6 +41,22 @@ will pass. If you edit `.github/workflows/ci.yml`, update
 `scripts/ci-local.sh` in the same commit (and vice versa), and run
 `actionlint .github/workflows/ci.yml`.
 
+Two steps exist because macOS builds skip the OS-gated native-SDK
+modules entirely (`cfg(any(windows, linux))`), which CI's ubuntu and
+windows legs do compile:
+
+- **cross** — `cargo clippy --target x86_64-unknown-linux-gnu` /
+  `x86_64-pc-windows-msvc` with `--features native-sdk`, via the rustup
+  `stable` toolchain (install the targets with `rustup target add
+  <triple> --toolchain stable`). Lib only — the gated *test* code needs
+  a real Linux environment.
+- **vm** — runs `cargo test --features native-sdk --lib` inside a Linux
+  VM via Apple's `container` CLI (`container system start` first; the
+  step auto-skips when the tooling isn't running). This is the only
+  local step that compiles and runs `#[cfg(test)]` code inside the
+  gated modules — a missed struct field in exactly such a test once
+  shipped red to CI past every other local check.
+
 Tiers 1–4 below are the core of the suite; the later tiers are optional but recommended if your pull request touches the parser, decompressor, or FFI surface.
 
 ## Test Pyramid
