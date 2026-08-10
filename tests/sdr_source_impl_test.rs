@@ -27,6 +27,46 @@ impl DwellAdvice for OverrideAdvice {
     }
 }
 
+/// Poll the mock server until a received request satisfies `pred`, or
+/// give up after `deadline`. Returns whether a match was seen.
+///
+/// The fixed-sleep alternative ("start the source, sleep N ms, assert
+/// the request arrived") is load-sensitive: under a fully parallel
+/// `cargo test` run the pump thread can be starved past any "long
+/// enough" constant, which made these tests flake while passing in
+/// isolation. Polling keeps the fast path fast (the first check
+/// usually succeeds) and gives the slow path a real deadline.
+async fn wait_for_request(
+    server: &MockServer,
+    deadline: Duration,
+    pred: impl Fn(&wiremock::Request) -> bool,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        if let Some(requests) = server.received_requests().await
+            && requests.iter().any(&pred)
+        {
+            return true;
+        }
+        if start.elapsed() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// `wait_for_request` predicate: a `/control` PUT whose JSON body retunes
+/// `frequencyCenter` to `freq` (within 1 Hz).
+fn control_put_tuning_to(freq: f64) -> impl Fn(&wiremock::Request) -> bool {
+    move |r: &wiremock::Request| {
+        r.url.path() == "/control"
+            && r.body_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v.get("frequencyCenter").and_then(|f| f.as_f64()))
+                .is_some_and(|f| (f - freq).abs() < 1.0)
+    }
+}
+
 #[test]
 fn test_aaronia_sdr_source_creation() {
     let backend = AaroniaBackend::Http("http://example.com".to_string());
@@ -203,16 +243,19 @@ async fn test_hop_mode_never_touches_remoteconfig() {
     let handle = Box::new(source)
         .start(config, Arc::new(MockAdvice))
         .unwrap();
-    // Long enough to span at least one hop (dwell_max=40ms) so `/control`
-    // is actually exercised, not just `/info`/`/stream`.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait until hopping actually exercises `/control` (dwell_max=40ms),
+    // not just `/info`/`/stream`.
+    let saw_control = wait_for_request(&mock_server, Duration::from_secs(5), |r| {
+        r.url.path() == "/control"
+    })
+    .await;
     (handle.stop)();
 
-    let requests = mock_server.received_requests().await.unwrap();
     assert!(
-        requests.iter().any(|r| r.url.path() == "/control"),
+        saw_control,
         "expected at least one /control PUT from hopping"
     );
+    let requests = mock_server.received_requests().await.unwrap();
     assert!(
         requests
             .iter()
@@ -267,29 +310,22 @@ async fn test_single_channel_honors_channel_override_via_control() {
     let handle = Box::new(source)
         .start(config, Arc::new(OverrideAdvice(override_freq)))
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // The first /control PUT is the builder's initial capture setup at
+    // `center_frequency_hz`, so wait specifically for the PUT that
+    // carries the override frequency.
+    let retuned_to_override = wait_for_request(
+        &mock_server,
+        Duration::from_secs(5),
+        control_put_tuning_to(override_freq),
+    )
+    .await;
     (handle.stop)();
 
-    let requests = mock_server.received_requests().await.unwrap();
-    let control_puts: Vec<_> = requests
-        .iter()
-        .filter(|r| r.url.path() == "/control")
-        .collect();
-    assert!(
-        !control_puts.is_empty(),
-        "expected the override to trigger a /control retune"
-    );
-    let retuned_to_override = control_puts.iter().any(|r| {
-        r.body_json::<serde_json::Value>()
-            .ok()
-            .and_then(|v| v.get("frequencyCenter").and_then(|f| f.as_f64()))
-            .map(|f| (f - override_freq).abs() < 1.0)
-            .unwrap_or(false)
-    });
     assert!(
         retuned_to_override,
-        "no /control PUT carried the override frequency {override_freq}: {control_puts:?}"
+        "no /control PUT carried the override frequency {override_freq}"
     );
+    let requests = mock_server.received_requests().await.unwrap();
     assert!(
         requests
             .iter()
@@ -344,25 +380,17 @@ async fn test_hop_mode_honors_channel_override_via_control() {
     let handle = Box::new(source)
         .start(config, Arc::new(OverrideAdvice(override_freq)))
         .unwrap();
-    // Long enough to span several would-be hop dwells; if the override
+    // Wait for the override to be requested; the window this spans covers
+    // several would-be hop dwells (dwell_max=40ms), so if the override
     // weren't honored we'd see /control PUTs for 1e9/2e9 instead.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let saw_override = wait_for_request(
+        &mock_server,
+        Duration::from_secs(5),
+        control_put_tuning_to(override_freq),
+    )
+    .await;
     (handle.stop)();
 
-    let requests = mock_server.received_requests().await.unwrap();
-    let control_bodies: Vec<serde_json::Value> = requests
-        .iter()
-        .filter(|r| r.url.path() == "/control")
-        .filter_map(|r| r.body_json::<serde_json::Value>().ok())
-        .collect();
-    assert!(
-        !control_bodies.is_empty(),
-        "expected at least one /control PUT"
-    );
-    let freqs: Vec<f64> = control_bodies
-        .iter()
-        .filter_map(|v| v.get("frequencyCenter").and_then(|f| f.as_f64()))
-        .collect();
     // The very first PUT is the builder's initial capture setup (always at
     // `center_frequency_hz`, before `hop_pump` runs), so we can't require
     // *every* PUT to be the override. What proves the hop list was bypassed
@@ -370,9 +398,16 @@ async fn test_hop_mode_honors_channel_override_via_control() {
     // channel (2e9, never legitimately reachable except by real hopping)
     // never was.
     assert!(
-        freqs.iter().any(|f| (f - override_freq).abs() < 1.0),
-        "override frequency {override_freq} never appeared in a /control PUT: {freqs:?}"
+        saw_override,
+        "override frequency {override_freq} never appeared in a /control PUT"
     );
+    let requests = mock_server.received_requests().await.unwrap();
+    let freqs: Vec<f64> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/control")
+        .filter_map(|r| r.body_json::<serde_json::Value>().ok())
+        .filter_map(|v| v.get("frequencyCenter").and_then(|f| f.as_f64()))
+        .collect();
     assert!(
         freqs.iter().all(|f| (f - 2e9).abs() > 1.0),
         "hop channel 2e9 should never be reached while overridden: {freqs:?}"

@@ -18,6 +18,10 @@ name: CI
 #
 # `workflow_dispatch` is enabled so the user can manually rebuild any
 # job without pushing.
+#
+# Local mirror: `scripts/ci-local.sh` reproduces each job's exact
+# command for pre-push verification — keep the two in sync. Note the
+# deny action's default arguments include `--all-features`.
 
 # Least-privilege token: no job in this workflow writes to the
 # repository (flagged by CodeQL actions/missing-workflow-permissions).

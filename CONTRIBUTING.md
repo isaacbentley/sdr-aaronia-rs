@@ -19,6 +19,28 @@ cargo fmt --all --check
 
 Note that a plain `cargo test` builds with the default features; suites gated on non-default features (e.g. `http_sink_test`, which needs `futuresdr`) are skipped. CI runs `cargo test --all-features`.
 
+## Pre-push: mirror CI locally
+
+Before pushing (or opening a PR), run the CI-parity script:
+
+```bash
+scripts/ci-local.sh
+```
+
+It reproduces the **exact** command each GitHub Actions job runs — fmt,
+clippy, `cargo test --all-features`, `cargo deny --all-features check`,
+`cargo hack check --each-feature --no-dev-deps`, `cargo machete`, and
+the pinned-nightly Miri module suite — and fails fast with install
+hints for any missing tool. Skip individual steps with e.g.
+`SKIP="miri hack" scripts/ci-local.sh` when iterating.
+
+The `--all-features` flags matter: several CI jobs validate the
+*all-features* dependency graph and feature set, so a default-features
+`cargo test` / `cargo deny check` passing locally does **not** imply CI
+will pass. If you edit `.github/workflows/ci.yml`, update
+`scripts/ci-local.sh` in the same commit (and vice versa), and run
+`actionlint .github/workflows/ci.yml`.
+
 Tiers 1–4 below are the core of the suite; the later tiers are optional but recommended if your pull request touches the parser, decompressor, or FFI surface.
 
 ## Test Pyramid
