@@ -307,6 +307,41 @@ which calls `AARTSAAPI_ConfigSetInteger(&d, &config, 6)`), and the
 maximum is index 9 = `1 / 512`. Resulting sample rate is
 `receiverclock / factor`.
 
+### Receiver channel selection and dual-channel capture
+
+The full SPECTRAN V6 has two RF inputs; `device/receiverchannel`
+selects `"Rx1"`, `"Rx2"`, or `"Rx1+Rx2"` (strings per the official
+samples). The binding models this as `RxChannel` (defined ungated in
+`utils.rs`, re-exported at the crate root and from `native_sdk`) and
+threads it through every configuration surface:
+
+*   `NativeSdkSource::set_receiver_channel(RxChannel)` — the direct,
+    raw-mode-only setter (errors on other open modes).
+*   `SdkConfig::receiver_channel: Option<RxChannel>` — applied by
+    `SdkSource::start_streaming` after `configure_iq_receiver` (which
+    defaults the key to `"Rx1"`), so an explicit selection wins.
+*   `AaroniaConfig::receiver_channel(RxChannel)` — unified-source
+    builder equivalent, applied in `init_native_sdk`.
+
+In `Rx1+Rx2` mode the SDK interleaves both receivers into one packet:
+each sample occupies `stride` floats laid out `[I1, Q1, I2, Q2, ...pad]`.
+`NativeSdkSource::read_samples_dual(rx1, rx2, max)` (also wrapped by
+`SdkSource::read_samples_dual`) demuxes that layout into two
+time-aligned `Complex32` streams with the same whole-packet carry-over
+rule as `read_samples`; the demux itself is the pure
+`utils::deinterleave_dual_iq`, unit- and Miri-tested. A packet whose
+`stride < 4` fails with a "set device/receiverchannel to Rx1+Rx2?"
+hint rather than silently duplicating a channel, and the plain
+`read_samples` on a dual stream extracts only the first channel. Do
+not interleave `read_samples` and `read_samples_dual` calls on one
+stream — each maintains its own carry buffer.
+
+> **Hardware-unverified:** like the rest of the `Rx2`/`Rx1+Rx2` paths,
+> the interleave layout follows the packet contract (`stride` = floats
+> from sample to sample), not a live dual-channel capture — the
+> development device is a single-channel V6 ECO. Verify against a full
+> V6 before production use.
+
 ### Per-mode IQ scaling
 
 The samples reveal that the f32 components in `AARTSAAPI_Packet::fp32`

@@ -45,6 +45,8 @@ pub enum SourceType {
     File,
 }
 
+pub use crate::utils::RxChannel;
+
 /// Configuration for the unified Aaronia source
 #[derive(Debug, Clone)]
 pub struct AaroniaConfig {
@@ -76,6 +78,11 @@ pub struct AaroniaConfig {
     pub stream_format: Option<crate::http_streaming::StreamFormat>,
     /// Stream scale for HTTP sources
     pub stream_scale: Option<f64>,
+    /// Receiver channel selection. Only meaningful for native-SDK
+    /// sources in `spectranv6/raw` mode; `None` keeps the SDK default
+    /// (`Rx1`). Ignored by HTTP and file backends (their channel
+    /// routing lives in the RTSA Suite mission graph).
+    pub receiver_channel: Option<RxChannel>,
 }
 
 impl Default for AaroniaConfig {
@@ -91,6 +98,7 @@ impl Default for AaroniaConfig {
             force_source_type: None,
             stream_format: None,
             stream_scale: None,
+            receiver_channel: None,
         }
     }
 }
@@ -173,6 +181,15 @@ impl AaroniaConfig {
         self.device_serial = Some(serial);
         self
     }
+
+    /// Select the receiver channel(s) for native-SDK captures
+    /// (`spectranv6/raw` only). With [`RxChannel::Rx1And2`], read both
+    /// channels via the native source's `read_samples_dual`.
+    #[must_use]
+    pub fn receiver_channel(mut self, channel: RxChannel) -> Self {
+        self.receiver_channel = Some(channel);
+        self
+    }
 }
 
 /// Unified Aaronia source that automatically selects the best available connection method
@@ -251,6 +268,19 @@ impl AaroniaSource {
                 validate_iq_mode(config.span_frequency, DEFAULT_RECEIVER_CLOCK_HZ)?;
             }
             SourceType::NativeSdk | SourceType::File => {}
+        }
+
+        // `receiver_channel` only means something to the native SDK
+        // backend — HTTP and file sources get their channel routing from
+        // the RTSA Suite mission graph / the recording itself. Warn
+        // instead of erroring so a config shared across backends stays
+        // usable, but make the ignored setting visible.
+        if source.config.receiver_channel.is_some() && source_type != SourceType::NativeSdk {
+            warn!(
+                "receiver_channel is set but the selected backend is {:?}; \
+                 the setting only applies to the native SDK backend and will be ignored",
+                source_type
+            );
         }
 
         // Initialize the selected source
@@ -391,6 +421,11 @@ impl AaroniaSource {
                 self.config.span_frequency,
                 self.config.reference_level,
             )?;
+            // `configure_iq_receiver` defaults the channel to Rx1;
+            // apply an explicit selection after it so the override wins.
+            if let Some(channel) = self.config.receiver_channel {
+                source.set_receiver_channel(channel)?;
+            }
 
             self.native_source = Some(source);
         }
@@ -1086,6 +1121,18 @@ mod tests {
         assert!(config.force_source_type.is_none());
         assert!(config.stream_format.is_none());
         assert!(config.stream_scale.is_none());
+        assert!(config.receiver_channel.is_none());
+    }
+
+    #[test]
+    fn test_aaronia_config_receiver_channel_builder() {
+        let config = AaroniaConfig::default()
+            .force_native_sdk()
+            .receiver_channel(RxChannel::Rx1And2);
+        assert_eq!(config.receiver_channel, Some(RxChannel::Rx1And2));
+
+        let config = AaroniaConfig::default().receiver_channel(RxChannel::Rx2);
+        assert_eq!(config.receiver_channel, Some(RxChannel::Rx2));
     }
 
     #[test]

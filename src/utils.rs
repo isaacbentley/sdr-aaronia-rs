@@ -25,6 +25,94 @@ pub fn user_agent() -> String {
     }
 }
 
+/// Which physical RF input(s) a Spectran V6 capture uses.
+///
+/// Maps to the native SDK's `device/receiverchannel` config item
+/// (`NativeSdkSource::set_receiver_channel`, `native-sdk` feature,
+/// Windows/Linux). Defined here — always compiled — so cross-platform
+/// configuration code can name a channel without feature/target gates;
+/// only *applying* it requires the native SDK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RxChannel {
+    /// First RF input (default).
+    Rx1,
+    /// Second RF input (full V6 only; hardware-unverified).
+    Rx2,
+    /// Both inputs, interleaved into one packet (full V6 only;
+    /// hardware-unverified). Read both streams with
+    /// `read_samples_dual` on the native SDK source.
+    Rx1And2,
+}
+
+impl RxChannel {
+    /// The exact string the SDK config item expects.
+    pub fn as_config_str(&self) -> &'static str {
+        match self {
+            Self::Rx1 => "Rx1",
+            Self::Rx2 => "Rx2",
+            Self::Rx1And2 => "Rx1+Rx2",
+        }
+    }
+}
+
+/// Deinterleave one dual-channel IQ packet into per-channel sample pairs.
+///
+/// In `Rx1+Rx2` capture the SDK delivers both receivers in a single
+/// packet: each sample occupies `stride` floats, laid out
+/// `[I1, Q1, I2, Q2, ...pad]` (channel 1 in floats 0–1, channel 2 in
+/// floats 2–3; any remaining floats up to `stride` are padding). On
+/// success this yields `(rx1, rx2)` pairs in sample order — as a
+/// borrowed iterator, so the per-packet hot path pays no intermediate
+/// allocation.
+///
+/// `floats` must hold at least `(num_samples - 1) * stride + 4` values —
+/// the last sample's four channel floats — and `stride` must be ≥ 4;
+/// anything less cannot be a dual-channel layout, and callers should
+/// treat it as "the stream is not dual-channel" (e.g.
+/// `device/receiverchannel` was not set to `Rx1+Rx2`). All bounds are
+/// validated up front, so the iterator itself never panics.
+pub fn deinterleave_dual_iq<'a>(
+    floats: &'a [f32],
+    num_samples: usize,
+    stride: usize,
+) -> Result<impl ExactSizeIterator<Item = (num_complex::Complex32, num_complex::Complex32)> + 'a> {
+    if stride < 4 {
+        return Err(Error::Sdk(format!(
+            "packet stride {} cannot carry two interleaved IQ channels (need >= 4); \
+             is device/receiverchannel set to Rx1+Rx2?",
+            stride
+        )));
+    }
+    if num_samples > 0 {
+        let needed = (num_samples - 1)
+            .checked_mul(stride)
+            .and_then(|n| n.checked_add(4))
+            .ok_or_else(|| {
+                Error::Sdk(format!(
+                    "dual-channel packet dimensions overflow: {} samples x stride {}",
+                    num_samples, stride
+                ))
+            })?;
+        if floats.len() < needed {
+            return Err(Error::Sdk(format!(
+                "dual-channel packet too short: {} floats for {} samples at stride {} (need {})",
+                floats.len(),
+                num_samples,
+                stride,
+                needed
+            )));
+        }
+    }
+    Ok((0..num_samples).map(move |i| {
+        let base = i * stride;
+        (
+            num_complex::Complex32::new(floats[base], floats[base + 1]),
+            num_complex::Complex32::new(floats[base + 2], floats[base + 3]),
+        )
+    }))
+}
+
 /// Parse frequency strings with units (e.g., "146.52M", "2.4G", "162.5k")
 ///
 /// Supports common RF units:
@@ -228,6 +316,69 @@ pub fn validate_iq_mode(span_freq_hz: f64, receiver_clock_hz: f64) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_rx_channel_config_strings() {
+        // Exact strings the SDK's device/receiverchannel item expects,
+        // per the official RTSA-API-Samples.
+        assert_eq!(RxChannel::Rx1.as_config_str(), "Rx1");
+        assert_eq!(RxChannel::Rx2.as_config_str(), "Rx2");
+        assert_eq!(RxChannel::Rx1And2.as_config_str(), "Rx1+Rx2");
+    }
+
+    #[test]
+    fn test_deinterleave_dual_iq_tight_stride() {
+        // Two samples, tightly packed at stride 4: [I1 Q1 I2 Q2] each.
+        let floats = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let pairs: Vec<_> = deinterleave_dual_iq(&floats, 2, 4).unwrap().collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, num_complex::Complex32::new(1.0, 2.0));
+        assert_eq!(pairs[0].1, num_complex::Complex32::new(3.0, 4.0));
+        assert_eq!(pairs[1].0, num_complex::Complex32::new(5.0, 6.0));
+        assert_eq!(pairs[1].1, num_complex::Complex32::new(7.0, 8.0));
+    }
+
+    #[test]
+    fn test_deinterleave_dual_iq_padded_stride() {
+        // Stride 6 with two padding floats per sample; the pad values
+        // (99.0) must never appear in either channel. The buffer ends
+        // at the last sample's fourth float — no trailing pad — which
+        // also pins the `(num-1)*stride + 4` length rule.
+        let floats = [
+            1.0, 2.0, 3.0, 4.0, 99.0, 99.0, // sample 0 + pad
+            5.0, 6.0, 7.0, 8.0, // sample 1, no trailing pad
+        ];
+        let pairs: Vec<_> = deinterleave_dual_iq(&floats, 2, 6).unwrap().collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[1].0, num_complex::Complex32::new(5.0, 6.0));
+        assert_eq!(pairs[1].1, num_complex::Complex32::new(7.0, 8.0));
+    }
+
+    #[test]
+    fn test_deinterleave_dual_iq_rejects_narrow_stride() {
+        // Stride 2 is a single-channel layout: the caller almost
+        // certainly forgot to set device/receiverchannel to Rx1+Rx2.
+        // (`match` instead of `unwrap_err`: the Ok type is an opaque
+        // iterator without Debug.)
+        let floats = [1.0, 2.0, 3.0, 4.0];
+        let err = match deinterleave_dual_iq(&floats, 2, 2) {
+            Err(e) => e,
+            Ok(_) => panic!("stride 2 must be rejected"),
+        };
+        assert!(err.to_string().contains("Rx1+Rx2"), "got: {err}");
+    }
+
+    #[test]
+    fn test_deinterleave_dual_iq_rejects_short_buffer() {
+        // Claims 3 samples at stride 4 but only carries 2.
+        let floats = [0.0; 8];
+        assert!(deinterleave_dual_iq(&floats, 3, 4).is_err());
+    }
+
+    #[test]
+    fn test_deinterleave_dual_iq_empty() {
+        assert_eq!(deinterleave_dual_iq(&[], 0, 4).unwrap().count(), 0);
+    }
 
     #[test]
     fn test_parse_frequency() {

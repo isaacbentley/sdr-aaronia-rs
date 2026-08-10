@@ -1277,6 +1277,13 @@ pub struct NativeSdkSource {
     stream_active: bool,
     device_connected: bool,
     sample_buffer: VecDeque<Complex32>,
+    /// Carry-over for [`Self::read_samples_dual`]: whole (Rx1, Rx2)
+    /// sample pairs not yet handed to the caller. Kept separate from
+    /// `sample_buffer` — the two read paths must not share a carry
+    /// stream, since a mono read of a dual carry would drop every Rx2
+    /// sample. Don't interleave `read_samples` and `read_samples_dual`
+    /// calls on one stream; each drains only its own carry.
+    dual_sample_buffer: VecDeque<(Complex32, Complex32)>,
 }
 
 /// Device health telemetry from the SDK's `AARTSAAPI_ConfigHealth` tree.
@@ -1361,6 +1368,7 @@ impl NativeSdkSource {
                 stream_active: false,
                 device_connected: false,
                 sample_buffer: VecDeque::new(),
+                dual_sample_buffer: VecDeque::new(),
             })
         }
     }
@@ -1617,10 +1625,9 @@ impl NativeSdkSource {
     /// > `Rx2` and `Rx1And2` are hardware-unverified: the developer's V6
     /// > ECO is a single-channel device, so only `Rx1` has been exercised
     /// > against real hardware. In `Rx1And2` mode the SDK interleaves both
-    /// > channels into one packet — [`Self::read_samples`] honours the
-    /// > packet's `stride` field, so it will extract the *first* channel
-    /// > correctly, but a proper dual-channel demux API (both channels
-    /// > out) is still future work.
+    /// > channels into one packet — read both with
+    /// > [`Self::read_samples_dual`]; [`Self::read_samples`] honours the
+    /// > packet's `stride` field and extracts only the *first* channel.
     ///
     /// Only available in raw mode; eco `iqreceiver` drives a fixed
     /// single-channel pipeline, and the config key doesn't exist there.
@@ -2102,6 +2109,174 @@ impl NativeSdkSource {
         }
     }
 
+    /// Read up to `max_samples` *pairs* of samples from a dual-channel
+    /// (`Rx1+Rx2`) stream, appending channel 1 to `rx1` and channel 2 to
+    /// `rx2`. Returns the number of pairs appended; both vectors always
+    /// grow by exactly that amount, so `rx1`/`rx2` stay index-aligned in
+    /// time.
+    ///
+    /// Requires the stream to have been configured with
+    /// [`RxChannel::Rx1And2`] (see [`Self::set_receiver_channel`]): the
+    /// SDK then interleaves both receivers into one packet,
+    /// `[I1, Q1, I2, Q2]` per sample. A packet whose `stride` cannot
+    /// carry two channels (< 4) fails with an actionable error rather
+    /// than silently duplicating or dropping a channel.
+    ///
+    /// Carry-over follows the same whole-packet rule as
+    /// [`Self::read_samples`]: the SDK reclaims a packet on consume, so
+    /// any tail beyond `max_samples` is retained internally (as pairs)
+    /// for the next call rather than discarded. Do not mix
+    /// [`Self::read_samples`] and this method on one stream — each
+    /// maintains its own carry buffer.
+    ///
+    /// > [!WARNING]
+    /// > Hardware-unverified, like the rest of the `Rx1And2` path: the
+    /// > developer's V6 ECO is single-channel, so the interleave layout
+    /// > is taken from the packet contract (`stride` = floats from
+    /// > sample to sample, two IQ pairs per sample) rather than a live
+    /// > dual-channel capture. Verify against a full V6 before
+    /// > production use.
+    pub unsafe fn read_samples_dual(
+        &mut self,
+        rx1: &mut Vec<Complex32>,
+        rx2: &mut Vec<Complex32>,
+        max_samples: usize,
+    ) -> Result<usize> {
+        unsafe {
+            if !self.stream_active {
+                return Err(Error::Sdk("Streaming not active".to_string()));
+            }
+
+            let ReadPlan {
+                from_carry,
+                remaining,
+            } = plan_read(self.dual_sample_buffer.len(), max_samples);
+            if from_carry > 0 {
+                for (a, b) in self.dual_sample_buffer.drain(0..from_carry) {
+                    rx1.push(a);
+                    rx2.push(b);
+                }
+            }
+            if remaining == 0 {
+                return Ok(from_carry);
+            }
+
+            let device = self
+                .device
+                .as_mut()
+                .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
+
+            let mut pairs_read = from_carry;
+
+            let started = std::time::Instant::now();
+            let packet_opt = loop {
+                match self.client.get_packet(device, 0, 0)? {
+                    Some(p) => break Some(p),
+                    None => {
+                        if started.elapsed() >= Self::READ_POLL_DEADLINE {
+                            break None;
+                        }
+                        std::thread::sleep(Self::READ_POLL_INTERVAL);
+                    }
+                }
+            };
+
+            if let Some(packet) = packet_opt {
+                if !packet.fp32.is_null() && packet.num > 0 {
+                    // Same corruption backstop as `read_samples`; the
+                    // dual lower bound (4 floats per sample) is enforced
+                    // by `deinterleave_dual_iq` with a clearer error.
+                    const MAX_IQ_STRIDE: i64 = 4096;
+                    if packet.stride > MAX_IQ_STRIDE {
+                        warn!(
+                            "Skipping packet with out-of-range IQ stride {} (expected <= {})",
+                            packet.stride, MAX_IQ_STRIDE
+                        );
+                        self.client.consume_packets(device, 0, 1)?;
+                        return Ok(pairs_read);
+                    }
+                    const MAX_SAMPLES: usize = 1 << 24;
+                    if packet.num as usize > MAX_SAMPLES / 4 {
+                        return Err(Error::Sdk(format!(
+                            "Packet sample count {} exceeds maximum allowed {}",
+                            packet.num,
+                            MAX_SAMPLES / 4
+                        )));
+                    }
+
+                    let packet_samples = packet.num as usize;
+                    let stride = packet.stride.max(0) as usize;
+                    let floats: &[f32] = if stride >= 4 {
+                        // The individual caps above still admit a corrupt
+                        // num/stride pair that *together* describe a
+                        // multi-GB slice; bound the product too. Real
+                        // packets are a few MB — 1<<26 floats (256 MiB)
+                        // is a corruption backstop, not a spec bound.
+                        const MAX_PACKET_FLOATS: usize = 1 << 26;
+                        let float_count = (packet_samples - 1) * stride + 4;
+                        if float_count > MAX_PACKET_FLOATS {
+                            self.client.consume_packets(device, 0, 1)?;
+                            return Err(Error::Sdk(format!(
+                                "dual-channel packet describes {} floats ({} samples x stride {}), \
+                                 exceeding the {} backstop (corrupt packet header?)",
+                                float_count, packet_samples, stride, MAX_PACKET_FLOATS
+                            )));
+                        }
+                        // SAFETY: fp32 verified non-null; float_count is
+                        // bounded just above; the SDK guarantees the
+                        // buffer valid for `num` samples of `stride`
+                        // floats, the last of which we read 4 into.
+                        std::slice::from_raw_parts(packet.fp32 as *const f32, float_count)
+                    } else {
+                        // Too narrow for two channels; let the demux
+                        // helper produce its diagnostic without reading
+                        // out of bounds.
+                        &[]
+                    };
+                    let pairs =
+                        match crate::utils::deinterleave_dual_iq(floats, packet_samples, stride) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                // Hand the packet back before surfacing the
+                                // error so the stream can continue.
+                                self.client.consume_packets(device, 0, 1)?;
+                                return Err(e);
+                            }
+                        };
+
+                    // Single pass, no intermediate buffer: the first
+                    // `to_caller` pairs satisfy this call, the rest are
+                    // carried over — whole-packet semantics identical to
+                    // the mono path.
+                    let (to_caller, _to_carry) = split_packet(packet_samples, remaining);
+                    for (i, (a, b)) in pairs.enumerate() {
+                        if i < to_caller {
+                            rx1.push(a);
+                            rx2.push(b);
+                        } else {
+                            self.dual_sample_buffer.push_back((a, b));
+                        }
+                    }
+                    pairs_read += to_caller;
+
+                    trace!(
+                        "Read {} dual IQ sample pairs (sample rate: {} Hz)",
+                        pairs_read, packet.step_frequency
+                    );
+                }
+
+                self.client.consume_packets(device, 0, 1)?;
+            } else {
+                debug!(
+                    "read_samples_dual: no packet within {:?} (stream live but idle)",
+                    Self::READ_POLL_DEADLINE
+                );
+            }
+
+            Ok(pairs_read)
+        }
+    }
+
     pub unsafe fn start_tx_stream(&mut self) -> Result<TxStream<'_>> {
         unsafe {
             let device = self
@@ -2205,28 +2380,12 @@ impl Drop for NativeSdkSource {
 /// configure_iq_receiver`] has always written and is the only variant
 /// verified against real hardware (see
 /// [`NativeSdkSource::set_receiver_channel`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RxChannel {
-    /// First RF input (default).
-    Rx1,
-    /// Second RF input (full V6 only; hardware-unverified).
-    Rx2,
-    /// Both inputs, interleaved into one packet (full V6 only;
-    /// hardware-unverified).
-    Rx1And2,
-}
-
-impl RxChannel {
-    /// The exact string the SDK config item expects.
-    pub fn as_config_str(&self) -> &'static str {
-        match self {
-            Self::Rx1 => "Rx1",
-            Self::Rx2 => "Rx2",
-            Self::Rx1And2 => "Rx1+Rx2",
-        }
-    }
-}
+///
+/// The enum itself lives in [`crate::utils`] so cross-platform
+/// configuration code can name a channel without the `native-sdk`
+/// feature/target gates; this re-export preserves the historical
+/// `native_sdk::RxChannel` path.
+pub use crate::utils::RxChannel;
 
 /// Transmit packet flags defining stream and segment boundaries.
 pub mod tx_flags {

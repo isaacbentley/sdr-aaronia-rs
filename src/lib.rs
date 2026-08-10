@@ -43,6 +43,7 @@ pub mod utils;
 
 pub use error::{Error, Result};
 pub use num_complex::Complex32;
+pub use utils::RxChannel;
 
 #[cfg(feature = "native-sdk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "native-sdk")))]

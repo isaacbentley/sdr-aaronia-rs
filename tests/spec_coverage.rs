@@ -206,6 +206,24 @@ const ENFORCED: &[InvariantRow] = &[
         test_fn: "test_invalid_chunk_handling",
         test_file: "src/file_source.rs",
     },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "RxChannel maps to the exact device/receiverchannel config strings",
+        test_fn: "test_rx_channel_config_strings",
+        test_file: "src/utils.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "dual-channel packets demux [I1 Q1 I2 Q2] per stride into two aligned streams",
+        test_fn: "test_deinterleave_dual_iq_padded_stride",
+        test_file: "src/utils.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "sub-dual stride is rejected with a receiverchannel hint, not misread",
+        test_fn: "test_deinterleave_dual_iq_rejects_narrow_stride",
+        test_file: "src/utils.rs",
+    },
 ];
 
 /// Print a per-area coverage summary. Intentionally has no assertions

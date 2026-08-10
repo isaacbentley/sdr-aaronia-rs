@@ -19,6 +19,7 @@
 //! [`crate::AaroniaSource`] (in [`crate::unified_source`]) instead.
 
 use crate::Result;
+use crate::utils::RxChannel;
 use std::time::Duration;
 
 pub mod native_sdk {
@@ -61,6 +62,13 @@ pub struct SdkConfig {
     /// `NativeSdkSource::read_samples`' signature — both breaking changes.
     /// Documented here so callers don't set it expecting a behaviour change.
     pub timeout: Duration,
+    /// Receiver channel selection, applied after the base IQ-receiver
+    /// configuration during [`SdkSource::start_streaming`]. `None`
+    /// keeps the default (`Rx1`). Only valid on `spectranv6/raw`;
+    /// an explicit selection on another mode fails `start_streaming`.
+    /// With [`RxChannel::Rx1And2`], read both channels via
+    /// [`SdkSource::read_samples_dual`].
+    pub receiver_channel: Option<RxChannel>,
 }
 
 impl Default for SdkConfig {
@@ -73,6 +81,7 @@ impl Default for SdkConfig {
             span_frequency: 10e6,   // 10 MHz
             reference_level: -20.0, // -20 dBm
             timeout: Duration::from_secs(30),
+            receiver_channel: None,
         }
     }
 }
@@ -163,6 +172,14 @@ impl SdkSource {
                 self.config.reference_level,
             )?;
 
+            // `configure_iq_receiver` defaults the channel to Rx1;
+            // apply an explicit selection after it so the override
+            // wins. Raw-mode-only: `set_receiver_channel` rejects other
+            // modes, which is correct for an explicit request.
+            if let Some(channel) = self.config.receiver_channel {
+                native_source.set_receiver_channel(channel)?;
+            }
+
             // Start streaming
             native_source.start_streaming()?;
         }
@@ -187,6 +204,26 @@ impl SdkSource {
     ) -> Result<usize> {
         match self.native_source.as_mut() {
             Some(native_source) => Ok(unsafe { native_source.read_samples(buffer, max_samples)? }),
+            None => Ok(0),
+        }
+    }
+
+    /// Read up to `max_samples` time-aligned sample *pairs* from a
+    /// dual-channel ([`RxChannel::Rx1And2`]) stream — Rx1 into `rx1`,
+    /// Rx2 into `rx2`. Returns the number of pairs appended. See
+    /// [`NativeSdkSource::read_samples_dual`](crate::native_sdk::NativeSdkSource::read_samples_dual)
+    /// for the packet-layout contract and its hardware-verification
+    /// caveat; don't mix this with [`Self::read_samples`] on one stream.
+    pub async fn read_samples_dual(
+        &mut self,
+        rx1: &mut Vec<num_complex::Complex32>,
+        rx2: &mut Vec<num_complex::Complex32>,
+        max_samples: usize,
+    ) -> Result<usize> {
+        match self.native_source.as_mut() {
+            Some(native_source) => {
+                Ok(unsafe { native_source.read_samples_dual(rx1, rx2, max_samples)? })
+            }
             None => Ok(0),
         }
     }
@@ -229,6 +266,7 @@ mod tests {
             span_frequency: 20e6,
             reference_level: -30.0,
             timeout: Duration::from_secs(60),
+            receiver_channel: None,
         };
 
         assert_eq!(config.device_type, "Test_Device");
@@ -281,6 +319,7 @@ mod tests {
             span_frequency: 40e6,
             reference_level: -10.0,
             timeout: Duration::from_secs(15),
+            receiver_channel: Some(RxChannel::Rx2),
         };
 
         let source = SdkSource::with_config(config.clone());
@@ -291,6 +330,7 @@ mod tests {
         assert_eq!(source_config.span_frequency, config.span_frequency);
         assert_eq!(source_config.reference_level, config.reference_level);
         assert_eq!(source_config.timeout, config.timeout);
+        assert_eq!(source_config.receiver_channel, Some(RxChannel::Rx2));
     }
 
     #[test]
@@ -318,6 +358,7 @@ mod tests {
             span_frequency: 50e6,
             reference_level: -15.0,
             timeout: Duration::from_secs(45),
+            receiver_channel: Some(RxChannel::Rx1And2),
         };
 
         source.update_config(new_config.clone());
@@ -328,6 +369,7 @@ mod tests {
         assert_eq!(updated_config.span_frequency, new_config.span_frequency);
         assert_eq!(updated_config.reference_level, new_config.reference_level);
         assert_eq!(updated_config.timeout, new_config.timeout);
+        assert_eq!(updated_config.receiver_channel, Some(RxChannel::Rx1And2));
     }
 
     #[test]
@@ -453,6 +495,7 @@ mod tests {
             span_frequency: 10e6,
             reference_level: -20.0,
             timeout: Duration::from_secs(30),
+            receiver_channel: None,
         };
 
         // Span should be much smaller than center frequency for typical use
