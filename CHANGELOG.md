@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+**Breaking — the next release must be 0.4.0, not 0.3.6.**
+
+### Breaking
+- `RtsaMetadata` lost `device_name`, `stream_sample_rate`, and
+  `stream_center_frequency`; `RtsaSource::stream_info()` now returns a
+  3-tuple. These fields were only ever populated by a fabricated
+  "proximity" STRM layout that no spec revision or capture uses; real
+  files always produced `None`.
+- `SdkConfig` and `AaroniaConfig` gained a public `receiver_channel`
+  field (breaks struct-literal construction);
+  `NativeSdkSource::configure_iq_receiver` takes the channel as a
+  fourth parameter so retunes re-apply it.
+
+### Added
+- Receiver-channel selection (`RxChannel`: `Rx1`/`Rx2`/`Rx1And2`) on
+  every native-SDK config surface, and true dual-channel capture via
+  `read_samples_dual` on `NativeSdkSource`, `SdkSource`, and
+  `AaroniaSource`, with a read-mode latch preventing silent mono/dual
+  mixing.
+- `StrmChunk::capture_start_offset`: RTSA files' undocumented STRM
+  trailing double, verified as the stream-relative capture start;
+  `start_time_ns` is now anchored with it so reported spans match the
+  recorded data.
+- `scripts/ci-local.sh`: local CI-parity gate incl. cross-target and
+  Linux-VM coverage of the OS-gated native-SDK modules.
+
+### Fixed
+- RTSA chunk parsing verified against the vendor spec and real
+  captures: STRT alignment padding and size-versioned tail offsets,
+  SPRV/ANTA fixed-field sizes, single standard STRM layout, official
+  `DSST`/`DSSU`/`DSPT` enum numbering with `Unknown` degradation, and
+  `mEndTime` treated as stream-relative duration.
+- Compressed `DSPT_SPECTRA` chunks now error explicitly instead of
+  returning compressed bytes reinterpreted as f32 spectra.
+- Native SDK: corrupt-packet guards consume the packet before erroring
+  (previously a corrupt head-of-queue packet livelocked every
+  subsequent read); carry buffers are flushed on `stop_streaming`.
+
 ## [v0.3.5] - 2026-08-06
 
 Documentation-and-polish release: every Markdown doc was audited against

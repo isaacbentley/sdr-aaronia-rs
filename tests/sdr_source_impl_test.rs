@@ -243,17 +243,22 @@ async fn test_hop_mode_never_touches_remoteconfig() {
     let handle = Box::new(source)
         .start(config, Arc::new(MockAdvice))
         .unwrap();
-    // Wait until hopping actually exercises `/control` (dwell_max=40ms),
-    // not just `/info`/`/stream`.
-    let saw_control = wait_for_request(&mock_server, Duration::from_secs(5), |r| {
-        r.url.path() == "/control"
-    })
+    // Wait for a /control PUT that tunes to the *second* hop channel:
+    // the builder itself issues an initial /control configure during
+    // start-up, so a bare path match would succeed before any hop ran
+    // and the never-touches-remoteconfig window below could contain
+    // zero hops. Only an actual hop retunes to 2 GHz.
+    let saw_hop = wait_for_request(
+        &mock_server,
+        Duration::from_secs(5),
+        control_put_tuning_to(2e9),
+    )
     .await;
     (handle.stop)();
 
     assert!(
-        saw_control,
-        "expected at least one /control PUT from hopping"
+        saw_hop,
+        "expected a /control PUT retuning to the 2nd hop channel"
     );
     let requests = mock_server.received_requests().await.unwrap();
     assert!(

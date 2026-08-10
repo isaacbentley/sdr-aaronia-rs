@@ -165,20 +165,15 @@ impl SdkSource {
 
             native_source.open_device(&open_mode, &device_info.serial_number)?;
 
-            // Configure device
+            // Configure device. The channel selection is a parameter of
+            // configure_iq_receiver (not a follow-up call) so any future
+            // reconfiguration path re-applies it automatically.
             native_source.configure_iq_receiver(
                 self.config.center_frequency,
                 self.config.span_frequency,
                 self.config.reference_level,
+                self.config.receiver_channel,
             )?;
-
-            // `configure_iq_receiver` defaults the channel to Rx1;
-            // apply an explicit selection after it so the override
-            // wins. Raw-mode-only: `set_receiver_channel` rejects other
-            // modes, which is correct for an explicit request.
-            if let Some(channel) = self.config.receiver_channel {
-                native_source.set_receiver_channel(channel)?;
-            }
 
             // Start streaming
             native_source.start_streaming()?;

@@ -162,10 +162,12 @@ bitflags! {
 /// Specifies the data type of individual data elements.
 ///
 /// Discriminants follow the official `DPSStreamSampleType` enum from
-/// Aaronia's RTSA file-format specification (rev. 4): sizes ascend with
-/// the signed variant *before* the unsigned one at each width
-/// (`U8, U16, S16, U32, S32, F32`), and the `..N` packet-storage
-/// variants repeat that order from 6.
+/// Aaronia's RTSA file-format specification (rev. 4): widths ascend
+/// with each width's *unsigned* variant immediately followed by its
+/// signed sibling (`U8, U16, S16, U32, S32, F32`) — not all unsigned
+/// then all signed, which is the mis-grouping an earlier revision
+/// encoded — and the `..N` packet-storage variants repeat that order
+/// from 6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -364,8 +366,8 @@ pub struct DsftChunk {
 /// (`quint64 mStreamID`, `double mStartTime`, `qint64 mStreamOffset`).
 /// The spec's own worked example is a 40-byte STRM chunk in exactly this
 /// layout; real RTSA-Suite captures write 48-byte chunks whose 8
-/// trailing bytes (an undocumented `double`, observed to equal the
-/// stream-relative time of the first sample) are skipped.
+/// trailing bytes carry the stream-relative capture start — see
+/// [`StrmChunk::capture_start_offset`].
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct StrmChunk {
@@ -373,6 +375,15 @@ pub struct StrmChunk {
     pub stream_id: u64,
     pub start_time: f64,
     pub stream_offset: i64,
+    /// Stream-relative time (seconds) at which recorded data actually
+    /// begins, parsed from the 8 undocumented trailing bytes RTSA-Suite
+    /// writes in 48-byte STRM chunks. `mStartTime` is the stream's
+    /// *clock zero*, not the first sample: in both LFS test captures
+    /// this offset equals the first SAMP packet time and the first
+    /// SPRV preview time exactly, and anchoring `mStartTime + offset`
+    /// against the DSFT completion time agrees to within 30 ms.
+    /// `None` for minimal 40-byte chunks (or implausible values).
+    pub capture_start_offset: Option<f64>,
 }
 
 /// SSTR (Sub Stream) Chunk
@@ -1083,7 +1094,14 @@ impl RtsaSource {
             // Standard RTSA format with SAMP chunks
             if let Some(sstr_chunk) = sstr_chunks.get(&samp_chunk.sub_stream_id) {
                 let total_samples = strt_chunk.as_ref().map(|s| s.num_samples).unwrap_or(0);
-                let start_time_ns = (primary_strm_chunk.start_time * 1_000_000_000.0) as u64;
+                // STRM.mStartTime is the stream's clock zero; recorded
+                // data begins capture_start_offset later (verified
+                // against both captures — without the offset the
+                // reported span is the stream clock's, many times the
+                // actual data duration).
+                let start_time_ns = ((primary_strm_chunk.start_time
+                    + primary_strm_chunk.capture_start_offset.unwrap_or(0.0))
+                    * 1_000_000_000.0) as u64;
                 // STRT.end_time is the stream *duration* (seconds
                 // relative to the stream start), so anchor it to the
                 // STRM start time to get the absolute end this field
@@ -1116,7 +1134,9 @@ impl RtsaSource {
                 None, // Unknown - must be determined by analysis
                 0.0,  // Unknown - will be set based on sample rate when known
                 total_samples,
-                (primary_strm_chunk.start_time * 1_000_000_000.0) as u64,
+                ((primary_strm_chunk.start_time
+                    + primary_strm_chunk.capture_start_offset.unwrap_or(0.0))
+                    * 1_000_000_000.0) as u64,
                 0, // Will be calculated based on total_samples and sample rate
             )
         } else {
@@ -1154,10 +1174,13 @@ impl RtsaSource {
             start_time_ns = (creation_time_val * 1_000_000_000.0) as u64;
         }
 
-        // Fallback for end_time_ns: calculate using sample rate and total samples if missing
+        // Fallback for end_time_ns: calculate using sample rate and total
+        // samples if missing. Saturating for the same reason as the
+        // STRT-anchored path above: both operands derive from
+        // file-controlled values.
         if end_time_ns == 0 && sample_rate > 0.0 && total_samples > 0 {
-            end_time_ns =
-                start_time_ns + ((total_samples as f64 / sample_rate) * 1_000_000_000.0) as u64;
+            end_time_ns = start_time_ns
+                .saturating_add(((total_samples as f64 / sample_rate) * 1_000_000_000.0) as u64);
         }
 
         // Fallback for bandwidth: use the first sub-stream span, or fall back to the sample rate
@@ -1813,8 +1836,9 @@ impl RtsaSource {
                 warnings.push("Stream tail indicates samples but zero payload size".to_string());
             }
             // end_time is the stream duration, so "ends after it
-            // starts" simply means the duration is positive.
-            if tail.end_time <= 0.0 {
+            // starts" simply means the duration is positive; NaN must
+            // fail the check too.
+            if tail.end_time.is_nan() || tail.end_time <= 0.0 {
                 errors.push("Stream tail reports a non-positive stream duration".to_string());
             }
         }
@@ -1995,6 +2019,20 @@ impl RtsaSource {
                                 match samp_chunk.sample_type {
                                     DspStreamSampleType::DsStF32
                                     | DspStreamSampleType::DsStF32N => {
+                                        if samp_chunk.compression > 0 {
+                                            // Same contract as the DSPT_IQ arm
+                                            // above: the compressed payload is
+                                            // proprietary, and reinterpreting
+                                            // it as raw f32 would silently
+                                            // return garbage spectra.
+                                            return Err(Error::FileFormat {
+                                                offset: 0,
+                                                reason: format!(
+                                                    "compressed DSPT_SPECTRA chunk at 0x{:08X}:                                                  in-band decompression is unsupported                                                  (proprietary format); export the file                                                  uncompressed via RTSAFileTool",
+                                                    offset
+                                                ),
+                                            });
+                                        }
                                         let samples =
                                             read_f32_vec(&mut self.reader, to_read as usize)?;
                                         Some(SampleData::Spectra(samples))
@@ -2352,9 +2390,24 @@ impl StrmChunk {
         let stream_offset = reader.read_i64::<LittleEndian>()?;
 
         let remaining = _size as i64 - HEADER_SIZE as i64 - 16;
-        if remaining > 0 {
-            reader.seek(SeekFrom::Current(remaining))?;
-        }
+        // 48-byte RTSA-Suite chunks carry one extra double: the
+        // stream-relative capture start (see the field doc). The field
+        // is undocumented, so gate on the exact size and a plausibility
+        // range — a garbage value must not shift every timestamp.
+        const MAX_PLAUSIBLE_CAPTURE_OFFSET_S: f64 = 3.2e8; // ~10 years
+        let capture_start_offset = if remaining == 8 {
+            let v = reader.read_f64::<LittleEndian>()?;
+            // Half-open range: rejects NaN and ±inf along with
+            // out-of-range values.
+            (0.0..MAX_PLAUSIBLE_CAPTURE_OFFSET_S)
+                .contains(&v)
+                .then_some(v)
+        } else {
+            if remaining > 0 {
+                reader.seek(SeekFrom::Current(remaining))?;
+            }
+            None
+        };
 
         Ok(StrmChunk {
             header: RtsaChunkHeader {
@@ -2367,6 +2420,7 @@ impl StrmChunk {
             stream_id,
             start_time,
             stream_offset,
+            capture_start_offset,
         })
     }
 }
@@ -2918,9 +2972,10 @@ mod tests {
     }
 
     // Test DspStreamSampleType enum conversion. Values follow the
-    // official DPSStreamSampleType enum: the signed variant precedes
-    // the unsigned one at each width (U8, U16, S16, U32, S32, F32),
-    // and the packet-storage variants repeat that order from 6.
+    // official DPSStreamSampleType enum: each width's unsigned variant
+    // immediately followed by its signed sibling (U8, U16, S16, U32,
+    // S32, F32), and the packet-storage variants repeat that order
+    // from 6.
     #[test]
     fn test_dsp_stream_sample_type_conversion() {
         let expected = [
@@ -3075,6 +3130,8 @@ mod tests {
         assert_eq!(strm.stream_id, 12345);
         assert!((strm.start_time - 1609459200.0).abs() < 1.0);
         assert_eq!(strm.stream_offset, 0);
+        // Minimal chunk: no trailing capture-start double.
+        assert_eq!(strm.capture_start_offset, None);
     }
 
     // Test STRM chunk parsing (48-byte chunk as written by RTSA Suite:
@@ -3098,6 +3155,12 @@ mod tests {
         assert_eq!(strm.stream_id, 98765);
         assert!((strm.start_time - 1609459200.0).abs() < 1.0);
         assert_eq!(strm.stream_offset, 4096);
+        // The trailing double is the stream-relative capture start
+        // (bytes above are the IQ capture's real value).
+        let offset = strm
+            .capture_start_offset
+            .expect("48-byte chunk carries the offset");
+        assert!((offset - 253.3999136000459).abs() < 1e-9);
         // The trailing bytes must be consumed so the reader is
         // positioned at the end of the chunk.
         assert_eq!(cursor.position(), 32);
@@ -3599,6 +3662,7 @@ mod tests {
             stream_id: 1,
             start_time: 1640995200.0,
             stream_offset: 0,
+            capture_start_offset: None,
         };
 
         let sstr_chunk = SstrChunk {

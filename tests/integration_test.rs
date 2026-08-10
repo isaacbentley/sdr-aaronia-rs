@@ -484,7 +484,12 @@ fn test_rtsa_spectra_capture_opens() {
 }
 
 #[test]
-fn test_rtsa_spectra_reads_samples() {
+fn test_rtsa_spectra_compressed_read_errors_explicitly() {
+    // The bundled SPECTRA capture's SAMP chunks are compressed
+    // (mCompression = 1). The reader used to reinterpret the compressed
+    // payload as raw f32 spectra and "succeed" with garbage values; it
+    // must instead surface an explicit unsupported-compression error,
+    // matching the DSPT_IQ contract.
     let path = cw_spectra_capture_path();
     if rtsa_fixture_missing(&path) {
         eprintln!("skipping test: fixture missing");
@@ -492,19 +497,14 @@ fn test_rtsa_spectra_reads_samples() {
     }
     let mut source = RtsaSource::open(&path).expect("RtsaSource::open should succeed");
 
-    // Try to read a large number of spectra samples to get at least one full spectrum
-    let data = source
+    let err = source
         .read_samples(10000, None)
-        .expect("read_samples should not error")
-        .expect("expected Some(SampleData)");
-
-    match data {
-        SampleData::Spectra(s) => {
-            assert!(!s.is_empty(), "expected non-empty spectra");
-            println!("Decoded {} spectra samples", s.len());
-        }
-        other => panic!("expected SampleData::Spectra, got {:?}", other),
-    }
+        .expect_err("compressed DSPT_SPECTRA must not silently decode as raw f32");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("compressed DSPT_SPECTRA"),
+        "error should name the unsupported compression, got: {msg}"
+    );
 }
 
 use proptest::prelude::*;

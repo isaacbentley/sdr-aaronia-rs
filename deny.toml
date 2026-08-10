@@ -1,5 +1,6 @@
-# cargo-deny configuration. CI runs `cargo deny check` (advisories,
-# licenses, bans, sources) — see `.github/workflows/ci.yml`'s `deny` job.
+# cargo-deny configuration. CI runs `cargo deny --all-features check`
+# (advisories, licenses, bans, sources; the action's default arguments
+# include --all-features) — see `.github/workflows/ci.yml`'s `deny` job.
 
 [advisories]
 version = 2

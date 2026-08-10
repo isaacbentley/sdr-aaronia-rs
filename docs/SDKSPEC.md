@@ -315,26 +315,36 @@ samples). The binding models this as `RxChannel` (defined ungated in
 `utils.rs`, re-exported at the crate root and from `native_sdk`) and
 threads it through every configuration surface:
 
+*   `NativeSdkSource::configure_iq_receiver(center, span, ref,
+    channel)` — the channel is a *parameter* of every (re)configuration
+    rather than a follow-up call, so a mid-stream retune (e.g.
+    `AaroniaSource::set_center_frequency`) re-applies the selection
+    instead of silently reverting the device to `Rx1`. `None` keeps the
+    `Rx1` default; an explicit selection on a non-raw open mode (or a
+    device without the key) is a hard error.
 *   `NativeSdkSource::set_receiver_channel(RxChannel)` — the direct,
-    raw-mode-only setter (errors on other open modes).
-*   `SdkConfig::receiver_channel: Option<RxChannel>` — applied by
-    `SdkSource::start_streaming` after `configure_iq_receiver` (which
-    defaults the key to `"Rx1"`), so an explicit selection wins.
+    raw-mode-only runtime setter (errors on other open modes).
+*   `SdkConfig::receiver_channel: Option<RxChannel>` — passed through
+    by `SdkSource::start_streaming`.
 *   `AaroniaConfig::receiver_channel(RxChannel)` — unified-source
-    builder equivalent, applied in `init_native_sdk`.
+    builder equivalent, passed through by `init_native_sdk` and every
+    retune.
 
 In `Rx1+Rx2` mode the SDK interleaves both receivers into one packet:
 each sample occupies `stride` floats laid out `[I1, Q1, I2, Q2, ...pad]`.
-`NativeSdkSource::read_samples_dual(rx1, rx2, max)` (also wrapped by
-`SdkSource::read_samples_dual`) demuxes that layout into two
-time-aligned `Complex32` streams with the same whole-packet carry-over
-rule as `read_samples`; the demux itself is the pure
-`utils::deinterleave_dual_iq`, unit- and Miri-tested. A packet whose
-`stride < 4` fails with a "set device/receiverchannel to Rx1+Rx2?"
-hint rather than silently duplicating a channel, and the plain
-`read_samples` on a dual stream extracts only the first channel. Do
-not interleave `read_samples` and `read_samples_dual` calls on one
-stream — each maintains its own carry buffer.
+`NativeSdkSource::read_samples_dual(rx1, rx2, max)` (wrapped by
+`SdkSource::read_samples_dual` and `AaroniaSource::read_samples_dual`)
+demuxes that layout into two time-aligned `Complex32` streams with the
+same whole-packet carry-over rule as `read_samples`; the demux itself
+is the pure `utils::deinterleave_dual_iq`, unit- and Miri-tested. A
+packet whose `stride < 4` fails with a "set device/receiverchannel to
+Rx1+Rx2?" hint rather than silently duplicating a channel. A streaming
+session latches onto whichever read path its first call uses — mixing
+`read_samples` and `read_samples_dual` on one stream would punch
+time-gaps into both outputs (each consumes whole packets the other
+never sees), so the second path errors instead of corrupting silently.
+`stop_streaming` clears both carry buffers and the latch, so a
+restarted session starts clean.
 
 > **Hardware-unverified:** like the rest of the `Rx2`/`Rx1+Rx2` paths,
 > the interleave layout follows the packet contract (`stride` = floats

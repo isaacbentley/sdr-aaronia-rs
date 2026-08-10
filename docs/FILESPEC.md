@@ -185,11 +185,17 @@ Indicates the start of a new stream.
 > *only* STRM layout, at every chunk size. The official spec's worked
 > example is a 40-byte STRM (16-byte chunk header + the 24 bytes above);
 > real RTSA-Suite captures write 48-byte STRM chunks that carry the same
-> three fields plus 8 undocumented trailing bytes (a `double`, observed
-> in both LFS test captures to equal the stream-relative start time of
-> the first preview segment). The Rust reader
-> (`StrmChunk::read_from` in `file_source.rs`) parses the standard
-> triplet and skips any trailing bytes. An earlier revision dispatched
+> three fields plus one undocumented trailing `double`: the
+> **stream-relative capture start**. `mStartTime` is the stream's clock
+> zero, not the first sample — in both LFS test captures the trailing
+> double equals the first SAMP packet time and the first SPRV preview
+> time exactly, and `mStartTime + offset` agrees with the DSFT
+> completion time minus `STRT::mEndTime` to within 30 ms. The Rust
+> reader (`StrmChunk::read_from` in `file_source.rs`) parses it into
+> `capture_start_offset` when the chunk is exactly 48 bytes and the
+> value is plausible (finite, `0 ≤ v < ~10 years`), and the metadata
+> layer anchors `start_time_ns` with it so the reported time span
+> matches the recorded data rather than the stream clock. An earlier revision dispatched
 > 40-byte chunks into a fabricated alternate "proximity" layout
 > (u32 id / stream type / f32 rate / f32 frequency / device name);
 > no spec revision, capture, or writer produces that layout, and it
@@ -455,8 +461,9 @@ Several chunks use enums or flags to specify data types or features. The most im
 > **Numbering (verified against the official spec)** — the numeric
 > values below are transcribed from the enum declarations in Aaronia's
 > official file-format document (rev. 4). Note the sample-type
-> ordering: at each width the *signed* variant precedes the *unsigned*
-> one (`U8, U16, S16, U32, S32, F32`) — an earlier revision of the
+> ordering: each width's *unsigned* variant is immediately followed by
+> its signed sibling (`U8, U16, S16, U32, S32, F32`), rather than all
+> unsigned then all signed — an earlier revision of the
 > Rust reader had `S16`/`U32` swapped and omitted `DSST_U32N` (9)
 > entirely, so a file using value 9 failed to open. The reader now
 > maps any value outside the specified range of these three `SAMP`
@@ -503,9 +510,8 @@ Specifies the physical unit for the sample data.
 | 19 | `DSSU_VOLT` | Volts. |
 | 20 | `DSSU_LOG_PERCENTAGE` | Logarithmic percentage (0 to 1). |
 
-Values 0–8 map in table order. This crate additionally accepts the
-undocumented value 19 (observed in captures), mapping it to an
-`Unknown` unit.
+The Rust reader maps all 21 values in table order; values outside 0–20
+degrade to an `Unknown` variant rather than rejecting the file.
 
 #### `SAMP` Chunk: `mPayloadType`
 Specifies the high-level structure of the sample data.

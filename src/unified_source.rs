@@ -184,7 +184,10 @@ impl AaroniaConfig {
 
     /// Select the receiver channel(s) for native-SDK captures
     /// (`spectranv6/raw` only). With [`RxChannel::Rx1And2`], read both
-    /// channels via the native source's `read_samples_dual`.
+    /// channels via [`AaroniaSource::read_samples_dual`]; the mono
+    /// [`AaroniaSource::read_samples`] on a dual stream is rejected by
+    /// the stream's read-mode latch rather than silently returning one
+    /// channel.
     #[must_use]
     pub fn receiver_channel(mut self, channel: RxChannel) -> Self {
         self.receiver_channel = Some(channel);
@@ -414,18 +417,17 @@ impl AaroniaSource {
                     .map(|c| c as widestring::WideChar)
                     .collect();
 
-            // Open and configure device
+            // Open and configure device. The channel selection is a
+            // parameter of configure_iq_receiver (not a follow-up call)
+            // so every reconfiguration path — including retunes —
+            // re-applies it automatically.
             source.open_device(open_mode, &serial_wide)?;
             source.configure_iq_receiver(
                 self.config.center_frequency,
                 self.config.span_frequency,
                 self.config.reference_level,
+                self.config.receiver_channel,
             )?;
-            // `configure_iq_receiver` defaults the channel to Rx1;
-            // apply an explicit selection after it so the override wins.
-            if let Some(channel) = self.config.receiver_channel {
-                source.set_receiver_channel(channel)?;
-            }
 
             self.native_source = Some(source);
         }
@@ -641,6 +643,45 @@ impl AaroniaSource {
     }
 
     /// Read IQ samples from the source
+    /// Read up to `max_samples` (Rx1, Rx2) sample *pairs* from a
+    /// dual-channel native-SDK stream — the unified-level counterpart
+    /// of `NativeSdkSource::read_samples_dual`. Requires the source to
+    /// have been built with
+    /// [`receiver_channel(RxChannel::Rx1And2)`](AaroniaConfig::receiver_channel)
+    /// on the native SDK backend; every other backend returns a
+    /// configuration error, since HTTP and file sources carry one
+    /// channel per stream.
+    pub async fn read_samples_dual(
+        &mut self,
+        rx1: &mut Vec<Complex32>,
+        rx2: &mut Vec<Complex32>,
+        max_samples: usize,
+    ) -> Result<usize> {
+        match self.source_type {
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            SourceType::NativeSdk => {
+                if let Some(ref mut source) = self.native_source {
+                    unsafe { source.read_samples_dual(rx1, rx2, max_samples) }
+                } else {
+                    Err(Error::Config(
+                        "Native SDK source not initialized".to_string(),
+                    ))
+                }
+            }
+            _ => {
+                let _ = (rx1, rx2, max_samples);
+                Err(Error::Config(format!(
+                    "read_samples_dual requires the native SDK backend with \
+                     receiver_channel = Rx1And2; current backend is {:?}",
+                    self.source_type
+                )))
+            }
+        }
+    }
+
     pub async fn read_samples(
         &mut self,
         buffer: &mut Vec<Complex32>,
@@ -817,6 +858,7 @@ impl AaroniaSource {
                             freq,
                             self.config.span_frequency,
                             self.config.reference_level,
+                            self.config.receiver_channel,
                         )?
                     };
                 } else {
@@ -1034,6 +1076,14 @@ impl AaroniaSourceBuilder {
     }
 
     /// Set the device serial number
+    /// Select the receiver channel(s) for native-SDK captures
+    /// (`spectranv6/raw` only) — see
+    /// [`AaroniaConfig::receiver_channel`].
+    pub fn receiver_channel(&mut self, channel: RxChannel) -> &mut Self {
+        self.config.receiver_channel = Some(channel);
+        self
+    }
+
     pub fn device_serial(&mut self, serial: String) -> &mut Self {
         self.config.device_serial = Some(serial);
         self
