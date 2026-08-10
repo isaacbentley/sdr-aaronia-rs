@@ -46,6 +46,11 @@ jobs:
   test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A full build + test leg normally finishes in ~3 minutes; the cap
+    # exists because a single hung test otherwise occupies a runner for
+    # the 6-hour GitHub default (observed: http_sink_test wedged a
+    # windows runner for ~2h before being cancelled by hand).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -100,6 +105,7 @@ jobs:
   miri:
     name: Miri (decompression + http_streaming + utils)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -133,6 +139,7 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -147,6 +154,7 @@ jobs:
   hack:
     name: cargo-hack (feature permutations)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -170,6 +178,7 @@ jobs:
   machete:
     name: cargo-machete (unused dependencies)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
