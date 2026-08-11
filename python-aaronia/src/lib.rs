@@ -13,17 +13,6 @@
 //! timeout, shutdown) releases the GIL, so other Python threads keep
 //! running and `KeyboardInterrupt` stays deliverable between calls.
 
-// These allows are all pyo3 0.22 proc-macro fallout, fixed upstream in
-// pyo3 0.23 — drop them when bumping: the expansions trip
-// edition-2024's unsafe_op_in_unsafe_fn, reference the `gil-refs` cfg,
-// and route #[pymethods] `PyResult` returns through an `.into()` in
-// generated wrapper fns that clippy ≥ 1.89 flags as useless_conversion
-// (attributed to the method signature; an impl-level allow doesn't
-// reach the wrappers, hence crate-level).
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(unexpected_cfgs)]
-#![allow(clippy::useless_conversion)]
-
 use arrow::array::{Array, FixedSizeListArray};
 use arrow::datatypes::{DataType, Field};
 use arrow::pyarrow::ToPyArrow;
@@ -106,7 +95,7 @@ fn map_any_err<E: std::fmt::Display>(e: E) -> PyErr {
 /// Every field is settable *and* readable (the earlier revision was
 /// write-only, and offered no way to reach a non-localhost device or a
 /// recorded file at all).
-#[pyclass(name = "AaroniaConfig")]
+#[pyclass(name = "AaroniaConfig", skip_from_py_object)]
 #[derive(Clone)]
 struct PyAaroniaConfig {
     inner: AaroniaConfig,
@@ -288,7 +277,7 @@ impl PyAaroniaSource {
         self.read_scratch.clear();
         let rt = self.rt.clone();
         let scratch = &mut self.read_scratch;
-        py.allow_threads(|| rt.block_on(source.read_samples(scratch, count)))
+        py.detach(|| rt.block_on(source.read_samples(scratch, count)))
             .map_err(map_aaronia_err)
     }
 }
@@ -311,7 +300,7 @@ impl PyAaroniaSource {
         let rt = self.rt.clone();
         let config_inner = config.inner.clone();
         let source = py
-            .allow_threads(|| {
+            .detach(|| {
                 rt.block_on(async {
                     let mut source = AaroniaSource::new(config_inner).await?;
                     source.start_streaming().await?;
@@ -328,7 +317,7 @@ impl PyAaroniaSource {
     fn stop_streaming(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(mut source) = self.source.take() {
             let rt = self.rt.clone();
-            py.allow_threads(|| rt.block_on(source.stop_streaming()))
+            py.detach(|| rt.block_on(source.stop_streaming()))
                 .map_err(map_aaronia_err)?;
         }
         Ok(())
@@ -343,14 +332,18 @@ impl PyAaroniaSource {
         count: usize,
     ) -> PyResult<Bound<'py, PyArray1<Complex32>>> {
         let read = self.read_into_scratch(py, count)?;
-        Ok(PyArray1::from_slice_bound(py, &self.read_scratch[..read]))
+        Ok(PyArray1::from_slice(py, &self.read_scratch[..read]))
     }
 
     /// Read up to `count` IQ samples as a PyArrow `FixedSizeListArray`
     /// of `[re, im]` float32 pairs. The samples are copied once while
     /// building the Arrow buffer; the Arrow → pyarrow handoff itself is
     /// the standard C-Data interface (no further copy).
-    fn read_samples_arrow(&mut self, py: Python<'_>, count: usize) -> PyResult<PyObject> {
+    fn read_samples_arrow<'py>(
+        &mut self,
+        py: Python<'py>,
+        count: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let read = self.read_into_scratch(py, count)?;
 
         let mut float_values = Vec::with_capacity(read * 2);
@@ -379,7 +372,7 @@ impl PyAaroniaSource {
             .as_mut()
             .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
-        py.allow_threads(|| rt.block_on(source.set_center_frequency(freq_hz)))
+        py.detach(|| rt.block_on(source.set_center_frequency(freq_hz)))
             .map_err(map_aaronia_err)
     }
 
@@ -391,7 +384,7 @@ impl PyAaroniaSource {
             .as_mut()
             .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
-        py.allow_threads(|| rt.block_on(source.set_span_frequency(rate_hz)))
+        py.detach(|| rt.block_on(source.set_span_frequency(rate_hz)))
             .map_err(map_aaronia_err)
     }
 
@@ -403,7 +396,7 @@ impl PyAaroniaSource {
             .as_mut()
             .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
-        py.allow_threads(|| rt.block_on(source.set_reference_level(dbm)))
+        py.detach(|| rt.block_on(source.set_reference_level(dbm)))
             .map_err(map_aaronia_err)
     }
 
@@ -427,7 +420,7 @@ impl PyAaroniaSource {
             .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
         let (rx1, rx2) = py
-            .allow_threads(|| {
+            .detach(|| {
                 rt.block_on(async {
                     let mut rx1 = Vec::new();
                     let mut rx2 = Vec::new();
@@ -437,8 +430,8 @@ impl PyAaroniaSource {
             })
             .map_err(map_aaronia_err)?;
         Ok((
-            PyArray1::from_slice_bound(py, &rx1),
-            PyArray1::from_slice_bound(py, &rx2),
+            PyArray1::from_slice(py, &rx1),
+            PyArray1::from_slice(py, &rx2),
         ))
     }
 
@@ -484,16 +477,13 @@ fn aaronia(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add(
         "AaroniaConnectionError",
-        py.get_type_bound::<AaroniaConnectionError>(),
+        py.get_type::<AaroniaConnectionError>(),
     )?;
     m.add(
         "AaroniaHardwareError",
-        py.get_type_bound::<AaroniaHardwareError>(),
+        py.get_type::<AaroniaHardwareError>(),
     )?;
-    m.add(
-        "AaroniaTimeoutError",
-        py.get_type_bound::<AaroniaTimeoutError>(),
-    )?;
+    m.add("AaroniaTimeoutError", py.get_type::<AaroniaTimeoutError>())?;
 
     Ok(())
 }
