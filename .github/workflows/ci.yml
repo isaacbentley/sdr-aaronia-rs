@@ -189,3 +189,67 @@ jobs:
 
       - name: cargo machete
         run: cargo machete
+
+  # The Python bindings and the SoapySDR C++ plugin previously compiled
+  # for the first time in release.yml — at tag time. These jobs make
+  # them PR-gated. Mirrored in scripts/ci-local.sh (python/soapy steps).
+  python:
+    name: Python bindings (maturin build + pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install Linux Dependencies
+        uses: ./.github/actions/linux-build-deps
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build and install wheel
+        run: |
+          python -m pip install maturin pytest numpy pyarrow
+          maturin build --release --manifest-path python-aaronia/Cargo.toml --out dist
+          python -m pip install dist/*.whl
+
+      - name: pytest
+        run: python -m pytest python-aaronia/test_basic.py -q
+
+  soapy:
+    name: SoapySDR plugin (cmake build + load check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install Linux Dependencies
+        uses: ./.github/actions/linux-build-deps
+
+      - name: Install SoapySDR
+        run: sudo apt-get install -y libsoapysdr-dev soapysdr-tools
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build plugin (drives cargo internally)
+        run: |
+          cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build soapy-aaronia/build
+
+      - name: Module load check
+        run: |
+          SOAPY_SDR_PLUGIN_PATH=$PWD/soapy-aaronia/build SoapySDRUtil --check=aaronia

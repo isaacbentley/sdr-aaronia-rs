@@ -11,7 +11,7 @@ A Rust library for interfacing with Aaronia Spectran SDR devices.
 
 `sdr-aaronia-rs` provides a unified API for interacting with Aaronia hardware, abstracting away the underlying transport layers. It supports native SDK connections, bidirectional HTTP streaming (RX/TX), and RTSA file sources through a single, consistent interface with deterministic source selection.
 
-In addition to the Rust crate, this project provides **Native Python Bindings** (via PyO3) for high-performance zero-copy NumPy/Arrow integration, and **C++ Plugins** for the SoapySDR and Seify ecosystems.
+In addition to the Rust crate, this project provides **Python bindings** (via PyO3) with single-copy NumPy/Arrow reads, a **C++ SoapySDR plugin**, and a **Rust-native seify backend**.
 
 ## Overview
 
@@ -30,8 +30,8 @@ Interfacing with SDR hardware typically requires choosing between proprietary na
 - **RTSA File Processing:** Reads RTSA capture files via buffered I/O, including metadata extraction and multi-stream support.
 - **Device Management:** Real-time control of streaming parameters, device health monitoring, input stream enumeration, and hierarchical configuration.
 - **FutureSDR Integration:** Optional `HttpSource` and `HttpSink` flowgraph blocks under the `futuresdr` feature.
-- **Python Data-Science Native:** Zero-copy bindings to NumPy arrays and Apache Arrow dataframes in Python via PyO3.
-- **C++ Ecosystem Plugins:** Drop-in support for `SoapySDR` and `Seify` abstraction layers natively.
+- **Python Data-Science Native:** PyO3 bindings with single-copy reads into NumPy arrays and Apache Arrow buffers (one copy out of the Rust receive buffer per read).
+- **SDR Ecosystem Plugins:** a C++ `SoapySDR` plugin and a Rust-native `seify` backend.
 
 *Note: writes to the HTTP `/remoteconfig` endpoint require a separate Aaronia "Remote Config" license; capture control via `/control` (including retuning) does not.*
 
@@ -42,11 +42,11 @@ Add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
 # By default, includes HTTP, File, native sdr-source trait, and C FFI backend support
-sdr-aaronia-rs = "0.3"
+sdr-aaronia-rs = "0.4"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
 # To enable additional backends, opt into their features (e.g. native-sdk, futuresdr)
-# sdr-aaronia-rs = { version = "0.3", features = ["native-sdk", "futuresdr"] }
+# sdr-aaronia-rs = { version = "0.4", features = ["native-sdk", "futuresdr"] }
 ```
 
 ## Quickstart
@@ -82,7 +82,7 @@ The `examples/` directory contains runnable examples for each subsystem:
 
 - **[http_iq_quickstart.rs](examples/http_iq_quickstart.rs)**: Connect to an RTSA HTTP server and stream live IQ data natively.
 - **[noaa_scanner.rs](examples/noaa_scanner.rs)**: Scan NOAA weather channels and demodulate FM audio in real-time using `FutureSDR`.
-- **[native_sdk_basic.rs](examples/native_sdk_basic.rs)**: Access hardware directly with zero-copy C++ Native SDK integration.
+- **[native_sdk_basic.rs](examples/native_sdk_basic.rs)**: Access hardware directly through the vendor's native SDK (Windows/Linux).
 - **[native_sdk_transmit.rs](examples/native_sdk_transmit.rs)**: Stream IQ bursts (e.g. LoRa chirps) over the Native SDK to standard Spectran V6 devices.
 - **[channel_hopping.rs](examples/channel_hopping.rs)**: Perform automatic frequency hopping using the native `sdr-source` feature.
 - **[read_rtsa_file.rs](examples/read_rtsa_file.rs)**: Open a local RTSA capture, parse the metadata headers, and read samples efficiently.
@@ -387,21 +387,29 @@ async fn main() -> Result<()> {
 
 ## Python Bindings (NumPy & Apache Arrow)
 
-The `python-aaronia` package provides Python native bindings to the Rust engine using PyO3, allowing you to use high-throughput zero-copy arrays in Pandas, NumPy, or PyArrow.
+The `python-aaronia` package provides Python bindings to the Rust engine
+using PyO3. Reads land in NumPy or PyArrow with exactly one copy out of
+the Rust receive buffer; blocking calls release the GIL. Wheels are
+abi3 (CPython ≥ 3.9); the PyPI distribution is `python-aaronia`, and
+the importable module is `aaronia`.
 
 ### Installation
-You can build the Python bindings locally using `maturin`:
+From a published release:
+```bash
+pip install python-aaronia
+```
+Or build locally with `maturin`:
 ```bash
 cd python-aaronia
-maturin develop
+maturin develop --release
 ```
 
 ### Python Streaming Example
 ```python
 from aaronia import AaroniaConfig, AaroniaSource
 
-# Auto-detects the backend and configures the stream
 config = AaroniaConfig()
+config.http_base_url = "http://localhost:54664"  # RTSA-Suite HTTP server
 config.format = "F32"
 config.center_freq = 2400e6
 config.sample_rate = 20e6
@@ -410,7 +418,7 @@ config.sample_rate = 20e6
 source = AaroniaSource()
 source.start_streaming(config)
 
-# 1. Zero-Copy NumPy Read (1D Complex32)
+# 1. NumPy read (1D complex64; blocks with the GIL released)
 np_samples = source.read_samples_numpy(1024)
 print(f"NumPy shape: {np_samples.shape}")
 
@@ -430,8 +438,15 @@ source.stop_streaming()
 
 The `sdr-aaronia-rs` workspace also acts as the source of truth for standard SDR ecosystem drivers:
 
-- **SoapySDR Plugin**: We provide a C++ `SoapySDR` driver in the `soapy-aaronia/` folder. It defaults to the low-bandwidth `CS16` format to optimize network traffic and gracefully exposes hardware timestamps and dropped-block telemetry.
-- **Seify Plugin**: We ship a direct Rust backend for `seify`.
+- **SoapySDR Plugin** (`soapy-aaronia/`, C++): CF32 and CS16 stream
+  formats (CS16 is a client-side conversion; for genuine low-bandwidth
+  *network* streaming pass the `format=I16` device arg, which switches
+  the HTTP wire format), retune-safe streaming, honoured timeouts,
+  timestamps and dropped-block telemetry. TX exists behind the
+  native SDK on Windows/Linux and is hardware-unverified.
+- **Seify backend** (Rust-native, `seify` feature): construct via
+  `AaroniaSeifyDevice::from_args`; not part of seify's built-in
+  enumeration registry.
 
 For deep-dive setup instructions and documentation on the C++ side and Bandwidth Optimization tricks, please see the dedicated [PLUGINS.md](PLUGINS.md) document.
 

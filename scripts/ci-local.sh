@@ -167,4 +167,37 @@ if ! skipped vm; then
     fi
 fi
 
+# ---- python job (maturin build + pytest, mirrors ci.yml) -----------
+if ! skipped python; then
+    if command -v python3 >/dev/null 2>&1; then
+        step "python bindings: cargo check -p python-aaronia (+ pytest when venv exists)"
+        cargo check -p python-aaronia
+        # Full maturin build + pytest when the dev venv is set up
+        # (python-aaronia/venv with maturin installed); cargo check
+        # alone still catches compile breakage everywhere.
+        if [[ -x python-aaronia/venv/bin/maturin ]]; then
+            (cd python-aaronia \
+                && VIRTUAL_ENV=$PWD/venv PATH=$PWD/venv/bin:$PATH \
+                   maturin develop --release >/dev/null \
+                && ./venv/bin/python -m pytest test_basic.py -q)
+        else
+            echo "python step: no python-aaronia/venv with maturin — ran cargo check only" >&2
+        fi
+    else
+        echo "python step: python3 not found — skipping" >&2
+    fi
+fi
+
+# ---- soapy job (cmake build + load check, mirrors ci.yml) ----------
+if ! skipped soapy; then
+    if pkg-config --exists SoapySDR 2>/dev/null; then
+        step "soapy plugin: cmake build + SoapySDRUtil --check=aaronia"
+        cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release >/dev/null
+        cmake --build soapy-aaronia/build >/dev/null
+        SOAPY_SDR_PLUGIN_PATH=$PWD/soapy-aaronia/build SoapySDRUtil --check=aaronia
+    else
+        echo "soapy step: SoapySDR not installed (brew install soapysdr / apt libsoapysdr-dev) — skipping" >&2
+    fi
+fi
+
 printf '\n\033[1;32mci-local: all steps passed.\033[0m\n'

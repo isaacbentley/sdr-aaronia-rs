@@ -16,3 +16,9 @@ python-aaronia/__pycache__/test_basic.cpython-314-pytest-9.1.1.pyc
 python-aaronia/err.txt
 python-aaronia/check_errors.txt
 branch_diff.txt
+
+# Python bindings dev environment and local plugin builds
+python-aaronia/venv/
+python-aaronia/**/__pycache__/
+soapy-aaronia/build/
+dist/

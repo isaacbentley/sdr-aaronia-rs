@@ -4,7 +4,7 @@
 
 ## 1. Seify Plugin (Rust Native)
 
-[Seify](https://github.com/mryndzionek/seify) is a modern, Rust-native SDR hardware abstraction layer. We provide a backend for `seify` directly within this crate.
+[Seify](https://github.com/FutureSDR/seify) is a Rust-native SDR hardware abstraction layer. We provide a backend for `seify` directly within this crate.
 
 ### Usage
 
@@ -12,10 +12,10 @@ To use the Seify plugin, enable the `seify` feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sdr-aaronia-rs = { version = "0.3.5", features = ["seify"] }
+sdr-aaronia-rs = { version = "0.4", features = ["seify"] }
 ```
 
-In your code, you can instantiate the device using the `AaroniaSeifyDevice` backend directly, or by passing the appropriate arguments string if it's registered with the global registry.
+Instantiate the device with `AaroniaSeifyDevice::from_args` and use it directly (or via `seify::dev::DynDeviceBackend`). The backend is **not** part of seify's built-in enumeration registry — `seify::enumerate()` will not discover it.
 
 ```rust
 use sdr_aaronia_rs::seify_impl::AaroniaSeifyDevice;
@@ -105,11 +105,22 @@ sdr.activateStream(rxStream)
 # ... read samples ...
 ```
 
-### Bandwidth Trade-off: CS16 vs CF32
+### Bandwidth Trade-off: wire format vs stream format
 
-The Aaronia hardware natively supplies 16-bit signed integer (`CS16`) I/Q data.
-- **`CS16` (Default)**: The plugin's native stream format is `CS16`. This requires exactly half the memory and bandwidth (32 bits per complex sample) compared to 32-bit floats. **This is highly recommended for network streaming** as it avoids overhead and allows for higher sample rates.
-- **`CF32`**: The plugin also supports `CF32`. When requesting this format, the C++ driver automatically converts the 16-bit integers to 32-bit floats on the fly. This format is convenient for DSP tools like GNU Radio that prefer floats, but it doubles the required memory bandwidth for sample transfers.
+Two different knobs, easy to confuse:
+
+- **App-side stream format** (`setupStream(..., CS16)` / `CF32`): what
+  the plugin hands your application. The C ABI always transfers CF32;
+  requesting `CS16` adds a client-side float→int16 conversion. It saves
+  application memory bandwidth but **zero network traffic**. The
+  plugin's native format is `CF32`.
+- **Network wire format** (device arg `format=I16`, optionally
+  `scale=N`): tells the RTSA HTTP server to send int16 on the wire —
+  this is the genuine low-bandwidth mode, halving network traffic:
+
+```python
+sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
+```
 
 ## 3. Metrics and Error Handling
 

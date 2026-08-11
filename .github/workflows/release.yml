@@ -9,6 +9,25 @@ permissions:
   contents: read
 
 jobs:
+  # Refuse to publish when the pushed tag disagrees with Cargo.toml —
+  # otherwise tag vX publishes whatever version the manifest happens to
+  # carry, across three registries.
+  tag_version_guard:
+    name: Tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - name: Compare tag and manifest versions
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          if [ "$tag" != "$crate" ]; then
+            echo "tag v$tag != Cargo.toml version $crate" >&2
+            exit 1
+          fi
+
   # Real gate (no continue-on-error): a breaking API change must be caught
   # here, before it's published, not merely reported per-PR where it can
   # never actually block anything. Runs against the tagged commit, so it
@@ -22,6 +41,7 @@ jobs:
   # SdkSinkBlock/the futuresdr 0.0.39 migration and builds cleanly.
   semver_checks:
     name: cargo-semver-checks
+    needs: tag_version_guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +87,7 @@ jobs:
 
   build-python:
     name: Build Python wheels
+    needs: semver_checks
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -84,20 +105,35 @@ jobs:
         with:
           python-version: '3.11'
 
+      # python-aaronia builds abi3 wheels (pyo3 abi3-py39), so one
+      # wheel per OS/arch covers CPython >= 3.9; the interpreter above
+      # is only the build host.
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release --manifest-path python-aaronia/Cargo.toml --out dist
 
+      # Source distribution: pip's fallback for platforms/pythons the
+      # wheel matrix doesn't cover.
+      - name: Build sdist
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --manifest-path python-aaronia/Cargo.toml --out dist
+
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
           name: python-wheels-${{ matrix.os }}
-          path: dist/*.whl
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
 
   build-soapy:
     name: Build SoapySDR Plugin
+    needs: semver_checks
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -126,26 +162,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build sdr-aaronia-rs (Release)
-        run: cargo build --release
-
+      # CMake drives the cargo build itself (static lib, linked into
+      # the module — the shipped artifact has no Rust dylib dependency).
+      # `cmake --build` works with both Makefile and Visual Studio
+      # multi-config generators; the old `make` invocation could not
+      # build on Windows at all, and VS puts outputs under Release/.
       - name: Build Soapy Plugin
         shell: bash
         run: |
-          mkdir -p soapy-aaronia/build
-          cd soapy-aaronia/build
           if [ "$RUNNER_OS" == "Windows" ]; then
-            cmake -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" ..
+            cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           else
-            cmake ..
+            cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release
           fi
-          make
+          cmake --build soapy-aaronia/build --config Release
 
+      # CMake MODULE targets are lib<name>.so on both Linux and macOS
+      # (SoapySDR modules on macOS are .so, not .dylib).
       - name: Package Plugin (macOS DMG)
         if: runner.os == 'macOS'
         run: |
           mkdir -p soapy-aaronia/dist/SoapyAaronia
-          cp soapy-aaronia/build/libaaroniaSupport.dylib soapy-aaronia/dist/SoapyAaronia/
+          cp soapy-aaronia/build/libaaroniaSupport.so soapy-aaronia/dist/SoapyAaronia/
           hdiutil create -volname SoapyAaronia -srcfolder soapy-aaronia/dist/SoapyAaronia -ov -format UDZO soapy-aaronia/dist/SoapyAaronia.dmg
 
       - name: Prepare Plugin Artifacts
@@ -155,7 +194,7 @@ jobs:
           if [ "$RUNNER_OS" == "Linux" ]; then
             cp soapy-aaronia/build/libaaroniaSupport.so soapy-aaronia/dist/
           elif [ "$RUNNER_OS" == "Windows" ]; then
-            cp soapy-aaronia/build/aaroniaSupport.dll soapy-aaronia/dist/
+            cp soapy-aaronia/build/Release/aaroniaSupport.dll soapy-aaronia/dist/
           fi
 
       - name: Upload Plugin
@@ -169,7 +208,7 @@ jobs:
 
   github-release:
     name: GitHub Release
-    needs: [build-python, build-soapy]
+    needs: [semver_checks, publish, build-python, build-soapy]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -192,7 +231,7 @@ jobs:
 
   pypi-publish:
     name: Publish Python wheels to PyPI
-    needs: [build-python]
+    needs: [semver_checks, publish, build-python]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -207,3 +246,7 @@ jobs:
 
       - name: Publish package
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A re-run of a partially failed release must not go red on
+          # the files that already made it to PyPI.
+          skip-existing: true
