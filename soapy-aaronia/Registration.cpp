@@ -61,7 +61,14 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         throw std::runtime_error(err);
     }
 
-    return new AaroniaSoapyDevice(source, args);
+    AaroniaSinkBuilder* sink_builder = aaronia_sink_builder_new();
+    AaroniaSink* sink = nullptr;
+    if (sink_builder) {
+        sink = aaronia_sink_build(sink_builder);
+        aaronia_sink_builder_free(sink_builder);
+    }
+
+    return new AaroniaSoapyDevice(source, sink, args);
 }
 
 static SoapySDR::Registry registerAaronia("aaronia", &findAaronia, &makeAaronia, SOAPY_SDR_ABI_VERSION);

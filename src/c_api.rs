@@ -1,5 +1,7 @@
 use crate::http_endpoints::HttpEndpointsClient;
-use crate::unified_source::{AaroniaSource, AaroniaSourceBuilder, SourceType};
+use crate::unified_sink::{AaroniaSinkBuilder, UnifiedSink};
+use crate::unified_source::{AaroniaSource, AaroniaSourceBuilder, SourceInfo, SourceType};
+use crate::utils::{self, format_frequency, format_sample_rate};
 use num_complex::Complex32;
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_void};
@@ -419,13 +421,61 @@ pub unsafe extern "C" fn aaronia_source_read_samples(
         }
         Ok(Err(e)) => {
             set_last_error(format!("aaronia_source_read_samples failed: {}", e));
-            -3 // Read error
+            // Specifically bubble up Timeout to Soapy's SOAPY_SDR_TIMEOUT (-3)
+            if let crate::Error::Io(ref io_err) = e
+                && io_err.kind() == std::io::ErrorKind::TimedOut
+            {
+                return -3;
+            }
+            -1 // Generic stream error
         }
         Err(ctx) => {
             set_last_error(format!("aaronia_source_read_samples: {}", ctx));
-            -3
+            -1 // Generic stream error
         }
     }
+}
+
+/// Read and clear the latched overrun flag from the source.
+///
+/// # Safety
+/// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
+///   and not yet freed; null returns `false`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_take_overrun(ptr: *mut c_void) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
+    source.take_overrun()
+}
+
+/// Get the cumulative number of dropped packets.
+///
+/// # Safety
+/// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
+///   and not yet freed; null returns `0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_get_cumulative_drops(ptr: *mut c_void) -> u64 {
+    if ptr.is_null() {
+        return 0;
+    }
+    let source = unsafe { &*(ptr as *mut AaroniaSource) };
+    source.cumulative_drops()
+}
+
+/// Get the hardware timestamp of the last received block (in nanoseconds since epoch).
+///
+/// # Safety
+/// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
+///   and not yet freed; null returns `0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_get_last_timestamp_ns(ptr: *mut c_void) -> i64 {
+    if ptr.is_null() {
+        return 0;
+    }
+    let source = unsafe { &*(ptr as *mut AaroniaSource) };
+    source.last_timestamp_ns()
 }
 
 /// Start streaming on the source. Returns an `AaroniaFfiError`.
@@ -903,6 +953,121 @@ pub unsafe extern "C" fn aaronia_get_error_message(error_code: AaroniaFfiError) 
         .unwrap_or_else(|_| CString::new("invalid").unwrap())
         .into_raw()
 }
+
+// -----------------------------------------------------------------------------
+// SINK API
+// -----------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_sink_builder_new() -> *mut AaroniaSinkBuilder {
+    Box::into_raw(Box::new(AaroniaSinkBuilder::new()))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_sink_builder_free(builder: *mut AaroniaSinkBuilder) {
+    if !builder.is_null() {
+        unsafe { drop(Box::from_raw(builder)) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_sink_build(builder: *mut AaroniaSinkBuilder) -> *mut c_void {
+    if builder.is_null() {
+        set_last_error("Null builder".to_string());
+        return ptr::null_mut();
+    }
+    let builder_ref = unsafe { Box::from_raw(builder) };
+    let sink = builder_ref.build();
+    Box::into_raw(Box::new(sink)) as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_sink_free(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        unsafe { drop(Box::from_raw(ptr as *mut UnifiedSink)) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_sink_initialize(ptr: *mut c_void) -> AaroniaFfiError {
+    if ptr.is_null() {
+        set_last_error("Null pointer".to_string());
+        return AaroniaFfiError::NullPointer;
+    }
+    let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.handle().clone(),
+            Err(e) => {
+                set_last_error(format!("Failed to create runtime: {}", e));
+                return AaroniaFfiError::InternalError;
+            }
+        },
+    };
+    
+    match handle.block_on(async { sink.initialize().await }) {
+        Ok(_) => AaroniaFfiError::Success,
+        Err(e) => {
+            set_last_error(format!("Initialize error: {}", e));
+            AaroniaFfiError::InternalError
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_sink_stop_streaming(ptr: *mut c_void) -> AaroniaFfiError {
+    if ptr.is_null() {
+        set_last_error("Null pointer".to_string());
+        return AaroniaFfiError::NullPointer;
+    }
+    let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.handle().clone(),
+            Err(e) => {
+                set_last_error(format!("Failed to create runtime: {}", e));
+                return AaroniaFfiError::InternalError;
+            }
+        },
+    };
+
+    match handle.block_on(async { sink.stop_streaming().await }) {
+        Ok(_) => AaroniaFfiError::Success,
+        Err(e) => {
+            set_last_error(format!("Stop streaming error: {}", e));
+            AaroniaFfiError::InternalError
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_sink_write_samples(
+    ptr: *mut c_void,
+    channel: i32,
+    start_time_s: f64,
+    end_time_s: f64,
+    samples: *const num_complex::Complex32,
+    num_samples: usize,
+) -> AaroniaFfiError {
+    if ptr.is_null() || samples.is_null() {
+        set_last_error("Null pointer".to_string());
+        return AaroniaFfiError::NullPointer;
+    }
+    
+    let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
+    let slice = unsafe { std::slice::from_raw_parts(samples, num_samples) };
+    
+    match sink.write_samples(channel, start_time_s, end_time_s, slice) {
+        Ok(_) => AaroniaFfiError::Success,
+        Err(e) => {
+            set_last_error(format!("Write error: {}", e));
+            AaroniaFfiError::InternalError
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

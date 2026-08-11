@@ -36,9 +36,13 @@ pub mod sdr_source {
 #[cfg(feature = "sdr-source")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sdr-source")))]
 pub mod sdr_source_impl;
+#[cfg(feature = "seify")]
+#[cfg_attr(docsrs, doc(cfg(feature = "seify")))]
+pub mod seify_impl;
 #[cfg(all(feature = "http", feature = "file"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "http", feature = "file"))))]
 pub mod unified_source;
+pub mod unified_sink;
 pub mod utils;
 
 pub use error::{Error, Result};

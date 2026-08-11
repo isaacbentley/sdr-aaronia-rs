@@ -78,6 +78,9 @@ AaroniaSource* aaronia_source_build(AaroniaSourceBuilder* builder);
 
 void aaronia_source_free(AaroniaSource* source);
 intptr_t aaronia_source_read_samples(AaroniaSource* source, FfiComplex* buffer, uintptr_t len);
+bool aaronia_source_take_overrun(AaroniaSource* source);
+uint64_t aaronia_source_get_cumulative_drops(AaroniaSource* source);
+int64_t aaronia_source_get_last_timestamp_ns(AaroniaSource* source);
 AaroniaFfiError aaronia_source_start_streaming(AaroniaSource* source);
 AaroniaFfiError aaronia_source_stop_streaming(AaroniaSource* source);
 AaroniaFfiError aaronia_source_set_center_frequency(AaroniaSource* source, double freq_hz);
@@ -85,6 +88,26 @@ AaroniaFfiError aaronia_source_set_span_frequency(AaroniaSource* source, double 
 AaroniaFfiError aaronia_source_set_reference_level(AaroniaSource* source, double ref_level_dbm);
 FfiSourceInfo* aaronia_source_get_source_info(AaroniaSource* source);
 void aaronia_source_info_free(FfiSourceInfo* info);
+
+// --- Sink FFI --- //
+
+typedef struct AaroniaSinkBuilder AaroniaSinkBuilder;
+typedef struct AaroniaSink AaroniaSink; // Opaque UnifiedSink
+
+AaroniaSinkBuilder* aaronia_sink_builder_new(void);
+void aaronia_sink_builder_free(AaroniaSinkBuilder* builder);
+AaroniaSink* aaronia_sink_build(AaroniaSinkBuilder* builder);
+void aaronia_sink_free(AaroniaSink* sink);
+AaroniaFfiError aaronia_sink_initialize(AaroniaSink* sink);
+AaroniaFfiError aaronia_sink_stop_streaming(AaroniaSink* sink);
+AaroniaFfiError aaronia_sink_write_samples(
+    AaroniaSink* sink,
+    int32_t channel,
+    double start_time_s,
+    double end_time_s,
+    const float _Complex* samples,
+    size_t num_samples
+);
 
 // --- Remote Control FFI --- //
 

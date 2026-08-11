@@ -4,8 +4,8 @@
 #include <stdexcept>
 #include <algorithm>
 
-AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, const SoapySDR::Kwargs &args)
-    : _source(source), _centerFrequency(100e6), _sampleRate(1e6), _referenceLevel(-20.0), _isStreaming(false)
+AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink, const SoapySDR::Kwargs &args)
+    : _source(source), _sink(sink), _centerFrequency(100e6), _sampleRate(1e6), _referenceLevel(-20.0), _isStreaming(false)
 {
     if (!_source) {
         throw std::runtime_error("AaroniaSoapyDevice initialized with null source pointer");
@@ -28,6 +28,13 @@ AaroniaSoapyDevice::~AaroniaSoapyDevice() {
         aaronia_source_free(_source);
         _source = nullptr;
     }
+    if (_sink) {
+        if (_isStreaming) {
+            aaronia_sink_stop_streaming(_sink);
+        }
+        aaronia_sink_free(_sink);
+        _sink = nullptr;
+    }
 }
 
 std::string AaroniaSoapyDevice::getDriverKey() const {
@@ -46,12 +53,12 @@ SoapySDR::Kwargs AaroniaSoapyDevice::getHardwareInfo() const {
 }
 
 size_t AaroniaSoapyDevice::getNumChannels(const int direction) const {
-    return (direction == SOAPY_SDR_RX) ? 1 : 0;
+    return (direction == SOAPY_SDR_RX || direction == SOAPY_SDR_TX) ? 1 : 0;
 }
 
 std::vector<std::string> AaroniaSoapyDevice::getStreamFormats(const int direction, const size_t channel) const {
     std::vector<std::string> formats;
-    if (direction == SOAPY_SDR_RX && channel == 0) {
+    if ((direction == SOAPY_SDR_RX || direction == SOAPY_SDR_TX) && channel == 0) {
         formats.push_back(SOAPY_SDR_CF32);
         formats.push_back(SOAPY_SDR_CS16);
     }
@@ -59,8 +66,8 @@ std::vector<std::string> AaroniaSoapyDevice::getStreamFormats(const int directio
 }
 
 std::string AaroniaSoapyDevice::getNativeStreamFormat(const int direction, const size_t channel, double &fullScale) const {
-    fullScale = 1.0;
-    return SOAPY_SDR_CF32;
+    fullScale = 32767.0; // 16-bit signed integer max value
+    return SOAPY_SDR_CS16;
 }
 
 SoapySDR::Stream *AaroniaSoapyDevice::setupStream(
@@ -69,8 +76,8 @@ SoapySDR::Stream *AaroniaSoapyDevice::setupStream(
     const std::vector<size_t> &channels,
     const SoapySDR::Kwargs &args)
 {
-    if (direction != SOAPY_SDR_RX) {
-        throw std::runtime_error("Only RX streams are currently supported");
+    if (direction != SOAPY_SDR_RX && direction != SOAPY_SDR_TX) {
+        throw std::runtime_error("Only RX and TX streams are supported");
     }
     if (!channels.empty() && channels[0] != 0) {
         throw std::runtime_error("Invalid channel");
@@ -81,7 +88,23 @@ SoapySDR::Stream *AaroniaSoapyDevice::setupStream(
     }
 
     _streamFormat = format;
-    return reinterpret_cast<SoapySDR::Stream *>(this);
+    
+    if (direction == SOAPY_SDR_TX) {
+        if (!_sink) {
+            throw std::runtime_error("TX sink not initialized");
+        }
+        AaroniaFfiError err = aaronia_sink_initialize(_sink);
+        if (err != Success) {
+            char* msg = aaronia_last_error();
+            std::string errMsg = msg ? msg : "Failed to initialize sink";
+            if (msg) aaronia_string_free(msg);
+            throw std::runtime_error(errMsg);
+        }
+    }
+    
+    // SoapySDR allows returning an opaque pointer to represent the stream
+    // Since we only support one stream at a time (TX or RX), we return this.
+    return (SoapySDR::Stream *)this;
 }
 
 void AaroniaSoapyDevice::closeStream(SoapySDR::Stream *stream) {
@@ -96,16 +119,18 @@ int AaroniaSoapyDevice::activateStream(
 {
     std::lock_guard<std::mutex> lock(_mutex);
     if (_isStreaming) return 0;
-
+    
+    if (stream != (SoapySDR::Stream *)this) {
+        // Technically it could be TX, but Aaronia doesn't have a strict start_streaming for sink except initialization.
+    }
+    
     AaroniaFfiError err = aaronia_source_start_streaming(_source);
     if (err != Success) {
         char* msg = aaronia_last_error();
-        std::string err_str = msg ? msg : "Unknown error";
+        std::string errMsg = msg ? msg : "Failed to start streaming";
         if (msg) aaronia_string_free(msg);
-        SoapySDR::logf(SOAPY_SDR_ERROR, "Failed to start streaming: %s", err_str.c_str());
         return SOAPY_SDR_STREAM_ERROR;
     }
-
     _isStreaming = true;
     return 0;
 }
@@ -119,6 +144,9 @@ int AaroniaSoapyDevice::deactivateStream(
     if (!_isStreaming) return 0;
 
     aaronia_source_stop_streaming(_source);
+    if (_sink) {
+        aaronia_sink_stop_streaming(_sink);
+    }
     _isStreaming = false;
     return 0;
 }
@@ -133,30 +161,78 @@ int AaroniaSoapyDevice::readStream(
 {
     if (!buffs || !buffs[0]) return SOAPY_SDR_STREAM_ERROR;
 
+    intptr_t read = -1;
     if (_streamFormat == SOAPY_SDR_CF32) {
         FfiComplex *out = static_cast<FfiComplex *>(buffs[0]);
-        intptr_t read = aaronia_source_read_samples(_source, out, numElems);
-        if (read < 0) {
-            return SOAPY_SDR_TIMEOUT;
-        }
-        return static_cast<int>(read);
+        read = aaronia_source_read_samples(_source, out, numElems);
     } else if (_streamFormat == SOAPY_SDR_CS16) {
         // Read into temporary float buffer and scale to int16
-        std::vector<FfiComplex> tempBuf(numElems);
-        intptr_t read = aaronia_source_read_samples(_source, tempBuf.data(), numElems);
-        if (read < 0) {
-            return SOAPY_SDR_TIMEOUT;
+        if (_tempFloatBuffer.size() < numElems) {
+            _tempFloatBuffer.resize(numElems);
         }
-
-        int16_t *out = static_cast<int16_t *>(buffs[0]);
-        for (intptr_t i = 0; i < read; ++i) {
-            out[i * 2]     = static_cast<int16_t>(std::clamp(tempBuf[i].re * 32767.0f, -32768.0f, 32767.0f));
-            out[i * 2 + 1] = static_cast<int16_t>(std::clamp(tempBuf[i].im * 32767.0f, -32768.0f, 32767.0f));
+        read = aaronia_source_read_samples(_source, _tempFloatBuffer.data(), numElems);
+        if (read > 0) {
+            int16_t *out = static_cast<int16_t *>(buffs[0]);
+            for (intptr_t i = 0; i < read; ++i) {
+                out[i * 2]     = static_cast<int16_t>(std::clamp(_tempFloatBuffer[i].re * 32767.0f, -32768.0f, 32767.0f));
+                out[i * 2 + 1] = static_cast<int16_t>(std::clamp(_tempFloatBuffer[i].im * 32767.0f, -32768.0f, 32767.0f));
+            }
         }
-        return static_cast<int>(read);
+    } else {
+        return SOAPY_SDR_STREAM_ERROR;
     }
 
-    return SOAPY_SDR_STREAM_ERROR;
+    if (read < 0) {
+        if (read == -3) return SOAPY_SDR_TIMEOUT;
+        return SOAPY_SDR_STREAM_ERROR;
+    }
+
+    if (read > 0) {
+        if (aaronia_source_take_overrun(_source)) {
+            flags |= SOAPY_SDR_END_ABRUPT | SOAPY_SDR_OVERFLOW;
+        }
+        timeNs = aaronia_source_get_last_timestamp_ns(_source);
+        flags |= SOAPY_SDR_HAS_TIME;
+    }
+
+    return static_cast<int>(read);
+}
+
+int AaroniaSoapyDevice::writeStream(
+    SoapySDR::Stream *stream,
+    const void * const *buffs,
+    const size_t numElems,
+    int &flags,
+    const long long timeNs,
+    const long timeoutUs)
+{
+    if (!_sink) {
+        return SOAPY_SDR_STREAM_ERROR;
+    }
+
+    double start_time_s = timeNs == 0 ? 0.0 : timeNs / 1e9;
+    double end_time_s = start_time_s + (numElems / _sampleRate);
+
+    AaroniaFfiError err = Success;
+    if (_streamFormat == SOAPY_SDR_CF32) {
+        err = aaronia_sink_write_samples(
+            _sink,
+            0,
+            start_time_s,
+            end_time_s,
+            static_cast<const float _Complex*>(buffs[0]),
+            numElems
+        );
+    } else {
+        // Not implemented for CS16 yet on TX
+        return SOAPY_SDR_STREAM_ERROR;
+    }
+
+    if (err != Success) {
+        return SOAPY_SDR_STREAM_ERROR;
+    }
+    
+    return (int)numElems;
 }
 
 std::vector<std::string> AaroniaSoapyDevice::listAntennas(const int direction, const size_t channel) const {
@@ -256,4 +332,29 @@ double AaroniaSoapyDevice::getGain(const int direction, const size_t channel, co
 
 SoapySDR::Range AaroniaSoapyDevice::getGainRange(const int direction, const size_t channel, const std::string &name) const {
     return SoapySDR::Range(-100.0, 10.0); // -100 dBm to +10 dBm
+}
+
+std::vector<std::string> AaroniaSoapyDevice::listSensors(void) const {
+    std::vector<std::string> sensors;
+    sensors.push_back("cumulative_drops");
+    return sensors;
+}
+
+SoapySDR::ArgInfo AaroniaSoapyDevice::getSensorInfo(const std::string &name) const {
+    SoapySDR::ArgInfo info;
+    if (name == "cumulative_drops") {
+        info.key = "cumulative_drops";
+        info.name = "Cumulative Drops";
+        info.type = SoapySDR::ArgInfo::INT;
+        info.description = "Total number of packet drops detected in the streaming connection";
+    }
+    return info;
+}
+
+std::string AaroniaSoapyDevice::readSensor(const std::string &name) const {
+    if (name == "cumulative_drops") {
+        uint64_t drops = aaronia_source_get_cumulative_drops(_source);
+        return std::to_string(drops);
+    }
+    return "";
 }

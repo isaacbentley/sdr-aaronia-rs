@@ -12,7 +12,7 @@
 
 class AaroniaSoapyDevice : public SoapySDR::Device {
 public:
-    AaroniaSoapyDevice(AaroniaSource* source, const SoapySDR::Kwargs &args);
+    AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink, const SoapySDR::Kwargs &args);
     ~AaroniaSoapyDevice() override;
 
     // Identification API
@@ -54,6 +54,14 @@ public:
         long long &timeNs,
         const long timeoutUs = 100000) override;
 
+    int writeStream(
+        SoapySDR::Stream *stream,
+        const void * const *buffs,
+        const size_t numElems,
+        int &flags,
+        const long long timeNs = 0,
+        const long timeoutUs = 100000) override;
+
     // Antenna API
     std::vector<std::string> listAntennas(const int direction, const size_t channel) const override;
     void setAntenna(const int direction, const size_t channel, const std::string &name) override;
@@ -76,14 +84,21 @@ public:
     double getGain(const int direction, const size_t channel, const std::string &name) const override;
     SoapySDR::Range getGainRange(const int direction, const size_t channel, const std::string &name) const override;
 
+    // Sensor API
+    std::vector<std::string> listSensors(void) const override;
+    SoapySDR::ArgInfo getSensorInfo(const std::string &name) const override;
+    std::string readSensor(const std::string &name) const override;
+
 private:
     AaroniaSource *_source;
+    AaroniaSink *_sink;
     mutable std::mutex _mutex;
     double _centerFrequency;
     double _sampleRate;
     double _referenceLevel;
     std::string _streamFormat;
     bool _isStreaming;
+    std::vector<FfiComplex> _tempFloatBuffer;
 };
 
 #endif // AARONIA_SOAPY_DEVICE_HPP
