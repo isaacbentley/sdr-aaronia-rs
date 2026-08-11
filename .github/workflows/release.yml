@@ -64,3 +64,128 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
+
+  build-python:
+    name: Build Python wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-build-deps
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --manifest-path python-aaronia/Cargo.toml --out dist
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels-${{ matrix.os }}
+          path: dist/*.whl
+
+  build-soapy:
+    name: Build SoapySDR Plugin
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-build-deps
+
+      - name: Install SoapySDR (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libsoapysdr-dev
+
+      - name: Install SoapySDR (macOS)
+        if: runner.os == 'macOS'
+        run: brew install soapysdr
+
+      - name: Install SoapySDR (Windows)
+        if: runner.os == 'Windows'
+        run: vcpkg install soapysdr:x64-windows
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build sdr-aaronia-rs (Release)
+        run: cargo build --release
+
+      - name: Build Soapy Plugin
+        shell: bash
+        run: |
+          mkdir -p soapy-aaronia/build
+          cd soapy-aaronia/build
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            cmake -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" ..
+          else
+            cmake ..
+          fi
+          make
+
+      - name: Package Plugin (macOS DMG)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p soapy-aaronia/dist/SoapyAaronia
+          cp soapy-aaronia/build/libaaroniaSupport.dylib soapy-aaronia/dist/SoapyAaronia/
+          hdiutil create -volname SoapyAaronia -srcfolder soapy-aaronia/dist/SoapyAaronia -ov -format UDZO soapy-aaronia/dist/SoapyAaronia.dmg
+
+      - name: Prepare Plugin Artifacts
+        shell: bash
+        run: |
+          mkdir -p soapy-aaronia/dist
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            cp soapy-aaronia/build/libaaroniaSupport.so soapy-aaronia/dist/
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+            cp soapy-aaronia/build/aaroniaSupport.dll soapy-aaronia/dist/
+          fi
+
+      - name: Upload Plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: soapy-plugin-${{ matrix.os }}
+          path: |
+            soapy-aaronia/dist/*.so
+            soapy-aaronia/dist/*.dll
+            soapy-aaronia/dist/*.dmg
+
+  github-release:
+    name: GitHub Release
+    needs: [build-python, build-soapy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.whl
+            artifacts/*.so
+            artifacts/*.dll
+            artifacts/*.dmg
+          generate_release_notes: true
