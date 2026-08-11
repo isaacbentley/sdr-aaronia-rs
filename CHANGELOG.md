@@ -2,9 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
-
-**Breaking — the next release must be 0.4.0, not 0.3.6.**
+## [v1.0.0] - 2026-08-10
 
 ### Breaking
 - `RtsaMetadata` lost `device_name`, `stream_sample_rate`, and
@@ -18,6 +16,11 @@ All notable changes to this project will be documented in this file.
   fourth parameter so retunes re-apply it.
 
 ### Added
+- **Production Python Bindings (`python-aaronia`)**: Full PyO3 bindings exported with error translation, type-safe config, and zero-copy IQ streaming directly to PyArrow/NumPy arrays.
+- **SoapySDR Plugin (`soapy-aaronia`)**: Added full C++ SoapySDR plugin built on the `sdr-aaronia-rs` C-API, including RX streaming, center frequency/sample rate controls, and `hasHardwareTime("GPS")` overrides.
+- **Transmit (TX) Support**: Added `UnifiedSink` (implementing `AaroniaSink` for native SDK TX) to support bidirectional streaming.
+- **Hardware Time Synchronization**: GPS time is now fetched securely from the telemetry `GpsState` tree and bubbled through the C-API to the SoapySDR Time API (`getHardwareTime("GPS")`).
+- **Automated Release CI/CD**: Added PyPI trusted publishing for Python wheels (via `maturin-action`) and GitHub Release packaging for the SoapySDR plugin (across Linux `.so`, Windows `.dll`, and macOS `.dmg`).
 - Receiver-channel selection (`RxChannel`: `Rx1`/`Rx2`/`Rx1And2`) on
   every native-SDK config surface, and true dual-channel capture via
   `read_samples_dual` on `NativeSdkSource`, `SdkSource`, and
