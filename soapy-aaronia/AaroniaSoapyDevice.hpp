@@ -62,6 +62,15 @@ public:
         const long long timeNs = 0,
         const long timeoutUs = 100000) override;
 
+    // Time API
+    bool hasHardwareTime(const std::string &what = "") const override;
+    long long getHardwareTime(const std::string &what = "") const override;
+
+    // Clocking API
+    std::vector<std::string> listClockSources(void) const override;
+    void setClockSource(const std::string &source) override;
+    std::string getClockSource(void) const override;
+
     // Antenna API
     std::vector<std::string> listAntennas(const int direction, const size_t channel) const override;
     void setAntenna(const int direction, const size_t channel, const std::string &name) override;

@@ -235,6 +235,41 @@ int AaroniaSoapyDevice::writeStream(
     return (int)numElems;
 }
 
+// --- Time API ---
+bool AaroniaSoapyDevice::hasHardwareTime(const std::string &what) const {
+    if (what == "" || what == "GPS") {
+        return true;
+    }
+    return false;
+}
+
+long long AaroniaSoapyDevice::getHardwareTime(const std::string &what) const {
+    if (what == "GPS") {
+        double gps_time_s = 0.0;
+        if (aaronia_source_get_gps_time(_source, &gps_time_s)) {
+            return static_cast<long long>(gps_time_s * 1e9);
+        }
+        return 0;
+    }
+    // Default to the last stream timestamp if no specific time source is requested
+    return aaronia_source_get_last_timestamp_ns(_source);
+}
+
+// --- Clocking API ---
+std::vector<std::string> AaroniaSoapyDevice::listClockSources(void) const {
+    return {"Internal"};
+}
+
+void AaroniaSoapyDevice::setClockSource(const std::string &source) {
+    if (source != "Internal") {
+        SoapySDR::logf(SOAPY_SDR_WARNING, "setClockSource('%s') not currently supported by Aaronia API bindings", source.c_str());
+    }
+}
+
+std::string AaroniaSoapyDevice::getClockSource(void) const {
+    return "Internal";
+}
+
 std::vector<std::string> AaroniaSoapyDevice::listAntennas(const int direction, const size_t channel) const {
     std::vector<std::string> ant;
     if (direction == SOAPY_SDR_RX) {

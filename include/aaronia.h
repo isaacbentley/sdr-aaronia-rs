@@ -81,6 +81,7 @@ intptr_t aaronia_source_read_samples(AaroniaSource* source, FfiComplex* buffer, 
 bool aaronia_source_take_overrun(AaroniaSource* source);
 uint64_t aaronia_source_get_cumulative_drops(AaroniaSource* source);
 int64_t aaronia_source_get_last_timestamp_ns(AaroniaSource* source);
+bool aaronia_source_get_gps_time(AaroniaSource* source, double* out_gps_time);
 AaroniaFfiError aaronia_source_start_streaming(AaroniaSource* source);
 AaroniaFfiError aaronia_source_stop_streaming(AaroniaSource* source);
 AaroniaFfiError aaronia_source_set_center_frequency(AaroniaSource* source, double freq_hz);

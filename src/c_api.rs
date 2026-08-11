@@ -478,6 +478,27 @@ pub unsafe extern "C" fn aaronia_source_get_last_timestamp_ns(ptr: *mut c_void) 
     source.last_timestamp_ns()
 }
 
+/// Get the current GPS time (in seconds since epoch) if available and valid.
+/// Returns `true` if GPS time was populated into `out_gps_time`, otherwise `false`.
+///
+/// # Safety
+/// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
+///   and not yet freed; null returns `false`.
+/// - `out_gps_time` must be a valid pointer to a `f64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_get_gps_time(ptr: *mut c_void, out_gps_time: *mut f64) -> bool {
+    if ptr.is_null() || out_gps_time.is_null() {
+        return false;
+    }
+    let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
+    if let Some(time) = source.get_gps_time() {
+        unsafe { *out_gps_time = time };
+        true
+    } else {
+        false
+    }
+}
+
 /// Start streaming on the source. Returns an `AaroniaFfiError`.
 ///
 /// # Safety

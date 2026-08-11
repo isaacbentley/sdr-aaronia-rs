@@ -176,11 +176,11 @@ impl AaroniaConfig {
     }
 
     /// Convenience method for HTTP streaming over constrained networks.
-    /// 
-    /// Sets the wire format to `Int16` and the scale factor to `32767.0`. 
-    /// This halves the network bandwidth requirement compared to the 
-    /// default `Float32` format (e.g. ~370 MB/s instead of ~740 MB/s at 
-    /// 92 MSPS), at the cost of a slightly higher CPU decode overhead and 
+    ///
+    /// Sets the wire format to `Int16` and the scale factor to `32767.0`.
+    /// This halves the network bandwidth requirement compared to the
+    /// default `Float32` format (e.g. ~370 MB/s instead of ~740 MB/s at
+    /// 92 MSPS), at the cost of a slightly higher CPU decode overhead and
     /// 16-bit quantization (~96 dB dynamic range).
     #[must_use]
     pub fn low_bandwidth_mode(mut self) -> Self {
@@ -227,7 +227,8 @@ pub struct AaroniaSource {
     /// Each item pairs a chunk of samples with whether the HTTP reader
     /// task's `DropDetector` observed a timestamp gap ending at (or
     /// before) that chunk — see `pending_overrun`.
-    http_receiver: Option<tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool)>>,
+    #[allow(clippy::type_complexity)]
+    http_receiver: Option<tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64)>>,
     /// Background task draining the HTTP `/stream` connection. Held so it
     /// can be aborted on `stop_streaming` / drop — otherwise it lingers
     /// parked on `next().await` (holding the open connection, so the
@@ -244,9 +245,30 @@ pub struct AaroniaSource {
     /// SDK and file backends always report `false` (see
     /// [`Self::take_overrun`]).
     pending_overrun: bool,
+    /// Cumulative number of drops reported by the `DropDetector`.
+    cumulative_drops: u64,
+    /// Hardware timestamp (in nanoseconds since UNIX epoch) of the most
+    /// recently received sample block.
+    last_timestamp_ns: i64,
 }
 
 impl AaroniaSource {
+    /// Get the latest GPS time (seconds since unix epoch), if valid and available.
+    pub fn get_gps_time(&mut self) -> Option<f64> {
+        match self.source_type {
+            #[cfg(all(feature = "native-sdk", any(target_os = "windows", target_os = "linux")))]
+            SourceType::NativeSdk => {
+                if let Some(sdk) = &mut self.native_source {
+                    if let Ok((_health, gps)) = unsafe { sdk.get_health_and_gps() } {
+                        return gps.time;
+                    }
+                }
+                None
+            }
+            _ => None, // HTTP and File don't support GPS time yet
+        }
+    }
+
     /// Create a new unified Aaronia source with automatic detection
     pub async fn new(config: AaroniaConfig) -> Result<Self> {
         let mut source = Self {
@@ -265,6 +287,8 @@ impl AaroniaSource {
             http_receiver: None,
             http_task: None,
             pending_overrun: false,
+            cumulative_drops: 0,
+            last_timestamp_ns: 0,
         };
 
         // Determine the best source type
@@ -537,7 +561,13 @@ impl AaroniaSource {
                                 drop_detector.observe(&packet),
                                 crate::http_streaming::DropResult::Drop { .. }
                             );
-                            if sender.send((packet.samples, dropped)).await.is_err() {
+                            let timestamp_ns = (packet.metadata.start_time * 1e9) as i64;
+                            let cumulative_drops = drop_detector.drops();
+                            if sender
+                                .send((packet.samples, dropped, cumulative_drops, timestamp_ns))
+                                .await
+                                .is_err()
+                            {
                                 // Receiver dropped, task can exit
                                 info!("Receiver dropped, HTTP streaming task exiting.");
                                 return;
@@ -738,10 +768,12 @@ impl AaroniaSource {
                 while collected < max_samples {
                     // If buffer is empty, try to receive more samples from the channel
                     match tokio::time::timeout(Duration::from_secs(30), receiver.recv()).await {
-                        Ok(Some((mut new_samples, dropped))) => {
+                        Ok(Some((mut new_samples, dropped, cum_drops, ts_ns))) => {
                             if dropped {
                                 self.pending_overrun = true;
                             }
+                            self.cumulative_drops = cum_drops;
+                            self.last_timestamp_ns = ts_ns;
                             let needed = max_samples - collected;
                             if new_samples.len() <= needed {
                                 collected += new_samples.len();
@@ -760,8 +792,11 @@ impl AaroniaSource {
                             break; // Channel closed
                         }
                         Err(_) => {
-                            tracing::warn!("Receive timeout");
-                            break;
+                            error!("Timeout waiting for HTTP samples.");
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "Timeout waiting for HTTP samples",
+                            )));
                         }
                     }
                 }
@@ -800,7 +835,19 @@ impl AaroniaSource {
     /// Callers (e.g. `SdrSource` implementations) call this once per
     /// `read_samples` to tag the resulting `IqPacket::overrun`.
     pub fn take_overrun(&mut self) -> bool {
-        std::mem::take(&mut self.pending_overrun)
+        let overrun = self.pending_overrun;
+        self.pending_overrun = false;
+        overrun
+    }
+
+    /// Return the cumulative number of dropped packets.
+    pub fn cumulative_drops(&self) -> u64 {
+        self.cumulative_drops
+    }
+
+    /// Return the hardware timestamp of the last received block (in nanoseconds).
+    pub fn last_timestamp_ns(&self) -> i64 {
+        self.last_timestamp_ns
     }
 
     /// Stop streaming
@@ -1008,9 +1055,7 @@ impl AaroniaSource {
                     .await?;
             }
             SourceType::File => {
-                warn!(
-                    "set_reference_level called on file source (no-op)"
-                );
+                warn!("set_reference_level called on file source (no-op)");
             }
         }
         self.config.reference_level = ref_level;
@@ -1457,6 +1502,8 @@ mod tests {
             http_receiver: None,
             http_task: None,
             pending_overrun: false,
+            cumulative_drops: 0,
+            last_timestamp_ns: 0,
         };
 
         let detected_type = source
@@ -1531,6 +1578,8 @@ mod tests {
             http_receiver: None,
             http_task: None,
             pending_overrun: false,
+            cumulative_drops: 0,
+            last_timestamp_ns: 0,
         };
 
         let result = source.detect_best_source_type().await;
@@ -1557,6 +1606,8 @@ mod tests {
             http_receiver: None,
             http_task: None,
             pending_overrun: false,
+            cumulative_drops: 0,
+            last_timestamp_ns: 0,
         };
 
         let detected_type = source
@@ -1585,6 +1636,8 @@ mod tests {
             http_receiver: None,
             http_task: None,
             pending_overrun: false,
+            cumulative_drops: 0,
+            last_timestamp_ns: 0,
         };
 
         let detected_type = source
@@ -1758,16 +1811,18 @@ mod tests {
             http_receiver: Some(chunk_rx),
             http_task: None,
             pending_overrun: false,
+            cumulative_drops: 0,
+            last_timestamp_ns: 0,
         };
 
         assert!(!source.take_overrun(), "no chunk received yet");
 
         chunk_tx
-            .send((vec![Complex32::new(1.0, 0.0)], false))
+            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 123456789))
             .await
             .expect("channel open");
         chunk_tx
-            .send((vec![Complex32::new(2.0, 0.0)], true))
+            .send((vec![Complex32::new(2.0, 0.0)], true, 1, 123456790))
             .await
             .expect("channel open");
         drop(chunk_tx);
