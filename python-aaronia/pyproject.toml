@@ -5,6 +5,7 @@ build-backend = "maturin"
 [project]
 name = "python-aaronia"
 description = "Python bindings for sdr-aaronia-rs (Aaronia SPECTRAN V6 SDR source)"
+readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.9"
 classifiers = [
