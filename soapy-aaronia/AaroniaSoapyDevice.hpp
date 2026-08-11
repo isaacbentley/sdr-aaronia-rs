@@ -86,6 +86,10 @@ public:
     void setSampleRate(const int direction, const size_t channel, const double rate) override;
     double getSampleRate(const int direction, const size_t channel) const override;
     SoapySDR::RangeList getSampleRateRange(const int direction, const size_t channel) const override;
+    std::vector<double> listSampleRates(const int direction, const size_t channel) const override;
+
+    // Stream geometry
+    size_t getStreamMTU(SoapySDR::Stream *stream) const override;
 
     // Gain API
     std::vector<std::string> listGains(const int direction, const size_t channel) const override;
@@ -101,11 +105,26 @@ public:
 private:
     AaroniaSource *_source;
     AaroniaSink *_sink;
+    // One mutex serializes every FFI call into the Rust objects: the C
+    // ABI materializes `&mut` references, so concurrent calls from a
+    // GUI thread (retune) and the streaming thread (readStream) would
+    // be undefined behaviour. readStream/writeStream/getHardwareTime/
+    // readSensor must take this lock too, not only the setters.
     mutable std::mutex _mutex;
     double _centerFrequency;
-    double _sampleRate;
+    double _sampleRate;    // RX sample rate
+    double _txSampleRate;  // TX sample rate (defaults to RX rate)
     double _referenceLevel;
-    std::string _streamFormat;
+    // Per-direction stream state. RX and TX streams are distinct
+    // handles (&_rxStreamTag / &_txStreamTag) with their own formats —
+    // a single shared format let an RX CS16 + TX CF32 app corrupt its
+    // own buffers when the second setupStream overwrote the first.
+    std::string _rxFormat;
+    std::string _txFormat;
+    bool _rxSetup;
+    bool _txSetup;
+    int _rxStreamTag;
+    int _txStreamTag;
     bool _isStreaming;
     std::vector<FfiComplex> _tempFloatBuffer;
 };

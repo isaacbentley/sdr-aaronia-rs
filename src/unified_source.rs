@@ -256,12 +256,15 @@ impl AaroniaSource {
     /// Get the latest GPS time (seconds since unix epoch), if valid and available.
     pub fn get_gps_time(&mut self) -> Option<f64> {
         match self.source_type {
-            #[cfg(all(feature = "native-sdk", any(target_os = "windows", target_os = "linux")))]
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             SourceType::NativeSdk => {
-                if let Some(sdk) = &mut self.native_source {
-                    if let Ok((_health, gps)) = unsafe { sdk.get_health_and_gps() } {
-                        return gps.time;
-                    }
+                if let Some(sdk) = &mut self.native_source
+                    && let Ok((_health, gps)) = unsafe { sdk.get_health_and_gps() }
+                {
+                    return gps.time;
                 }
                 None
             }
@@ -726,6 +729,113 @@ impl AaroniaSource {
         }
     }
 
+    /// Deadline-bounded read for latency-sensitive callers (the
+    /// SoapySDR plugin's `readStream`, which must honour the
+    /// application's `timeoutUs` — `read_samples`'s fixed 30-second
+    /// full-fill loop violates that contract outright).
+    ///
+    /// Semantics differ from [`Self::read_samples`] in two deliberate
+    /// ways: the wait is bounded by `timeout` instead of a fixed 30 s
+    /// per receive, and hitting the deadline with *some* samples
+    /// collected returns them as a partial read instead of discarding
+    /// them into an error. Only a deadline with **zero** samples yields
+    /// `Error::Io(TimedOut)`. `timeout` of zero performs a non-blocking
+    /// drain of already-buffered samples.
+    ///
+    /// File and native-SDK backends delegate to their existing reads
+    /// (disk reads don't wait; the SDK path polls with its own short
+    /// internal deadline, looped here until `timeout` expires).
+    pub async fn read_samples_deadline(
+        &mut self,
+        buffer: &mut Vec<Complex32>,
+        max_samples: usize,
+        timeout: Duration,
+    ) -> Result<usize> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        match self.source_type {
+            SourceType::Http => {
+                let start_len = buffer.len();
+                let receiver = self
+                    .http_receiver
+                    .as_mut()
+                    .ok_or_else(|| Error::Config("HTTP receiver not initialized".to_string()))?;
+
+                let from_buffer = self.sample_buffer.len().min(max_samples);
+                if from_buffer > 0 {
+                    buffer.extend(self.sample_buffer.drain(0..from_buffer));
+                }
+
+                let mut collected = from_buffer;
+                while collected < max_samples {
+                    let recv = tokio::time::timeout_at(deadline, receiver.recv()).await;
+                    match recv {
+                        Ok(Some((mut new_samples, dropped, cum_drops, ts_ns))) => {
+                            if dropped {
+                                self.pending_overrun = true;
+                            }
+                            self.cumulative_drops = cum_drops;
+                            self.last_timestamp_ns = ts_ns;
+                            let needed = max_samples - collected;
+                            if new_samples.len() <= needed {
+                                collected += new_samples.len();
+                                buffer.append(&mut new_samples);
+                            } else {
+                                collected += needed;
+                                buffer.extend(new_samples.drain(0..needed));
+                                self.sample_buffer.extend(new_samples);
+                            }
+                        }
+                        Ok(None) => {
+                            // Dead stream: error when nothing was
+                            // collected (see read_samples's identical
+                            // handling), else return the tail.
+                            if collected == 0 {
+                                return Err(Error::Protocol(
+                                    "HTTP sample stream closed (reader task ended)".to_string(),
+                                ));
+                            }
+                            break;
+                        }
+                        Err(_) => break, // deadline: partial read
+                    }
+                }
+                if collected == 0 && max_samples > 0 {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "no samples arrived within the read deadline",
+                    )));
+                }
+                Ok(buffer.len() - start_len)
+            }
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            SourceType::NativeSdk => {
+                let start_len = buffer.len();
+                loop {
+                    let n = self
+                        .read_samples(buffer, max_samples - (buffer.len() - start_len))
+                        .await?;
+                    let total = buffer.len() - start_len;
+                    if total >= max_samples
+                        || tokio::time::Instant::now() >= deadline
+                        || (n == 0 && total > 0)
+                    {
+                        if total == 0 && max_samples > 0 {
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "no samples arrived within the read deadline",
+                            )));
+                        }
+                        return Ok(total);
+                    }
+                }
+            }
+            _ => self.read_samples(buffer, max_samples).await,
+        }
+    }
+
     pub async fn read_samples(
         &mut self,
         buffer: &mut Vec<Complex32>,
@@ -788,8 +898,17 @@ impl AaroniaSource {
                             }
                         }
                         Ok(None) => {
-                            info!("HTTP sample channel closed.");
-                            break; // Channel closed
+                            // Reader task gone (server closed the stream or
+                            // the parser gave up). Returning Ok(0) forever
+                            // here made every consumer spin on a dead
+                            // stream with no way to distinguish "no data
+                            // yet" from "stream is dead" — surface it.
+                            if collected == 0 {
+                                return Err(Error::Protocol(
+                                    "HTTP sample stream closed (reader task ended)".to_string(),
+                                ));
+                            }
+                            break;
                         }
                         Err(_) => {
                             error!("Timeout waiting for HTTP samples.");
@@ -960,6 +1079,12 @@ impl AaroniaSource {
 
     /// Update the span frequency (sample rate) of the running source.
     pub async fn set_span_frequency(&mut self, span: f64) -> Result<()> {
+        // Enforce the IQ-mode constraint at runtime exactly as the
+        // builder does at construction: without this, an out-of-range
+        // runtime rate was shipped to the server unchecked, the request
+        // was silently clamped device-side, and the cached value made
+        // the plugin report a rate the hardware wasn't producing.
+        validate_iq_mode(span, DEFAULT_RECEIVER_CLOCK_HZ)?;
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",

@@ -220,6 +220,19 @@ pub struct AARTSAAPI_Device {
     pub d: *mut c_void,
 }
 
+// SAFETY: both handles are opaque, heap-allocated vendor objects owned
+// exclusively by their wrapper structs and only ever used behind `&mut`
+// (exclusive access). The AARTSAAPI vendor samples configure and poll
+// from worker threads other than the opening thread, and the API
+// documents no thread affinity, so *transferring exclusive ownership*
+// between threads (`Send`) is sound. `Sync` is deliberately NOT
+// implemented: concurrent shared access to one handle is unproven and
+// everything in this crate serializes access instead. Required so
+// `Mutex<AaroniaSource>` (native backend) is `Send`, which seify's
+// device traits demand.
+unsafe impl Send for AARTSAAPI_Handle {}
+unsafe impl Send for AARTSAAPI_Device {}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct AARTSAAPI_Config {

@@ -1,39 +1,41 @@
-import pyarrow as pa
-from aaronia import AaroniaConfig, AaroniaSource
+#!/usr/bin/env python3
+"""Stream IQ samples from an RTSA-Suite HTTP server into PyArrow.
 
-def main():
-    print("Initializing Aaronia SDR...")
-    config = AaroniaConfig()
-    config.center_freq = 2.4e9  # 2.4 GHz
-    config.sample_rate = 10e6   # 10 MHz
-    config.format = "F32"
+Reads come back as a FixedSizeListArray of [re, im] float32 pairs —
+one copy out of the Rust receive buffer, then a copy-free Arrow C-Data
+handoff into pyarrow. (Not "zero-copy": one copy per read is the honest
+count.)
 
-    source = AaroniaSource()
+Usage:
+    python python_arrow_example.py [http://host:54664]
+"""
+
+import sys
+
+import aaronia
+
+url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:54664"
+
+config = aaronia.AaroniaConfig()
+config.http_base_url = url          # pins the HTTP backend
+config.center_freq = 2.44e9         # Hz
+config.sample_rate = 15.36e6        # Hz
+
+source = aaronia.AaroniaSource()
+try:
     source.start_streaming(config)
+except aaronia.AaroniaConnectionError as e:
+    raise SystemExit(f"cannot reach {url}: {e}")
 
-    print("Streaming started.")
-    
-    try:
-        # Read 1024 samples as an Arrow array
-        print("Reading 1024 samples (Arrow format)...")
-        arrow_data = source.read_samples_arrow(1024)
-        
-        # Cast to pyarrow array for inspection
-        array = pa.array(arrow_data)
-        
-        print(f"Read {len(array)} IQ pairs.")
-        print(f"Data type: {array.type}")
-        print("First 5 samples:")
-        for i in range(min(5, len(array))):
-            print(f"  {array[i]}")
-
-        drops = source.cumulative_drops()
-        if drops > 0:
-            print(f"Warning: {drops} drops detected!")
-            
-    finally:
-        print("Stopping streaming...")
-        source.stop_streaming()
-
-if __name__ == "__main__":
-    main()
+try:
+    for i in range(5):
+        # Blocks (GIL released) until 16384 samples arrive or the
+        # internal 30 s timeout raises AaroniaTimeoutError.
+        batch = source.read_samples_arrow(16384)
+        first = batch[0].as_py()
+        print(
+            f"batch {i}: {len(batch)} IQ pairs, "
+            f"first = {first[0]:+.3e} {first[1]:+.3e}j"
+        )
+finally:
+    source.stop_streaming()

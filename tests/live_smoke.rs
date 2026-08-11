@@ -594,62 +594,11 @@ fn live_stream_seify() {
     streamer.deactivate_at(None).expect("deactivate");
 }
 
-#[test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL and SOAPY_SDR_PLUGIN_PATH set"]
-fn live_stream_soapy() {
-    // This test requires the SoapySDR Aaronia plugin to be built and accessible via SOAPY_SDR_PLUGIN_PATH
-    // E.g., SOAPY_SDR_PLUGIN_PATH=$(pwd)/soapy-aaronia/build cargo test ...
-    let url = live_url();
-    let args = format!("driver=aaronia,url={}", url);
-
-    let dev = match soapysdr::Device::new(args.as_str()) {
-        Ok(dev) => dev,
-        Err(e) => {
-            println!(
-                "SKIP soapy test: failed to open soapy device: {} (plugin may not be built/loaded)",
-                e
-            );
-            return;
-        }
-    };
-
-    let hw = dev.hardware_key().expect("hardware_key");
-    println!("soapy opened hardware: {}", hw);
-    assert_eq!(hw, "Spectran V6");
-
-    let mut stream = dev
-        .rx_stream::<num_complex::Complex<i16>>(&[0])
-        .expect("rx_stream");
-    stream.activate(None).expect("activate");
-
-    let mut buffer = [num_complex::Complex::<i16>::new(0, 0); 1024];
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut total_read = 0;
-
-    while Instant::now() < deadline && total_read == 0 {
-        match stream.read(&mut [&mut buffer], 1_000_000) {
-            Ok(n) if n > 0 => {
-                total_read += n;
-                break;
-            }
-            Ok(_) => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) if e.code == soapysdr::ErrorCode::Timeout => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => {
-                panic!("soapy read error: {}", e);
-            }
-        }
-    }
-
-    println!("soapy read {} samples", total_read);
-    assert!(total_read > 0, "must read at least one packet");
-    assert!(
-        buffer[0..total_read].iter().any(|s| s.re != 0 || s.im != 0),
-        "samples should not be all-zero"
-    );
-
-    stream.deactivate(None).expect("deactivate");
-}
+// NOTE: there is intentionally no Rust-side SoapySDR live test here.
+// A `soapysdr` dev-dependency makes `cargo test` unbuildable on any
+// machine without system SoapySDR + libclang. Equivalent live coverage:
+//   SOAPY_SDR_PLUGIN_PATH=$PWD/soapy-aaronia/build \
+//     SoapySDRUtil --probe="driver=aaronia,url=$AARONIA_LIVE_URL"
+//   SOAPY_SDR_PLUGIN_PATH=$PWD/soapy-aaronia/build \
+//     SoapySDRUtil --args="driver=aaronia,url=$AARONIA_LIVE_URL" --rate=1e6
+// plus ci.yml's `soapy` job (cmake build + module load check).

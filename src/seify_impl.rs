@@ -1,4 +1,14 @@
 //! Native [`seify`] driver implementation for `sdr-aaronia-rs`.
+//!
+//! Integration status: construct via [`AaroniaSeifyDevice::from_args`]
+//! and use the trait objects directly (or through
+//! `seify::dev::DynDeviceBackend`). The device is `Clone` (all state is
+//! behind `Arc`s) as seify's `Device::from_impl` requires. It is *not*
+//! part of seify's built-in enumeration registry — `seify::enumerate()`
+//! will not discover it; open it explicitly.
+//!
+//! Blocking: every control call and `read` uses `Runtime::block_on`
+//! internally and must not be called from within an async runtime.
 
 use crate::unified_source::{AaroniaSource, AaroniaSourceBuilder, SourceType};
 use num_complex::Complex32;
@@ -10,13 +20,24 @@ use seify::{
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
-/// Seify device wrapper around [`AaroniaSource`].
-pub struct AaroniaSeifyDevice {
-    source: Arc<Mutex<AaroniaSource>>,
-    runtime: Arc<Runtime>,
+/// Cached tuning state shared across clones; updated by the setters so
+/// the getters reflect the last applied values (plain fields on the
+/// device made every getter permanently stale after the first retune).
+#[derive(Debug, Clone, Copy)]
+struct Tuning {
     center_frequency: f64,
     sample_rate: f64,
     reference_level: f64,
+}
+
+/// Seify device wrapper around [`AaroniaSource`]. `Clone` shares the
+/// underlying source/runtime/tuning (required by seify's
+/// `Device::from_impl`).
+#[derive(Clone)]
+pub struct AaroniaSeifyDevice {
+    source: Arc<Mutex<AaroniaSource>>,
+    runtime: Arc<Runtime>,
+    tuning: Arc<Mutex<Tuning>>,
 }
 
 impl AaroniaSeifyDevice {
@@ -69,18 +90,18 @@ impl AaroniaSeifyDevice {
         Ok(Self {
             source: Arc::new(Mutex::new(source)),
             runtime,
-            center_frequency,
-            sample_rate,
-            reference_level,
+            tuning: Arc::new(Mutex::new(Tuning {
+                center_frequency,
+                sample_rate,
+                reference_level,
+            })),
         })
     }
 }
 
 impl DeviceInfo for AaroniaSeifyDevice {
     fn driver(&self) -> seify::Driver {
-        // Seify's Driver enum doesn't natively include a dynamically-named external driver easily,
-        // we'll return AaroniaHttp if it compiles, otherwise Dummy.
-        seify::Driver::Dummy
+        seify::Driver::AaroniaHttp
     }
 
     fn id(&self) -> std::result::Result<String, seify::Error> {
@@ -88,7 +109,10 @@ impl DeviceInfo for AaroniaSeifyDevice {
     }
 
     fn info(&self) -> std::result::Result<Args, seify::Error> {
-        Ok(Args::new())
+        let mut args = Args::new();
+        args.set("driver", "aaronia");
+        args.set("label", "Aaronia Spectran V6 (sdr-aaronia-rs)");
+        Ok(args)
     }
 
     fn num_channels(&self, direction: Direction) -> std::result::Result<usize, seify::Error> {
@@ -112,7 +136,7 @@ impl FrequencyControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(self.center_frequency)
+        Ok(self.tuning.lock().unwrap().center_frequency)
     }
 
     fn frequency_range(
@@ -123,7 +147,8 @@ impl FrequencyControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(Range::new(vec![RangeItem::Interval(0.0, f64::MAX)]))
+        // Spectran V6 tuning range.
+        Ok(Range::new(vec![RangeItem::Interval(10.0, 6.0e9)]))
     }
 
     fn frequency_components(
@@ -176,6 +201,7 @@ impl FrequencyControl for AaroniaSeifyDevice {
         self.runtime
             .block_on(source.set_center_frequency(frequency))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
+        self.tuning.lock().unwrap().center_frequency = frequency;
         Ok(())
     }
 }
@@ -189,7 +215,7 @@ impl SampleRateControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(self.sample_rate)
+        Ok(self.tuning.lock().unwrap().sample_rate)
     }
 
     fn get_sample_rate_range(
@@ -200,7 +226,8 @@ impl SampleRateControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(Range::new(vec![RangeItem::Interval(0.0, f64::MAX)]))
+        // Capped at the IQ-mode constraint (span * 1.5 <= 92.16 MHz).
+        Ok(Range::new(vec![RangeItem::Interval(10e3, 61.44e6)]))
     }
 
     fn set_sample_rate(
@@ -216,6 +243,7 @@ impl SampleRateControl for AaroniaSeifyDevice {
         self.runtime
             .block_on(source.set_span_frequency(rate))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
+        self.tuning.lock().unwrap().sample_rate = rate;
         Ok(())
     }
 }
@@ -229,7 +257,7 @@ impl GainControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(Some(self.reference_level))
+        Ok(Some(self.tuning.lock().unwrap().reference_level))
     }
 
     fn gain_elements(
@@ -248,7 +276,8 @@ impl GainControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(Range::new(vec![RangeItem::Interval(-100.0, 100.0)]))
+        // Reference level in dBm (matches the Soapy plugin's REF gain).
+        Ok(Range::new(vec![RangeItem::Interval(-100.0, 10.0)]))
     }
 
     fn set_gain_element(
@@ -292,6 +321,7 @@ impl GainControl for AaroniaSeifyDevice {
         self.runtime
             .block_on(source.set_reference_level(gain))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
+        self.tuning.lock().unwrap().reference_level = gain;
         Ok(())
     }
 }
@@ -305,7 +335,13 @@ impl RxDevice for AaroniaSeifyDevice {
         _args: Args,
     ) -> std::result::Result<Self::RxStreamer, seify::Error> {
         if channels != [0] {
-            return Err(seify::Error::invalid_channel(Direction::Rx, channels[0], 1));
+            // `channels.first()` guards the empty-list case, which used
+            // to panic inside the error path itself.
+            return Err(seify::Error::invalid_channel(
+                Direction::Rx,
+                channels.first().copied().unwrap_or(0),
+                1,
+            ));
         }
         Ok(AaroniaSeifyRxStreamer {
             source: self.source.clone(),
@@ -364,10 +400,19 @@ impl RxStreamer for AaroniaSeifyRxStreamer {
         let mut source = self.source.lock().unwrap();
         let buf = &mut buffers[0];
 
+        // Honour the caller's timeout (a non-positive value gets a
+        // sane default); partial reads within the deadline are
+        // returned rather than discarded. The source mutex is held for
+        // at most this bounded duration.
+        let timeout = if _timeout_us > 0 {
+            std::time::Duration::from_micros(_timeout_us as u64)
+        } else {
+            std::time::Duration::from_millis(100)
+        };
         let mut temp = Vec::with_capacity(buf.len());
         let read = self
             .runtime
-            .block_on(source.read_samples(&mut temp, buf.len()))
+            .block_on(source.read_samples_deadline(&mut temp, buf.len(), timeout))
             .map_err(|e| {
                 if let crate::Error::Io(ref io_err) = e
                     && io_err.kind() == std::io::ErrorKind::TimedOut
