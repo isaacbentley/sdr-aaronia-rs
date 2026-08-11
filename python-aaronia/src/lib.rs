@@ -13,11 +13,16 @@
 //! timeout, shutdown) releases the GIL, so other Python threads keep
 //! running and `KeyboardInterrupt` stays deliverable between calls.
 
-// The two allows: pyo3 0.22's proc-macros expand to code that trips
-// edition-2024's unsafe_op_in_unsafe_fn and reference the `gil-refs`
-// cfg; both are fixed upstream in pyo3 0.23 — drop these when bumping.
+// These allows are all pyo3 0.22 proc-macro fallout, fixed upstream in
+// pyo3 0.23 — drop them when bumping: the expansions trip
+// edition-2024's unsafe_op_in_unsafe_fn, reference the `gil-refs` cfg,
+// and route #[pymethods] `PyResult` returns through an `.into()` in
+// generated wrapper fns that clippy ≥ 1.89 flags as useless_conversion
+// (attributed to the method signature; an impl-level allow doesn't
+// reach the wrappers, hence crate-level).
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(unexpected_cfgs)]
+#![allow(clippy::useless_conversion)]
 
 use arrow::array::{Array, FixedSizeListArray};
 use arrow::datatypes::{DataType, Field};
@@ -244,6 +249,12 @@ impl PyAaroniaConfig {
     }
 }
 
+/// The `(rx1, rx2)` pair returned by `read_samples_dual_numpy`.
+type DualArrays<'py> = (
+    Bound<'py, PyArray1<Complex32>>,
+    Bound<'py, PyArray1<Complex32>>,
+);
+
 /// A streaming IQ source. Construct, `start_streaming(config)`, then
 /// call the `read_samples_*` methods; each blocks (GIL released) until
 /// `count` samples arrive or the internal 30-second timeout raises
@@ -404,10 +415,7 @@ impl PyAaroniaSource {
         &mut self,
         py: Python<'py>,
         count: usize,
-    ) -> PyResult<(
-        Bound<'py, PyArray1<Complex32>>,
-        Bound<'py, PyArray1<Complex32>>,
-    )> {
+    ) -> PyResult<DualArrays<'py>> {
         if count > MAX_READ_SAMPLES {
             return Err(PyValueError::new_err(format!(
                 "count {count} exceeds the per-read limit of {MAX_READ_SAMPLES} samples"

@@ -24,6 +24,14 @@ All notable changes to this project will be documented in this file.
   license-free `/control` endpoint; the license gates only
   `/remoteconfig` writes.
 
+### CI
+- Clippy now runs with `--workspace` (CI, `scripts/ci-local.sh`, and the
+  Linux-VM leg): `python-aaronia` is a workspace member that no job
+  linted, and it had accumulated 12 unflagged clippy errors — a genuine
+  `type_complexity` (fixed with a type alias) and 11 `useless_conversion`
+  reports from pyo3 0.22's `#[pymethods]` wrapper codegen (crate-level
+  allow, documented for removal at pyo3 ≥ 0.23).
+
 ## [v0.5.0] - 2026-08-11
 
 Breaking 0.x release combining the RTSA file-format verification work

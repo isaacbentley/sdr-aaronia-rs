@@ -73,8 +73,9 @@ if ! skipped fmt; then
 fi
 
 if ! skipped clippy; then
-    step "cargo clippy --all-features --all-targets -- -D warnings"
-    cargo clippy --all-features --all-targets -- -D warnings
+    # --workspace pulls in python-aaronia, which no other step lints.
+    step "cargo clippy --workspace --all-features --all-targets -- -D warnings"
+    cargo clippy --workspace --all-features --all-targets -- -D warnings
 fi
 
 if ! skipped test; then
@@ -139,7 +140,7 @@ fi
 # (~/Documents ⇒ EDEADLK), hence the rsync to /private/tmp first.
 if ! skipped vm; then
     if container system status >/dev/null 2>&1; then
-        step "CI ubuntu leg in Linux VM: clippy --all-features --all-targets + cargo test --all-features"
+        step "CI ubuntu leg in Linux VM: clippy --workspace --all-features --all-targets + cargo test --all-features"
         # Dedicated directory: nothing else may write here (a shared
         # scratch copy once had another tool rsync over it mid-run).
         vm_dir=/private/tmp/aaronia-ci-vm
@@ -149,17 +150,22 @@ if ! skipped vm; then
         # stale call signature shipped red to CI past a --lib-only VM
         # run. This mirrors CI's ubuntu leg command-for-command.
         # rust:slim lacks what the GitHub ubuntu runner image ships
-        # preinstalled: clippy, pkg-config, and ALSA headers (futuresdr's
-        # audio feature -> alsa-sys). Install per run; the persistent
-        # target/ under $vm_dir keeps rebuilds incremental.
+        # preinstalled: clippy, pkg-config, ALSA headers (futuresdr's
+        # audio feature -> alsa-sys), and python3 (pyo3's build script
+        # needs an interpreter for the --workspace clippy leg). Install
+        # per run; the persistent target/ under $vm_dir keeps rebuilds
+        # incremental.
         # --memory 8g: the all-features lib-test link OOM-kills the
         # container CLI's default allocation (ld dies with SIGKILL).
+        # clippy is --workspace (mirrors CI); test stays root-crate —
+        # python-aaronia's Python-side behavior is covered by the
+        # python step below and CI's maturin+pytest job.
         container run --rm --memory 8g --cpus 4 \
             -v "$vm_dir":/w -w /w -e PROPTEST_CASES="$PROPTEST_CASES" rust:slim \
             sh -c 'rustup component add clippy >/dev/null 2>&1; \
                    apt-get update -qq >/dev/null && \
-                   apt-get install -y -qq pkg-config libasound2-dev >/dev/null; \
-                   cargo clippy --all-features --all-targets -- -D warnings \
+                   apt-get install -y -qq pkg-config libasound2-dev python3 >/dev/null; \
+                   cargo clippy --workspace --all-features --all-targets -- -D warnings \
                    && cargo test --all-features'
     else
         echo "vm step: 'container system start' not running — skipping" \

@@ -13,7 +13,7 @@ cd sdr-aaronia-rs
 # Run the standard validation suite
 cargo test                                        # unit + integration + properties (default features)
 cargo test --test spec_coverage -- --nocapture    # spec inventory report
-cargo clippy --all-features --all-targets -- -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
