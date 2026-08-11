@@ -1,0 +1,18 @@
+[package]
+name = "python-aaronia"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "aaronia"
+crate-type = ["cdylib"]
+
+[dependencies]
+sdr-aaronia-rs = { path = "../" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+arrow = { version = "53.0", features = ["pyarrow"] }
+num-complex = "0.4"
+tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures = "0.3"
+pyo3-log = "0.11"
