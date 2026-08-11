@@ -5,7 +5,7 @@
 [![CI](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/sdr-aaronia-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
-A Rust library for interfacing with Aaronia Spectran SDR devices.
+Unified Rust interface for Aaronia Spectran Spectrum Analyzers / SDRs, featuring Python bindings, a SoapySDR plugin, HTTP streaming, and native SDK support.
 
 *Disclaimer: This project is not affiliated with Aaronia AG. Aaronia, SPECTRAN, and RTSA-Suite PRO are trademarks of Aaronia AG.*
 
