@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "python-aaronia"
+description = "Python bindings for sdr-aaronia-rs (Aaronia SPECTRAN V6 SDR source)"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Topic :: Communications :: Ham Radio",
+    "Topic :: Scientific/Engineering",
+]
+# Version comes from python-aaronia/Cargo.toml (single source of truth).
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
+Changelog = "https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/CHANGELOG.md"
