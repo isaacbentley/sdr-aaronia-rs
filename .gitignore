@@ -12,3 +12,7 @@ tests/sdk/
 
 # CMake build directory for SoapySDR plugin
 soapy-aaronia/build/
+python-aaronia/__pycache__/test_basic.cpython-314-pytest-9.1.1.pyc
+python-aaronia/err.txt
+python-aaronia/check_errors.txt
+branch_diff.txt

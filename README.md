@@ -11,6 +11,8 @@ A Rust library for interfacing with Aaronia Spectran SDR devices.
 
 `sdr-aaronia-rs` provides a unified API for interacting with Aaronia hardware, abstracting away the underlying transport layers. It supports native SDK connections, bidirectional HTTP streaming (RX/TX), and RTSA file sources through a single, consistent interface with deterministic source selection.
 
+In addition to the Rust crate, this project provides **Native Python Bindings** (via PyO3) for high-performance zero-copy NumPy/Arrow integration, and **C++ Plugins** for the SoapySDR and Seify ecosystems.
+
 ## Overview
 
 Interfacing with SDR hardware typically requires choosing between proprietary native SDKs, HTTP streaming protocols, or file-based playback. Each approach demands a different API and configuration lifecycle.
@@ -28,6 +30,8 @@ Interfacing with SDR hardware typically requires choosing between proprietary na
 - **RTSA File Processing:** Reads RTSA capture files via buffered I/O, including metadata extraction and multi-stream support.
 - **Device Management:** Real-time control of streaming parameters, device health monitoring, input stream enumeration, and hierarchical configuration.
 - **FutureSDR Integration:** Optional `HttpSource` and `HttpSink` flowgraph blocks under the `futuresdr` feature.
+- **Python Data-Science Native:** Zero-copy bindings to NumPy arrays and Apache Arrow dataframes in Python via PyO3.
+- **C++ Ecosystem Plugins:** Drop-in support for `SoapySDR` and `Seify` abstraction layers natively.
 
 *Note: writes to the HTTP `/remoteconfig` endpoint require a separate Aaronia "Remote Config" license; capture control via `/control` (including retuning) does not.*
 
@@ -380,6 +384,56 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+## Python Bindings (NumPy & Apache Arrow)
+
+The `python-aaronia` package provides Python native bindings to the Rust engine using PyO3, allowing you to use high-throughput zero-copy arrays in Pandas, NumPy, or PyArrow.
+
+### Installation
+You can build the Python bindings locally using `maturin`:
+```bash
+cd python-aaronia
+maturin develop
+```
+
+### Python Streaming Example
+```python
+from aaronia import AaroniaConfig, AaroniaSource
+
+# Auto-detects the backend and configures the stream
+config = AaroniaConfig()
+config.format = "F32"
+config.center_freq = 2400e6
+config.sample_rate = 20e6
+
+# Connect to the stream
+source = AaroniaSource()
+source.start_streaming(config)
+
+# 1. Zero-Copy NumPy Read (1D Complex32)
+np_samples = source.read_samples_numpy(1024)
+print(f"NumPy shape: {np_samples.shape}")
+
+# 2. Apache Arrow Dataframe Integration
+arrow_samples = source.read_samples_arrow(1024)
+print(f"Arrow records: {len(arrow_samples)}")
+
+# Health Metrics
+drops = source.cumulative_drops()
+overrun = source.take_overrun()
+print(f"Stream Drops: {drops}, Buffer Overrun: {overrun}")
+
+source.stop_streaming()
+```
+
+## C++ SDR Plugins (SoapySDR & Seify)
+
+The `sdr-aaronia-rs` workspace also acts as the source of truth for standard SDR ecosystem drivers:
+
+- **SoapySDR Plugin**: We provide a C++ `SoapySDR` driver in the `soapy-aaronia/` folder. It defaults to the low-bandwidth `CS16` format to optimize network traffic and gracefully exposes hardware timestamps and dropped-block telemetry.
+- **Seify Plugin**: We ship a direct Rust backend for `seify`.
+
+For deep-dive setup instructions and documentation on the C++ side and Bandwidth Optimization tricks, please see the dedicated [PLUGINS.md](PLUGINS.md) document.
 
 ## Environment Variables
 

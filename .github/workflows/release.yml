@@ -189,3 +189,21 @@ jobs:
             artifacts/*.dll
             artifacts/*.dmg
           generate_release_notes: true
+
+  pypi-publish:
+    name: Publish Python wheels to PyPI
+    needs: [build-python]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: python-wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish package
+        uses: pypa/gh-action-pypi-publish@release/v1
