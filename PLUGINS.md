@@ -12,7 +12,7 @@ To use the Seify plugin, enable the `seify` feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sdr-aaronia-rs = { version = "0.4", features = ["seify"] }
+sdr-aaronia-rs = { version = "0.5", features = ["seify"] }
 ```
 
 Instantiate the device with `AaroniaSeifyDevice::from_args` and use it directly (or via `seify::dev::DynDeviceBackend`). The backend is **not** part of seify's built-in enumeration registry — `seify::enumerate()` will not discover it.

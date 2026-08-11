@@ -2,16 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased] — 0.4.0
+## [v0.5.0] - 2026-08-11
 
-Restores the recorded versioning decision: this range contains breaking
-API changes on a 0.x crate, so the next release is **0.4.0** (a branch
-briefly relabelled it 1.0.0; a 1.0 stability commitment on top of
-never-hardware-verified TX and freshly reviewed bindings is exactly
-what 1.0 must not be). New surfaces below (Python bindings, SoapySDR
-plugin, TX, GPS time) shipped through a six-stream production review;
-their hardware-facing paths remain **hardware-unverified** where noted
-in the docs.
+Breaking 0.x release combining the RTSA file-format verification work
+with the new binding/plugin surfaces. (The recorded floor for this
+range was 0.4.0; it ships as 0.5.0 to reflect the added Python/SoapySDR/
+TX/GPS feature scope. A branch briefly relabelled it 1.0.0 — a 1.0
+stability commitment on top of never-hardware-verified TX and freshly
+reviewed bindings is exactly what 1.0 must not be.) The new surfaces
+(Python bindings, SoapySDR plugin, TX, GPS time) shipped through a
+six-stream production review with live-hardware validation of the RX
+paths; hardware-facing TX/dual-channel paths remain
+**hardware-unverified** where noted in the docs.
 
 ### Breaking
 - `RtsaMetadata` lost `device_name`, `stream_sample_rate`, and
