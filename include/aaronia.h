@@ -80,6 +80,9 @@ void aaronia_source_free(AaroniaSource* source);
 intptr_t aaronia_source_read_samples(AaroniaSource* source, FfiComplex* buffer, uintptr_t len);
 AaroniaFfiError aaronia_source_start_streaming(AaroniaSource* source);
 AaroniaFfiError aaronia_source_stop_streaming(AaroniaSource* source);
+AaroniaFfiError aaronia_source_set_center_frequency(AaroniaSource* source, double freq_hz);
+AaroniaFfiError aaronia_source_set_span_frequency(AaroniaSource* source, double span_hz);
+AaroniaFfiError aaronia_source_set_reference_level(AaroniaSource* source, double ref_level_dbm);
 FfiSourceInfo* aaronia_source_get_source_info(AaroniaSource* source);
 void aaronia_source_info_free(FfiSourceInfo* info);
 

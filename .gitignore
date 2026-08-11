@@ -9,3 +9,6 @@ tests/sdk/
 
 # Local agent configuration/memory
 .agents/
+
+# CMake build directory for SoapySDR plugin
+soapy-aaronia/build/
