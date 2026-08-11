@@ -175,6 +175,20 @@ impl AaroniaConfig {
         self
     }
 
+    /// Convenience method for HTTP streaming over constrained networks.
+    /// 
+    /// Sets the wire format to `Int16` and the scale factor to `32767.0`. 
+    /// This halves the network bandwidth requirement compared to the 
+    /// default `Float32` format (e.g. ~370 MB/s instead of ~740 MB/s at 
+    /// 92 MSPS), at the cost of a slightly higher CPU decode overhead and 
+    /// 16-bit quantization (~96 dB dynamic range).
+    #[must_use]
+    pub fn low_bandwidth_mode(mut self) -> Self {
+        self.stream_format = Some(crate::http_streaming::StreamFormat::Int16);
+        self.stream_scale = Some(32767.0);
+        self
+    }
+
     /// Set the device serial number
     #[must_use]
     pub fn device_serial(mut self, serial: String) -> Self {
@@ -894,6 +908,112 @@ impl AaroniaSource {
             }
         }
         self.config.center_frequency = freq;
+        Ok(())
+    }
+
+    /// Update the span frequency (sample rate) of the running source.
+    pub async fn set_span_frequency(&mut self, span: f64) -> Result<()> {
+        match self.source_type {
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            SourceType::NativeSdk => {
+                if let Some(ref mut source) = self.native_source {
+                    unsafe {
+                        source.configure_iq_receiver(
+                            self.config.center_frequency,
+                            span,
+                            self.config.reference_level,
+                            self.config.receiver_channel,
+                        )?
+                    };
+                } else {
+                    return Err(Error::Config(
+                        "Native SDK source not initialized".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            )))]
+            SourceType::NativeSdk => {
+                return Err(Error::Config("Native SDK not available".to_string()));
+            }
+            SourceType::Http => {
+                let client = self
+                    .http_client
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                client
+                    .configure_capture(crate::http_endpoints::CaptureControl {
+                        frequency_span: Some(span),
+                        control_type: crate::http_endpoints::ControlType::Capture,
+                        ..Default::default()
+                    })
+                    .await?;
+            }
+            SourceType::File => {
+                warn!(
+                    "set_span_frequency called on file source (no-op); RTSA files carry their own span"
+                );
+            }
+        }
+        self.config.span_frequency = span;
+        Ok(())
+    }
+
+    /// Update the reference level (in dBm) of the running source.
+    pub async fn set_reference_level(&mut self, ref_level: f64) -> Result<()> {
+        match self.source_type {
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            SourceType::NativeSdk => {
+                if let Some(ref mut source) = self.native_source {
+                    unsafe {
+                        source.configure_iq_receiver(
+                            self.config.center_frequency,
+                            self.config.span_frequency,
+                            ref_level,
+                            self.config.receiver_channel,
+                        )?
+                    };
+                } else {
+                    return Err(Error::Config(
+                        "Native SDK source not initialized".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            )))]
+            SourceType::NativeSdk => {
+                return Err(Error::Config("Native SDK not available".to_string()));
+            }
+            SourceType::Http => {
+                let client = self
+                    .http_client
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                client
+                    .configure_capture(crate::http_endpoints::CaptureControl {
+                        reference_level: Some(ref_level as f32),
+                        control_type: crate::http_endpoints::ControlType::Capture,
+                        ..Default::default()
+                    })
+                    .await?;
+            }
+            SourceType::File => {
+                warn!(
+                    "set_reference_level called on file source (no-op)"
+                );
+            }
+        }
+        self.config.reference_level = ref_level;
         Ok(())
     }
 

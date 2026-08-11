@@ -484,6 +484,96 @@ pub unsafe extern "C" fn aaronia_source_stop_streaming(ptr: *mut c_void) -> Aaro
     }
 }
 
+/// Set the center frequency (in Hz) on a live source.
+///
+/// # Safety
+/// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_set_center_frequency(
+    ptr: *mut c_void,
+    freq_hz: f64,
+) -> AaroniaFfiError {
+    clear_last_error();
+    if ptr.is_null() {
+        set_last_error("aaronia_source_set_center_frequency: source pointer is null");
+        return AaroniaFfiError::NullPointer;
+    }
+
+    let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
+
+    match ffi_block_on(source.set_center_frequency(freq_hz)) {
+        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Err(e)) => {
+            set_last_error(format!("aaronia_source_set_center_frequency failed: {}", e));
+            AaroniaFfiError::InternalError
+        }
+        Err(ctx) => {
+            set_last_error(format!("aaronia_source_set_center_frequency: {}", ctx));
+            AaroniaFfiError::RuntimeContext
+        }
+    }
+}
+
+/// Set the span frequency / sample rate (in Hz) on a live source.
+///
+/// # Safety
+/// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_set_span_frequency(
+    ptr: *mut c_void,
+    span_hz: f64,
+) -> AaroniaFfiError {
+    clear_last_error();
+    if ptr.is_null() {
+        set_last_error("aaronia_source_set_span_frequency: source pointer is null");
+        return AaroniaFfiError::NullPointer;
+    }
+
+    let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
+
+    match ffi_block_on(source.set_span_frequency(span_hz)) {
+        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Err(e)) => {
+            set_last_error(format!("aaronia_source_set_span_frequency failed: {}", e));
+            AaroniaFfiError::InternalError
+        }
+        Err(ctx) => {
+            set_last_error(format!("aaronia_source_set_span_frequency: {}", ctx));
+            AaroniaFfiError::RuntimeContext
+        }
+    }
+}
+
+/// Set the reference level (in dBm) on a live source.
+///
+/// # Safety
+/// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_set_reference_level(
+    ptr: *mut c_void,
+    ref_level_dbm: f64,
+) -> AaroniaFfiError {
+    clear_last_error();
+    if ptr.is_null() {
+        set_last_error("aaronia_source_set_reference_level: source pointer is null");
+        return AaroniaFfiError::NullPointer;
+    }
+
+    let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
+
+    match ffi_block_on(source.set_reference_level(ref_level_dbm)) {
+        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Err(e)) => {
+            set_last_error(format!("aaronia_source_set_reference_level failed: {}", e));
+            AaroniaFfiError::InternalError
+        }
+        Err(ctx) => {
+            set_last_error(format!("aaronia_source_set_reference_level: {}", ctx));
+            AaroniaFfiError::RuntimeContext
+        }
+    }
+}
+
 /// Return a heap-allocated [`FfiSourceInfo`] describing the source. The
 /// caller must free it with [`aaronia_source_info_free`]. Returns `NULL`
 /// on null input.

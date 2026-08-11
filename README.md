@@ -169,6 +169,26 @@ async fn main() -> Result<()> {
 }
 ```
 
+### Bandwidth vs. Precision Tradeoffs (HTTP Streaming)
+
+When using the HTTP backend over a network link, the wire format heavily impacts bandwidth. `sdr-aaronia-rs` defaults to lossless Float32 for maximum precision, but you can opt into a low-bandwidth integer mode if network throughput is a bottleneck.
+
+```rust,no_run
+use sdr_aaronia_rs::AaroniaConfig;
+
+// Default (Float32): 8 bytes/sample on the wire. Lossless, zero-copy decode.
+// At 92 MSPS, requires ~740 MB/s network throughput (best for localhost).
+let _high_fidelity = AaroniaConfig::default()
+    .center_frequency(2.4e9);
+
+// Low Bandwidth (Int16): 4 bytes/sample. Halves network traffic.
+// Requires setting both the format and the encode scale factor.
+// At 92 MSPS, requires ~370 MB/s.
+let _low_bandwidth = AaroniaConfig::default()
+    .center_frequency(2.4e9)
+    .low_bandwidth_mode(); // Sets StreamFormat::Int16 and scale=32767.0
+```
+
 ### Custom Configuration Profiles
 
 Build your own configuration for specific bands:
