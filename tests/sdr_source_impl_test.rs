@@ -56,14 +56,20 @@ async fn wait_for_request(
 }
 
 /// `wait_for_request` predicate: a `/control` PUT whose JSON body retunes
-/// `frequencyCenter` to `freq` (within 1 Hz).
+/// `frequencyCenter` to `freq` (within 1 Hz) *and* carries
+/// `frequencySpan`. The span requirement is a regression guard: RTSA
+/// servers silently ignore capture PUTs with a lone frequency field, so
+/// a center-only PUT is not a retune (live-verified; see
+/// `configure_capture`).
 fn control_put_tuning_to(freq: f64) -> impl Fn(&wiremock::Request) -> bool {
     move |r: &wiremock::Request| {
         r.url.path() == "/control"
-            && r.body_json::<serde_json::Value>()
-                .ok()
-                .and_then(|v| v.get("frequencyCenter").and_then(|f| f.as_f64()))
-                .is_some_and(|f| (f - freq).abs() < 1.0)
+            && r.body_json::<serde_json::Value>().ok().is_some_and(|v| {
+                v.get("frequencySpan").and_then(|s| s.as_f64()).is_some()
+                    && v.get("frequencyCenter")
+                        .and_then(|f| f.as_f64())
+                        .is_some_and(|f| (f - freq).abs() < 1.0)
+            })
     }
 }
 

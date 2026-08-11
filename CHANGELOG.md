@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **Mid-stream HTTP retuning was silently broken on real hardware.**
+  Live testing against RTSA-Suite PRO (SPECTRAN V6 ECO) showed the
+  `/control` capture endpoint applies a frequency change only when
+  `frequencyCenter` and `frequencySpan` are both present; a lone
+  frequency field returns `{"success":true}` but is ignored, so
+  `set_center_frequency` / `set_span_frequency` (and therefore hop-mode
+  retuning and the SoapySDR/seify/Python retune surfaces over HTTP)
+  reported success while the device kept streaming at the old tuning.
+  All HTTP retune paths now send the complete capture tuple (center,
+  span, reference level), `configure_capture` warns on lone-frequency
+  payloads, and a live smoke test (`live_retune_full_tuple_applies`)
+  plus a span-required mock predicate guard the regression.
+  `referenceLevel`-only PUTs were unaffected (they apply on their own).
+- Corrected the docs that mis-attributed the silent-ignore behavior to
+  the Aaronia "Remote Config" license (READMEs, DESIGN.md, HTTPSPEC.md,
+  `probe_remote_config_license` doc comments): retuning goes through the
+  license-free `/control` endpoint; the license gates only
+  `/remoteconfig` writes.
+
 ## [v0.5.0] - 2026-08-11
 
 Breaking 0.x release combining the RTSA file-format verification work

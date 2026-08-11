@@ -13,7 +13,8 @@
 
 use futures::stream::StreamExt;
 use sdr_aaronia_rs::http_endpoints::{
-    AuthMethod, HttpEndpointsClient, InputProcessingType, StreamParams, TxSampleRequest,
+    AuthMethod, CaptureControl, ControlType, HttpEndpointsClient, InputProcessingType,
+    StreamParams, TxSampleRequest,
 };
 use sdr_aaronia_rs::http_streaming::{DropDetector, PayloadType, StreamFormat};
 use std::time::{Duration, Instant};
@@ -592,6 +593,63 @@ fn live_stream_seify() {
     );
 
     streamer.deactivate_at(None).expect("deactivate");
+}
+
+/// The `/control` capture endpoint applies a frequency change only when
+/// `frequencyCenter` and `frequencySpan` travel together — a lone
+/// frequency field returns `{"success":true}` but is silently ignored
+/// (no license involved). This proves the crate's full-tuple retune path
+/// actually moves the device, then restores the original tuning.
+#[tokio::test]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+async fn live_retune_full_tuple_applies() {
+    let c = client();
+
+    let before = c.get_sample(None).await.expect("/sample baseline");
+    let center0 = (before.start_frequency + before.end_frequency) / 2.0;
+    let span0 = before.end_frequency - before.start_frequency;
+    println!(
+        "baseline: center={:.3} MHz span={:.3} MHz",
+        center0 / 1e6,
+        span0 / 1e6
+    );
+
+    // Two span-widths down: unambiguous vs. the baseline, and still
+    // comfortably inside the V6 tuning range for any plausible mission.
+    let target = center0 - 2.0 * span0;
+    let retune = |center: f64| CaptureControl {
+        frequency_center: Some(center),
+        frequency_span: Some(span0),
+        control_type: ControlType::Capture,
+        ..Default::default()
+    };
+
+    c.configure_capture(retune(target))
+        .await
+        .expect("retune PUT");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut applied = false;
+    while Instant::now() < deadline {
+        let s = c.get_sample(None).await.expect("/sample poll");
+        let center = (s.start_frequency + s.end_frequency) / 2.0;
+        if (center - target).abs() < span0 / 2.0 {
+            applied = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Restore before asserting so a failed assertion doesn't leave the
+    // device parked off-mission.
+    c.configure_capture(retune(center0))
+        .await
+        .expect("restore PUT");
+
+    assert!(
+        applied,
+        "full-tuple /control retune to {target} Hz never reflected in /sample"
+    );
 }
 
 // NOTE: there is intentionally no Rust-side SoapySDR live test here.

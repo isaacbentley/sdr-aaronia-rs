@@ -917,7 +917,27 @@ impl HttpEndpointsClient {
     }
 
     /// Configures capture parameters via the `/control` endpoint.
+    ///
+    /// **Frequency changes need `frequencyCenter` and `frequencySpan`
+    /// together.** RTSA servers return `{"success":true}` for a capture
+    /// `PUT` that carries only one of the two frequency fields but
+    /// silently ignore it; the retune applies only when both are present
+    /// (verified live against RTSA-Suite PRO driving a SPECTRAN V6 ECO —
+    /// center-only and span-only PUTs each no-opped, center+span
+    /// applied). `referenceLevel` does apply on its own. A lone frequency
+    /// field logs a warning here and is still sent, since other server
+    /// versions may accept it.
     pub async fn configure_capture(&self, config: CaptureControl) -> Result<()> {
+        let has_range = config.frequency_start.is_some() && config.frequency_end.is_some();
+        if !has_range && (config.frequency_center.is_some() != config.frequency_span.is_some()) {
+            warn!(
+                "Partial capture PUT ({:?}): RTSA servers are known to accept a lone \
+                 frequencyCenter/frequencySpan with success=true but silently ignore it; \
+                 include both fields for the retune to apply",
+                config
+            );
+        }
+
         let url = format!("{}/control", self.base_url);
         let request = self.control_request(self.client.put(&url)).json(&config);
         Self::ensure_success("Capture configuration", request.send().await?)?;
@@ -1060,9 +1080,12 @@ impl HttpEndpointsClient {
     /// `reflevel` parameter by +1 dB and restores it best-effort. If the
     /// restore fails (network drop mid-probe), the device is left with the
     /// adjusted reference level. Only call this when you genuinely need
-    /// proof of write capability — e.g. before frequency-hopping, where an
-    /// unlicensed `configure_capture` silently no-ops server-side and
-    /// mis-tags every downstream packet.
+    /// proof of `/remoteconfig` write capability. Note that retuning does
+    /// **not** — [`Self::configure_capture`] goes through the license-free
+    /// `/control` endpoint. (An earlier revision justified this probe by
+    /// claiming unlicensed `configure_capture` calls silently no-op; live
+    /// testing traced that behavior to partial capture payloads, not
+    /// licensing.)
     ///
     /// # Returns
     /// - `RemoteConfigStatus::Active` - License is active, write operations work

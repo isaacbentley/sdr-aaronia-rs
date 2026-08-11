@@ -283,6 +283,16 @@ packet-metadata object, so `payload`, `minPower`, `maxPower`, and
 }
 ```
 
+> **Both frequency fields are required for a retune to apply.** Live
+> testing against RTSA-Suite PRO (HTTP server block fed by a SPECTRAN
+> V6 ECO) shows the server returns `{"success":true}` for a capture
+> `PUT` carrying only `frequencyCenter` or only `frequencySpan` but
+> silently ignores it — the device keeps streaming at its previous
+> tuning. Sending `frequencyCenter` **and** `frequencySpan` together
+> applies reliably. `referenceLevel` on its own does apply. No license
+> is involved: `/control` capture writes work without the Remote
+> Config license.
+
 #### Start/Stop Antenna Autorotation
 ```json
 {
@@ -554,7 +564,7 @@ Data captured using antennas with location or directional information.
 The client therefore exposes two methods:
 
 - `detect_remote_config_license()` — **read-only**. Never touches device state. Classifies 401/403 responses; on read success it returns `Unknown` (write capability unproven).
-- `probe_remote_config_write_license()` — **active probe**. Performs a read-modify-restore cycle on `reflevel` (+1 dB, restored best-effort) to positively verify write capability. Use only when you need proof — e.g. before frequency hopping, where an unlicensed retune silently no-ops server-side.
+- `probe_remote_config_write_license()` — **active probe**. Performs a read-modify-restore cycle on `reflevel` (+1 dB, restored best-effort) to positively verify write capability. Use only when you genuinely need proof of `/remoteconfig` write access. Frequency hopping does **not** need it — retuning goes through the license-free `/control` endpoint (see the capture-control note above; the silent-ignore behavior once attributed to licensing was traced to partial capture payloads).
 
 **Practical Detection (Active Probe)**:
 ```rust

@@ -33,7 +33,7 @@ Interfacing with SDR hardware typically requires choosing between proprietary na
 - **Python Data-Science Native:** PyO3 bindings with single-copy reads into NumPy arrays and Apache Arrow buffers (one copy out of the Rust receive buffer per read).
 - **SDR Ecosystem Plugins:** a C++ `SoapySDR` plugin and a Rust-native `seify` backend.
 
-*Note: writes to the HTTP `/remoteconfig` endpoint require a separate Aaronia "Remote Config" license; capture control via `/control` (including retuning) does not.*
+*Note: writes to the HTTP `/remoteconfig` endpoint require a separate Aaronia "Remote Config" license; capture control via `/control` (including retuning) does not. One server quirk to know: `/control` applies a frequency change only when `frequencyCenter` **and** `frequencySpan` are both present — a lone frequency field returns `{"success":true}` but is silently ignored. The crate always sends the complete tuple.*
 
 ## Installation
 

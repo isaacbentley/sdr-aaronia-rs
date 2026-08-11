@@ -57,7 +57,11 @@ sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
   device arg changes what crosses the network.
 - `readStream` honours `timeoutUs` and returns partial reads within the
   deadline, per the SoapySDR contract. Retuning while streaming is safe
-  (fully serialized against the reader).
+  (fully serialized against the reader) and needs no Aaronia license:
+  the plugin retunes through the RTSA `/control` endpoint, always
+  sending center frequency and span together — RTSA servers silently
+  ignore capture requests that carry only one of the two (live-verified
+  against RTSA-Suite PRO with a SPECTRAN V6 ECO).
 - **TX:** `CF32`, single channel, available only when the module is
   built against the native SDK on Windows/Linux — elsewhere
   `setupStream(TX)` fails with a descriptive error. Bursts are pushed
@@ -78,8 +82,5 @@ sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
 - One RX channel through the plugin (`rx_channel=Rx2` selects the second
   antenna input; true dual-channel reads are available via the crate's
   Rust/Python/C APIs, not the Soapy streaming interface).
-- Without Aaronia's Remote Config license, the RTSA server accepts
-  retune requests over HTTP but may silently ignore them — the device
-  keeps streaming at the mission's configured frequency.
 - Enumeration advertises a default localhost candidate without probing
   it (`find()` must not block on the network).

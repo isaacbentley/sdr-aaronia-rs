@@ -1012,11 +1012,20 @@ impl AaroniaSource {
 
     /// Retune the source to a new centre frequency without rebuilding it.
     ///
-    /// - **HTTP**: wraps `HttpEndpointsClient::configure_capture(frequency_center=freq)`,
-    ///   a `PUT` to the license-free `/control` endpoint. The RTSA-Suite
-    ///   "Remote Config" license gates the `/remoteconfig` write path, not
-    ///   this one; callers that need a `/remoteconfig` write-license check
-    ///   should call [`Self::probe_remote_config_license`] separately.
+    /// - **HTTP**: wraps `HttpEndpointsClient::configure_capture`, a `PUT`
+    ///   to the license-free `/control` endpoint, always sending the
+    ///   complete capture tuple (centre, span, reference level) with the
+    ///   unchanged values taken from the cached config. The full tuple is
+    ///   load-bearing: RTSA servers return `{"success":true}` for a
+    ///   capture `PUT` that carries only one of the two frequency fields
+    ///   but silently ignore it — the retune applies only when
+    ///   `frequencyCenter` and `frequencySpan` are both present (verified
+    ///   live against RTSA-Suite PRO driving a SPECTRAN V6 ECO; the
+    ///   reference level, by contrast, does apply on its own). The
+    ///   RTSA-Suite "Remote Config" license gates
+    ///   the `/remoteconfig` write path, not this one; callers that need
+    ///   a `/remoteconfig` write-license check should call
+    ///   [`Self::probe_remote_config_license`] separately.
     /// - **Native SDK**: re-issues `configure_iq_receiver` with the new
     ///   centre frequency, the existing span, and the existing reference
     ///   level. The SDK config system applies the change to the open device
@@ -1059,9 +1068,14 @@ impl AaroniaSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                // Full tuple, not just the changed field: the server
+                // ignores capture PUTs that lack frequencySpan (see the
+                // doc comment above).
                 client
                     .configure_capture(crate::http_endpoints::CaptureControl {
                         frequency_center: Some(freq),
+                        frequency_span: Some(self.config.span_frequency),
+                        reference_level: Some(self.config.reference_level as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
@@ -1118,9 +1132,13 @@ impl AaroniaSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                // Full tuple: partial capture PUTs are silently ignored
+                // by the server (see `set_center_frequency`).
                 client
                     .configure_capture(crate::http_endpoints::CaptureControl {
+                        frequency_center: Some(self.config.center_frequency),
                         frequency_span: Some(span),
+                        reference_level: Some(self.config.reference_level as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
@@ -1171,8 +1189,12 @@ impl AaroniaSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                // Full tuple: partial capture PUTs are silently ignored
+                // by the server (see `set_center_frequency`).
                 client
                     .configure_capture(crate::http_endpoints::CaptureControl {
+                        frequency_center: Some(self.config.center_frequency),
+                        frequency_span: Some(self.config.span_frequency),
                         reference_level: Some(ref_level as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
@@ -1189,11 +1211,13 @@ impl AaroniaSource {
 
     /// Probe the RTSA-Suite Remote Config license status, returning
     /// [`crate::http_endpoints::RemoteConfigStatus::Active`] for non-HTTP
-    /// sources (they don't need it). Hopping orchestrators should check
-    /// this before relying on mid-stream `set_center_frequency` — without
-    /// the license, `configure_capture` returns HTTP 200 OK server-side
-    /// but silently ignores the frequency change, which would otherwise
-    /// cause downstream packets to be mis-tagged with the wrong channel.
+    /// sources (they don't need it). This concerns **`/remoteconfig`
+    /// writes only** — mid-stream retuning via [`Self::set_center_frequency`]
+    /// goes through the license-free `/control` endpoint and does not
+    /// need this probe. (An earlier revision claimed unlicensed
+    /// `configure_capture` calls were silently ignored; live testing
+    /// showed the silent ignore was caused by partial capture payloads,
+    /// not licensing — see `set_center_frequency`.)
     ///
     /// **On HTTP sources this is an active probe that temporarily
     /// perturbs device state**: it adjusts the reference level by +1 dB
