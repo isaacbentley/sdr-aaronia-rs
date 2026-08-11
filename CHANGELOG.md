@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.5.1] - 2026-08-11
+
 ### Fixed
 - **Mid-stream HTTP retuning was silently broken on real hardware.**
   Live testing against RTSA-Suite PRO (SPECTRAN V6 ECO) showed the
