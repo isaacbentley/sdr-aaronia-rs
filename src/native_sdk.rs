@@ -225,13 +225,14 @@ pub struct AARTSAAPI_Device {
 // (exclusive access). The AARTSAAPI vendor samples configure and poll
 // from worker threads other than the opening thread, and the API
 // documents no thread affinity, so *transferring exclusive ownership*
-// between threads (`Send`) is sound. `Sync` is deliberately NOT
-// implemented: concurrent shared access to one handle is unproven and
-// everything in this crate serializes access instead. Required so
-// `Mutex<AaroniaSource>` (native backend) is `Send`, which seify's
-// device traits demand.
+// between threads (`Send`) is sound. `Sync` is also implemented because
+// PyO3 0.23+ requires `#[pyclass]` structs to be `Send + Sync`. This is
+// safe because the handle is only ever accessed via `&mut self`, meaning
+// concurrent shared access is impossible in safe Rust.
 unsafe impl Send for AARTSAAPI_Handle {}
+unsafe impl Sync for AARTSAAPI_Handle {}
 unsafe impl Send for AARTSAAPI_Device {}
+unsafe impl Sync for AARTSAAPI_Device {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
