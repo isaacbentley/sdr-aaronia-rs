@@ -80,10 +80,20 @@ jobs:
       # Cargo.toml, so a release can't accidentally ship against
       # dependency versions that were never actually tested by the gates
       # above.
+      # Idempotent: a release re-run (transient runner failures happen)
+      # must not go red because the crate version already landed on the
+      # first attempt.
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          if curl -fsS "https://crates.io/api/v1/crates/sdr-aaronia-rs/${version}" \
+               | grep -q "\"num\":\"${version}\""; then
+            echo "sdr-aaronia-rs ${version} already on crates.io — skipping publish"
+          else
+            cargo publish --locked
+          fi
 
   build-python:
     name: Build Python wheels
