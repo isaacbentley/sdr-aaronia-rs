@@ -1,13 +1,15 @@
 # python-aaronia
 
-Python bindings for [`sdr-aaronia-rs`](https://github.com/isaacbentley/sdr-aaronia-rs) —
-stream IQ samples from Aaronia SPECTRAN V6 devices (via an RTSA-Suite PRO
-HTTP server block or the native SDK) or play back recorded `.rtsa` files,
-straight into NumPy or Apache Arrow.
+Python bindings for
+[`sdr-aaronia-rs`](https://github.com/isaacbentley/sdr-aaronia-rs).
+Stream IQ samples from Aaronia SPECTRAN V6 devices, through an
+RTSA-Suite PRO HTTP server block or the native SDK, or play back
+recorded `.rtsa` files, into NumPy or Apache Arrow.
 
 - **PyPI package:** `python-aaronia` · **importable module:** `aaronia`
-- **Wheels:** abi3, CPython ≥ 3.9, one wheel per OS/arch (plus an sdist
-  for everything else — building from source needs a Rust toolchain)
+- **Wheels:** abi3, CPython ≥ 3.9, one wheel per OS and architecture,
+  plus an sdist for other platforms. Building from the sdist requires a
+  Rust toolchain.
 - **License:** GPL-3.0-or-later
 
 ## Install
@@ -16,7 +18,7 @@ straight into NumPy or Apache Arrow.
 pip install python-aaronia
 ```
 
-Or from a checkout (requires Rust + [maturin](https://maturin.rs)):
+From a checkout, which requires Rust and [maturin](https://maturin.rs):
 
 ```bash
 cd python-aaronia
@@ -49,6 +51,11 @@ src.stop_streaming()
 File playback: set `cfg.file_path = "capture.rtsa"` instead of
 `http_base_url`.
 
+The
+[quickstart](https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/QUICKSTART.md)
+covers configuring the RTSA-Suite HTTP Server block, which everything
+above depends on.
+
 ## Configuration (`AaroniaConfig`)
 
 Every field is readable and writable.
@@ -61,7 +68,7 @@ Every field is readable and writable.
 | `center_freq` | Center frequency, Hz |
 | `sample_rate` | IQ sample rate, Hz (the Aaronia "span") |
 | `reference_level` | Reference level, dBm |
-| `format` | HTTP wire format: `"F32"`, `"F16"`, or `"I16"` (true low-bandwidth mode) |
+| `format` | HTTP wire format: `"F32"`, `"F16"` or `"I16"`. `I16` is the low-bandwidth network mode |
 | `receiver_channel` | `"Rx1"` (default), `"Rx2"`, or `"Rx1And2"` (native SDK, full V6) |
 | `read_timeout` | Seconds a blocking read waits before `AaroniaTimeoutError` (default `30.0`) |
 | `auto_reconnect` | Reconnect the HTTP stream after a drop (default `True`) |
@@ -69,32 +76,32 @@ Every field is readable and writable.
 Unknown `format`/`receiver_channel` strings raise `ValueError` instead of
 silently defaulting.
 
-## Semantics worth knowing
+## Behaviour
 
-- **One copy per read.** Samples are copied once out of the Rust receive
-  buffer into a NumPy/Arrow-owned buffer — safe to hold indefinitely.
-  (Not "zero-copy"; one copy is the honest count.)
+- **One copy per read.** Samples are copied once from the Rust receive
+  buffer into a NumPy or Arrow owned buffer, which is then safe to hold
+  indefinitely. This is not zero-copy; one copy is the accurate count.
 - **Blocking calls release the GIL.** Other Python threads keep running;
   `KeyboardInterrupt` is delivered between calls. Reads block until
   `count` samples arrive or `cfg.read_timeout` seconds (default 30)
   elapse, which raises `AaroniaTimeoutError`.
-- **Connecting retries transient failures** (up to 4 attempts over ~4.5 s),
-  so a cold `*.local` hostname or a server still starting up doesn't fail
-  on the first try.
-- **Dropped streams reconnect automatically** (`auto_reconnect`, default
-  on): the reader reopens the stream, re-applies the current tuning, and
-  flags the first read after the gap via `take_overrun()`. After five
-  failed attempts the stream ends and reads raise
-  `AaroniaConnectionError`.
+- **Connecting retries transient failures**, up to 4 attempts within a
+  10 second budget, so a cold `*.local` hostname or a server that is
+  still starting does not fail on the first attempt.
+- **Dropped streams reconnect automatically** when `auto_reconnect` is
+  enabled, which is the default. The reader reopens the stream,
+  re-applies the current tuning, and flags the first read after the gap
+  through `take_overrun()`. After five failed attempts the stream ends
+  and reads raise `AaroniaConnectionError`.
 - **Typed exceptions.** `AaroniaConnectionError` (unreachable endpoint),
-  `AaroniaTimeoutError`, `AaroniaHardwareError` (device/SDK errors),
-  `ValueError` (invalid configuration) — mapped from the Rust error
-  enum, with the full cause chain in the message.
-- **Dual-channel** (`receiver_channel = "Rx1And2"`,
-  `read_samples_dual_numpy(count)` → two time-aligned arrays) requires
-  the native-SDK backend: Windows/Linux with the Aaronia SDK installed,
-  and a full (two-input) V6. Hardware-unverified — the development
-  device is a single-channel V6 ECO.
+  `AaroniaTimeoutError`, `AaroniaHardwareError` (device and SDK errors)
+  and `ValueError` (invalid configuration), mapped from the Rust error
+  enum with the full cause chain in the message.
+- **Dual-channel** reads (`receiver_channel = "Rx1And2"` with
+  `read_samples_dual_numpy(count)`, returning two time-aligned arrays)
+  require the native-SDK backend: Windows or Linux with the Aaronia SDK
+  installed, and a two-input V6. This path is hardware-unverified; the
+  development device is a single-channel V6 ECO.
 
 ## Source methods
 

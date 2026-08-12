@@ -5,6 +5,21 @@
 //! Provides a unified interface for connecting to Aaronia Spectran V6 units over
 //! the Aaronia RTSA HTTP API, the Native C++ SDK, or reading raw IQ data from files.
 
+/// Compile-checks the Rust snippets in the standalone guides.
+///
+/// `README.md` is doctested by the `include_str!` above; the guides in
+/// `docs/` live outside the API documentation but must not rot either —
+/// a snippet that no longer compiles is worse than no snippet.
+/// `cfg(doctest)` means this module exists only while doctests run, so
+/// nothing is added to the rendered docs.
+#[cfg(doctest)]
+#[doc = include_str!("../docs/QUICKSTART.md")]
+mod quickstart_guide {}
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/USAGE.md")]
+mod usage_guide {}
+
 #[cfg(feature = "ffi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
 pub mod c_api;

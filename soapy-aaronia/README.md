@@ -3,17 +3,51 @@
 A [SoapySDR](https://github.com/pothosware/SoapySDR) module for Aaronia
 SPECTRAN V6 devices, backed by the
 [`sdr-aaronia-rs`](https://github.com/isaacbentley/sdr-aaronia-rs) crate's
-C API. The Rust library is **statically linked** into the module — the
-shipped `libaaroniaSupport` has no Rust runtime dependency to install.
+C API. The Rust library is statically linked into the module, so the
+shipped `libaaroniaSupport` has no Rust runtime dependency.
 
-Works with any SoapySDR application (GQRX, SDR++, GNU Radio's Soapy
-blocks, `SoapySDRUtil`, the SoapySDR Python bindings).
+Works with any SoapySDR application: GQRX, SDR++, GNU Radio's Soapy
+blocks, `SoapySDRUtil` and the SoapySDR Python bindings.
+[docs/APPS.md](../docs/APPS.md) covers per-application setup.
 
-## Build
+## Install a prebuilt module
+
+Each [release](https://github.com/isaacbentley/sdr-aaronia-rs/releases)
+attaches a built module per platform, so neither CMake nor a Rust
+toolchain is required. Download the archive for your operating system
+and unpack it.
+
+Find where SoapySDR looks for modules:
+
+```bash
+SoapySDRUtil --info | grep -i "module"
+```
+
+Copy the module (`aaroniaSupport.dll` on Windows, `libaaroniaSupport.so`
+elsewhere) into that directory. Alternatively, place it anywhere and set
+`SOAPY_SDR_PLUGIN_PATH` to the containing folder, which requires no
+administrator rights:
+
+```bash
+export SOAPY_SDR_PLUGIN_PATH=/path/to/unpacked
+SoapySDRUtil --check=aaronia
+```
+
+On macOS, Gatekeeper quarantines downloaded binaries; clear it once:
+
+```bash
+xattr -d com.apple.quarantine libaaroniaSupport.so
+```
+
+The Rust library is statically linked, so nothing else needs
+installing. Applications that enumerate plugins at startup, such as
+SDR++ and GQRX, must be launched after `SOAPY_SDR_PLUGIN_PATH` is set.
+
+## Build from source
 
 Requirements: CMake ≥ 3.14, a C++17 compiler, SoapySDR ≥ 0.7 with dev
 headers (`libsoapysdr-dev` / `brew install soapysdr` / vcpkg `soapysdr`),
-and a Rust toolchain — CMake drives `cargo build --release` itself.
+and a Rust toolchain. CMake invokes `cargo build --release` itself.
 
 ```bash
 cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release
@@ -42,7 +76,7 @@ sudo cmake --install soapy-aaronia/build
 | `file` | Play back a recorded `.rtsa` file |
 | `serial` | Select a device by serial via the native-SDK backend (Windows/Linux with the Aaronia SDK; omit `url` to allow SDK auto-detection) |
 | `freq` / `rate` / `ref_level` | Initial center frequency, sample rate, reference level |
-| `format` | HTTP **wire** format; `format=I16` (optionally `scale=N`) is the genuine low-bandwidth network mode |
+| `format` | HTTP wire format. `format=I16`, optionally with `scale=N`, is the low-bandwidth network mode |
 | `rx_channel` | `Rx1` (default), `Rx2`, or `Rx1And2` (native SDK, full V6 only) |
 | `read_timeout` | Seconds the crate's own blocking reads wait (default 30). `readStream` always uses SoapySDR's per-call `timeoutUs`, so this rarely matters here |
 | `reconnect` | `1` (default) reconnects the stream automatically after a drop; `0` restores fail-fast behaviour |
@@ -54,35 +88,35 @@ sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
 
 ## Streams
 
-- **RX:** `CF32` (native) and `CS16`. Note the distinction: the
-  app-side stream format is a client-side conversion; only the `format=`
-  device arg changes what crosses the network.
+- **RX:** `CF32` (native) and `CS16`. The application-side stream format
+  is a client-side conversion. Only the `format=` device argument
+  changes what crosses the network.
 - `readStream` honours `timeoutUs` and returns partial reads within the
-  deadline, per the SoapySDR contract. Retuning while streaming is safe
-  (fully serialized against the reader) and needs no Aaronia license:
-  the plugin retunes through the RTSA `/control` endpoint, always
-  sending center frequency and span together — RTSA servers silently
-  ignore capture requests that carry only one of the two (live-verified
-  against RTSA-Suite PRO with a SPECTRAN V6 ECO).
+  deadline, per the SoapySDR contract. Retuning while streaming is safe,
+  being fully serialised against the reader, and requires no Aaronia
+  licence. The plugin retunes through the RTSA `/control` endpoint and
+  always sends center frequency and span together, because RTSA servers
+  ignore capture requests carrying only one of the two. This was
+  verified against RTSA-Suite PRO with a SPECTRAN V6 ECO.
 - **TX:** `CF32`, single channel, available only when the module is
-  built against the native SDK on Windows/Linux — elsewhere
+  built against the native SDK on Windows or Linux. Elsewhere
   `setupStream(TX)` fails with a descriptive error. Bursts are pushed
   for immediate transmission; timed TX (`SOAPY_SDR_HAS_TIME`) is not
-  supported. **The entire TX path is hardware-unverified.**
+  supported. The TX path is hardware-unverified.
 
 ## Time, gain, sensors
 
-- `hasHardwareTime("GPS")` probes truthfully: it is only true on the
-  native-SDK backend with a valid GPS fix. `getHardwareTime("GPS")`
-  returns epoch nanoseconds (integer-domain conversion).
-- The single gain element **`REF` is the Aaronia reference level in
-  dBm** — *raising* it reduces sensitivity; it is not an amplifier gain.
+- `hasHardwareTime("GPS")` returns true only on the native-SDK backend
+  with a valid GPS fix. `getHardwareTime("GPS")` returns epoch
+  nanoseconds, converted in the integer domain.
+- The single gain element, `REF`, is the Aaronia reference level in dBm.
+  It is not an amplifier gain: raising it reduces sensitivity.
 - `readSensor("cumulative_drops")` reports server-side dropped blocks.
 
 ## Known limitations
 
-- One RX channel through the plugin (`rx_channel=Rx2` selects the second
-  antenna input; true dual-channel reads are available via the crate's
-  Rust/Python/C APIs, not the Soapy streaming interface).
+- One RX channel through the plugin. `rx_channel=Rx2` selects the second
+  antenna input; simultaneous dual-channel reads are available through
+  the crate's Rust, Python and C APIs, not the SoapySDR interface.
 - Enumeration advertises a default localhost candidate without probing
-  it (`find()` must not block on the network).
+  it, because `find()` must not block on the network.

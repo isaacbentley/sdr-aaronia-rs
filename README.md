@@ -33,7 +33,7 @@ Interfacing with SDR hardware typically requires choosing between proprietary na
 - **Python Data-Science Native:** PyO3 bindings with single-copy reads into NumPy arrays and Apache Arrow buffers (one copy out of the Rust receive buffer per read).
 - **SDR Ecosystem Plugins:** a C++ `SoapySDR` plugin and a Rust-native `seify` backend.
 
-*Note: writes to the HTTP `/remoteconfig` endpoint require a separate Aaronia "Remote Config" license; capture control via `/control` (including retuning) does not. One server quirk to know: `/control` applies a frequency change only when `frequencyCenter` **and** `frequencySpan` are both present — a lone frequency field returns `{"success":true}` but is silently ignored. The crate always sends the complete tuple.*
+*Note: writes to the HTTP `/remoteconfig` endpoint require a separate Aaronia "Remote Config" license; capture control via `/control`, including retuning, does not. One server behaviour to be aware of: `/control` applies a frequency change only when `frequencyCenter` and `frequencySpan` are both present. A request carrying one of them returns `{"success":true}` and is ignored. The crate always sends the complete tuple.*
 
 ## Installation
 
@@ -76,314 +76,35 @@ async fn main() -> Result<()> {
 }
 ```
 
-## Usage Examples
+## Usage
 
-The `examples/` directory contains runnable examples for each subsystem:
+The Quickstart above covers the unified API: set RF parameters, read
+samples. [docs/USAGE.md](docs/USAGE.md) has worked examples for the rest:
+the builder pattern, explicit backend selection, wire formats and network
+bandwidth, configuration profiles, device control, FutureSDR integration,
+authentication, and low-level stream access. Its Rust snippets are
+compiled as doctests.
 
-- **[http_iq_quickstart.rs](examples/http_iq_quickstart.rs)**: Connect to an RTSA HTTP server and stream live IQ data natively.
-- **[noaa_scanner.rs](examples/noaa_scanner.rs)**: Scan NOAA weather channels and demodulate FM audio in real-time using `FutureSDR`.
-- **[native_sdk_basic.rs](examples/native_sdk_basic.rs)**: Access hardware directly through the vendor's native SDK (Windows/Linux).
-- **[native_sdk_transmit.rs](examples/native_sdk_transmit.rs)**: Stream IQ bursts (e.g. LoRa chirps) over the Native SDK to standard Spectran V6 devices.
-- **[channel_hopping.rs](examples/channel_hopping.rs)**: Perform automatic frequency hopping using the native `sdr-source` feature.
-- **[read_rtsa_file.rs](examples/read_rtsa_file.rs)**: Open a local RTSA capture, parse the metadata headers, and read samples efficiently.
-- **[dump_metadata.rs](examples/dump_metadata.rs)**: Inspect the DSFH metadata tree inside `.rtsa` captures for debugging.
-- **[device_control.rs](examples/device_control.rs)**: Perform device health checks, list available inputs, and safely interact with Aaronia HTTP endpoints.
+The programs in `examples/` cover the same ground as runnable code, and
+are built by CI:
 
-### Unified API (Auto-Detection)
+| Task | Example |
+| --- | --- |
+| HTTP IQ streaming, first samples | [`http_iq_quickstart.rs`](examples/http_iq_quickstart.rs) |
+| Health checks, input enumeration, recording control, license probing | [`device_control.rs`](examples/device_control.rs) |
+| Frequency hopping via the `sdr-source` traits | [`channel_hopping.rs`](examples/channel_hopping.rs) |
+| FutureSDR flowgraph with FM demodulation | [`noaa_scanner.rs`](examples/noaa_scanner.rs) |
+| Native SDK capture and transmit | [`native_sdk_basic.rs`](examples/native_sdk_basic.rs), [`native_sdk_transmit.rs`](examples/native_sdk_transmit.rs) |
+| RTSA file playback and metadata inspection | [`read_rtsa_file.rs`](examples/read_rtsa_file.rs), [`dump_metadata.rs`](examples/dump_metadata.rs) |
+| Python (NumPy and Arrow), SoapySDR from Python | [`python_arrow_example.py`](examples/python_arrow_example.py), [`soapy_python_example.py`](examples/soapy_python_example.py) |
 
-The recommended approach is to specify the RF parameters and let the library handle backend selection.
-
-```rust,no_run
-use sdr_aaronia_rs::{AaroniaSource, AaroniaConfig};
-use anyhow::Result;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Specify RF parameters; the library auto-detects the best backend
-    let config = AaroniaConfig::default()
-        .center_frequency(446.0e6)     // 446 MHz UHF amateur
-        .span_frequency(10.0e6)        // 10 MHz span
-        .reference_level(-30.0);       // -30 dBm
-
-    let mut source = AaroniaSource::new(config).await?;
-    println!("Selected Source: {:?}", source.get_source_info());
-
-    // Read IQ samples using the unified interface
-    let mut samples = Vec::with_capacity(1024);
-    let n = source.read_samples(&mut samples, 1024).await?;
-    println!("Received {} IQ samples", n);
-
-    Ok(())
-}
+```bash
+# args: <center-hz> <sample-rate-hz> <url>
+cargo run --example http_iq_quickstart --features http -- 2440e6 12.288e6 http://localhost:54664
 ```
 
-### Builder Pattern with Auto-Detection
-
-`AaroniaSourceBuilder` is the high-level unified builder. By default the backend is auto-detected, but it can be pinned explicitly with `http_source(url)`, `file_source(path)`, or `force_source_type(...)`; additional knobs include `device_serial(...)`, `stream_format(...)`, `stream_scale(...)`, and `receiver_channel(...)` (native-SDK RX selection, incl. dual-channel `Rx1And2`).
-
-```rust,no_run
-use sdr_aaronia_rs::AaroniaSourceBuilder;
-use anyhow::Result;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let mut builder = AaroniaSourceBuilder::new();
-    builder
-        .center_frequency(2.44e9)     // 2.4 GHz ISM band
-        .span_frequency(20.0e6)       // 20 MHz span
-        .reference_level(-25.0);      // -25 dBm
-
-    let mut source = builder.build().await?;
-
-    // The API is identical regardless of which backend was selected
-    let mut samples = Vec::with_capacity(1024);
-    source.read_samples(&mut samples, 1024).await?;
-
-    Ok(())
-}
-```
-
-### Explicit Source Selection
-
-You can force a specific backend if auto-detection is not desired:
-
-```rust,no_run
-use sdr_aaronia_rs::{AaroniaSource, AaroniaConfig};
-use anyhow::Result;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Force Native SDK
-    let sdk_config = AaroniaConfig::default()
-        .center_frequency(2.44e9)
-        .span_frequency(20.0e6)
-        .reference_level(-20.0)
-        .force_native_sdk();
-    let _sdk_source = AaroniaSource::new(sdk_config).await?;
-
-    // Force HTTP Streaming
-    let http_config = AaroniaConfig::from_http("http://192.168.1.100");
-    let _http_source = AaroniaSource::new(http_config).await?;
-
-    // Force RTSA File Source
-    let file_config = AaroniaConfig::from_file("capture.rtsa");
-    let _file_source = AaroniaSource::new(file_config).await?;
-
-    Ok(())
-}
-```
-
-### Bandwidth vs. Precision Tradeoffs (HTTP Streaming)
-
-When using the HTTP backend over a network link, the wire format heavily impacts bandwidth. `sdr-aaronia-rs` defaults to lossless Float32 for maximum precision, but you can opt into a low-bandwidth integer mode if network throughput is a bottleneck.
-
-```rust,no_run
-use sdr_aaronia_rs::AaroniaConfig;
-
-// Default (Float32): 8 bytes/sample on the wire. Lossless, zero-copy decode.
-// At 92 MSPS, requires ~740 MB/s network throughput (best for localhost).
-let _high_fidelity = AaroniaConfig::default()
-    .center_frequency(2.4e9);
-
-// Low Bandwidth (Int16): 4 bytes/sample. Halves network traffic.
-// Requires setting both the format and the encode scale factor.
-// At 92 MSPS, requires ~370 MB/s.
-let _low_bandwidth = AaroniaConfig::default()
-    .center_frequency(2.4e9)
-    .low_bandwidth_mode(); // Sets StreamFormat::Int16 and scale=32767.0
-```
-
-### Custom Configuration Profiles
-
-Build your own configuration for specific bands:
-
-```rust,no_run
-use sdr_aaronia_rs::AaroniaConfig;
-
-// UHF amateur band
-let _config = AaroniaConfig::default()
-    .center_frequency(446.0e6)    // 446 MHz
-    .span_frequency(10.0e6)       // 10 MHz span
-    .reference_level(-30.0);      // -30 dBm
-
-// 2m amateur band
-let _config = AaroniaConfig::default()
-    .center_frequency(146.52e6)   // 2m amateur
-    .span_frequency(25e3)         // 25 kHz
-    .reference_level(-30.0);      // -30 dBm
-```
-
-### Device Control & Monitoring
-
-Use the `HttpEndpointsClient` to manage the physical device state, retrieve health telemetry, and manage stream inputs.
-
-```rust,no_run
-use sdr_aaronia_rs::{HttpEndpointsClient, AuthMethod};
-use sdr_aaronia_rs::http_endpoints::{CaptureControl, ControlType};
-use anyhow::Result;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let client = HttpEndpointsClient::new(
-        "http://127.0.0.1:54664".to_string(),
-        AuthMethod::None
-    )?;
-
-    // Retrieve device information
-    let info = client.get_info().await?;
-    println!("Connected to: {} ({})", info.title, info.name);
-
-    // Start/stop streaming
-    client.control_streaming(true).await?;
-
-    // Apply capture configuration
-    let config = CaptureControl {
-        frequency_center: Some(162.4e6),
-        frequency_span: Some(25e3),
-        reference_level: Some(-20.0),
-        control_type: ControlType::Capture,
-        ..Default::default()
-    };
-    client.configure_capture(config).await?;
-
-    Ok(())
-}
-```
-
-### FutureSDR Integration (Advanced)
-
-For existing [FutureSDR](https://github.com/FutureSDR/FutureSDR) users, the low-level block API integrates high-throughput streams (both RX and TX) into a flowgraph. `HttpSourceBuilder`, `HttpSinkBuilder`, and the corresponding blocks require the `futuresdr` feature:
-
-```rust,ignore
-use sdr_aaronia_rs::{HttpSourceBuilder, HttpSinkBuilder};
-use futuresdr::runtime::Flowgraph;
-use anyhow::Result;
-
-fn main() -> Result<()> {
-    // Low-level FutureSDR blocks
-    let source = HttpSourceBuilder::new("http://127.0.0.1:54664")
-        .frequency(146.52e6)
-        .sample_rate(25e3)
-        .build()?;
-
-    let sink = HttpSinkBuilder::new("http://127.0.0.1:54664")
-        .frequency(433.0e6)
-        .sample_rate(1e6)
-        .build()?;
-
-    // Use in FutureSDR flowgraph
-    let mut fg = Flowgraph::new();
-    let _src = fg.add_block(source);
-    let _sink = fg.add_block(sink);
-    // ... connect to other blocks
-
-    Ok(())
-}
-```
-
-### Advanced Streaming with Authentication
-
-The low-level `HttpSourceBuilder` (also part of the `futuresdr` feature) offers advanced properties (e.g., `buffer_size`, `timeout_ms`, `rate_reduction`) and authentication settings:
-
-```rust,ignore
-use sdr_aaronia_rs::{AuthMethod, HttpSourceBuilder, StreamFormat};
-use anyhow::Result;
-
-fn main() -> Result<()> {
-    let _advanced_source = HttpSourceBuilder::new("http://127.0.0.1:54664")
-        .frequency(446.125e6)           // UHF band
-        .sample_rate(12.5e3)            // Narrow bandwidth
-        .format(StreamFormat::Int16)    // High-performance format
-        .auth(AuthMethod::Basic {
-            username: "admin".to_string(),
-            password: "secure_pass".to_string(),
-        })
-        .input("main")                  // Specific input stream
-        .rate_reduction(4)              // Bandwidth optimization
-        .buffer_size(16384)             // Large buffer
-        .timeout_ms(1000)               // Fast timeout
-        .build()?;
-    Ok(())
-}
-```
-
-### Low-Level Asynchronous Stream Reading
-
-```rust,no_run
-use sdr_aaronia_rs::http_endpoints::{HttpEndpointsClient, AuthMethod, StreamParamsBuilder};
-use sdr_aaronia_rs::http_streaming::StreamFormat;
-use futures::stream::StreamExt;
-use anyhow::Result;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let client = HttpEndpointsClient::new(
-        "http://127.0.0.1:54664".to_string(),
-        AuthMethod::None
-    )?;
-
-    let stream_params = StreamParamsBuilder::new()
-        .format(StreamFormat::Float32)
-        .input("main".to_string())
-        .build();
-
-    let mut stream = client.start_stream(stream_params).await?;
-
-    while let Some(packet_result) = stream.next().await {
-        match packet_result {
-            Ok(packet) => println!("Received packet with {} samples", packet.samples.len()),
-            Err(e) => eprintln!("Error receiving packet: {}", e),
-        }
-    }
-
-    Ok(())
-}
-```
-
-### Additional Device Management
-
-**Recording Control**
-```rust,no_run
-use sdr_aaronia_rs::{HttpEndpointsClient, AuthMethod};
-use anyhow::Result;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let client = HttpEndpointsClient::new("http://127.0.0.1:54664".to_string(), AuthMethod::None)?;
-    client.control_recording(true, Some("my_recording".to_string())).await?;
-    client.control_recording(false, None).await?;
-    Ok(())
-}
-```
-
-**Input Management**
-```rust,no_run
-use sdr_aaronia_rs::{HttpEndpointsClient, AuthMethod};
-use sdr_aaronia_rs::http_endpoints::InputProcessingType;
-use anyhow::Result;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let client = HttpEndpointsClient::new("http://127.0.0.1:54664".to_string(), AuthMethod::None)?;
-    let _inputs = client.get_inputs().await?;
-    let _new_input = client.create_input("main", InputProcessingType::Average).await?;
-    Ok(())
-}
-```
-
-**Token Authentication Flow**
-```rust,no_run
-use sdr_aaronia_rs::{HttpEndpointsClient, AuthMethod};
-use anyhow::Result;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let client = HttpEndpointsClient::new("http://127.0.0.1:54664".to_string(), AuthMethod::None)?;
-    let user = client.get_user().await?;
-    let _auth = AuthMethod::Token { token: user.token };
-    Ok(())
-}
-```
+[docs/QUICKSTART.md](docs/QUICKSTART.md) covers configuring the
+RTSA-Suite HTTP Server block, which all of the above depends on.
 
 ## Python Bindings (NumPy & Apache Arrow)
 
@@ -450,26 +171,69 @@ The `sdr-aaronia-rs` workspace also acts as the source of truth for standard SDR
 
 For deep-dive setup instructions and documentation on the C++ side and Bandwidth Optimization tricks, please see the dedicated [PLUGINS.md](PLUGINS.md) document.
 
+## Hardware verification status
+
+Not every code path has been exercised against hardware. The
+development device is a SPECTRAN V6 ECO with a single RX channel and no
+TX licence, driven through RTSA-Suite PRO over HTTP from macOS. Paths
+requiring a second RX input, a transmitter, or the Windows/Linux native
+SDK are marked unverified.
+
+| Capability | Backend | Status |
+| --- | --- | --- |
+| IQ streaming, all four wire formats (F32 / F16 / I16 / JSON) | HTTP | **Live-verified** |
+| Spectra streaming | HTTP | **Live-verified** |
+| Mid-stream retuning (centre, span) | HTTP | **Live-verified** |
+| Mid-stream reference-level change | HTTP | Confirmed manually against the device; no automated live assertion |
+| Auto-reconnect after a dropped stream | HTTP | Streaming live-verified; the drop-and-recover path is mock-tested |
+| Drop/overrun detection, rate reduction, `scale=N` | HTTP | **Live-verified** |
+| Long-run stability (>120 s continuous) | HTTP | **Live-verified** |
+| Connect retry | HTTP | Mock-tested; the mDNS race it addresses did not reproduce on demand |
+| `.rtsa` playback and metadata | File | **Verified against real captures**, byte-compared with the official format specification |
+| seify backend | HTTP | **Live-verified** |
+| SoapySDR plugin RX | HTTP | Verified manually (~9.7 Msps via `SoapySDRUtil`); no automated live test, as a `soapysdr` dev-dependency would make `cargo test` unbuildable without system SoapySDR |
+| Python bindings RX | HTTP | Verified manually (NumPy and Arrow); no automated live test |
+| TX (`UnifiedSink`, `aaronia_sink_*`, SoapySDR TX) | Native SDK | **Hardware-unverified**. No TX-licensed device available |
+| Dual-channel RX (`Rx1And2`, `read_samples_dual`) | Native SDK | **Hardware-unverified**. Requires a full V6 |
+| GPS hardware time | Native SDK | **Hardware-unverified** |
+| Native SDK capture generally | Native SDK | **Hardware-unverified**; compiled and unit-tested in a Linux VM each release |
+| HTTP TX push (`/sample`) | HTTP | Endpoint exercised live; RF output not measured |
+
+"Live-verified" means an `#[ignore]`d test in
+[`tests/live_smoke.rs`](tests/live_smoke.rs) asserts the behaviour
+against hardware, and is reproducible by anyone with a device. Entries
+marked "verified manually" were observed working but have no automated
+assertion and can regress without detection. Run the automated set
+with:
+
+```bash
+cargo test --all-features --test live_smoke -- --ignored --nocapture
+```
+
+Contributions that convert an unverified row, particularly from users
+with a full V6 or a TX licence, are welcome.
+
 ## Connection Resilience
 
 Connecting (the `/info` probe and initial tuning PUT) retries transient
-failures — refused connections, unresolved DNS, 5xx/408/429 — up to 4 times
-with exponential backoff, bounded by a 10 s total budget so a wrong hostname
-reports itself promptly; 4xx and config errors fail on the first attempt.
-This matters for `*.local` hostnames, which refuse the first connection from
-a cold process while mDNS resolves.
+failures up to 4 times with exponential backoff, bounded by a 10 second
+total budget. Refused connections, unresolved DNS and 5xx/408/429
+responses are retried; 4xx and configuration errors fail on the first
+attempt. This matters for `*.local` hostnames, which refuse the first
+connection from a cold process while mDNS resolves.
 
 `AaroniaConfig::read_timeout` (default 30 s) bounds `read_samples`.
-`read_samples_deadline` — and therefore the SoapySDR and seify paths — uses
+`read_samples_deadline`, and therefore the SoapySDR and seify paths, uses
 its caller's per-call deadline instead.
 
-A dropped HTTP stream (RTSA restart, network blip) reconnects automatically
-— `AaroniaConfig::auto_reconnect`, on by default. The reader reopens the
-stream, re-applies the current tuning (a restarted server comes back on its
-mission's frequency), and flags the first packet after the gap as an
-overrun so callers know samples were missed. After 5 attempts (~8 s of
-backoff) it gives up and reads report a closed stream, which is exactly the
-behaviour you get with `auto_reconnect(false)`.
+A dropped HTTP stream, from an RTSA restart or a network interruption,
+reconnects automatically. This is `AaroniaConfig::auto_reconnect`,
+enabled by default. The reader reopens the stream, re-applies the
+current tuning (a restarted server returns to its mission's frequency),
+and flags the first packet after the gap as an overrun so callers know
+samples were missed. After 5 attempts, roughly 8 seconds of backoff, it
+stops and reads report a closed stream, matching the behaviour of
+`auto_reconnect(false)`.
 
 ## Environment Variables
 
@@ -500,11 +264,6 @@ Functionality is grouped behind Cargo features so unused dependencies stay out o
 | `sdr-source` | Integrates `AaroniaSdrSource` implementing the native `SdrSource` traits. | **Yes** |
 | `ffi` | Builds the C-API export layer. | **Yes** |
 
-## MSRV & Semver Policy
-
-- **MSRV:** This crate does not maintain an explicit Minimum Supported Rust Version (MSRV) policy and tracks the latest `stable` compiler.
-- **Semver:** This crate follows semantic versioning. While in `0.x.y`, breaking API changes will result in a minor version bump (e.g. `0.1.x` to `0.2.0`). MSRV bumps will also occur on minor version releases.
-
 ## Testing & Contributing
 
 The test suite consists of unit tests, integration tests against LFS captures, and property tests enforcing specification invariants.
@@ -512,6 +271,14 @@ The test suite consists of unit tests, integration tests against LFS captures, a
 Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on running the test suite, generating coverage reports, and formatting your code before submitting a Pull Request.
 
 ## Documentation
+
+Start here:
+
+- [Quickstart](docs/QUICKSTART.md) — configuring an RTSA-Suite mission, first samples in Rust, Python and SoapySDR, and troubleshooting for common setup failures.
+- [Usage](docs/USAGE.md) — worked examples for each part of the API.
+- [Using existing SDR apps](docs/APPS.md) — SDR++, GQRX, GNU Radio, SoapySDR from Python.
+
+Reference:
 
 - [Architecture & Design](DESIGN.md) — Internal architecture and execution flow.
 - [RTSA File Format Specification](docs/FILESPEC.md) — On-disk `.rtsa` capture-file format and how this crate parses it.

@@ -50,6 +50,32 @@ All notable changes to this project will be documented in this file.
   `read_samples_deadline` bounded by the dwell deadline it already
   computes.
 
+### Documentation
+- **Hardware-verification matrix in the README.** Every capability is now
+  labelled live-verified, mock-tested, or hardware-unverified, with the
+  development device stated outright (SPECTRAN V6 ECO, single RX, no TX
+  licence, driven over HTTP from macOS). The TX, dual-channel and
+  native-SDK paths have never been exercised against hardware, stated in
+  one place rather than scattered across five documents.
+- **`docs/QUICKSTART.md`** — the RTSA-Suite mission configuration that
+  everything depends on and that no document previously covered: adding
+  the HTTP Server block, connecting the device output to it, verifying
+  with `curl`, first samples in Rust/Python/SoapySDR, and the common
+  failure modes (span versus sample rate, partial retune PUTs, network
+  saturation at Float32 rates).
+- **`docs/APPS.md`** — per-application setup for SDR++, GQRX, GNU Radio
+  and SoapySDR-from-Python, including that the single `REF` gain element
+  is a reference level in dBm, where raising it *reduces* sensitivity.
+- **Prebuilt install instructions** for the SoapySDR plugin: every
+  release already attached built modules, but the README only explained
+  building from source with CMake and a Rust toolchain.
+- **`docs/USAGE.md`** — the worked examples that previously made up 60%
+  of the README, moved out of it and now compiled as doctests so they
+  cannot drift from the API. The README keeps the quickstart and points
+  to the guides (516 lines down to 291).
+- Rust snippets in `docs/QUICKSTART.md` are compile-checked as doctests
+  via a `cfg(doctest)` module, so the guides can't drift from the API.
+
 ### CI
 - GitHub releases now lead with this file's entry for the tag being
   released, instead of only an auto-generated commit list (which is
