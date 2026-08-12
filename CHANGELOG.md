@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.6.0] - 2026-08-11
+
+Reliability and documentation release. The HTTP backend now survives the
+conditions real deployments meet: a server that is still starting, and a
+stream that drops mid-session. The documentation states plainly which
+paths have run against hardware and which have not.
+
+### Breaking
+- `AaroniaConfig` gained public `read_timeout` and `auto_reconnect`
+  fields, which breaks struct-literal construction. The builder methods
+  are unaffected.
+- Automatic stream reconnection is **enabled by default**. A dropped
+  HTTP stream previously ended the session and made every later read
+  return `Error::Protocol`; it now recovers, and reads block for up to
+  roughly 8 seconds of reconnect attempts instead of failing
+  immediately. `auto_reconnect(false)` restores the old behaviour.
+- SoapySDR plugin release assets are now per-platform archives
+  (`SoapyAaronia-<version>-<os>-<arch>.tar.gz`, `.zip` on Windows)
+  instead of bare `.so`/`.dll` files and a `.dmg`. Anything fetching the
+  old filenames must unpack the archive instead.
+
 ### Added
 - **Connect retry with backoff.** Reaching the RTSA server (the `/info`
   probe and the initial tuning PUT) now retries transient failures up to
