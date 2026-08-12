@@ -10,9 +10,13 @@ All notable changes to this project will be documented in this file.
 - **The published macOS SoapySDR module would not load, on any Mac.**
   `dlopen` failed with "symbol not found in flat namespace" for a Rust
   vtable entry that the linker had itself defined and localised in the
-  same image. Resolving symbols at link time was not enough on its own,
-  so the module also links with the classic linker where that is still
-  supported, and the builds select the newest Xcode on the runner.
+  same image. SoapySDR's installed CMake export lists `-flat_namespace`
+  in the imported target's interface, so it reached the end of every
+  module's link line and forced flat-namespace binding; the module
+  links directly against libSoapySDR and does not need it. Removing it
+  takes the module from 5670 flat-namespace binds to none, so the
+  failure cannot recur rather than depending on a linker version — some
+  hit the defect and some did not, which is why local builds worked.
   Every 0.5.x, 0.6.x, 0.7.0 and 0.7.1 macOS archive is affected; the
   Linux and Windows modules are not.
 - **The packaged module's load check ran on Linux only**, which is how

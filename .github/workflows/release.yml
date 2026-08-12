@@ -176,11 +176,11 @@ jobs:
         if: runner.os == 'Windows'
         run: vcpkg install soapysdr:x64-windows
 
-      # The linker defect this plugin hit is Xcode-version specific: an
-      # older ld left a dangling flat-namespace bind for a symbol it had
-      # defined in the same image, and a newer one does not. Use the
-      # newest Xcode the runner image ships rather than whatever
-      # xcode-select happens to point at.
+      # Hygiene, not the fix: the module's link line no longer asks for
+      # a flat namespace, so the dangling-bind defect that broke every
+      # published macOS module cannot recur. Older linkers hit it and
+      # newer ones did not, so build with the newest Xcode the image
+      # ships rather than whatever xcode-select happens to point at.
       - name: Select newest Xcode (macOS)
         if: runner.os == 'macOS'
         run: |

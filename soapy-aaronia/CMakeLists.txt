@@ -15,22 +15,31 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(SoapySDR "0.7" REQUIRED)
 
-# CMake links MODULE targets on macOS with `-undefined dynamic_lookup`,
-# which tells the linker to leave unresolved symbols for load time. The
-# Apple linker then emitted a flat-namespace bind for a Rust vtable
-# entry it had already localised into the same image, and dyld could
-# not find it — so every published macOS module failed to load with
-# "symbol not found in flat namespace", while the same source built
-# with a newer Xcode was fine. Resolving at link time makes that a
-# build failure instead of something a user discovers.
+# SoapySDR's installed CMake export lists `-flat_namespace` in the
+# imported target's INTERFACE_LINK_LIBRARIES, so it lands at the end of
+# every module's link line and forces flat-namespace symbol binding.
+# That is how a module could end up with a dangling bind: the linker
+# defined a Rust vtable symbol, localised it into this image, and still
+# emitted a flat-namespace bind for it, which dyld could not resolve —
+# so `dlopen` failed with "symbol not found in flat namespace" and the
+# published macOS module never loaded. The module links directly
+# against libSoapySDR, so two-level binding resolves those symbols
+# without it.
 #
-# SoapySDR's own module macro does the same for GNU toolchains
-# (`-Wl,--no-undefined`) and for the stated reason; it just never
-# covered Apple.
-# CMake has spelled this flag both ways across versions
-# (`-undefined dynamic_lookup` and `-Wl,-undefined,dynamic_lookup`), and
-# recent versions omit it entirely, so match both and tolerate neither
-# being present.
+# Also drop `-undefined dynamic_lookup`, which CMake has spelled both
+# ways across versions and recent versions omit entirely: a module that
+# fails to load is worse than one that fails to link, which is the
+# reason SoapySDR's own macro passes `-Wl,--no-undefined` for GNU
+# toolchains.
+if (APPLE AND TARGET SoapySDR)
+    get_target_property(_soapy_iface SoapySDR INTERFACE_LINK_LIBRARIES)
+    if (_soapy_iface)
+        list(REMOVE_ITEM _soapy_iface "-flat_namespace")
+        set_target_properties(SoapySDR PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${_soapy_iface}")
+    endif()
+endif()
+
 if (APPLE)
     string(REGEX REPLACE "(-Wl,)?-undefined[ ,]dynamic_lookup" ""
         CMAKE_SHARED_MODULE_CREATE_CXX_FLAGS
@@ -85,23 +94,10 @@ if (APPLE)
     # the generator emits, this one comes last and wins.
     target_link_options(aaroniaSupport PRIVATE "LINKER:-undefined,error")
 
-    # Resolving symbols at link time was not enough on its own. Apple's
-    # current linker also emitted a flat-namespace bind for a Rust
-    # vtable entry it had itself defined and localised in this image,
-    # which dyld then could not resolve; the same source linked with a
-    # newer Xcode does not. The classic linker does not take that path.
-    #
-    # Checked rather than assumed: -ld_classic is deprecated and will
-    # eventually be refused, and by then the bug it works around is
-    # someone else's history. The load check in CI is what proves the
-    # module still opens either way.
-    include(CheckLinkerFlag OPTIONAL RESULT_VARIABLE _have_check_linker_flag)
-    if (_have_check_linker_flag)
-        check_linker_flag(CXX "LINKER:-ld_classic" HAVE_LD_CLASSIC)
-        if (HAVE_LD_CLASSIC)
-            target_link_options(aaroniaSupport PRIVATE "LINKER:-ld_classic")
-        endif()
-    endif()
+    # `-flat_namespace` is stripped above, so the linker cannot emit a
+    # flat-namespace bind for a symbol it defined here. The module load
+    # check in CI is what proves that, on the toolchain that shipped the
+    # broken module.
 endif()
 
 # System libraries required by the statically-linked Rust runtime
