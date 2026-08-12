@@ -358,7 +358,16 @@ configuration of zones is not supported.
 
 > **`frequencySpan` is a usable-bandwidth request, not a sample rate.**
 > The device halves its top rate down a ladder — 61.44 MHz on the V6
-> ECO this was measured against. Given a span
+> ECO this was measured against. The usable RF bandwidth it declares in
+> `startFrequency..endFrequency` is exactly 0.8 x Fs at every rate,
+> checked at 61.44, 15.36, 7.68 and 3.84 MHz; every sample still
+> arrives, so an FFT spans the whole rate, but only that 80% is flat
+> and calibrated. Sweeping the receiver's own noise floor puts the real
+> filter at or beyond the declared edge at decimated rates (flat within
+> 0.5 dB across 0.80 x Fs at 15.36 MHz, 0.89 at 7.68 MHz) and just
+> inside it at full span (about 1 dB down at the declared edge, 3 dB at
+> 0.84 x Fs), which is where Aaronia's 44 MHz data-sheet figure for the
+> ECO comes from. Given a span
 > it cannot produce, it selects the rate whose alias-free bandwidth
 > (0.8 x Fs) is nearest the request: 2.5 MHz yields Fs = 3.84 MHz,
 > 1.3 MHz yields 1.92 MHz, and 10 MHz yields 15.36 MHz. A value that is

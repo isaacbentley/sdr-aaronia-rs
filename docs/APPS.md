@@ -104,10 +104,13 @@ directly and skip the SoapySDR layer.
 
 ## General notes
 
-- Sample rate is the Aaronia "span", not the usable RF bandwidth. The
-  alias-free span measured 80% of the rate on a V6 ECO — roughly
-  49 MHz within a 61.44 MHz capture — so ask for the rate that covers
-  the bandwidth you need rather than the bandwidth itself.
+- Sample rate is the Aaronia "span", not the usable RF bandwidth. Every
+  sample reaches the application, so the display spans the full rate,
+  but only the middle 80% is flat and calibrated — RTSA reports exactly
+  0.8 x Fs as the packet's frequency range. Set the rate whose 80%
+  covers the span you want to see: 61.44 MHz of sampling gives roughly
+  49 MHz of calibrated spectrum. The edges are real data, just rolled
+  off.
 - `readStream` honours `timeoutUs` and returns partial reads within the
   deadline, per the SoapySDR contract.
 - Retuning mid-stream is safe and requires no Aaronia licence.

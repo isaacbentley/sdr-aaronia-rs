@@ -304,11 +304,24 @@ pub fn receiver_clock_for_label(label: &str) -> f64 {
 /// is known rather than assuming this ceiling.
 pub const IQ_CLOCK_HZ: f64 = 61_440_000.0;
 
-/// Fraction of the sample rate that survives the anti-alias filter.
+/// Fraction of the sample rate that the device declares as usable RF
+/// bandwidth.
 ///
-/// Measured as exactly 0.8 at four different rates on a SPECTRAN V6
-/// ECO: 15.36 MHz sampling reports a 12.288 MHz span, 30.72 reports
-/// 24.576, 7.68 reports 6.144, and 120 kHz reports 96 kHz.
+/// Every sample reaches the caller, so an FFT of them spans the whole
+/// rate; this is the part of it that the anti-alias filter keeps flat
+/// and that calibration covers. RTSA reports it as
+/// `startFrequency..endFrequency`, and the ratio is exactly 0.8 at
+/// every rate — a fixed rule rather than a per-rate measurement.
+/// Checked at 61.44, 15.36, 7.68 and 3.84 MHz on a SPECTRAN V6 ECO,
+/// all reading 0.8000.
+///
+/// Measuring the receiver's own noise floor on that device backs the
+/// figure up: the response is flat to within 0.5 dB across 0.80 of the
+/// rate at 15.36 MHz sampling and 0.89 at 7.68 MHz. Full span is the
+/// tight case — the analog filter is roughly 1 dB down by the declared
+/// edge and 3 dB down at 0.84 of the rate — which is why Aaronia's
+/// data sheet quotes 44 MHz for the ECO rather than the 49.152 MHz it
+/// declares there.
 pub const USABLE_BANDWIDTH_RATIO: f64 = 0.8;
 
 /// The IQ sample rates available at the default receiver clock,

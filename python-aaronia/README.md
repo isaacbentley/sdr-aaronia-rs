@@ -83,9 +83,19 @@ aaronia.sample_rates()                  # every rate, highest first
 aaronia.sample_rate_for_bandwidth(8e6)  # 15.36e6: the lowest rate covering 8 MHz
 ```
 
-A rate carries only 80% of itself as alias-free bandwidth — measured
-at four rates on a V6 ECO — which is why 8 MHz of spectrum needs
-15.36 MHz of sampling.
+**Sample rate is not RF bandwidth.** You get every sample, so an FFT of
+them spans the full rate — but only the middle 80% is flat and
+calibrated. That is not an approximation: RTSA reports exactly 0.8 x Fs
+as the packet's frequency range at every rate. Outside it, data still
+arrives, attenuated and uncalibrated.
+
+So **to see N Hz of spectrum, sample at N / 0.8**, which is what
+`sample_rate_for_bandwidth()` computes. Aaronia's data sheet quotes a
+more conservative figure still — 44 MHz for the ECO against the
+49.152 MHz it declares at full span — because the analog filter is
+already about 1 dB down at that edge. The
+[quickstart](https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/QUICKSTART.md#4-troubleshooting)
+has the measurements.
 
 `sample_rates()` returns the ladder for a SPECTRAN V6 ECO — 61.44 MHz
 down to 120 kHz — which is measured, rung by rung. A full V6 has a

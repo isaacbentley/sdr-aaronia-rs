@@ -110,6 +110,13 @@ round number the hardware cannot produce would be silently adjusted.
 `setSampleRate` snaps a request to the nearest rung and logs when it
 has to.
 
+**The rate is not the RF bandwidth.** Every sample reaches you, so a
+waterfall spans the full rate, but only the middle 80% is flat and
+calibrated — RTSA reports exactly 0.8 x Fs as the packet's frequency
+range at every rate. Set the rate whose 80% covers the span you want to
+look at: 15.36 MHz of sampling to see 12 MHz of spectrum. The edges of
+the display are real data, just rolled off.
+
 The advertised ladder is a SPECTRAN V6 ECO's: 61.44 MHz down to
 120 kHz, measured rung by rung. A full V6 has a selectable receiver
 clock and reaches higher, by how much is not settled — see [the note in

@@ -141,8 +141,36 @@ different:
 | Where you see it | Example | Meaning |
 | --- | --- | --- |
 | `span_frequency`, and `sampleFrequency` in packet metadata | 15.36 MHz | The sample rate, Fs |
-| `startFrequency`..`endFrequency` in packet metadata | 12.288 MHz | Usable alias-free bandwidth, measured at 0.8 x Fs on a V6 ECO |
+| `startFrequency`..`endFrequency` in packet metadata | 12.288 MHz | Usable RF bandwidth: exactly 0.8 x Fs, at every rate |
 | The Span control in the RTSA GUI | `1 / 4` | Decimation of the top rate, so Fs = 61.44 / 4 on an ECO |
+
+**You get every sample, but only the middle 80% is calibrated.** An FFT
+of the samples spans the full Fs. RTSA reports 0.8 x Fs as the packet's
+frequency range, at every rate — a fixed rule, not a per-rate
+measurement — and that is the part the anti-alias filter keeps flat and
+the calibration covers. Data outside it still arrives, attenuated and
+uncalibrated.
+
+So **to see N Hz of spectrum, sample at N / 0.8**: 8 MHz of signal needs
+10 MHz of sampling, and the lowest rung providing it is 15.36 MHz.
+`iq_sample_rate_for_bandwidth` does that arithmetic;
+`aaronia.sample_rate_for_bandwidth` is the Python equivalent.
+
+The 80% figure holds up when measured. Averaging the receiver's own
+noise floor on a V6 ECO, the response is flat to within 0.5 dB across
+0.80 x Fs at 15.36 MHz sampling and 0.89 x Fs at 7.68 MHz — at or
+beyond what is declared. At full span it is tighter: the analog filter
+is about 1 dB down by the declared edge and 3 dB down at 0.84 x Fs,
+which is why Aaronia's data sheet quotes 44 MHz of real-time bandwidth
+for the ECO rather than the 49.152 MHz the device declares. Take the
+declared span as the working figure and the data sheet as the
+guaranteed one.
+
+That sweep sees the antenna as well as the receiver, so the full-span
+roll-off is an upper bound on how good the filter is, not a
+measurement of it alone. It is enough to show the declared 80% is
+physically grounded rather than an arbitrary number, which is what the
+figure is used for here.
 
 The device halves its top rate down a ten-rung ladder, shown in the GUI
 as Full through `1 / 512`. On a V6 ECO that is 61.44 MHz down to

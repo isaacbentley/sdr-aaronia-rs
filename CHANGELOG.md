@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Documentation
+- **Measured what the 80% usable-bandwidth figure actually is, and
+  explained it in one sentence.** Sample rate and RF bandwidth were
+  described as related by a ratio without saying what the ratio was or
+  where it came from. RTSA declares exactly 0.8 x Fs as the packet's
+  frequency range at every rate — a fixed rule, checked at 61.44,
+  15.36, 7.68 and 3.84 MHz — and every sample still arrives, so an FFT
+  spans the whole rate while only that 80% is flat and calibrated.
+  Sweeping the receiver's own noise floor on a V6 ECO confirms it: the
+  response is flat within 0.5 dB across 0.80 of the rate at 15.36 MHz
+  sampling and 0.89 at 7.68 MHz, and at full span the analog filter is
+  about 1 dB down by the declared edge — which is where Aaronia's
+  44 MHz data-sheet figure comes from, against the 49.152 MHz the
+  device itself declares. The guidance readers need is one line: to see
+  N Hz of spectrum, sample at N / 0.8.
 - **The READMEs stated the V6 ECO's sample-rate ladder as if it were
   every device's.** "The device runs a fixed ladder of rates: 61.44 MHz
   halved down to 120 kHz" is measured and true for an ECO, but a full
