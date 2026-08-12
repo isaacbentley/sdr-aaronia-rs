@@ -14,8 +14,17 @@ blocks, `SoapySDRUtil` and the SoapySDR Python bindings.
 
 Each [release](https://github.com/isaacbentley/sdr-aaronia-rs/releases)
 attaches a built module per platform, so neither CMake nor a Rust
-toolchain is required. Download the archive for your operating system
-and unpack it.
+toolchain is required. Download the archive for your system and unpack
+it:
+
+| Platform | Archive |
+| --- | --- |
+| Linux x86-64 | `SoapyAaronia-<version>-linux-x86_64.tar.gz` |
+| macOS (Apple silicon) | `SoapyAaronia-<version>-macos-arm64.tar.gz` |
+| Windows x86-64 | `SoapyAaronia-<version>-windows-x86_64.zip` |
+
+Each archive contains the module, these instructions as `INSTALL.md`,
+and the licence.
 
 Find where SoapySDR looks for modules:
 

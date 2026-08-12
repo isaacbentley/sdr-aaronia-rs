@@ -163,7 +163,10 @@ jobs:
 
       - name: Install SoapySDR (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y libsoapysdr-dev
+        # soapysdr-tools provides SoapySDRUtil, which the packaging step
+        # uses to confirm the stripped module still loads. libsoapysdr-dev
+        # alone does not pull it in.
+        run: sudo apt-get install -y libsoapysdr-dev soapysdr-tools
 
       - name: Install SoapySDR (macOS)
         if: runner.os == 'macOS'
@@ -194,31 +197,66 @@ jobs:
 
       # CMake MODULE targets are lib<name>.so on both Linux and macOS
       # (SoapySDR modules on macOS are .so, not .dylib).
-      - name: Package Plugin (macOS DMG)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p soapy-aaronia/dist/SoapyAaronia
-          cp soapy-aaronia/build/libaaroniaSupport.so soapy-aaronia/dist/SoapyAaronia/
-          hdiutil create -volname SoapyAaronia -srcfolder soapy-aaronia/dist/SoapyAaronia -ov -format UDZO soapy-aaronia/dist/SoapyAaronia.dmg
-
-      - name: Prepare Plugin Artifacts
+      # One self-describing archive per platform. A bare
+      # `libaaroniaSupport.so` on a release page says nothing about its
+      # version, OS, architecture, or that it is a SoapySDR plugin, and
+      # gives the user no clue where to put it. Each archive therefore
+      # carries the module, install instructions and the licence.
+      # Per-platform rather than one combined archive: the Linux module
+      # alone is several MB, and a Windows user should not download all
+      # three to get one.
+      - name: Package Plugin
         shell: bash
         run: |
-          mkdir -p soapy-aaronia/dist
-          if [ "$RUNNER_OS" == "Linux" ]; then
-            cp soapy-aaronia/build/libaaroniaSupport.so soapy-aaronia/dist/
-          elif [ "$RUNNER_OS" == "Windows" ]; then
-            cp soapy-aaronia/build/Release/aaroniaSupport.dll soapy-aaronia/dist/
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          case "$RUNNER_OS" in
+            Linux)   os=linux;   arch=x86_64 ;;
+            Windows) os=windows; arch=x86_64 ;;
+            macOS)   os=macos;   arch="$(uname -m)" ;;
+            *) echo "unknown runner OS: $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          stage="SoapyAaronia-${version}-${os}-${arch}"
+          mkdir -p "soapy-aaronia/dist/$stage"
+
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            cp soapy-aaronia/build/Release/aaroniaSupport.dll "soapy-aaronia/dist/$stage/"
+          else
+            cp soapy-aaronia/build/libaaroniaSupport.so "soapy-aaronia/dist/$stage/"
           fi
+          # The Linux module shipped ~19 MB against ~5 MB for Windows,
+          # the difference being debug symbols. --strip-debug drops those
+          # and keeps every symbol the loader needs; a full strip is not
+          # worth the risk on a dlopen'd module. macOS is left alone: it
+          # is already the same size as the Windows build.
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            before=$(stat -c%s "soapy-aaronia/dist/$stage/libaaroniaSupport.so")
+            strip --strip-debug "soapy-aaronia/dist/$stage/libaaroniaSupport.so"
+            after=$(stat -c%s "soapy-aaronia/dist/$stage/libaaroniaSupport.so")
+            echo "stripped debug symbols: $before -> $after bytes"
+            # A module that no longer loads is worse than a large one.
+            SOAPY_SDR_PLUGIN_PATH="$PWD/soapy-aaronia/dist/$stage" \
+              SoapySDRUtil --check=aaronia
+          fi
+
+          cp LICENSE "soapy-aaronia/dist/$stage/" 2>/dev/null || true
+          cp soapy-aaronia/README.md "soapy-aaronia/dist/$stage/INSTALL.md"
+
+          cd soapy-aaronia/dist
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            7z a -tzip "${stage}.zip" "$stage" >/dev/null
+          else
+            tar czf "${stage}.tar.gz" "$stage"
+          fi
+          ls -lh "$stage".*
 
       - name: Upload Plugin
         uses: actions/upload-artifact@v4
         with:
           name: soapy-plugin-${{ matrix.os }}
           path: |
-            soapy-aaronia/dist/*.so
-            soapy-aaronia/dist/*.dll
-            soapy-aaronia/dist/*.dmg
+            soapy-aaronia/dist/*.zip
+            soapy-aaronia/dist/*.tar.gz
 
   github-release:
     name: GitHub Release
@@ -258,12 +296,13 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          # *.tar.gz covers both the Python sdist and the Unix plugin
+          # archives; the two never collide because the plugin archives
+          # are named SoapyAaronia-<version>-<os>-<arch>.
           files: |
             artifacts/*.whl
             artifacts/*.tar.gz
-            artifacts/*.so
-            artifacts/*.dll
-            artifacts/*.dmg
+            artifacts/*.zip
           body_path: release-notes.md
           generate_release_notes: true
 

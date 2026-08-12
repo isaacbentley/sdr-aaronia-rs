@@ -51,6 +51,12 @@ All notable changes to this project will be documented in this file.
   computes.
 
 ### Documentation
+- **Python type stubs.** `python-aaronia/aaronia.pyi` documents the full
+  binding surface, and maturin packages it with the required `py.typed`
+  marker, so editors and type checkers now understand the module.
+  Verified by building the wheel and inspecting its contents, by
+  `mypy --strict`, and by comparing every declared name against the
+  installed module.
 - **Hardware-verification matrix in the README.** Every capability is now
   labelled live-verified, mock-tested, or hardware-unverified, with the
   development device stated outright (SPECTRAN V6 ECO, single RX, no TX
@@ -77,6 +83,23 @@ All notable changes to this project will be documented in this file.
   via a `cfg(doctest)` module, so the guides can't drift from the API.
 
 ### CI
+- **Release assets are now self-describing archives.** The plugin
+  shipped as bare `libaaroniaSupport.so`, `aaroniaSupport.dll` and a
+  `.dmg`, none of which stated a version, operating system,
+  architecture, or that they were SoapySDR plugins. Releases now attach
+  `SoapyAaronia-<version>-<os>-<arch>.tar.gz` (`.zip` on Windows), each
+  containing the module, install instructions and the licence. The
+  `.dmg` is gone; it was an unusual container for a single plugin file
+  and did not avoid macOS quarantine. Per-platform archives are kept
+  deliberately, since a combined one would make every user download all
+  three modules to obtain one. Anything downloading the previous bare
+  filenames (`libaaroniaSupport.so`, `aaroniaSupport.dll`,
+  `SoapyAaronia.dmg`) by name needs updating to fetch and unpack the
+  archive instead.
+- The Linux module is built with debug symbols stripped, which is where
+  its roughly 19 MB against the Windows build's 5 MB came from, and the
+  release job verifies the stripped module still loads via
+  `SoapySDRUtil --check` before publishing it.
 - GitHub releases now lead with this file's entry for the tag being
   released, instead of only an auto-generated commit list (which is
   still appended). A missing entry degrades to a note rather than
