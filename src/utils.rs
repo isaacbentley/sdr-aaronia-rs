@@ -283,6 +283,84 @@ pub fn receiver_clock_for_label(label: &str) -> f64 {
     }
 }
 
+/// Master clock the IQ sample-rate ladder divides down from.
+pub const IQ_CLOCK_HZ: f64 = 61_440_000.0;
+
+/// Fraction of the sample rate that survives the anti-alias filter.
+///
+/// Measured as exactly 0.8 at four different rates on a SPECTRAN V6
+/// ECO: 15.36 MHz sampling reports a 12.288 MHz span, 30.72 reports
+/// 24.576, 7.68 reports 6.144, and 120 kHz reports 96 kHz.
+pub const USABLE_BANDWIDTH_RATIO: f64 = 0.8;
+
+/// Every IQ sample rate the hardware can run, highest first.
+///
+/// The device divides [`IQ_CLOCK_HZ`] by powers of two, which the RTSA
+/// GUI shows as Full through `1 / 512`. Nothing between these exists:
+/// a request for any other rate is adjusted, so a caller that assumes
+/// it got what it asked for will compute every derived frequency
+/// wrongly.
+pub fn iq_sample_rates() -> [f64; 10] {
+    let mut rates = [0.0; 10];
+    for (n, rate) in rates.iter_mut().enumerate() {
+        *rate = IQ_CLOCK_HZ / (1u32 << n) as f64;
+    }
+    rates
+}
+
+/// Alias-free bandwidth delivered at `sample_rate_hz`.
+///
+/// This is the width the stream's `startFrequency`..`endFrequency`
+/// covers, and it is smaller than the sample rate. Use it when asking
+/// "how much spectrum am I actually seeing", and the sample rate itself
+/// when converting sample indices or FFT bins to time or frequency.
+pub fn usable_bandwidth_hz(sample_rate_hz: f64) -> f64 {
+    sample_rate_hz * USABLE_BANDWIDTH_RATIO
+}
+
+/// The supported sample rate closest to `requested_hz`.
+///
+/// Use this to report an achievable rate before streaming starts. Note
+/// that the RTSA server, given an unsupported rate, does not choose the
+/// nearest one: see [`iq_sample_rate_for_bandwidth`].
+pub fn nearest_iq_sample_rate(requested_hz: f64) -> f64 {
+    iq_sample_rates()
+        .into_iter()
+        .min_by(|a, b| {
+            (a - requested_hz)
+                .abs()
+                .total_cmp(&(b - requested_hz).abs())
+        })
+        .unwrap_or(IQ_CLOCK_HZ)
+}
+
+/// The lowest sample rate whose alias-free bandwidth covers
+/// `bandwidth_hz`.
+///
+/// This is the calculation to use when a caller thinks in terms of "I
+/// need to see N Hz of spectrum". Wanting 8 MHz of usable bandwidth
+/// needs 10 MHz of sampling, and the lowest rate that provides it is
+/// 15.36 MHz. Multiplying the desired bandwidth by some factor and
+/// hoping is how callers end up processing at a rate the hardware is
+/// not running: the device would honour such a request by picking its
+/// own rate, leaving every derived frequency wrong.
+///
+/// Returns [`IQ_CLOCK_HZ`] when the request exceeds what the hardware
+/// can cover.
+pub fn iq_sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
+    let needed = bandwidth_hz / USABLE_BANDWIDTH_RATIO;
+    iq_sample_rates()
+        .into_iter()
+        .filter(|rate| *rate >= needed)
+        .fold(None::<f64>, |best, rate| {
+            Some(match best {
+                Some(b) if b <= rate => b,
+                _ => rate,
+            })
+        })
+        .unwrap_or(IQ_CLOCK_HZ)
+}
+
 /// Hardware constraint for IQ Mode: the configured span frequency
 /// must satisfy `span_freq * 1.5 ≤ receiver_clock`. Misconfigurations cause
 /// the SDK to silently emit corrupted samples; reject them at the API
@@ -311,6 +389,62 @@ pub fn validate_iq_mode(span_freq_hz: f64, receiver_clock_hz: f64) -> Result<()>
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+
+    /// The ten rates the device reports in its own decimation enum.
+    #[test]
+    fn ladder_matches_the_device() {
+        let rates = iq_sample_rates();
+        assert_eq!(rates[0], 61_440_000.0, "Full");
+        assert_eq!(rates[2], 15_360_000.0, "1 / 4");
+        assert_eq!(rates[9], 120_000.0, "1 / 512");
+        for pair in rates.windows(2) {
+            assert!((pair[0] / pair[1] - 2.0).abs() < 1e-9, "each step halves");
+        }
+    }
+
+    /// Measured on hardware at four separate rates.
+    #[test]
+    fn usable_bandwidth_is_four_fifths_of_the_rate() {
+        assert_eq!(usable_bandwidth_hz(15_360_000.0), 12_288_000.0);
+        assert_eq!(usable_bandwidth_hz(30_720_000.0), 24_576_000.0);
+        assert_eq!(usable_bandwidth_hz(7_680_000.0), 6_144_000.0);
+        assert_eq!(usable_bandwidth_hz(120_000.0), 96_000.0);
+    }
+
+    #[test]
+    fn nearest_rate_snaps_to_the_ladder() {
+        assert_eq!(nearest_iq_sample_rate(15_360_000.0), 15_360_000.0);
+        // 10 MHz sits between 7.68 and 15.36, closer to 7.68.
+        assert_eq!(nearest_iq_sample_rate(10_000_000.0), 7_680_000.0);
+        assert_eq!(nearest_iq_sample_rate(1.0e9), 61_440_000.0);
+        assert_eq!(nearest_iq_sample_rate(1.0), 120_000.0);
+    }
+
+    /// Wanting N Hz of spectrum needs N / 0.8 of sampling, rounded up to
+    /// a rate that exists.
+    #[test]
+    fn rate_for_bandwidth_covers_the_request() {
+        // 8 MHz of spectrum needs 10 MHz of sampling; 7.68 is too slow.
+        assert_eq!(iq_sample_rate_for_bandwidth(8_000_000.0), 15_360_000.0);
+        // An exact fit is not rounded up unnecessarily.
+        assert_eq!(iq_sample_rate_for_bandwidth(12_288_000.0), 15_360_000.0);
+        assert_eq!(iq_sample_rate_for_bandwidth(6_144_000.0), 7_680_000.0);
+        // Beyond the hardware, report the maximum rather than nothing.
+        assert_eq!(iq_sample_rate_for_bandwidth(1.0e9), 61_440_000.0);
+
+        for want in [50_000.0, 1.0e6, 5.0e6, 20.0e6, 49.0e6] {
+            let rate = iq_sample_rate_for_bandwidth(want);
+            assert!(
+                usable_bandwidth_hz(rate) >= want || rate == IQ_CLOCK_HZ,
+                "{want} Hz should be covered by {rate} Hz sampling"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

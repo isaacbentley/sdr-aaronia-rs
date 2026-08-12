@@ -19,6 +19,16 @@ All notable changes to this project will be documented in this file.
   sources now report the rate, centre frequency and usable bandwidth
   from the stream's own metadata once packets arrive.
 
+### Added
+- `iq_sample_rates`, `usable_bandwidth_hz`, `nearest_iq_sample_rate` and
+  `iq_sample_rate_for_bandwidth` in `utils`, with the constants
+  `IQ_CLOCK_HZ` and `USABLE_BANDWIDTH_RATIO`. The device samples at
+  61.44 MHz divided by a power of two and delivers 0.8 of that as
+  alias-free bandwidth. Callers were deriving their own rates from
+  guesses, so the relationships now live in one tested place. Wanting
+  8 MHz of spectrum needs 10 MHz of sampling, and
+  `iq_sample_rate_for_bandwidth` returns the 15.36 MHz that provides it.
+
 ### Documentation
 - Documented what `/control`'s `frequencySpan` actually means. It is a
   request for usable bandwidth, not a sample rate: the device picks the
