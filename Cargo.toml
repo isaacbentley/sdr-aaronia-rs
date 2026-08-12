@@ -2,7 +2,7 @@
 name = "sdr-aaronia-rs"
 description = "Unified Rust interface for Aaronia Spectran Spectrum Analyzers / SDRs, featuring Python bindings, a SoapySDR plugin, HTTP streaming, and native SDK support."
 license = "GPL-3.0-or-later"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
 readme = "README.md"
