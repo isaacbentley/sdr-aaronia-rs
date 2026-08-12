@@ -105,7 +105,7 @@ import aaronia
 cfg = aaronia.AaroniaConfig()
 cfg.http_base_url = "http://localhost:54664"
 cfg.center_freq = 2.44e9
-cfg.sample_rate = 12.288e6
+cfg.sample_rate = 15.36e6
 
 src = aaronia.AaroniaSource()
 src.start_streaming(cfg)

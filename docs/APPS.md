@@ -73,7 +73,7 @@ from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
 import numpy as np
 
 sdr = SoapySDR.Device("driver=aaronia,url=http://localhost:54664")
-sdr.setSampleRate(SOAPY_SDR_RX, 0, 12.288e6)
+sdr.setSampleRate(SOAPY_SDR_RX, 0, 15.36e6)
 sdr.setFrequency(SOAPY_SDR_RX, 0, 2.44e9)
 
 rx = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)

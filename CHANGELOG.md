@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **The SoapySDR plugin advertised sample rates the hardware cannot
+  produce.** Seven of the ten rates it listed, 1, 2, 5, 10 and 20 MHz
+  among them, do not exist on the device, which runs at 61.44 MHz
+  divided by a power of two. Applications build their rate dropdowns
+  from that list, so choosing 10 MHz ran the device at a different rate
+  while the application went on displaying 10. The list is now the real
+  ladder, 61.44 MHz down to 120 kHz, and `setSampleRate` snaps to the
+  nearest one and logs when it has to.
+- **The crate reported the requested sample rate rather than the one in
+  use.** The device adjusts a rate it cannot produce, so
+  `get_source_info()` described a capture that was not happening. HTTP
+  sources now report the rate, centre frequency and usable bandwidth
+  from the stream's own metadata once packets arrive.
+
+### Documentation
+- Documented what `/control`'s `frequencySpan` actually means. It is a
+  request for usable bandwidth, not a sample rate: the device picks the
+  rate whose alias-free span is nearest, so 2.5 MHz yields 3.84 MHz and
+  10 MHz yields 15.36 MHz. Values on the rate ladder round-trip exactly,
+  which is why the field looks like a sample rate in ordinary use.
+  Verified across nine requests on a V6 ECO.
+
 ## [v0.6.0] - 2026-08-11
 
 Reliability and documentation release. The HTTP backend now handles a

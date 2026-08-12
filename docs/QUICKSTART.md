@@ -60,7 +60,7 @@ use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
 async fn main() -> anyhow::Result<()> {
     let config = AaroniaConfig::from_http("http://localhost:54664")
         .center_frequency(2.44e9)
-        .span_frequency(12.288e6)   // sample rate, not RF bandwidth
+        .span_frequency(15.36e6)    // sample rate (Fs), not RF bandwidth
         .reference_level(-20.0);
 
     let mut source = AaroniaSource::new(config).await?;
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 
 ```bash
 # args: <center-hz> <sample-rate-hz> <url>
-cargo run --example http_iq_quickstart --features http -- 2440e6 12.288e6 http://localhost:54664
+cargo run --example http_iq_quickstart --features http -- 2440e6 15.36e6 http://localhost:54664
 ```
 
 ### Python
@@ -92,7 +92,7 @@ import aaronia
 cfg = aaronia.AaroniaConfig()
 cfg.http_base_url = "http://localhost:54664"
 cfg.center_freq = 2.44e9
-cfg.sample_rate = 12.288e6
+cfg.sample_rate = 15.36e6
 
 src = aaronia.AaroniaSource()
 src.start_streaming(cfg)
@@ -124,22 +124,41 @@ Usually the missing connection from step 4: the device block's output is
 not wired to the HTTP Server block. `curl /sample` shows whether data is
 present.
 
-**Span and sample rate.**
+**Span, sample rate and the "1 / 4" in the GUI.**
 `span_frequency` is the IQ sample rate (Fs). The name comes from the
-Aaronia API. It is not the usable RF bandwidth, which is smaller because
-of the anti-alias filter (roughly 49 MHz usable within a 61.44 MHz Fs
-capture). The device derives its decimation steps from a 61.44 MHz
-clock. Over HTTP the RTSA-Suite accepts rates across its supported
-range, and the crate rejects a rate that would violate the IQ-mode
-constraint before streaming starts.
+Aaronia API. Three numbers describe the same capture and they are all
+different:
+
+| Where you see it | Example | Meaning |
+| --- | --- | --- |
+| `span_frequency`, and `sampleFrequency` in packet metadata | 15.36 MHz | The sample rate, Fs |
+| `startFrequency`..`endFrequency` in packet metadata | 12.288 MHz | Usable alias-free bandwidth, which measures 0.8 x Fs |
+| The Span control in the RTSA GUI | `1 / 4` | Decimation of the 61.44 MHz clock, so Fs = 61.44 / 4 |
+
+The device runs at 61.44 MHz divided by a power of two, ten rates from
+61.44 MHz down to 120 kHz, shown in the GUI as Full through `1 / 512`.
+
+**Pass one of those rates and you get it exactly.** Anything else is
+silently adjusted, and not to the nearest rate: the server reads the
+requested span as the *usable bandwidth* you want and picks the rate
+whose usable span is closest. Asking for 2.5 MHz gives Fs = 3.84 MHz,
+whose usable span is 3.07 MHz, rather than the numerically closer
+1.92 MHz. Verified across nine requests on a V6 ECO.
+
+`AaroniaSource::get_source_info()` reports the rate the server is
+actually sending once packets are flowing, so read it back rather than
+assuming.
+
+The crate rejects a rate that would violate the IQ-mode constraint
+before streaming starts, but it does not second-guess the ladder.
 
 **Retuning has no effect.**
 The `/control` endpoint applies a frequency change only when
 `frequencyCenter` and `frequencySpan` are both present. A request
 carrying one of them returns `{"success":true}` and is ignored. This
 crate always sends the complete tuple, so use `set_center_frequency`
-instead of issuing PUTs directly. No Aaronia licence is involved; the
-licence gates `/remoteconfig`, which the crate does not use for tuning.
+instead of issuing PUTs directly. No Aaronia licence is involved: the
+crate tunes through `/control`, which needs none.
 
 **Network saturation at high sample rates.**
 Float32 requires roughly 740 MB/s at 92 MSPS. On anything other than
@@ -165,7 +184,7 @@ use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
 let config = AaroniaConfig::default()
     .force_native_sdk()
     .center_frequency(2.44e9)
-    .span_frequency(12.288e6);
+    .span_frequency(15.36e6);
 let mut source = AaroniaSource::new(config).await?;
 # Ok(())
 # }

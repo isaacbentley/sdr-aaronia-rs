@@ -84,6 +84,22 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(4);
 /// attempt counter on every round and reconnect indefinitely.
 const RECONNECT_HEALTHY_AFTER: Duration = Duration::from_secs(30);
 
+/// What the server is actually delivering, read back from packet
+/// metadata.
+///
+/// A requested sample rate is not necessarily the one you get: the
+/// device runs at 61.44 MHz divided by a power of two and quietly
+/// snaps anything else to that ladder, so asking for 12.288 MHz yields
+/// 15.36 MHz. Reporting the request back to callers made the crate,
+/// and every binding above it, describe a capture that was not
+/// happening. These fields are `0.0` until the first packet arrives.
+#[derive(Debug, Clone, Copy, Default)]
+struct ObservedStream {
+    sample_rate: f64,
+    center_frequency: f64,
+    bandwidth: f64,
+}
+
 /// Whether the reader task should attempt another reconnect, counting
 /// the attempt when it should. Split out so the "stream failed to
 /// start" and "stream died mid-flight" paths can't drift apart.
@@ -408,6 +424,10 @@ pub struct AaroniaSource {
     native_source: Option<NativeSdkSource>,
 
     http_client: Option<HttpEndpointsClient>,
+    /// Stream parameters as the server reports them, updated by the HTTP
+    /// reader task. Preferred over the configured values when reporting
+    /// state, because the device may not honour a request exactly.
+    http_observed: Option<Arc<Mutex<ObservedStream>>>,
     /// Tuning the HTTP reader task re-applies after a reconnect. Shared
     /// with the retune setters, which write their *intent* here before
     /// issuing the PUT — so a reconnect racing a user retune re-applies
@@ -476,6 +496,7 @@ impl AaroniaSource {
             native_source: None,
 
             http_client: None,
+            http_observed: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -741,6 +762,8 @@ impl AaroniaSource {
             reference_level: self.config.reference_level,
         }));
         let tuning_for_task = tuning.clone();
+        let observed = Arc::new(Mutex::new(ObservedStream::default()));
+        let observed_for_task = observed.clone();
         let auto_reconnect = self.config.auto_reconnect;
 
         // Spawn a task to continuously read from the HTTP stream and send samples
@@ -791,6 +814,24 @@ impl AaroniaSource {
                             consecutive_errors = 0;
                             // The HTTP stream already returns parsed StreamPacket objects
                             if packet.metadata.payload == crate::http_streaming::PayloadType::Iq {
+                                // Record what the server says it is
+                                // sending, so callers see the real rate
+                                // rather than the one they asked for.
+                                {
+                                    let cfg = &packet.sdr_config;
+                                    let mut obs =
+                                        observed_for_task.lock().unwrap_or_else(|p| p.into_inner());
+                                    if cfg.sample_rate > 0.0 {
+                                        obs.sample_rate = cfg.sample_rate;
+                                    }
+                                    if cfg.center_frequency > 0.0 {
+                                        obs.center_frequency = cfg.center_frequency;
+                                    }
+                                    if cfg.bandwidth > 0.0 {
+                                        obs.bandwidth = cfg.bandwidth;
+                                    }
+                                }
+
                                 let dropped = matches!(
                                     drop_detector.observe(&packet),
                                     crate::http_streaming::DropResult::Drop { .. }
@@ -891,6 +932,7 @@ impl AaroniaSource {
         });
 
         self.http_client = Some(client);
+        self.http_observed = Some(observed);
         self.http_tuning = Some(tuning);
         self.http_receiver = Some(receiver); // Store the receiver
         self.http_task = Some(reader_task); // Held so stop/drop can abort it
@@ -1295,6 +1337,7 @@ impl AaroniaSource {
                 // stale handle here would let retunes made while stopped
                 // reach a task that no longer exists.
                 self.http_tuning = None;
+                self.http_observed = None;
                 info!("HTTP streaming stopped: reader task aborted, receiver dropped.");
             }
             SourceType::File => {
@@ -1580,12 +1623,25 @@ impl AaroniaSource {
     }
 
     /// Get information about the current source
+    /// Current source state.
+    ///
+    /// On HTTP sources the frequency, rate and bandwidth come from the
+    /// stream's own metadata once packets are flowing, which is not
+    /// always what was requested: the device snaps a sample rate to
+    /// 61.44 MHz over a power of two. Before the first packet, and on
+    /// other backends, the configured values are reported.
     pub fn get_source_info(&self) -> SourceInfo {
+        let observed = self
+            .http_observed
+            .as_ref()
+            .map(|o| *o.lock().unwrap_or_else(|p| p.into_inner()))
+            .unwrap_or_default();
+        let pick = |seen: f64, configured: f64| if seen > 0.0 { seen } else { configured };
         SourceInfo {
             source_type: self.source_type.clone(),
-            center_frequency: self.config.center_frequency,
-            span_frequency: self.config.span_frequency,
-            bandwidth_hz: self.config.bandwidth_hz,
+            center_frequency: pick(observed.center_frequency, self.config.center_frequency),
+            span_frequency: pick(observed.sample_rate, self.config.span_frequency),
+            bandwidth_hz: pick(observed.bandwidth, self.config.bandwidth_hz),
             reference_level: self.config.reference_level,
             device_serial: self.config.device_serial.clone(),
         }
@@ -1981,6 +2037,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_observed: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -2058,6 +2115,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_observed: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -2087,6 +2145,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_observed: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -2118,6 +2177,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_observed: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -2294,6 +2354,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_observed: None,
             http_tuning: None,
             file_source: None,
             http_receiver: Some(chunk_rx),

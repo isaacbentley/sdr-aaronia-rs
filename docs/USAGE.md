@@ -327,7 +327,7 @@ code you can run. CI builds them, so they stay current:
 
 ```bash
 # args: <center-hz> <sample-rate-hz> <url>
-cargo run --example http_iq_quickstart --features http -- 2440e6 12.288e6 http://localhost:54664
+cargo run --example http_iq_quickstart --features http -- 2440e6 15.36e6 http://localhost:54664
 ```
 
 ## Related

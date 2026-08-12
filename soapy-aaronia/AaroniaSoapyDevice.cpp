@@ -460,9 +460,28 @@ void AaroniaSoapyDevice::setSampleRate(const int direction, const size_t channel
     }
     if (direction != SOAPY_SDR_RX) return;
 
-    AaroniaFfiError err = aaronia_source_set_span_frequency(_source, rate);
+    // Snap to a rate the device can actually produce. It decimates a
+    // 61.44 MHz clock by powers of two and silently adjusts anything
+    // else, so caching the requested value made getSampleRate report a
+    // rate the hardware was not running: an application asking for
+    // 10 MHz displayed 10 MHz while receiving 7.68.
+    const double wanted = rate;
+    const std::vector<double> supported = listSampleRates(SOAPY_SDR_RX, 0);
+    double snapped = supported.front();
+    for (const double candidate : supported) {
+        if (std::fabs(candidate - wanted) < std::fabs(snapped - wanted)) {
+            snapped = candidate;
+        }
+    }
+    if (std::fabs(snapped - wanted) > 1.0) {
+        SoapySDR::logf(SOAPY_SDR_WARNING,
+                       "setSampleRate: %g Hz is not a supported rate; using %g Hz",
+                       wanted, snapped);
+    }
+
+    AaroniaFfiError err = aaronia_source_set_span_frequency(_source, snapped);
     if (err == Success) {
-        _sampleRate = rate;
+        _sampleRate = snapped;
     } else {
         SoapySDR::logf(SOAPY_SDR_ERROR, "setSampleRate failed: %s",
                        lastErrorOr("unknown error").c_str());
@@ -474,6 +493,16 @@ double AaroniaSoapyDevice::getSampleRate(const int direction, const size_t chann
     std::lock_guard<std::mutex> lock(_mutex);
     if (direction == SOAPY_SDR_TX) {
         return _txSampleRate > 0.0 ? _txSampleRate : _sampleRate;
+    }
+    // While streaming, the crate reports the rate the server states in
+    // its packet metadata, which is authoritative. Fall back to the
+    // snapped request before the first packet arrives.
+    if (_isStreaming && _source) {
+        if (FfiSourceInfo *info = aaronia_source_get_source_info(_source)) {
+            const double actual = info->span_frequency;
+            aaronia_source_info_free(info);
+            if (actual > 0.0) return actual;
+        }
     }
     return _sampleRate;
 }
@@ -492,12 +521,24 @@ SoapySDR::RangeList AaroniaSoapyDevice::getSampleRateRange(const int direction, 
 std::vector<double> AaroniaSoapyDevice::listSampleRates(const int direction, const size_t channel) const {
     (void)direction;
     (void)channel;
-    // Discrete suggestions for apps that build rate dropdowns from
-    // listSampleRates (SDR++ shows an empty list without this). The
-    // ladder mirrors the V6 decimation steps below the IQ-mode cap;
-    // arbitrary rates within getSampleRateRange also work over HTTP.
+    // The device's actual rates: a 61.44 MHz clock decimated by powers of
+    // two, which is what the RTSA GUI shows as Full through 1 / 512. Apps
+    // build their rate dropdowns from this list, so it has to be the real
+    // ladder. It previously advertised round numbers (1, 2, 5, 10, 20 MHz)
+    // that the hardware cannot produce: requesting one silently ran the
+    // device at a neighbouring rate while the application displayed the
+    // rate it asked for. Verified against a V6 ECO's own decimation enum.
     return {
-        250e3, 500e3, 1e6, 2e6, 5e6, 10e6, 15.36e6, 20e6, 30.72e6, 61.44e6,
+        61.44e6,    // Full
+        30.72e6,    // 1 / 2
+        15.36e6,    // 1 / 4
+        7.68e6,     // 1 / 8
+        3.84e6,     // 1 / 16
+        1.92e6,     // 1 / 32
+        960e3,      // 1 / 64
+        480e3,      // 1 / 128
+        240e3,      // 1 / 256
+        120e3,      // 1 / 512
     };
 }
 

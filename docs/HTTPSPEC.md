@@ -283,6 +283,16 @@ packet-metadata object, so `payload`, `minPower`, `maxPower`, and
 }
 ```
 
+> **`frequencySpan` is a usable-bandwidth request, not a sample rate.**
+> The device runs at 61.44 MHz divided by a power of two. Given a span
+> it cannot produce, it selects the rate whose alias-free bandwidth
+> (0.8 x Fs) is nearest the request: 2.5 MHz yields Fs = 3.84 MHz,
+> 1.3 MHz yields 1.92 MHz, and 10 MHz yields 15.36 MHz. A value that is
+> itself on the rate ladder round-trips exactly, which is why the field
+> behaves like a sample rate in ordinary use. `sampleFrequency` in the
+> packet metadata reports the rate in force; `startFrequency` and
+> `endFrequency` bound the usable span. Verified on a V6 ECO.
+
 > **Both frequency fields are required for a retune to apply.** Live
 > testing against RTSA-Suite PRO (HTTP server block fed by a SPECTRAN
 > V6 ECO) shows the server returns `{"success":true}` for a capture
