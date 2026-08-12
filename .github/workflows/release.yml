@@ -176,6 +176,21 @@ jobs:
         if: runner.os == 'Windows'
         run: vcpkg install soapysdr:x64-windows
 
+      # The linker defect this plugin hit is Xcode-version specific: an
+      # older ld left a dangling flat-namespace bind for a symbol it had
+      # defined in the same image, and a newer one does not. Use the
+      # newest Xcode the runner image ships rather than whatever
+      # xcode-select happens to point at.
+      - name: Select newest Xcode (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          newest=$(find /Applications -maxdepth 1 -name 'Xcode*.app' 2>/dev/null | sort -V | tail -1)
+          if [ -n "$newest" ]; then
+            sudo xcode-select -s "$newest"
+          fi
+          xcodebuild -version
+          ld -v 2>&1 | head -2 || true
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -191,7 +206,8 @@ jobs:
             cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           else
-            cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release
+            cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_VERBOSE_MAKEFILE=ON
           fi
           cmake --build soapy-aaronia/build --config Release
 

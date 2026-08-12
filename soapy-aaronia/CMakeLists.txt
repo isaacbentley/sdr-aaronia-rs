@@ -84,6 +84,24 @@ if (APPLE)
     # Belt and braces with the flag removal above: whichever `-undefined`
     # the generator emits, this one comes last and wins.
     target_link_options(aaroniaSupport PRIVATE "LINKER:-undefined,error")
+
+    # Resolving symbols at link time was not enough on its own. Apple's
+    # current linker also emitted a flat-namespace bind for a Rust
+    # vtable entry it had itself defined and localised in this image,
+    # which dyld then could not resolve; the same source linked with a
+    # newer Xcode does not. The classic linker does not take that path.
+    #
+    # Checked rather than assumed: -ld_classic is deprecated and will
+    # eventually be refused, and by then the bug it works around is
+    # someone else's history. The load check in CI is what proves the
+    # module still opens either way.
+    include(CheckLinkerFlag OPTIONAL RESULT_VARIABLE _have_check_linker_flag)
+    if (_have_check_linker_flag)
+        check_linker_flag(CXX "LINKER:-ld_classic" HAVE_LD_CLASSIC)
+        if (HAVE_LD_CLASSIC)
+            target_link_options(aaroniaSupport PRIVATE "LINKER:-ld_classic")
+        endif()
+    endif()
 endif()
 
 # System libraries required by the statically-linked Rust runtime

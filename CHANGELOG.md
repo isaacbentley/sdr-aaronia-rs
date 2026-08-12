@@ -4,25 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [v0.7.1] - 2026-08-12
+## [v0.7.2] - 2026-08-12
 
 ### Fixed
 - **The published macOS SoapySDR module would not load, on any Mac.**
   `dlopen` failed with "symbol not found in flat namespace" for a Rust
-  vtable entry. CMake links module targets on macOS with
-  `-undefined dynamic_lookup`, and the Apple linker emitted a
-  flat-namespace bind for a symbol it had already localised into the
-  same image. The module now resolves its symbols at link time, so this
-  is a build failure rather than something a user meets on first run.
-  Every 0.5.x, 0.6.x and 0.7.0 macOS archive is affected; the Linux and
-  Windows modules are not.
-- **The packaged module's load check ran on Linux only**, which is why
-  the above shipped. It now runs on all three platforms at release
-  time, and CI builds and checks the plugin on macOS as well as Linux.
+  vtable entry that the linker had itself defined and localised in the
+  same image. Resolving symbols at link time was not enough on its own,
+  so the module also links with the classic linker where that is still
+  supported, and the builds select the newest Xcode on the runner.
+  Every 0.5.x, 0.6.x, 0.7.0 and 0.7.1 macOS archive is affected; the
+  Linux and Windows modules are not.
+- **The packaged module's load check ran on Linux only**, which is how
+  the above shipped for as long as it did. It now runs on all three
+  platforms at release time, and CI builds and checks the plugin on
+  macOS as well as Linux. Both check the reported text: `--check` exits
+  0 even when the driver failed to load.
 
 ### Documentation
 - The Linux module needs glibc 2.38 or later, so it does not load on
   Ubuntu 22.04 or Debian 12. Said so in the plugin README.
+
+## [v0.7.1] - 2026-08-12
+
+An incomplete fix for the macOS module, superseded by 0.7.2. It reached
+crates.io and PyPI but published no GitHub release: the new load check
+refused to ship a macOS module that would not open. The Rust crate and
+the Python wheels are sound and identical in content to 0.7.2.
 
 ## [v0.7.0] - 2026-08-12
 
