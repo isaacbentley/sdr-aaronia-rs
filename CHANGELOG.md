@@ -29,7 +29,21 @@ All notable changes to this project will be documented in this file.
   8 MHz of spectrum needs 10 MHz of sampling, and
   `iq_sample_rate_for_bandwidth` returns the 15.36 MHz that provides it.
 
+### Fixed (native SDK)
+- **Sweep mode set the wrong resolution-bandwidth key.** It sent
+  `main/rbw`, which no Aaronia sample uses; the key is `main/rbwfreq`.
+  Checked against Aaronia's published `SweepSpectrumEco` sample, which
+  also confirms `main/startfreq`, `main/stopfreq`, `main/reflevel` and
+  the `spectranv6eco/sweepsa` open string that this crate already used.
+  The sweep path remains hardware-unverified.
+
 ### Documentation
+- **GPS time needs GPS switched on, and the crate does not do it.**
+  Devices ship with `device/gpsmode` disabled, so `get_gps_time` would
+  return `None` indefinitely and appear broken. Aaronia's `GPSTime`
+  sample sets `device/gpsmode` to "Location and Time" and
+  `device/sclksource` to "GPS Provider" before starting the device;
+  `get_gps_time` now says so.
 - Documented what `/control`'s `frequencySpan` actually means. It is a
   request for usable bandwidth, not a sample rate: the device picks the
   rate whose alias-free span is nearest, so 2.5 MHz yields 3.84 MHz and

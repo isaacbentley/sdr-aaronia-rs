@@ -1689,7 +1689,12 @@ impl NativeSdkSource {
     /// Configure the `sweepsa` (spectrum sweep) config group.
     ///
     /// > [!WARNING]
-    /// > Hardware-unverified: the `main/startfreq`/`main/stopfreq`/
+    /// > Key names now match Aaronia's `SweepSpectrumEco` sample, which
+    /// > sets `main/startfreq`, `main/stopfreq`, `main/rbwfreq` and
+    /// > `main/reflevel` after opening `spectranv6eco/sweepsa`. This code
+    /// > previously sent `main/rbw`, which no sample uses.
+    /// >
+    /// > Still hardware-unverified: the `main/startfreq`/`main/stopfreq`/
     /// > `main/rbw`/`main/vbw` config paths are inferred from the naming
     /// > convention used elsewhere in the SDK config tree, not confirmed
     /// > against a live `sweepsa`-mode device (the developer's V6 ECO
@@ -1721,7 +1726,8 @@ impl NativeSdkSource {
                 info!("Set sweepsa stopfreq to {} Hz", config.stop_frequency);
             }
 
-            if let Ok(mut config_node) = self.client.find_config(device, &mut root, "main/rbw") {
+            if let Ok(mut config_node) = self.client.find_config(device, &mut root, "main/rbwfreq")
+            {
                 self.client
                     .set_config_float(device, &mut config_node, config.rbw)?;
                 info!("Set sweepsa rbw to {} Hz", config.rbw);

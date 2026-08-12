@@ -463,7 +463,22 @@ pub struct AaroniaSource {
 }
 
 impl AaroniaSource {
-    /// Get the latest GPS time (seconds since unix epoch), if valid and available.
+    /// Get the latest GPS time (seconds since unix epoch), if valid and
+    /// available.
+    ///
+    /// Native SDK only; returns `None` on the HTTP and file backends.
+    ///
+    /// **GPS has to be switched on first, and this crate does not do it.**
+    /// The device ships with `device/gpsmode` set to `Disabled`, in which
+    /// state the telemetry this reads never reports a valid fix, so the
+    /// method returns `None` forever and looks broken. Aaronia's `GPSTime`
+    /// sample enables it by setting `device/gpsmode` to
+    /// `"Location and Time"` and `device/sclksource` to `"GPS Provider"`
+    /// before starting the device. Configure those in the RTSA-Suite, or
+    /// through the config tree, and allow time for a fix.
+    ///
+    /// Hardware-unverified: no GPS-equipped device has been available to
+    /// test against.
     pub fn get_gps_time(&mut self) -> Option<f64> {
         match self.source_type {
             #[cfg(all(

@@ -51,7 +51,7 @@ Available on Windows and Linux only, behind the non-default `native-sdk` feature
 - **IQ mode constraint**: enforces `span * 1.5 <= receiverclock` by reading the live device clock before streaming.
 - **Data path (RX)**: polls `GetPacket` on the C++ side every 5 ms. Where the packet stride allows, the raw sample buffer is reinterpreted in place as `Complex32` (no per-sample conversion) before being copied into the caller's buffer.
 - **Data path (TX)**: provides an experimental `TxStream` API built on `SendPacket`. This path is hardware-unverified pending full V6 testing, as the ECO model lacks TX.
-- **Sweep-spectra mode**: configures non-IQ sweeping via `SweepsaConfig` by modifying `"main/startfreq"`, `"main/stopfreq"`, `"main/rbw"`, and related keys (these config paths are inferred from the SDK naming convention and are hardware-unverified). Supports the `"spectranv6/sweepsa"` and `"spectranv6eco/sweepsa"` open strings.
+- **Sweep-spectra mode**: configures non-IQ sweeping via `SweepsaConfig` by modifying `"main/startfreq"`, `"main/stopfreq"`, `"main/rbwfreq"` and `"main/reflevel"`. These key names match Aaronia's own `SweepSpectrumEco` sample; the code previously sent `"main/rbw"`, which no sample uses. Supports the `"spectranv6/sweepsa"` and `"spectranv6eco/sweepsa"` open strings, both of which the samples confirm. The path itself remains hardware-unverified.
 - **Health and GPS telemetry**: exposes `HealthState` and `GpsState` structs populated by a recursive configuration tree-walker (`walk_health_tree`) that fetches device diagnostics dynamically. Not yet exercised against live hardware.
 
 ### 4.2 HTTP Streaming
