@@ -998,8 +998,12 @@ impl HttpEndpointsClient {
     /// **LICENSING NOTE**: This endpoint requires a separate "Remote Config" license
     /// from Aaronia. Without this license, configuration changes will fail with authorization errors.
     ///
-    /// **Alternative**: For unlicensed use, consider using the Native SDK which may allow
-    /// configuration changes without the remote config license restriction.
+    /// **Alternatives without that license**: retuning and capture control
+    /// go through `/control` ([`Self::configure_capture`]), which needs no
+    /// license, and the native SDK configures the device directly. Note
+    /// that a `/remoteconfig` write applies a frequency change from the
+    /// frequency field alone, whereas `/control` ignores a capture request
+    /// unless the center frequency and span are both present.
     ///
     /// See: <https://aaronia.com/en/software-licence-remote-config>
     /// Documentation: <https://rtsa-manual.aaronia.com/en/Content/C_Operation/DDCommandCenter/RemoteConfig.htm>

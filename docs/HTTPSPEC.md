@@ -388,6 +388,44 @@ packet-metadata object, so `payload`, `minPower`, `maxPower`, and
 }
 ```
 
+**Full PUT form** (config tree). Aaronia's own automation example uses this
+shape for every setting it changes:
+
+```json
+{
+  "request": 11,
+  "receiverName": "Block_Spectran_V6B_0",
+  "config": {
+    "type": "group",
+    "items": [
+      {
+        "type": "group",
+        "name": "main",
+        "items": [
+          { "type": "float", "name": "centerfreq", "value": 2440000000 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Notes verified against a live V6 ECO:
+
+- **Field names are model-specific.** The V6B example writes `centerfreq`;
+  a V6 ECO exposes `centerfreq0` and `centerfreq1` for its two channels.
+  Read `GET /remoteconfig` and use the names that device reports.
+- **A frequency change needs only the frequency field.** This differs from
+  `/control`, where a capture request is ignored unless `frequencyCenter`
+  and `frequencySpan` are both present.
+- **The `receiverName` key is case-tolerant.** `receivername` was accepted
+  identically.
+- Enum-valued settings are written as their label string, for example
+  `decimation` as `"1 / 128"`, not as an index.
+- Other keys the example writes: `run` (bool), `preamp` (`"Auto"`),
+  `reflevel` (float), and `filerecord` (bool) plus a filename template on
+  a FileWriter block, which is how it starts and stops recording.
+
 **Simplified PUT form**: in addition to the full `{request, config}` shape, the server accepts a shorter per-block write (used by the SDR++ and SDRangel Aaronia plugins), exposed via `HttpEndpointsClient::simple_remote_config`:
 ```json
 {
@@ -707,6 +745,7 @@ consult:
 
 - **RTSA-Suite PRO HTTP streaming** (Aaronia V6 forum) — [v6-forum.aaronia.de/forum/topic/rtsa-suite-pro-http-streaming](https://v6-forum.aaronia.de/forum/topic/rtsa-suite-pro-http-streaming/)
 - Aaronia RTSA-Suite PRO product documentation — <https://rtsa-manual.aaronia.com/>
+- **Aaronia's own automation example** — [Aaronia-Open-source/python_RTSA_HTTP_API_Sequence_Example](https://github.com/Aaronia-Open-source/python_RTSA_HTTP_API_Sequence_Example). A Python script that runs a measurement sequence and records to disk, driving the device entirely through `PUT /remoteconfig`. It is the source of the config-tree write example below.
 
 The content here is derived from the above plus empirical analysis of live
 RTSA-Suite PRO streams. "Aaronia", "RTSA", and "Spectran" are the property of
