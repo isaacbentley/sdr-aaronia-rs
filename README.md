@@ -82,25 +82,8 @@ async fn main() -> Result<()> {
 quickstart leaves out: the builder pattern, explicit backend selection,
 wire formats and network bandwidth, configuration profiles, device
 control, FutureSDR integration, authentication and low-level stream
-access. Its Rust snippets are compiled as doctests.
-
-The programs in `examples/` cover the same ground as runnable code, and
-are built by CI:
-
-| Task | Example |
-| --- | --- |
-| HTTP IQ streaming, first samples | [`http_iq_quickstart.rs`](examples/http_iq_quickstart.rs) |
-| Health checks, input enumeration, recording control, license probing | [`device_control.rs`](examples/device_control.rs) |
-| Frequency hopping via the `sdr-source` traits | [`channel_hopping.rs`](examples/channel_hopping.rs) |
-| FutureSDR flowgraph with FM demodulation | [`noaa_scanner.rs`](examples/noaa_scanner.rs) |
-| Native SDK capture and transmit | [`native_sdk_basic.rs`](examples/native_sdk_basic.rs), [`native_sdk_transmit.rs`](examples/native_sdk_transmit.rs) |
-| RTSA file playback and metadata inspection | [`read_rtsa_file.rs`](examples/read_rtsa_file.rs), [`dump_metadata.rs`](examples/dump_metadata.rs) |
-| Python (NumPy and Arrow), SoapySDR from Python | [`python_arrow_example.py`](examples/python_arrow_example.py), [`soapy_python_example.py`](examples/soapy_python_example.py) |
-
-```bash
-# args: <center-hz> <sample-rate-hz> <url>
-cargo run --example http_iq_quickstart --features http -- 2440e6 12.288e6 http://localhost:54664
-```
+access. Its Rust snippets are compiled as doctests, and it indexes the
+runnable programs in [`examples/`](examples/).
 
 [docs/QUICKSTART.md](docs/QUICKSTART.md) covers configuring the
 RTSA-Suite HTTP Server block, which all of the above depends on.
