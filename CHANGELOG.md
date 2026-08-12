@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.7.3] - 2026-08-12
+
+### Fixed
+- The Windows leg of the new module load check could not run: vcpkg's
+  SoapySDR port ships no `SoapySDRUtil`, so the check failed rather
+  than verifying anything, and 0.7.2 published no release archives.
+  Where the tool is absent the packaged DLL is now loaded directly,
+  which still catches a module whose dependencies do not resolve away
+  from the build machine.
+
 ## [v0.7.2] - 2026-08-12
 
 ### Fixed
@@ -31,10 +41,11 @@ All notable changes to this project will be documented in this file.
 
 ## [v0.7.1] - 2026-08-12
 
-An incomplete fix for the macOS module, superseded by 0.7.2. It reached
-crates.io and PyPI but published no GitHub release: the new load check
-refused to ship a macOS module that would not open. The Rust crate and
-the Python wheels are sound and identical in content to 0.7.2.
+An incomplete fix for the macOS module, superseded by 0.7.2. Like
+0.7.2, it reached crates.io and PyPI but published no release archives,
+because the new load check refused to ship a macOS module that would
+not open. Its crate and wheels are sound and identical in content to
+0.7.3.
 
 ## [v0.7.0] - 2026-08-12
 

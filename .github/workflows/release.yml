@@ -259,24 +259,42 @@ jobs:
           # localised into the same image. The check is worth nothing on
           # the platforms it skips.
           if [ "$RUNNER_OS" == "Windows" ]; then
-            util=$(find "$VCPKG_INSTALLATION_ROOT/installed/x64-windows" \
-                     -name SoapySDRUtil.exe -print -quit 2>/dev/null || true)
-            if [ -z "$util" ]; then
-              echo "SoapySDRUtil.exe not found under vcpkg; cannot verify the module loads" >&2
-              exit 1
+            util=$(find "$VCPKG_INSTALLATION_ROOT" -name SoapySDRUtil.exe \
+                     -print -quit 2>/dev/null || true)
+            if [ -n "$util" ]; then
+              # The tool needs the vcpkg DLLs beside it on PATH.
+              PATH="$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin:$PATH" \
+                SOAPY_SDR_PLUGIN_PATH="$PWD/soapy-aaronia/dist/$stage" \
+                "$util" --check=aaronia | tee check.log
+              grep -q "PRESENT" check.log
+            else
+              # vcpkg's soapysdr port ships no SoapySDRUtil, so load the
+              # module directly. That still catches what breaks a
+              # packaged module — a DLL whose dependencies do not
+              # resolve on a machine that is not the build machine.
+              dll=$(cygpath -w "$PWD/soapy-aaronia/dist/$stage/aaroniaSupport.dll")
+              bin=$(cygpath -w "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin")
+              powershell -NoProfile -Command "
+                \$ErrorActionPreference = 'Stop'
+                \$env:PATH = '$bin;' + \$env:PATH
+                Add-Type -Namespace Native -Name Lib -MemberDefinition '
+                  [DllImport(\"kernel32\", SetLastError=true)]
+                  public static extern IntPtr LoadLibrary(string path);'
+                \$h = [Native.Lib]::LoadLibrary('$dll')
+                if (\$h -eq [IntPtr]::Zero) {
+                  \$e = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                  throw \"LoadLibrary failed (\$e): \$((New-Object ComponentModel.Win32Exception \$e).Message)\"
+                }
+                Write-Host 'module loaded'"
             fi
-            # The tool needs the vcpkg DLLs beside it on PATH.
-            PATH="$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin:$PATH" \
-              SOAPY_SDR_PLUGIN_PATH="$PWD/soapy-aaronia/dist/$stage" \
-              "$util" --check=aaronia | tee check.log
           else
+            # --check reports a missing driver on stdout and still exits
+            # 0, so the exit status alone would pass on a module that
+            # failed to load.
             SOAPY_SDR_PLUGIN_PATH="$PWD/soapy-aaronia/dist/$stage" \
               SoapySDRUtil --check=aaronia | tee check.log
+            grep -q "PRESENT" check.log
           fi
-          # --check reports a missing driver on stdout and still exits 0,
-          # so the exit status alone would pass on a module that failed
-          # to load.
-          grep -q "PRESENT" check.log
 
           cp LICENSE "soapy-aaronia/dist/$stage/" 2>/dev/null || true
           cp soapy-aaronia/README.md "soapy-aaronia/dist/$stage/INSTALL.md"
