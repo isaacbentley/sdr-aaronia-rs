@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **The Homebrew formula is no longer a release asset.** It is uploaded
+  as the `homebrew-formula` workflow artifact instead. Homebrew 4 and
+  later cannot install from a formula URL, so on the release page it
+  was a file no user could act on, listed among ones they can. Its only
+  reader is whoever updates the tap, and the checksums are still
+  rendered against the published archives so none are computed by hand.
+
 ### Documentation
 - **Measured what the 80% usable-bandwidth figure actually is, and
   explained it in one sentence.** Sample rate and RF bandwidth were

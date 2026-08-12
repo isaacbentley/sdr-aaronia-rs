@@ -365,6 +365,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          mkdir -p formula
           mac="artifacts/SoapyAaronia-${version}-macos-arm64.tar.gz"
           linux="artifacts/SoapyAaronia-${version}-linux-x86_64.tar.gz"
           for f in "$mac" "$linux"; do
@@ -376,9 +377,20 @@ jobs:
           sed -e "s/^  version \".*\"/  version \"${version}\"/" \
               -e "s/REPLACE_WITH_SHA256_OF_MACOS_ARM64_ARCHIVE/$(sha256sum "$mac" | cut -d' ' -f1)/" \
               -e "s/REPLACE_WITH_SHA256_OF_LINUX_X86_64_ARCHIVE/$(sha256sum "$linux" | cut -d' ' -f1)/" \
-              packaging/homebrew/soapy-aaronia.rb > artifacts/soapy-aaronia.rb
+              packaging/homebrew/soapy-aaronia.rb > formula/soapy-aaronia.rb
           echo "--- rendered formula ---"
-          cat artifacts/soapy-aaronia.rb
+          cat formula/soapy-aaronia.rb
+
+      # A workflow artifact, not a release asset. Homebrew 4 and later
+      # cannot install from a formula URL, so on the release page this
+      # is a file no user can do anything with, sitting among ones they
+      # can. Its only reader is whoever updates the tap, and they can
+      # take it from here.
+      - name: Upload Homebrew formula
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: formula/soapy-aaronia.rb
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -390,7 +402,6 @@ jobs:
             artifacts/*.whl
             artifacts/*.tar.gz
             artifacts/*.zip
-            artifacts/soapy-aaronia.rb
           body_path: release-notes.md
           generate_release_notes: true
 

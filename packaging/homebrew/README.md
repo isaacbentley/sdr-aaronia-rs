@@ -23,11 +23,18 @@ Homebrew pulls in SoapySDR, drops the module into
 
 ## Each release
 
-The release workflow renders this file against the published archives
-and attaches the result to the release as `soapy-aaronia.rb`, with the
-version and both SHA-256 checksums filled in. Copy that file into the
-tap repository as `Formula/soapy-aaronia.rb` and commit. Nothing needs
+The release workflow renders this file against the published archives,
+with the version and both SHA-256 checksums filled in, and uploads it
+as the **`homebrew-formula` workflow artifact** — not a release asset.
+Download it from the release run's Artifacts section, copy it into the
+tap repository as `Formula/soapy-aaronia.rb`, and commit. Nothing needs
 hashing by hand.
+
+It is deliberately not attached to the release page: Homebrew 4 and
+later cannot install from a formula URL, so there it would be a file no
+user could act on, sitting among ones they can. Once the tap exists,
+the better move is to have the workflow commit to it directly and skip
+this step.
 
 Before pushing, `brew audit --strict --online soapy-aaronia` checks the
 formula, and `brew install --build-from-source` proves it works.
