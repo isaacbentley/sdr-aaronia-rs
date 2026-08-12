@@ -36,7 +36,25 @@ All notable changes to this project will be documented in this file.
   samples set `device/receiverclock` to "92MHz" or "245MHz"; only the
   default has been checked against hardware.
 
+### Added (native SDK)
+- **Device-family auto-detection.** `detect_device_family` and
+  `open_detected_device` try each known family in turn, so an ECO owner
+  no longer has to know that the default `spectranv6` will not find
+  their device and that `spectranv6eco` is the string they needed.
+- **`read_spectra`**, with the stream index taken from the open mode
+  rather than assumed. `spectranv6/raw` carries spectra on stream 2 and
+  IQ on stream 0; every other mode uses stream 0. Hardware-unverified.
+- **`receiver_clock_hz`** on the native source, and
+  `spectranv6eco/rtsa` added to the known open modes. The clock sets the
+  rate ladder's ceiling, so callers that need to know which rates exist
+  can now ask instead of assuming.
+
 ### Fixed (native SDK)
+- **The V6 ECO's fixed receiver clock was recorded as 61.44 MHz.** It is
+  92.16 MHz: an ECO streams at 61.44 MHz sampling, measured against real
+  hardware, and the constraint checked at configuration time is
+  `span * 1.5 <= clock`. The old value rejected every span above
+  40.96 MHz, including the device's own maximum.
 - **Dual-channel capture selected the wrong mode and would have
   returned corrupted samples.** `RxChannel::Rx1And2` wrote
   `device/receiverchannel = "Rx1+Rx2"`, which delivers the two inputs as

@@ -590,6 +590,44 @@ Data captured using antennas with location or directional information.
 | `azimuth` | Azimuth of directional antenna |
 | `declination` | Declination of directional antenna |
 
+## What the native SDK samples tell us about this API
+
+Aaronia's [C++ SDK samples](https://github.com/Aaronia-Open-source/RTSA-API-Samples)
+drive the same hardware through a different transport, so some of what
+they establish applies here and some does not.
+
+### GPS needs enabling, over HTTP too
+
+The `device/gpsmode` and `device/sclksource` keys the `GPSTime` sample
+writes are the same keys this config tree exposes, so the prerequisite
+is identical. A device ships with `gpsmode` set to `Disabled` and takes
+its stream clock from whatever `sclksource` names, which on the system
+tested here was `10MHz` rather than GPS. Timestamps are not
+GPS-disciplined until both change, and nothing reports an error
+meanwhile.
+
+Observed on a V6 ECO: `gpsmode` offers `Disabled`, `Location`, `Time`
+and `Location and Time`; `sclksource` offers `Consumer`, `Oscillator`,
+`GPS`, `PPS`, `10MHz` and three `... Provider` variants.
+
+### The rate ladder carries over
+
+`decimation0` takes the same labels as the SDK's `main/decimation`,
+`"Full"` through `"1 / 512"`, verified by writing one over HTTP. Both
+transports drive the same divider.
+
+### Two things that do not carry over
+
+- **Receiver-channel selection.** There is no `device/receiverchannel`
+  here. The tree exposes per-channel settings instead — `centerfreq0`
+  and `centerfreq1`, `decimation0` and `decimation1`, `rfchsource0` and
+  `rfchsource1` — and which channels reach the stream is a property of
+  the RTSA mission graph. The SDK's `Rx12` versus `Rx1+Rx2` distinction
+  has no equivalent.
+- **Stream indices.** The SDK separates IQ from spectra by packet stream
+  index. HTTP selects data with the `input=` parameter and reports the
+  kind in each packet's `payload` field.
+
 ## Authorization & Licensing
 
 ### HTTP Streaming vs Remote Configuration

@@ -725,6 +725,43 @@ impl NativeSdkClient {
         }
     }
 
+    /// The device families this SDK knows about, in the order worth
+    /// trying.
+    pub const DEVICE_FAMILIES: [&'static str; 2] = ["spectranv6", "spectranv6eco"];
+
+    /// Find which family actually has a device attached.
+    ///
+    /// `AARTSAAPI_EnumDevice` matches one family at a time, so a caller
+    /// configured for `spectranv6` finds nothing on a machine holding
+    /// only a V6 ECO, and the failure reads as "no device" rather than
+    /// "wrong family". This tries each family in turn and returns the
+    /// first that enumerates a device, so the common case needs no
+    /// configuration at all.
+    ///
+    /// # Safety
+    /// `handle` must be an open library handle.
+    pub unsafe fn detect_device_family(
+        &self,
+        handle: &mut AARTSAAPI_Handle,
+    ) -> Result<Option<&'static str>> {
+        for family in Self::DEVICE_FAMILIES {
+            match unsafe { self.enum_device(handle, family, 0) } {
+                Ok(Some(_)) => {
+                    info!("Detected device family {family}");
+                    return Ok(Some(family));
+                }
+                // An empty family is the normal answer for the one that
+                // is not attached; keep looking.
+                Ok(None) => continue,
+                Err(e) => {
+                    debug!("Enumerating {family} failed, trying the next: {e}");
+                    continue;
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub unsafe fn enum_device(
         &self,
         handle: &mut AARTSAAPI_Handle,
@@ -1240,6 +1277,27 @@ pub(crate) fn split_packet(packet_samples: usize, remaining: usize) -> (usize, u
     (to_caller, packet_samples - to_caller)
 }
 
+/// What one spectra packet described, alongside the values appended to
+/// the caller's buffer.
+///
+/// A packet holds `frames` consecutive spectra of `bins_per_frame`
+/// values each, laid out one after another, so frame `i` occupies
+/// `[i * bins_per_frame ..][.. bins_per_frame]` of what was appended.
+/// Values are dBm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpectraRead {
+    /// Number of spectra in the packet.
+    pub frames: usize,
+    /// Bins in each spectrum.
+    pub bins_per_frame: usize,
+    /// Frequency of the first bin, in Hz.
+    pub start_frequency_hz: f64,
+    /// Spacing between bins, in Hz.
+    pub step_frequency_hz: f64,
+    /// Packet start time, on the device's clock.
+    pub start_time: f64,
+}
+
 // === High-Level Stream Manager ===
 
 /// The open-mode supplied to `AARTSAAPI_OpenDevice`. Tracking which family /
@@ -1251,6 +1309,9 @@ pub enum DeviceOpenMode {
     Raw,
     /// `spectranv6eco/iqreceiver` — IQ receiver on the ECO platform.
     EcoIqReceiver,
+    /// `spectranv6eco/rtsa` — the ECO's raw pipeline, which is what its
+    /// spectrum sample opens. There is no `spectranv6eco/raw`.
+    EcoRtsa,
     /// `spectranv6/sweepsa` — sweep spectrum analyzer on the V6 platform.
     Sweepsa,
     /// `spectranv6eco/sweepsa` — sweep spectrum analyzer on the ECO platform.
@@ -1267,6 +1328,9 @@ impl DeviceOpenMode {
     pub fn from_open_string(s: &str) -> Self {
         match s {
             "spectranv6/raw" => Self::Raw,
+            // The ECO's equivalent of raw mode is called rtsa; it has no
+            // "spectranv6eco/raw".
+            "spectranv6eco/rtsa" => Self::EcoRtsa,
             "spectranv6eco/iqreceiver" => Self::EcoIqReceiver,
             "spectranv6/sweepsa" => Self::Sweepsa,
             "spectranv6eco/sweepsa" => Self::EcoSweepsa,
@@ -1280,6 +1344,22 @@ impl DeviceOpenMode {
     /// exposes them; eco's `iqreceiver` drives a fixed pipeline.
     pub fn supports_raw_only_keys(&self) -> bool {
         matches!(self, Self::Raw)
+    }
+
+    /// Which stream index carries spectra in this mode.
+    ///
+    /// Not a property of the device family, which is how this reads at
+    /// first glance. In `spectranv6/raw` the same device delivers IQ on
+    /// stream 0 and spectra on stream 2, selected by
+    /// `device/outputformat`; Aaronia's `RawIQ` and `RawSpectrum`
+    /// samples differ in exactly that. Every other mode, including the
+    /// ECO's `rtsa` and both `sweepsa` variants, carries spectra on
+    /// stream 0.
+    pub fn spectra_stream_index(&self) -> i32 {
+        match self {
+            Self::Raw => 2,
+            _ => 0,
+        }
     }
 }
 
@@ -1305,6 +1385,11 @@ pub struct NativeSdkSource {
     /// time-gaps into both outputs (each call consumes whole packets
     /// the other path never sees), so the second path errors instead.
     read_mode: Option<ReadMode>,
+    /// Receiver clock in Hz, learned when the IQ receiver is configured.
+    /// The sample-rate ladder is derived from it, so callers that need
+    /// to know which rates exist should read it rather than assume the
+    /// default. `None` until the device has been configured.
+    receiver_clock_hz: Option<f64>,
 }
 
 /// Which of the two packet-consuming read paths a streaming session
@@ -1399,6 +1484,7 @@ impl NativeSdkSource {
                 sample_buffer: VecDeque::new(),
                 dual_sample_buffer: VecDeque::new(),
                 read_mode: None,
+                receiver_clock_hz: None,
             })
         }
     }
@@ -1592,6 +1678,40 @@ impl NativeSdkSource {
 
             info!("Device {} opened successfully", device_type);
             Ok(())
+        }
+    }
+
+    /// Open whichever device is present, without the caller naming the
+    /// family.
+    ///
+    /// `mode` is the suffix, for example `"raw"` or `"iqreceiver"`. The
+    /// family is detected first, then joined to it. Note the two
+    /// families do not offer identical modes: the V6 has `raw`, while
+    /// the ECO's equivalent is `rtsa`, so pass a mode the detected
+    /// family supports or use [`Self::open_device`] directly.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::open_device`].
+    pub unsafe fn open_detected_device(
+        &mut self,
+        mode: &str,
+        serial_number: &[WideChar],
+    ) -> Result<()> {
+        unsafe {
+            let family = {
+                let handle = self
+                    .handle
+                    .as_mut()
+                    .ok_or_else(|| Error::Sdk("SDK not initialized".to_string()))?;
+                self.client.detect_device_family(handle)?.ok_or_else(|| {
+                    Error::Sdk(format!(
+                        "no Aaronia device found in any known family ({})",
+                        NativeSdkClient::DEVICE_FAMILIES.join(", ")
+                    ))
+                })?
+            };
+            let open_string = format!("{family}/{mode}");
+            self.open_device(&open_string, serial_number)
         }
     }
 
@@ -1887,13 +2007,18 @@ impl NativeSdkSource {
                     crate::utils::DEFAULT_RECEIVER_CLOCK_HZ
                 }
             } else {
-                // Eco devices report no receiverclock key; the family is fixed
-                // at 61.44 MHz per the README. Use that here so the IQ Mode
-                // constraint is checked against the right clock.
-                const ECO_FIXED_CLOCK_HZ: f64 = 61_440_000.0;
-                ECO_FIXED_CLOCK_HZ
+                // Eco devices report no receiverclock key: the clock is
+                // fixed. It is 92.16 MHz, not the 61.44 MHz this used to
+                // assume. A V6 ECO streams at 61.44 MHz sampling, measured
+                // over HTTP against real hardware, and the constraint
+                // checked below is `span * 1.5 <= clock`, so the clock
+                // cannot be lower than 92.16 MHz. With the old value this
+                // rejected every span above 40.96 MHz, including the
+                // device's own maximum.
+                crate::utils::DEFAULT_RECEIVER_CLOCK_HZ
             };
 
+            self.receiver_clock_hz = Some(actual_clock_hz);
             crate::utils::validate_iq_mode(span_freq, actual_clock_hz)?;
 
             info!("IQ Receiver configuration completed");
@@ -1978,6 +2103,101 @@ impl NativeSdkSource {
     /// total wait so a stalled device can't block the caller indefinitely.
     pub const READ_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
     pub const READ_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// The receiver clock in Hz, once the device has been configured.
+    ///
+    /// Worth reading rather than assuming: the sample-rate ladder runs
+    /// from `clock / 1.5` downward in halves, so a V6 on the 245 MHz
+    /// clock reaches rates a V6 ECO cannot. Pass this to
+    /// [`crate::utils::iq_sample_rates_for_clock`] to get the rates this
+    /// device actually supports.
+    pub fn receiver_clock_hz(&self) -> Option<f64> {
+        self.receiver_clock_hz
+    }
+
+    /// Read one packet of spectra, appending its values to `out`.
+    ///
+    /// Returns `None` when no packet arrived within
+    /// [`Self::READ_POLL_DEADLINE`], matching the IQ read.
+    ///
+    /// The stream index comes from the open mode rather than a constant:
+    /// `spectranv6/raw` carries spectra on stream 2 while its IQ is on
+    /// stream 0, and every other mode uses stream 0. See
+    /// [`DeviceOpenMode::spectra_stream_index`]. The device must also be
+    /// producing spectra in the first place, which in raw mode means
+    /// `device/outputformat` set to `"spectra"`.
+    ///
+    /// > Hardware-unverified. The packet layout, `num` frames of `size`
+    /// > bins, follows Aaronia's `RawSpectrum` sample; no spectra-capable
+    /// > device has been available to run it against.
+    ///
+    /// # Safety
+    /// The device must be open and streaming.
+    pub unsafe fn read_spectra(&mut self, out: &mut Vec<f32>) -> Result<Option<SpectraRead>> {
+        unsafe {
+            if !self.stream_active {
+                return Err(Error::Sdk("Streaming not active".to_string()));
+            }
+            let stream = self
+                .open_mode
+                .as_ref()
+                .map(DeviceOpenMode::spectra_stream_index)
+                .unwrap_or(0);
+            let device = self
+                .device
+                .as_mut()
+                .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
+
+            let started = std::time::Instant::now();
+            let packet_opt = loop {
+                match self.client.get_packet(device, stream, 0)? {
+                    Some(p) => break Some(p),
+                    None => {
+                        if started.elapsed() >= Self::READ_POLL_DEADLINE {
+                            break None;
+                        }
+                        std::thread::sleep(Self::READ_POLL_INTERVAL);
+                    }
+                }
+            };
+
+            let Some(packet) = packet_opt else {
+                return Ok(None);
+            };
+
+            // Consume on every path out from here: `get_packet` always
+            // returns the head of the queue, so leaving one behind makes
+            // every later read return the same packet forever.
+            let result = (|| {
+                if packet.fp32.is_null() || packet.num <= 0 || packet.size == 0 {
+                    return Ok(None);
+                }
+                let frames = packet.num as usize;
+                let bins = packet.size as usize;
+                // Bound the product before allocating: a corrupt header
+                // must not size a multi-gigabyte copy.
+                const MAX_VALUES: usize = 1 << 26;
+                let total = frames.checked_mul(bins).filter(|n| *n <= MAX_VALUES);
+                let Some(total) = total else {
+                    return Err(Error::Sdk(format!(
+                        "spectra packet claims {frames} frames of {bins} bins,                          which exceeds the {MAX_VALUES}-value limit"
+                    )));
+                };
+                out.reserve(total);
+                out.extend_from_slice(std::slice::from_raw_parts(packet.fp32, total));
+                Ok(Some(SpectraRead {
+                    frames,
+                    bins_per_frame: bins,
+                    start_frequency_hz: packet.start_frequency,
+                    step_frequency_hz: packet.step_frequency,
+                    start_time: packet.start_time,
+                }))
+            })();
+
+            self.client.consume_packets(device, stream, 1)?;
+            result
+        }
+    }
 
     /// Read up to `max_samples` complex IQ pairs from the device.
     ///
