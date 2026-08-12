@@ -189,6 +189,11 @@ impl UnifiedSink {
         )),
         allow(unused_variables)
     )]
+    /// Aaronia's `IQTransceiverSweep` sample precedes real data with a
+    /// zero-length packet carrying only `STREAM_START`, timestamped at
+    /// the master stream clock, "to improve startup synch". Passing an
+    /// empty slice here does the same thing. Untested against hardware,
+    /// like the rest of this path, but it is what the vendor does.
     pub fn write_samples(
         &mut self,
         channel: i32,

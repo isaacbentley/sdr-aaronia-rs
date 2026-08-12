@@ -37,6 +37,15 @@ All notable changes to this project will be documented in this file.
   default has been checked against hardware.
 
 ### Fixed (native SDK)
+- **Dual-channel capture selected the wrong mode and would have
+  returned corrupted samples.** `RxChannel::Rx1And2` wrote
+  `device/receiverchannel = "Rx1+Rx2"`, which delivers the two inputs as
+  two independent streams at indices 0 and 1. This crate reads a single
+  stream and deinterleaves it, which is the contract of the other mode,
+  `"Rx12"`. On a two-input V6 the result would have been Rx1's samples
+  split into two bogus channels, with no error anywhere. It now writes
+  `"Rx12"`. Aaronia's `RawIQ2RX` and `RawIQ2RXInterleave` samples
+  demonstrate one mode each. Still hardware-unverified.
 - **Sweep mode set the wrong resolution-bandwidth key.** It sent
   `main/rbw`, which no Aaronia sample uses; the key is `main/rbwfreq`.
   Checked against Aaronia's published `SweepSpectrumEco` sample, which

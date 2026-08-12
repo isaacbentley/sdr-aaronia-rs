@@ -39,9 +39,18 @@ pub enum RxChannel {
     Rx1,
     /// Second RF input (full V6 only; hardware-unverified).
     Rx2,
-    /// Both inputs, interleaved into one packet (full V6 only;
-    /// hardware-unverified). Read both streams with
-    /// `read_samples_dual` on the native SDK source.
+    /// Both inputs interleaved into a single stream (full V6 only;
+    /// hardware-unverified). Read with `read_samples_dual` on the
+    /// native SDK source.
+    ///
+    /// The device offers two ways to run both inputs and they are not
+    /// interchangeable. `"Rx12"`, used here, interleaves the pair into
+    /// one stream: four floats per sample, `[I0, Q0, I1, Q1]`, read
+    /// from stream 0. `"Rx1+Rx2"` instead delivers two independent
+    /// streams that must be fetched and consumed separately, at indices
+    /// 0 and 1. Aaronia's `RawIQ2RXInterleave` and `RawIQ2RX` samples
+    /// show one each. This crate reads a single stream and
+    /// deinterleaves it, so it requires the former.
     Rx1And2,
 }
 
@@ -51,7 +60,10 @@ impl RxChannel {
         match self {
             Self::Rx1 => "Rx1",
             Self::Rx2 => "Rx2",
-            Self::Rx1And2 => "Rx1+Rx2",
+            // Not "Rx1+Rx2": that selects two separate streams, while
+            // this crate reads one interleaved stream. See the variant
+            // documentation above.
+            Self::Rx1And2 => "Rx12",
         }
     }
 }
@@ -80,7 +92,7 @@ pub fn deinterleave_dual_iq<'a>(
     if stride < 4 {
         return Err(Error::Sdk(format!(
             "packet stride {} cannot carry two interleaved IQ channels (need >= 4); \
-             is device/receiverchannel set to Rx1+Rx2?",
+             is device/receiverchannel set to Rx12?",
             stride
         )));
     }
@@ -497,7 +509,10 @@ mod tests {
         // per the official RTSA-API-Samples.
         assert_eq!(RxChannel::Rx1.as_config_str(), "Rx1");
         assert_eq!(RxChannel::Rx2.as_config_str(), "Rx2");
-        assert_eq!(RxChannel::Rx1And2.as_config_str(), "Rx1+Rx2");
+        // "Rx12" interleaves both inputs into one stream, which is
+        // what this crate reads. "Rx1+Rx2" would deliver two separate
+        // streams and silently break the deinterleave.
+        assert_eq!(RxChannel::Rx1And2.as_config_str(), "Rx12");
     }
 
     #[test]
@@ -539,7 +554,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("stride 2 must be rejected"),
         };
-        assert!(err.to_string().contains("Rx1+Rx2"), "got: {err}");
+        assert!(err.to_string().contains("Rx12"), "got: {err}");
     }
 
     #[test]

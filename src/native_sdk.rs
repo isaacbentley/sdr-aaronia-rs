@@ -2494,11 +2494,16 @@ impl Drop for NativeSdkSource {
 /// `device/receiverchannel` config item.
 ///
 /// The full SPECTRAN V6 has two RF inputs; the V6 ECO has one. The config
-/// strings (`"Rx1"`, `"Rx2"`, `"Rx1+Rx2"`) come from the official
-/// RTSA-API-Samples; `"Rx1"` is what [`NativeSdkSource::
-/// configure_iq_receiver`] has always written and is the only variant
-/// verified against real hardware (see
-/// [`NativeSdkSource::set_receiver_channel`]).
+/// strings come from the official RTSA-API-Samples, which use four:
+/// `"Rx1"`, `"Rx2"`, `"Rx12"` and `"Rx1+Rx2"`. The last two both enable
+/// both inputs but differ in delivery — `"Rx12"` interleaves them into
+/// one stream, `"Rx1+Rx2"` produces two independent streams — so they
+/// are not interchangeable. This crate reads one stream and
+/// deinterleaves it, so [`RxChannel::Rx1And2`] writes `"Rx12"`.
+///
+/// `"Rx1"` is what [`NativeSdkSource::configure_iq_receiver`] has
+/// always written and is the only variant verified against real
+/// hardware (see [`NativeSdkSource::set_receiver_channel`]).
 ///
 /// The enum itself lives in [`crate::utils`] so cross-platform
 /// configuration code can name a channel without the `native-sdk`

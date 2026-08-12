@@ -876,3 +876,61 @@ the Aaronia Software License Agreement governs use of the SDK itself (see
 [Licensing Considerations](#licensing-considerations)); this community document
 describes only the public interface. "Aaronia", "RTSA", and "Spectran" are the
 property of Aaronia AG.
+
+## Facts taken from Aaronia's published samples
+
+The following come from
+[Aaronia-Open-source/RTSA-API-Samples](https://github.com/Aaronia-Open-source/RTSA-API-Samples),
+read in full. They are vendor code rather than vendor documentation, but
+they are the closest thing to an authoritative statement of how the API
+is meant to be driven, and this crate's native-SDK paths cannot be
+tested here.
+
+### Both receivers, two different modes
+
+`device/receiverchannel` takes four values, and the last two are not
+interchangeable:
+
+| Value | Delivery |
+| --- | --- |
+| `Rx1`, `Rx2` | One input, one stream |
+| `Rx12` | Both inputs interleaved into **one** stream: four floats per sample, `[I0, Q0, I1, Q1]`, read from stream 0 |
+| `Rx1+Rx2` | Both inputs as **two independent streams**, fetched and consumed separately at indices 0 and 1 |
+
+`RawIQ2RXInterleave` uses the first, `RawIQ2RX` the second. This crate
+reads a single stream and deinterleaves it, so it writes `Rx12`.
+
+### V6 against V6 ECO
+
+| | Full V6 | V6 ECO |
+| --- | --- | --- |
+| Family string | `spectranv6` | `spectranv6eco` |
+| `device/receiverchannel` | Set explicitly | Never set: one receiver |
+| `device/receiverclock` | Set, `"92MHz"` or `"245MHz"` | Never set: fixed |
+| Spectrum packets | Stream index 2 | Stream index 0 |
+| Raw-mode open string | `spectranv6/raw` | `spectranv6eco/rtsa` |
+
+The clock matters beyond configuration: with `span * 1.5 <=
+receiverclock`, a V6 on the fast clock reaches roughly 163 MHz of span
+where the ECO's fixed clock allows 61.44 MHz.
+
+### Sample rates
+
+`main/decimation` accepts either the label (`"1 / 64"`) or the index
+(`6`). Combined with the clock, that gives the rate ladder: the top rate
+is `receiverclock / 1.5` and each step halves it.
+
+### Transmitting
+
+The samples flag the first packet `SEGMENT_START | STREAM_START`, the
+last `SEGMENT_END | STREAM_END`, and everything between `0`. The
+transceiver samples additionally send a zero-length packet carrying only
+`STREAM_START`, timestamped at the master stream clock, before real
+data, to improve startup synchronisation.
+
+### Keys this crate does not use
+
+`device/outputformat` (`"iq"` or `"spectra"`), `main/demodcenterfreq`
+and `main/demodspanfreq`, `main/centerfreqtx` and `main/centerfreqrx`
+for independent transceiver tuning, `calibration/preamp`, and the
+read-only `boostusbbytessecond` throughput reading.
