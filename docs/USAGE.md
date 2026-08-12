@@ -303,6 +303,13 @@ async fn main() -> Result<()> {
 }
 ```
 
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `AARONIA_SDK_PATH` | Overrides the RTSA-Suite installation directory used for SDK / `RTSAFileTool` detection. Works on every platform. On macOS — which has no default install path and no native SDK build — it only affects `RTSAFileTool` and XML-config detection. |
+| `AARONIA_USER_AGENT` | Overrides the HTTP `User-Agent` string sent by every outbound request (default: `sdr-aaronia-rs/<version>`). |
+
 ## Related
 
 - [QUICKSTART.md](QUICKSTART.md) — RTSA-Suite mission setup and troubleshooting.

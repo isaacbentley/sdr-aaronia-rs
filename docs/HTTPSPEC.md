@@ -564,7 +564,7 @@ Data captured using antennas with location or directional information.
 The client therefore exposes two methods:
 
 - `detect_remote_config_license()` — **read-only**. Never touches device state. Classifies 401/403 responses; on read success it returns `Unknown` (write capability unproven).
-- `probe_remote_config_write_license()` — **active probe**. Performs a read-modify-restore cycle on `reflevel` (+1 dB, restored best-effort) to positively verify write capability. Use only when you genuinely need proof of `/remoteconfig` write access. Frequency hopping does **not** need it — retuning goes through the license-free `/control` endpoint (see the capture-control note above; the silent-ignore behavior once attributed to licensing was traced to partial capture payloads).
+- `probe_remote_config_write_license()` — **active probe**. Performs a read-modify-restore cycle on `reflevel` (+1 dB, restored best-effort) to positively verify write capability. Use only when you genuinely need proof of `/remoteconfig` write access. `AaroniaSource::probe_remote_config_license()` delegates to it for HTTP sources, and reports `Active` for the file and native-SDK backends, which do not need the licence. Frequency hopping does **not** need it — retuning goes through the license-free `/control` endpoint (see the capture-control note above; the silent-ignore behavior once attributed to licensing was traced to partial capture payloads).
 
 **Practical Detection (Active Probe)**:
 ```rust

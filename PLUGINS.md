@@ -122,7 +122,15 @@ Two different knobs, easy to confuse:
 sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
 ```
 
-## 3. Metrics and Error Handling
+## 3. Transmit
+
+TX is available through the SoapySDR plugin only when it is built
+against the native SDK on Windows or Linux. Elsewhere `setupStream` for
+TX fails with a descriptive error. Bursts are sent for immediate
+transmission; timed TX is not supported. The whole TX path is
+hardware-unverified. See [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
+## 4. Metrics and Error Handling
 
 Both the native Rust API and the Python/C++ bindings expose critical metrics to monitor the health of your RTSA stream:
 

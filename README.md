@@ -106,112 +106,65 @@ cargo run --example http_iq_quickstart --features http -- 2440e6 12.288e6 http:/
 [docs/QUICKSTART.md](docs/QUICKSTART.md) covers configuring the
 RTSA-Suite HTTP Server block, which all of the above depends on.
 
-## Python Bindings (NumPy & Apache Arrow)
+## Using it from other tools
 
-The `python-aaronia` package provides Python bindings to the Rust engine
-using PyO3. Reads land in NumPy or PyArrow with exactly one copy out of
-the Rust receive buffer; blocking calls release the GIL. Wheels are
-abi3 (CPython ≥ 3.9); the PyPI distribution is `python-aaronia`, and
-the importable module is `aaronia`.
+The Rust crate is the engine. The same code drives three other
+surfaces, so an Aaronia device works in the tools people already use.
 
-### Installation
-From a published release:
+### Python
+
 ```bash
 pip install python-aaronia
 ```
-Or build locally with `maturin`:
-```bash
-cd python-aaronia
-maturin develop --release
-```
 
-### Python Streaming Example
 ```python
-from aaronia import AaroniaConfig, AaroniaSource
+import aaronia
 
-config = AaroniaConfig()
-config.http_base_url = "http://localhost:54664"  # RTSA-Suite HTTP server
-config.format = "F32"
-config.center_freq = 2400e6
-config.sample_rate = 20e6
+cfg = aaronia.AaroniaConfig()
+cfg.http_base_url = "http://localhost:54664"
+cfg.center_freq = 2.44e9
+cfg.sample_rate = 12.288e6
 
-# Connect to the stream
-source = AaroniaSource()
-source.start_streaming(config)
-
-# 1. NumPy read (1D complex64; blocks with the GIL released)
-np_samples = source.read_samples_numpy(1024)
-print(f"NumPy shape: {np_samples.shape}")
-
-# 2. Apache Arrow Dataframe Integration
-arrow_samples = source.read_samples_arrow(1024)
-print(f"Arrow records: {len(arrow_samples)}")
-
-# Health Metrics
-drops = source.cumulative_drops()
-overrun = source.take_overrun()
-print(f"Stream Drops: {drops}, Buffer Overrun: {overrun}")
-
-source.stop_streaming()
+src = aaronia.AaroniaSource()
+src.start_streaming(cfg)
+samples = src.read_samples_numpy(65536)   # numpy complex64
+src.stop_streaming()
 ```
 
-## C++ SDR Plugins (SoapySDR & Seify)
+Reads land in NumPy or PyArrow with one copy out of the receive buffer.
+Blocking calls release the GIL, errors arrive as typed exceptions, and
+the package ships type stubs. Wheels are abi3 for CPython 3.9 and
+later. Full reference: [python-aaronia/README.md](python-aaronia/README.md).
 
-The `sdr-aaronia-rs` workspace also acts as the source of truth for standard SDR ecosystem drivers:
-
-- **SoapySDR Plugin** (`soapy-aaronia/`, C++): CF32 and CS16 stream
-  formats (CS16 is a client-side conversion; for genuine low-bandwidth
-  *network* streaming pass the `format=I16` device arg, which switches
-  the HTTP wire format), retune-safe streaming, honoured timeouts,
-  timestamps and dropped-block telemetry. TX exists behind the
-  native SDK on Windows/Linux and is hardware-unverified.
-- **Seify backend** (Rust-native, `seify` feature): construct via
-  `AaroniaSeifyDevice::from_args`; not part of seify's built-in
-  enumeration registry.
-
-For deep-dive setup instructions and documentation on the C++ side and Bandwidth Optimization tricks, please see the dedicated [PLUGINS.md](PLUGINS.md) document.
-
-## Hardware verification status
-
-Not every code path has been exercised against hardware. The
-development device is a SPECTRAN V6 ECO with a single RX channel and no
-TX licence, driven through RTSA-Suite PRO over HTTP from macOS. Paths
-requiring a second RX input, a transmitter, or the Windows/Linux native
-SDK are marked unverified.
-
-| Capability | Backend | Status |
-| --- | --- | --- |
-| IQ streaming, all four wire formats (F32 / F16 / I16 / JSON) | HTTP | **Live-verified** |
-| Spectra streaming | HTTP | **Live-verified** |
-| Mid-stream retuning (centre, span) | HTTP | **Live-verified** |
-| Mid-stream reference-level change | HTTP | Confirmed manually against the device; no automated live assertion |
-| Auto-reconnect after a dropped stream | HTTP | Streaming live-verified; the drop-and-recover path is mock-tested |
-| Drop/overrun detection, rate reduction, `scale=N` | HTTP | **Live-verified** |
-| Long-run stability (>120 s continuous) | HTTP | **Live-verified** |
-| Connect retry | HTTP | Mock-tested; the mDNS race it addresses did not reproduce on demand |
-| `.rtsa` playback and metadata | File | **Verified against real captures**, byte-compared with the official format specification |
-| seify backend | HTTP | **Live-verified** |
-| SoapySDR plugin RX | HTTP | Verified manually (~9.7 Msps via `SoapySDRUtil`); no automated live test, as a `soapysdr` dev-dependency would make `cargo test` unbuildable without system SoapySDR |
-| Python bindings RX | HTTP | Verified manually (NumPy and Arrow); no automated live test |
-| TX (`UnifiedSink`, `aaronia_sink_*`, SoapySDR TX) | Native SDK | **Hardware-unverified**. No TX-licensed device available |
-| Dual-channel RX (`Rx1And2`, `read_samples_dual`) | Native SDK | **Hardware-unverified**. Requires a full V6 |
-| GPS hardware time | Native SDK | **Hardware-unverified** |
-| Native SDK capture generally | Native SDK | **Hardware-unverified**; compiled and unit-tested in a Linux VM each release |
-| HTTP TX push (`/sample`) | HTTP | Endpoint exercised live; RF output not measured |
-
-"Live-verified" means an `#[ignore]`d test in
-[`tests/live_smoke.rs`](tests/live_smoke.rs) asserts the behaviour
-against hardware, and is reproducible by anyone with a device. Entries
-marked "verified manually" were observed working but have no automated
-assertion and can regress without detection. Run the automated set
-with:
+### SoapySDR: GQRX, SDR++, GNU Radio and others
 
 ```bash
-cargo test --all-features --test live_smoke -- --ignored --nocapture
+SoapySDRUtil --probe="driver=aaronia,url=http://localhost:54664"
 ```
 
-Contributions that convert an unverified row, particularly from users
-with a full V6 or a TX licence, are welcome.
+Every release attaches a prebuilt plugin for Linux, macOS and Windows,
+so no toolchain is needed. The plugin streams CF32 and CS16, honours
+`timeoutUs` with partial reads, stays safe to retune while streaming,
+and reports timestamps and dropped-block counts.
+
+Per-application setup is in [docs/APPS.md](docs/APPS.md). Installation,
+building from source and the wire-format trade-offs are in
+[PLUGINS.md](PLUGINS.md); pass `format=I16` to halve network bandwidth,
+which is a real wire-format change rather than a client-side conversion.
+
+### seify (Rust-native)
+
+Enable the `seify` feature and construct the device with
+`AaroniaSeifyDevice::from_args`. It is not part of seify's built-in
+enumeration, so it will not appear in `seify::enumerate()`. See
+[PLUGINS.md](PLUGINS.md).
+
+### What has been tested
+
+Not every path has run against hardware. Transmit, dual-channel capture
+and the native-SDK backend have not.
+[docs/VERIFICATION.md](docs/VERIFICATION.md) gives the status of each
+feature and how it was checked.
 
 ## Connection Resilience
 
@@ -234,22 +187,6 @@ and flags the first packet after the gap as an overrun so callers know
 samples were missed. After 5 attempts, roughly 8 seconds of backoff, it
 stops and reads report a closed stream, matching the behaviour of
 `auto_reconnect(false)`.
-
-## Environment Variables
-
-| Variable | Effect |
-|---|---|
-| `AARONIA_SDK_PATH` | Overrides the RTSA-Suite installation directory used for SDK / `RTSAFileTool` detection. Works on every platform. On macOS — which has no default install path and no native SDK build — it only affects `RTSAFileTool` and XML-config detection. |
-| `AARONIA_USER_AGENT` | Overrides the HTTP `User-Agent` string sent by every outbound request (default: `sdr-aaronia-rs/<version>`). |
-
-## Remote Config License Detection
-
-Read access to `/remoteconfig` works without a license, so a read-only check cannot prove write capability. `HttpEndpointsClient` exposes both options:
-
-- `detect_remote_config_license()` — read-only, never touches device state; returns `Unknown` when reads succeed.
-- `probe_remote_config_write_license()` — **actively verifies** writes by temporarily adjusting `reflevel` by +1 dB (restored best-effort). `AaroniaSource::probe_remote_config_license()` delegates to it for HTTP sources.
-
-The hopping orchestrator itself retunes through the license-free `/control` endpoint and does not gate on this probe; the license only affects `/remoteconfig` writes.
 
 ## Feature Flags
 
@@ -275,14 +212,16 @@ Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on runni
 Start here:
 
 - [Quickstart](docs/QUICKSTART.md) — configuring an RTSA-Suite mission, first samples in Rust, Python and SoapySDR, and troubleshooting for common setup failures.
-- [Usage](docs/USAGE.md) — worked examples for each part of the API.
+- [Usage](docs/USAGE.md) — worked examples for each part of the API, plus the `AARONIA_SDK_PATH` and `AARONIA_USER_AGENT` environment variables.
 - [Using existing SDR apps](docs/APPS.md) — SDR++, GQRX, GNU Radio, SoapySDR from Python.
 
 Reference:
 
+- [Verification status](docs/VERIFICATION.md) — which features have been tested against real hardware.
+- [SDR plugins](PLUGINS.md) — SoapySDR and seify setup, wire-format trade-offs, metrics.
 - [Architecture & Design](DESIGN.md) — Internal architecture and execution flow.
 - [RTSA File Format Specification](docs/FILESPEC.md) — On-disk `.rtsa` capture-file format and how this crate parses it.
-- [HTTP API Specification](docs/HTTPSPEC.md) — The RTSA HTTP streaming and control API.
+- [HTTP API Specification](docs/HTTPSPEC.md) — The RTSA HTTP streaming and control API, including Remote Config licence detection.
 - [Native SDK Specification](docs/SDKSPEC.md) — The Aaronia RTSA-Suite PRO SDK surface and the Rust binding notes.
 - [Changelog](CHANGELOG.md) — Release history.
 
