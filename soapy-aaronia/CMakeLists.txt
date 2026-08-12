@@ -15,6 +15,28 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(SoapySDR "0.7" REQUIRED)
 
+# CMake links MODULE targets on macOS with `-undefined dynamic_lookup`,
+# which tells the linker to leave unresolved symbols for load time. The
+# Apple linker then emitted a flat-namespace bind for a Rust vtable
+# entry it had already localised into the same image, and dyld could
+# not find it — so every published macOS module failed to load with
+# "symbol not found in flat namespace", while the same source built
+# with a newer Xcode was fine. Resolving at link time makes that a
+# build failure instead of something a user discovers.
+#
+# SoapySDR's own module macro does the same for GNU toolchains
+# (`-Wl,--no-undefined`) and for the stated reason; it just never
+# covered Apple.
+# CMake has spelled this flag both ways across versions
+# (`-undefined dynamic_lookup` and `-Wl,-undefined,dynamic_lookup`), and
+# recent versions omit it entirely, so match both and tolerate neither
+# being present.
+if (APPLE)
+    string(REGEX REPLACE "(-Wl,)?-undefined[ ,]dynamic_lookup" ""
+        CMAKE_SHARED_MODULE_CREATE_CXX_FLAGS
+        "${CMAKE_SHARED_MODULE_CREATE_CXX_FLAGS}")
+endif()
+
 # Include path to aaronia.h
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
@@ -57,6 +79,12 @@ SOAPY_SDR_MODULE_UTIL(
     LIBRARIES ${RUST_STATIC_LIB}
 )
 add_dependencies(aaroniaSupport sdr_aaronia_rs_static)
+
+if (APPLE)
+    # Belt and braces with the flag removal above: whichever `-undefined`
+    # the generator emits, this one comes last and wins.
+    target_link_options(aaroniaSupport PRIVATE "LINKER:-undefined,error")
+endif()
 
 # System libraries required by the statically-linked Rust runtime
 # (std, tokio, reqwest/rustls/aws-lc). Missing entries here surface as

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/ibentley/src/sdr-aaronia-rs/soapy-aaronia/build-test/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

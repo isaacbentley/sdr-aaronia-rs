@@ -234,10 +234,33 @@ jobs:
             strip --strip-debug "soapy-aaronia/dist/$stage/libaaroniaSupport.so"
             after=$(stat -c%s "soapy-aaronia/dist/$stage/libaaroniaSupport.so")
             echo "stripped debug symbols: $before -> $after bytes"
-            # A module that no longer loads is worse than a large one.
-            SOAPY_SDR_PLUGIN_PATH="$PWD/soapy-aaronia/dist/$stage" \
-              SoapySDRUtil --check=aaronia
           fi
+
+          # Prove the packaged module actually loads, on every platform.
+          # This ran on Linux only, and macOS shipped a module that no
+          # Mac could dlopen for several releases as a result: the
+          # linker left a flat-namespace bind to a symbol it had
+          # localised into the same image. The check is worth nothing on
+          # the platforms it skips.
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            util=$(find "$VCPKG_INSTALLATION_ROOT/installed/x64-windows" \
+                     -name SoapySDRUtil.exe -print -quit 2>/dev/null || true)
+            if [ -z "$util" ]; then
+              echo "SoapySDRUtil.exe not found under vcpkg; cannot verify the module loads" >&2
+              exit 1
+            fi
+            # The tool needs the vcpkg DLLs beside it on PATH.
+            PATH="$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin:$PATH" \
+              SOAPY_SDR_PLUGIN_PATH="$PWD/soapy-aaronia/dist/$stage" \
+              "$util" --check=aaronia | tee check.log
+          else
+            SOAPY_SDR_PLUGIN_PATH="$PWD/soapy-aaronia/dist/$stage" \
+              SoapySDRUtil --check=aaronia | tee check.log
+          fi
+          # --check reports a missing driver on stdout and still exits 0,
+          # so the exit status alone would pass on a module that failed
+          # to load.
+          grep -q "PRESENT" check.log
 
           cp LICENSE "soapy-aaronia/dist/$stage/" 2>/dev/null || true
           cp soapy-aaronia/README.md "soapy-aaronia/dist/$stage/INSTALL.md"

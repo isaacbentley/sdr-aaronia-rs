@@ -228,8 +228,16 @@ jobs:
         run: python -m pytest python-aaronia/test_basic.py -q
 
   soapy:
+    # macOS as well as Linux: the two toolchains link a dlopen'd module
+    # differently, and a macOS-only link defect shipped through several
+    # releases because nothing built the plugin on a Mac before the
+    # release job did.
     name: SoapySDR plugin (cmake build + load check)
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -237,10 +245,16 @@ jobs:
           lfs: false
 
       - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
         uses: ./.github/actions/linux-build-deps
 
-      - name: Install SoapySDR
+      - name: Install SoapySDR (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get install -y libsoapysdr-dev soapysdr-tools
+
+      - name: Install SoapySDR (macOS)
+        if: runner.os == 'macOS'
+        run: brew install soapysdr
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -253,6 +267,10 @@ jobs:
           cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release
           cmake --build soapy-aaronia/build
 
+      # --check reports a missing driver on stdout; check the text, not
+      # just the exit status.
       - name: Module load check
         run: |
-          SOAPY_SDR_PLUGIN_PATH=$PWD/soapy-aaronia/build SoapySDRUtil --check=aaronia
+          SOAPY_SDR_PLUGIN_PATH=$PWD/soapy-aaronia/build \
+            SoapySDRUtil --check=aaronia | tee check.log
+          grep -q "PRESENT" check.log

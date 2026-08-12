@@ -23,6 +23,10 @@ it:
 | macOS (Apple silicon) | `SoapyAaronia-<version>-macos-arm64.tar.gz` |
 | Windows x86-64 | `SoapyAaronia-<version>-windows-x86_64.zip` |
 
+The Linux module is built on Ubuntu 24.04 and needs glibc 2.38 or
+later, so it does not load on Ubuntu 22.04 or Debian 12. Build from
+source on those.
+
 Each archive contains the module, an installer, these instructions as
 `INSTALL.md`, and the licence. Run the installer from the unpacked
 directory:
