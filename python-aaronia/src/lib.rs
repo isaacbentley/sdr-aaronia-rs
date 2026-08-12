@@ -261,6 +261,19 @@ impl PyAaroniaConfig {
     fn get_read_timeout(&self) -> f64 {
         self.inner.read_timeout.as_secs_f64()
     }
+
+    /// Reconnect the HTTP stream automatically when the server closes it
+    /// or the transport fails (default `True`). The first read after a
+    /// gap reports an overrun.
+    #[setter]
+    fn set_auto_reconnect(&mut self, enabled: bool) {
+        self.inner.auto_reconnect = enabled;
+    }
+
+    #[getter]
+    fn get_auto_reconnect(&self) -> bool {
+        self.inner.auto_reconnect
+    }
 }
 
 /// The `(rx1, rx2)` pair returned by `read_samples_dual_numpy`.

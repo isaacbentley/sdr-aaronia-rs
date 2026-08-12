@@ -91,6 +91,9 @@ void aaronia_source_builder_stream_scale(AaroniaSourceBuilder* builder, double s
 // aaronia_source_read_samples; aaronia_source_read_samples_timeout uses
 // its own per-call deadline. 0 is ignored.
 void aaronia_source_builder_read_timeout_us(AaroniaSourceBuilder* builder, uint64_t timeout_us);
+// Automatic reconnection of the HTTP sample stream (default true). When
+// false, a dropped stream ends the session and later reads error out.
+void aaronia_source_builder_auto_reconnect(AaroniaSourceBuilder* builder, bool enabled);
 AaroniaSource* aaronia_source_build(AaroniaSourceBuilder* builder);
 
 // --- AaroniaSource FFI --- //

@@ -45,6 +45,7 @@ sudo cmake --install soapy-aaronia/build
 | `format` | HTTP **wire** format; `format=I16` (optionally `scale=N`) is the genuine low-bandwidth network mode |
 | `rx_channel` | `Rx1` (default), `Rx2`, or `Rx1And2` (native SDK, full V6 only) |
 | `read_timeout` | Seconds the crate's own blocking reads wait (default 30). `readStream` always uses SoapySDR's per-call `timeoutUs`, so this rarely matters here |
+| `reconnect` | `1` (default) reconnects the stream automatically after a drop; `0` restores fail-fast behaviour |
 
 ```python
 import SoapySDR

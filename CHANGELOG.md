@@ -21,6 +21,35 @@ All notable changes to this project will be documented in this file.
   SoapySDR and seify paths) continues to use its caller's per-call
   deadline.
 
+- **Automatic HTTP stream reconnection, enabled by default**
+  (`AaroniaConfig::auto_reconnect`). An RTSA-Suite restart or a brief
+  network drop used to end a session permanently — the reader task
+  exited and every later read returned `Error::Protocol`. The reader now
+  reopens the stream up to 5 times with exponential backoff (~8 s total),
+  re-applies the current tuning (a restarted server comes back on its
+  mission's frequency, which would otherwise stream the wrong band
+  unnoticed), resyncs the drop detector, and flags the first packet after
+  the gap as an overrun. The attempt budget resets only after a
+  connection has stayed up for 30 s, so a server that accepts and
+  immediately hangs up can't reconnect forever. Exhausting the attempts,
+  or setting `auto_reconnect(false)`, reproduces the old fail-fast
+  behaviour exactly. Exposed as a Python `auto_reconnect` property, the
+  C API `aaronia_source_builder_auto_reconnect`, and a `reconnect=0|1`
+  SoapySDR device arg.
+- `DropDetector::resync()` — forgets the last packet's timestamp while
+  keeping the cumulative counters, for use across a deliberate
+  discontinuity. `reset()` zeroes the counters too, which would make the
+  monotonic total consumers read jump backwards after a reconnect.
+
+### Fixed
+- **Channel hopping could stall for up to the read timeout.** `hop_pump`
+  read with `read_samples`, which waits for a full block or 30 s — vastly
+  longer than a 20-40 ms dwell — so a stalled server (or, once
+  auto-reconnect landed, a stream working through its backoff) held the
+  pump and starved every remaining hop. It now reads with
+  `read_samples_deadline` bounded by the dwell deadline it already
+  computes.
+
 ### CI
 - GitHub releases now lead with this file's entry for the tag being
   released, instead of only an auto-generated commit list (which is

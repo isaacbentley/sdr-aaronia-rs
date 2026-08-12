@@ -471,6 +471,19 @@ impl DropDetector {
         self.drops = 0;
         self.cumulative_gap = 0.0;
     }
+
+    /// Forget the last observed packet while **keeping** the accumulated
+    /// drop statistics.
+    ///
+    /// For use across a deliberate discontinuity — a stream reconnect,
+    /// say — where the next packet's timestamp bears no relation to the
+    /// previous one and would otherwise be reported as one enormous
+    /// drop. [`Self::reset`] would zero the counters instead, making the
+    /// cumulative total that consumers read as monotonic jump backwards
+    /// and corrupting anything computing deltas from it.
+    pub fn resync(&mut self) {
+        self.last_end_time = None;
+    }
 }
 
 /// Simple HTTP stream parser for Aaronia RTSA format

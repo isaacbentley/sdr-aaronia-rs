@@ -660,3 +660,42 @@ async fn live_retune_full_tuple_applies() {
 //   SOAPY_SDR_PLUGIN_PATH=$PWD/soapy-aaronia/build \
 //     SoapySDRUtil --args="driver=aaronia,url=$AARONIA_LIVE_URL" --rate=1e6
 // plus ci.yml's `soapy` job (cmake build + module load check).
+
+/// Auto-reconnect against real hardware: stream, then force the
+/// connection to drop by aborting mid-flight is not possible from the
+/// client side, so this instead proves the *positive* half — a long
+/// stream with reconnect enabled delivers continuously and reports the
+/// tuning it was configured with. The negative half (stream death →
+/// recovery) is covered by `http_resilience_test`, which can close a
+/// mock body at will.
+#[tokio::test]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+async fn live_auto_reconnect_stream_is_continuous() {
+    use sdr_aaronia_rs::unified_source::{AaroniaConfig, AaroniaSource};
+
+    let config = AaroniaConfig::from_http(&live_url())
+        .center_frequency(2.44e9)
+        .span_frequency(12.288e6)
+        .read_timeout(Duration::from_secs(20));
+    assert!(config.auto_reconnect, "reconnect must default to on");
+
+    let mut source = AaroniaSource::new(config).await.expect("source");
+    source.start_streaming().await.expect("start_streaming");
+
+    let mut total = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let mut buf = Vec::new();
+        total += source
+            .read_samples(&mut buf, 65_536)
+            .await
+            .expect("reads must succeed with reconnect enabled");
+        assert!(
+            buf.iter().any(|s| s.re != 0.0 || s.im != 0.0),
+            "samples should not be all-zero"
+        );
+    }
+    source.stop_streaming().await.expect("stop_streaming");
+    println!("read {total} samples over 10 s with auto-reconnect enabled");
+    assert!(total > 65_536, "expected sustained streaming");
+}

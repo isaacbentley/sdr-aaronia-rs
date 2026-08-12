@@ -16,6 +16,7 @@ use futures::stream::StreamExt;
 use num_complex::Complex32;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -63,6 +64,58 @@ const CONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 
 /// Ceiling for the connect backoff.
 const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
+/// Reconnect attempts after a stream dies, before the reader task gives
+/// up and the source reports a closed stream.
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
+/// First delay before a reconnect attempt; doubles up to
+/// [`RECONNECT_BACKOFF_MAX`] (≈8 s across all attempts).
+const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
+
+/// Ceiling for the reconnect backoff. Kept well inside the default
+/// [`DEFAULT_READ_TIMEOUT`] so a successful reconnect stays invisible
+/// to a caller blocked in `read_samples`.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(4);
+
+/// How long a connection must survive before it counts as healthy and
+/// earns back the full reconnect budget. Without this, a server that
+/// accepts a connection and immediately closes it would reset the
+/// attempt counter on every round and reconnect indefinitely.
+const RECONNECT_HEALTHY_AFTER: Duration = Duration::from_secs(30);
+
+/// Whether the reader task should attempt another reconnect, counting
+/// the attempt when it should. Split out so the "stream failed to
+/// start" and "stream died mid-flight" paths can't drift apart.
+fn should_reconnect(auto_reconnect: bool, attempts: &mut u32) -> bool {
+    if !auto_reconnect {
+        return false;
+    }
+    if *attempts >= MAX_RECONNECT_ATTEMPTS {
+        error!(
+            "HTTP stream did not recover after {MAX_RECONNECT_ATTEMPTS} reconnect attempts; \
+             giving up (reads will report a closed stream)"
+        );
+        return false;
+    }
+    *attempts += 1;
+    true
+}
+
+/// The capture tuning the reader task must restore after reconnecting.
+///
+/// Tuning lives on the device, not the stream, so a plain reconnect
+/// usually keeps it — but if the RTSA-Suite itself restarted, it comes
+/// back on the mission's configured frequency and the stream would
+/// silently deliver the wrong band. Shared with the retune setters so a
+/// reconnect re-applies the *current* tuning rather than whatever was
+/// configured at startup.
+#[derive(Debug, Clone, Copy)]
+struct CaptureTuning {
+    center: f64,
+    span: f64,
+    reference_level: f64,
+}
 
 /// Hard ceiling on the total time spent retrying, measured from the
 /// first attempt.
@@ -183,6 +236,20 @@ pub struct AaroniaConfig {
     /// Default: 30 s. Lower it for dashboards that would rather show a
     /// gap than stall; raise it for slow sweeps.
     pub read_timeout: Duration,
+    /// Reconnect the HTTP sample stream automatically when the server
+    /// closes it or the transport fails (default: `true`).
+    ///
+    /// An RTSA-Suite restart or a brief network drop otherwise ends the
+    /// session permanently: the reader task exits and every subsequent
+    /// read returns [`Error::Protocol`]. With this enabled the reader
+    /// retries a bounded number of times, re-applies the current tuning
+    /// (the server may have come back on its mission's frequency), and
+    /// flags the first packet after the gap as an overrun so callers can
+    /// tell that samples were missed. Once the attempts are exhausted
+    /// the stream ends exactly as it does with this disabled.
+    ///
+    /// Ignored by the file and native-SDK backends.
+    pub auto_reconnect: bool,
 }
 
 impl Default for AaroniaConfig {
@@ -200,6 +267,7 @@ impl Default for AaroniaConfig {
             stream_scale: None,
             receiver_channel: None,
             read_timeout: DEFAULT_READ_TIMEOUT,
+            auto_reconnect: true,
         }
     }
 }
@@ -316,6 +384,14 @@ impl AaroniaConfig {
         self.read_timeout = timeout;
         self
     }
+
+    /// Enable or disable automatic stream reconnection (default: on) —
+    /// see [`AaroniaConfig::auto_reconnect`].
+    #[must_use]
+    pub fn auto_reconnect(mut self, enabled: bool) -> Self {
+        self.auto_reconnect = enabled;
+        self
+    }
 }
 
 /// Unified Aaronia source that automatically selects the best available connection method
@@ -332,6 +408,11 @@ pub struct AaroniaSource {
     native_source: Option<NativeSdkSource>,
 
     http_client: Option<HttpEndpointsClient>,
+    /// Tuning the HTTP reader task re-applies after a reconnect. Shared
+    /// with the retune setters, which write their *intent* here before
+    /// issuing the PUT — so a reconnect racing a user retune re-applies
+    /// the value the user asked for, not the one it replaced.
+    http_tuning: Option<Arc<Mutex<CaptureTuning>>>,
     file_source: Option<RtsaSource>,
     /// Each item pairs a chunk of samples with whether the HTTP reader
     /// task's `DropDetector` observed a timestamp gap ending at (or
@@ -395,6 +476,7 @@ impl AaroniaSource {
             native_source: None,
 
             http_client: None,
+            http_tuning: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -651,72 +733,165 @@ impl AaroniaSource {
         // pool instead of standing up a duplicate.
         let client_for_task = client.clone();
 
+        // Tuning shared with the retune setters so a reconnect restores
+        // what the caller most recently asked for.
+        let tuning = Arc::new(Mutex::new(CaptureTuning {
+            center: self.config.center_frequency,
+            span: self.config.span_frequency,
+            reference_level: self.config.reference_level,
+        }));
+        let tuning_for_task = tuning.clone();
+        let auto_reconnect = self.config.auto_reconnect;
+
         // Spawn a task to continuously read from the HTTP stream and send samples
         let reader_task = tokio::spawn(async move {
-            let mut http_stream = match client_for_task.start_stream(stream_params).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    error!("Failed to start HTTP stream: {:?}", e);
-                    return;
-                }
-            };
-
             // Parse errors are recoverable (the parser resyncs at the next
             // packet header), so don't kill the stream on the first one —
             // only bail after a run of consecutive failures, which
             // indicates the transport itself is broken.
             const MAX_CONSECUTIVE_STREAM_ERRORS: u32 = 5;
-            let mut consecutive_errors = 0u32;
-            let mut drop_detector = crate::http_streaming::DropDetector::default();
 
-            loop {
-                match http_stream.next().await {
-                    Some(Ok(packet)) => {
-                        consecutive_errors = 0;
-                        // The HTTP stream already returns parsed StreamPacket objects
-                        if packet.metadata.payload == crate::http_streaming::PayloadType::Iq {
-                            let dropped = matches!(
-                                drop_detector.observe(&packet),
-                                crate::http_streaming::DropResult::Drop { .. }
-                            );
-                            let timestamp_ns = (packet.metadata.start_time * 1e9) as i64;
-                            let cumulative_drops = drop_detector.drops();
-                            if sender
-                                .send((packet.samples, dropped, cumulative_drops, timestamp_ns))
-                                .await
-                                .is_err()
-                            {
-                                // Receiver dropped, task can exit
-                                info!("Receiver dropped, HTTP streaming task exiting.");
+            let mut drop_detector = crate::http_streaming::DropDetector::default();
+            let mut reconnects = 0u32;
+            let mut backoff = RECONNECT_BACKOFF_INITIAL;
+            // Set after a reconnect so the first packet across the gap
+            // is reported as an overrun: samples *were* missed, and the
+            // DropDetector can't see it (its timestamp history is reset
+            // to avoid attributing the whole outage to one packet).
+            let mut flag_overrun_after_gap = false;
+
+            // Outer loop: one iteration per stream connection.
+            'reconnect: loop {
+                let mut http_stream =
+                    match client_for_task.start_stream(stream_params.clone()).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            error!("Failed to start HTTP stream: {:?}", e);
+                            // Fall through to the reconnect decision below
+                            // rather than returning: a server that is still
+                            // coming back up refuses this exactly as it
+                            // refuses a mid-stream reconnect.
+                            if !should_reconnect(auto_reconnect, &mut reconnects) {
                                 return;
                             }
-                        } else {
-                            warn!(
-                                "HTTP streaming task received non-IQ payload type: {:?}",
-                                packet.metadata.payload
-                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                            flag_overrun_after_gap = true;
+                            continue 'reconnect;
                         }
-                    }
-                    Some(Err(e)) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors >= MAX_CONSECUTIVE_STREAM_ERRORS {
-                            error!(
-                                "HTTP stream failed {} times in a row, giving up: {:?}",
-                                consecutive_errors, e
-                            );
-                            break;
+                    };
+
+                let mut consecutive_errors = 0u32;
+                let connected_at = std::time::Instant::now();
+
+                // Inner loop: packets on the current connection.
+                loop {
+                    match http_stream.next().await {
+                        Some(Ok(packet)) => {
+                            consecutive_errors = 0;
+                            // The HTTP stream already returns parsed StreamPacket objects
+                            if packet.metadata.payload == crate::http_streaming::PayloadType::Iq {
+                                let dropped = matches!(
+                                    drop_detector.observe(&packet),
+                                    crate::http_streaming::DropResult::Drop { .. }
+                                ) || std::mem::take(&mut flag_overrun_after_gap);
+                                let timestamp_ns = (packet.metadata.start_time * 1e9) as i64;
+                                let cumulative_drops = drop_detector.drops();
+                                if sender
+                                    .send((packet.samples, dropped, cumulative_drops, timestamp_ns))
+                                    .await
+                                    .is_err()
+                                {
+                                    // Receiver dropped, task can exit
+                                    info!("Receiver dropped, HTTP streaming task exiting.");
+                                    return;
+                                }
+                            } else {
+                                warn!(
+                                    "HTTP streaming task received non-IQ payload type: {:?}",
+                                    packet.metadata.payload
+                                );
+                            }
                         }
-                        warn!("Recoverable HTTP stream error: {:?}", e);
-                    }
-                    None => {
-                        info!("HTTP stream ended.");
-                        break; // Stream ended
+                        Some(Err(e)) => {
+                            consecutive_errors += 1;
+                            if consecutive_errors >= MAX_CONSECUTIVE_STREAM_ERRORS {
+                                error!(
+                                    "HTTP stream failed {} times in a row: {:?}",
+                                    consecutive_errors, e
+                                );
+                                break;
+                            }
+                            warn!("Recoverable HTTP stream error: {:?}", e);
+                        }
+                        None => {
+                            info!("HTTP stream ended.");
+                            break; // Stream ended
+                        }
                     }
                 }
+
+                // A connection that stayed up this long was genuinely
+                // healthy, so a later outage starts from a full budget.
+                // Gating this on uptime rather than on "a packet
+                // arrived" matters: a server that accepts, sends one
+                // packet and hangs up would otherwise reset the counter
+                // every round and reconnect forever.
+                if connected_at.elapsed() >= RECONNECT_HEALTHY_AFTER {
+                    reconnects = 0;
+                    backoff = RECONNECT_BACKOFF_INITIAL;
+                }
+
+                // The connection is gone. Reconnect, or let the task end
+                // (dropping `sender`), which surfaces to readers as a
+                // closed stream — the pre-reconnect behaviour.
+                if !should_reconnect(auto_reconnect, &mut reconnects) {
+                    return;
+                }
+                warn!(
+                    "HTTP stream lost; reconnecting in {backoff:?} \
+                     (attempt {reconnects}/{MAX_RECONNECT_ATTEMPTS})"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+
+                // Re-apply tuning: if the RTSA-Suite restarted, it came
+                // back on its mission's frequency and would otherwise
+                // stream the wrong band under the caller's nose. Best
+                // effort — a failure here is reported and the stream is
+                // attempted anyway, since a wrongly-tuned stream is
+                // still more useful than none and the next reconnect
+                // retries the tuning.
+                let desired = *tuning_for_task
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Err(e) = client_for_task
+                    .configure_capture(crate::http_endpoints::CaptureControl {
+                        frequency_center: Some(desired.center),
+                        frequency_span: Some(desired.span),
+                        reference_level: Some(desired.reference_level as f32),
+                        control_type: crate::http_endpoints::ControlType::Capture,
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    warn!("Re-applying tuning after reconnect failed: {e}");
+                }
+
+                // Timestamps restart across the gap; without this the
+                // detector would count the whole outage as one enormous
+                // drop. `flag_overrun_after_gap` carries the signal
+                // instead. `resync`, not `reset`: the latter also zeroes
+                // the cumulative counters, which consumers read as a
+                // monotonic total — rolling it back mid-session is worse
+                // than losing the gap.
+                drop_detector.resync();
+                flag_overrun_after_gap = true;
             }
         });
 
         self.http_client = Some(client);
+        self.http_tuning = Some(tuning);
         self.http_receiver = Some(receiver); // Store the receiver
         self.http_task = Some(reader_task); // Held so stop/drop can abort it
 
@@ -1116,6 +1291,10 @@ impl AaroniaSource {
                     task.abort();
                 }
                 self.http_receiver = None;
+                // The next `start_streaming` publishes fresh state; a
+                // stale handle here would let retunes made while stopped
+                // reach a task that no longer exists.
+                self.http_tuning = None;
                 info!("HTTP streaming stopped: reader task aborted, receiver dropped.");
             }
             SourceType::File => {
@@ -1125,6 +1304,24 @@ impl AaroniaSource {
         }
 
         Ok(())
+    }
+
+    /// Record a tuning change for the HTTP reader task to re-apply if it
+    /// has to reconnect. No-op for non-HTTP sources, which have no
+    /// reader task.
+    fn publish_tuning(
+        tuning: &Option<Arc<Mutex<CaptureTuning>>>,
+        edit: impl FnOnce(&mut CaptureTuning),
+    ) {
+        if let Some(tuning) = tuning {
+            // A panic in the reader task must not turn every later
+            // retune into a panic of its own; the data is a few plain
+            // floats, so recovering the poisoned value is safe.
+            let mut guard = tuning
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            edit(&mut guard);
+        }
     }
 
     /// Retune the source to a new centre frequency without rebuilding it.
@@ -1185,6 +1382,10 @@ impl AaroniaSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                // Publish the intent *before* the PUT so a reconnect
+                // racing this call restores the frequency the caller
+                // asked for rather than the one it is replacing.
+                Self::publish_tuning(&self.http_tuning, |t| t.center = freq);
                 // Full tuple, not just the changed field: the server
                 // ignores capture PUTs that lack frequencySpan (see the
                 // doc comment above).
@@ -1249,6 +1450,7 @@ impl AaroniaSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                Self::publish_tuning(&self.http_tuning, |t| t.span = span);
                 // Full tuple: partial capture PUTs are silently ignored
                 // by the server (see `set_center_frequency`).
                 client
@@ -1306,6 +1508,7 @@ impl AaroniaSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                Self::publish_tuning(&self.http_tuning, |t| t.reference_level = ref_level);
                 // Full tuple: partial capture PUTs are silently ignored
                 // by the server (see `set_center_frequency`).
                 client
@@ -1560,6 +1763,13 @@ impl AaroniaSourceBuilder {
         self
     }
 
+    /// Enable or disable automatic stream reconnection (default: on) —
+    /// see [`AaroniaConfig::auto_reconnect`].
+    pub fn auto_reconnect(&mut self, enabled: bool) -> &mut Self {
+        self.config.auto_reconnect = enabled;
+        self
+    }
+
     /// Build the AaroniaSource
     pub async fn build(&self) -> Result<AaroniaSource> {
         AaroniaSource::new(self.config.clone()).await
@@ -1771,6 +1981,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_tuning: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -1847,6 +2058,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_tuning: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -1875,6 +2087,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_tuning: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -1905,6 +2118,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_tuning: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -2080,6 +2294,7 @@ mod tests {
             ))]
             native_source: None,
             http_client: None,
+            http_tuning: None,
             file_source: None,
             http_receiver: Some(chunk_rx),
             http_task: None,

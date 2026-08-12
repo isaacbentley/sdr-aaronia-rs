@@ -463,6 +463,14 @@ a cold process while mDNS resolves.
 `read_samples_deadline` — and therefore the SoapySDR and seify paths — uses
 its caller's per-call deadline instead.
 
+A dropped HTTP stream (RTSA restart, network blip) reconnects automatically
+— `AaroniaConfig::auto_reconnect`, on by default. The reader reopens the
+stream, re-applies the current tuning (a restarted server comes back on its
+mission's frequency), and flags the first packet after the gap as an
+overrun so callers know samples were missed. After 5 attempts (~8 s of
+backoff) it gives up and reads report a closed stream, which is exactly the
+behaviour you get with `auto_reconnect(false)`.
+
 ## Environment Variables
 
 | Variable | Effect |

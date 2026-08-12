@@ -466,7 +466,20 @@ async fn hop_pump(
                 .unwrap_or_else(|_| Vec::with_capacity(block_size));
             raw_buffer.clear();
 
-            let n = match source.read_samples(&mut raw_buffer, block_size).await {
+            // Bound the read by the dwell deadline. `read_samples` waits
+            // until the block fills or `read_timeout` (30 s by default)
+            // expires — orders of magnitude longer than a dwell. A
+            // stalled server would hold the pump here and starve every
+            // remaining hop; with auto-reconnect enabled a stream
+            // reconnecting through its backoff does the same, since the
+            // channel stays open instead of closing. Returning whatever
+            // arrived by the deadline keeps the hop cadence intact, and
+            // the `n == 0` branch below already handles an empty read.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let n = match source
+                .read_samples_deadline(&mut raw_buffer, block_size, remaining)
+                .await
+            {
                 Ok(v) => {
                     read_errors = 0;
                     v
@@ -478,7 +491,7 @@ async fn hop_pump(
                             "{READ_ERROR_BAILOUT} consecutive read errors — source likely dead: {e}"
                         )));
                     }
-                    warn!("Aaronia read_samples error during hop: {e}");
+                    warn!("Aaronia read error during hop: {e}");
                     break;
                 }
             };

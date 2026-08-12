@@ -64,6 +64,7 @@ Every field is readable and writable.
 | `format` | HTTP wire format: `"F32"`, `"F16"`, or `"I16"` (true low-bandwidth mode) |
 | `receiver_channel` | `"Rx1"` (default), `"Rx2"`, or `"Rx1And2"` (native SDK, full V6) |
 | `read_timeout` | Seconds a blocking read waits before `AaroniaTimeoutError` (default `30.0`) |
+| `auto_reconnect` | Reconnect the HTTP stream after a drop (default `True`) |
 
 Unknown `format`/`receiver_channel` strings raise `ValueError` instead of
 silently defaulting.
@@ -80,6 +81,11 @@ silently defaulting.
 - **Connecting retries transient failures** (up to 4 attempts over ~4.5 s),
   so a cold `*.local` hostname or a server still starting up doesn't fail
   on the first try.
+- **Dropped streams reconnect automatically** (`auto_reconnect`, default
+  on): the reader reopens the stream, re-applies the current tuning, and
+  flags the first read after the gap via `take_overrun()`. After five
+  failed attempts the stream ends and reads raise
+  `AaroniaConnectionError`.
 - **Typed exceptions.** `AaroniaConnectionError` (unreachable endpoint),
   `AaroniaTimeoutError`, `AaroniaHardwareError` (device/SDK errors),
   `ValueError` (invalid configuration) — mapped from the Rust error

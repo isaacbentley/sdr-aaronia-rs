@@ -135,6 +135,14 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
                 builder, static_cast<uint64_t>(seconds * 1e6));
         }
     }
+    // reconnect=0 opts out of automatic stream reconnection (on by
+    // default): a dropped stream then ends the session instead of
+    // recovering, and readStream reports an error.
+    if (args.count("reconnect") != 0) {
+        const std::string &v = args.at("reconnect");
+        const bool enabled = !(v == "0" || v == "false" || v == "no");
+        aaronia_source_builder_auto_reconnect(builder, enabled);
+    }
 
     SourceGuard source(aaronia_source_build(builder));
     if (!source.p) {

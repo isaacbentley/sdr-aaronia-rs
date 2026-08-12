@@ -428,6 +428,25 @@ pub unsafe extern "C" fn aaronia_source_builder_read_timeout_us(
     }
 }
 
+/// Enable (`true`, the default) or disable automatic reconnection of the
+/// HTTP sample stream after the server closes it or the transport fails.
+/// When disabled, a dropped stream ends the session and later reads
+/// report an error.
+///
+/// # Safety
+/// `builder` must be a live pointer from [`aaronia_source_builder_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_builder_auto_reconnect(
+    builder: *mut AaroniaSourceBuilder,
+    enabled: bool,
+) {
+    unsafe {
+        if let Some(builder) = builder.as_mut() {
+            builder.auto_reconnect(enabled);
+        }
+    }
+}
+
 /// Consume the builder and asynchronously build an `AaroniaSource`. Returns
 /// an opaque pointer that must later be freed with
 /// [`aaronia_source_free`], or `NULL` on error.
