@@ -3357,6 +3357,7 @@ mod tests {
             sample_buffer: VecDeque::new(),
             dual_sample_buffer: VecDeque::new(),
             read_mode: None,
+            receiver_clock_hz: None,
         };
 
         assert!(!source.is_streaming());
