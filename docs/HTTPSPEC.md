@@ -161,6 +161,15 @@ http://localhost:54664/stream?format=int16&scale=1000000
 http://localhost:54664/stream?rate_reduction=10
 ```
 
+### Liveness
+
+There is no status endpoint. Aaronia's own remote control notes probe
+with `curl -v http://127.0.0.1:54664/api/status` and treat the `404 Not
+Found` as the answer: a reply of any kind proves the port is open, the
+mission is loaded and the HTTP Server block is running. A connection
+refused or a timeout means it is not. `/info` serves the same purpose
+and returns something useful, which is what this crate uses.
+
 ### Application Process Control
 **URL**: `/app/process`  
 **Method**: PUT  
@@ -320,13 +329,35 @@ packet-metadata object, so `payload`, `minPower`, `maxPower`, and
 }
 ```
 
-#### Save/Reload Mission
+#### Save/Reload/Load Mission
 ```json
 {
   "save": true,
   "type": "mission"
 }
 ```
+
+A mission can also be swapped outright, which is how a headless station
+changes what it is running. `load` takes an absolute path to an `.rmix`
+on the machine running RTSA-Suite, not on the client:
+```json
+{
+  "type": "mission",
+  "load": true,
+  "file": "C:/Aaronia/Recordings/HTTP streaming/http_test.rmix"
+}
+```
+A mission carrying an HTTP Server block must already be running, or
+there is nothing listening to accept the request. Aaronia's remote
+control notes (rev 4, May 2026) give this as a `curl` invocation from
+an elevated prompt. This crate does not expose it: swapping the mission
+out from under a running capture is the caller's decision to make
+deliberately, not a side effect of a library call.
+
+**Every `/control` payload needs its `type`.** A body without one is
+rejected with `400` and the text `Type argument missing`, so a
+hand-built payload that omits it fails loudly rather than silently —
+unlike a partial capture request, which is accepted and ignored.
 
 ### Configuration Endpoints
 
@@ -430,8 +461,18 @@ Notes verified against a live V6 ECO:
   and `frequencySpan` are both present.
 - **The `receiverName` key is case-tolerant.** `receivername` was accepted
   identically.
-- Enum-valued settings are written as their label string, for example
-  `decimation` as `"1 / 128"`, not as an index.
+- **Enum-valued settings take either the label string or the index.**
+  Aaronia's example writes `decimation` as `"1 / 128"`; writing
+  `decimation0` as the integer `3` was accepted and applied identically
+  (verified against `/sample`: index 3 gave 7.68 MHz, index 2 gave
+  15.36 MHz). Indices are positions in the `values` list that
+  `GET /remoteconfig` reports for that item.
+- **Groups other than `main` work**, and several can go in one PUT:
+  `{"main": {...}, "calibration": {"preamp": 1}}` applied both.
+- **An unknown block name is a silent no-op.** A `simpleconfig` PUT
+  naming a block that is not in the mission returns HTTP 200 and changes
+  nothing. There is no error to catch, so read the value back if it
+  matters.
 - Other keys the example writes: `run` (bool), `preamp` (`"Auto"`),
   `reflevel` (float), and `filerecord` (bool) plus a filename template on
   a FileWriter block, which is how it starts and stops recording.
@@ -445,7 +486,15 @@ Notes verified against a live V6 ECO:
   }
 }
 ```
-`receiverName` must match a block in the running mission; `HttpEndpointsClient::find_iq_demodulator_block_name` auto-discovers it.
+`receiverName` must match a block in the running mission;
+`HttpEndpointsClient::find_iq_demodulator_block_name` auto-discovers it.
+A name that matches nothing still returns 200 (see above).
+
+In the full `{request, config}` form the receiver name is ignored
+altogether: the write is routed by `config.name`. Sending
+`receivername`, `receiverName` or no name at all applied the same
+change. Nothing depends on getting that key right, and nothing warns
+when it is wrong.
 
 **Configuration Item Fields**:
 | Field | Description |
@@ -577,7 +626,38 @@ The samples in a category ordered packet have one measurement per category.
 }
 ```
 
-As with histograms, category samples are a flat number array (one value per category).
+As with histograms, category samples are a flat number array (one value
+per category) — that is what a live server produced.
+
+**Aaronia's own example is not flat.** Their remote control notes show
+the Spectrum block's `Marker` output wired to an HTTP Server, and the
+resulting `/sample` reads:
+
+```json
+{
+  "payload": "spectra",
+  "startFrequency": 0, "endFrequency": 0, "sampleFrequency": 0,
+  "sampleSize": 4, "sampleDepth": 1,
+  "categories": [
+    { "name": "Slow Sine(R)",      "startFrequency": 2403000000, "endFrequency": 2405000000 },
+    { "name": "Marker",            "startFrequency": 2412852325.3, "endFrequency": 2412852335.3 }
+  ],
+  "samples": [[-78.6, -57.26, -47.28, -114.25]]
+}
+```
+
+Three things differ from a spectra stream and are worth knowing before
+parsing one: `payload` reads `spectra` rather than `categories`; the
+three frequency fields are all `0`, so nothing can be derived from
+them; and `samples` is an array *of arrays*, one row of one value per
+category.
+
+The consequence for this crate: `PacketMetadata::samples` counts
+top-level array elements, so a single nested row counts as **1**, not
+as the number of categories. No marker source has been available to
+test against, so the counting is left as it is rather than changed on
+the strength of a screenshot. Read `categories.len()` when you need the
+number of values in such a packet.
 
 ### Antenna Data
 Data captured using antennas with location or directional information.
@@ -614,7 +694,29 @@ and `Location and Time`; `sclksource` offers `Consumer`, `Oscillator`,
 
 `decimation0` takes the same labels as the SDK's `main/decimation`,
 `"Full"` through `"1 / 512"`, verified by writing one over HTTP. Both
-transports drive the same divider.
+transports drive the same divider. Over HTTP the index works as well as
+the label: writing `3` and reading `/sample` back gave 7.68 MHz, and `2`
+gave 15.36 MHz, which is 61.44 MHz halved that many times on a V6 ECO.
+
+#### Unresolved: what "Full" means on a full V6
+
+The SDK constrains `spanfreq ≤ receiverclock / 1.5`, and a V6 ECO
+follows it exactly: a fixed 92.16 MHz clock, "Full" measured at
+61.44 MHz. `iq_sample_rates_for_clock` takes that ratio as the rule.
+
+Aaronia's Remote Config screenshots do not agree for the full V6. Both
+the 2021 and the 2022 one show a `Block_Spectran_V6B` with **Receiver
+Clock `92MHz`**, **Span `Full`** and **IQ Samples/s ≈ 92.16 MHz** — the
+clock itself, not two thirds of it. Either the ceiling is the clock on a
+full V6 and only the ECO pays the 1.5, or that counter reports something
+other than the delivered sample rate.
+
+Nothing here settles it, and no full V6 has been available to measure.
+Until one is, `iq_sample_rates_for_clock` may understate the top of the
+ladder by 1.5x for a full V6 at a non-default clock. Read the rate the
+device reports in stream metadata rather than trusting the computed
+ladder when it matters. The ECO path, which is what this crate has been
+measured on, is unaffected.
 
 ### Two things that do not carry over
 
@@ -655,10 +757,17 @@ transports drive the same divider.
   and may be what actually matters.
 - This crate does not depend on the answer: it tunes through `/control`,
   which needs no license.
+- Re-confirmed 2026-08-12 against RTSA-Suite PRO and a V6 ECO on the
+  same unlicensed system, in both payload forms, for `centerfreq0`,
+  `decimation0`, `reflevel0` and `calibration/preamp`.
 
 **License Detection Methods**:
 
-**Important**: Read access to `/remoteconfig` is available WITHOUT license, but write operations require the license. Because reads are license-free, a read-only check cannot distinguish "licensed" from "unlicensed" — only a write test can.
+**Important**: reads of `/remoteconfig` are license-free, so a read-only
+check cannot prove write capability either way — only a write test can.
+It cannot prove the *license* either: writes succeeded on an unlicensed
+system (see above), so a successful probe means "this server accepts
+writes", not "this server is licensed".
 
 The client therefore exposes two methods:
 
@@ -793,8 +902,8 @@ fn parse_iq_int16(data: &[u8], metadata_scale: f32) -> Vec<Complex32> {
 |---------|------|---------|
 | 1.0 | 2025-01-11 | Initial HTTP specification from original documentation |
 | 2.0 | 2025-01-11 | Enhanced with comprehensive streaming protocol specification and implementation guidelines |
+| 2.2 | 2026-08-12 | Verified Aaronia's V6 remote control notes (rev 4) against hardware: enum writes by index, multi-group and non-`main` `simpleconfig` PUTs, the silent no-op on an unknown block name, the ignored receiver name in the config-tree form; documented mission loading and the `type` requirement on `/control`, the absence of a status endpoint, and the unresolved conflict over what "Full" means on a full V6; resolved a contradiction over what the Remote Config licence gates |
 | 2.1 | 2026-08-06 | Live-hardware corrections folded in (two-byte separator, spectra frame counting, `scale` inversion); documented `/samples`, the `/sample` TX push, and the `simpleconfig` PUT form; corrected `limit` semantics, field types, and flat histogram/categories sample arrays; removed decorative icons |
-
 ---
 
 ## Sources and Attribution

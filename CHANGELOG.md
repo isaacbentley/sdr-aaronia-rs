@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+- Checked Aaronia's V6 remote control notes (rev 4, May 2026) against
+  the hardware. `/remoteconfig` enum fields take an index as well as a
+  label; one `simpleconfig` PUT can carry several groups, and groups
+  other than `main` work; and a PUT naming a block that is not in the
+  mission returns 200 and changes nothing, which
+  `simple_remote_config` now warns about since it reports `Ok(())` for
+  a write that did not happen. In the config-tree form the receiver
+  name is ignored altogether — the write is routed by `config.name`.
+- Documented loading a mission over `/control`, and that every
+  `/control` payload needs its `type` or the server answers `400`.
+  Loading a mission is deliberately not exposed by the crate: swapping
+  the mission under a running capture should be a caller's decision,
+  not a side effect.
+- Noted that RTSA-Suite has no status endpoint. Aaronia's own liveness
+  check reads the `404` from `/api/status` as proof the server is up.
+- **What "Full" means on a full V6 is unresolved.** A V6 ECO follows the
+  SDK's `spanfreq <= receiverclock / 1.5`, measured. Aaronia's Remote
+  Config screenshots show a full V6 at a 92 MHz clock delivering
+  92.16 MHz of IQ samples per second at span "Full" — the clock itself.
+  `iq_sample_rates_for_clock` may therefore understate the top of the
+  ladder by 1.5x for a full V6 at a non-default clock; it says so now.
+  Settling it needs a full V6.
+- HTTPSPEC contradicted itself on the Remote Config licence, asserting
+  in one section that writes need it and in another that a live
+  unlicensed system accepts them. The second is what the hardware does,
+  re-confirmed for centre frequency, decimation, reference level and
+  the preamplifier.
+- SDKSPEC still gave the V6 ECO's receiver clock as 61.44 MHz, which
+  0.6.2 corrected in code to 92.16 MHz. 61.44 MHz is the ECO's top IQ
+  rate, that clock over 1.5; the document had the two confused.
+- **A marker stream does not look like the categories payload this
+  document described.** Aaronia's example of the Spectrum block's
+  `Marker` output wired to an HTTP Server reports `payload: "spectra"`,
+  zero for all three frequency fields, and `samples` as an array of
+  arrays rather than the flat array a live server produced. Because
+  `PacketMetadata::samples` counts top-level elements, one nested row
+  counts as 1 rather than as the number of categories. No marker source
+  has been available to test, so the counting is documented rather than
+  changed.
+
 ## [v0.7.3] - 2026-08-12
 
 ### Fixed

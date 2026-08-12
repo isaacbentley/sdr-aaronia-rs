@@ -52,9 +52,9 @@ The Aaronia RTSA Vendor SDK provides low-level, high-performance access to Aaron
     *   **SpectranV6 ECO**: `spectranv6eco/raw`, `spectranv6eco/iqreceiver`, `spectranv6eco/iqtransceiver`, `spectranv6eco/iqtransmitter`, `spectranv6eco/sweepsa`
 *   **Configuration Tree**: Hierarchical configuration system with verified parameters:
     *   **Clock Rates** (V6): 46MHz (46.08), 61MHz (61.44), 76MHz (76.80), 92MHz (92.16), 122MHz (122.88), 184MHz (184.32), 245MHz (245.76), 492MHz (491.52) — see the full label table under [Rust Binding Notes](#rust-binding-notes)
-    *   **Clock Rates** (V6 ECO): Fixed at 61.44 MHz
+    *   **Clock Rates** (V6 ECO): fixed at 92.16 MHz. Its top IQ rate is 61.44 MHz, which is that clock over 1.5 — the two are easy to confuse and this document once recorded the rate as the clock
     *   **Decimation**: Full, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, 1/128, 1/256, 1/512
-    *   **IQ Mode Sample Rate**: equal to `spanfreq` (constraint: `spanfreq ≤ receiverclock / 1.5`)
+    *   **IQ Mode Sample Rate**: equal to `spanfreq` (constraint: `spanfreq ≤ receiverclock / 1.5`). Measured on a V6 ECO. Aaronia's Remote Config screenshots show a full V6 at a 92 MHz clock streaming ~92.16 MHz of IQ, which this constraint would forbid; see [HTTPSPEC](HTTPSPEC.md#unresolved-what-full-means-on-a-full-v6). Unresolved, and untested on a full V6
 *   **Health Monitoring**: Real-time device status including temperatures, sample rates, power levels, USB statistics, GPS data
 
 The SDK is designed for building custom spectrum analysis applications, SDR integration, and specialized RF measurement tools.
@@ -256,8 +256,8 @@ source.open_device("spectranv6/raw", &serial_wide)?;
 `NativeSdkSource::configure_iq_receiver` calls
 `utils::validate_iq_mode(span, clock)` after applying the config,
 where `clock` is read live from `device/receiverclock` via
-`AARTSAAPI_ConfigGetString` (or 61.44 MHz on eco devices, which expose no
-such key and run at a fixed clock). The check enforces
+`AARTSAAPI_ConfigGetString` (or `DEFAULT_RECEIVER_CLOCK_HZ`, 92.16 MHz,
+on eco devices, which expose no such key and run at a fixed clock). The check enforces
 `span * 1.5 <= clock` and returns a typed error before the device starts.
 
 The ConfigItem labels the SDK exposes are *rounded* — `"92MHz"` is

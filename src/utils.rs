@@ -333,8 +333,17 @@ pub fn iq_sample_rates() -> [f64; 10] {
 /// [`DEFAULT_RECEIVER_CLOCK_HZ`], verified rung by rung. A full V6 can
 /// select other clocks — Aaronia's own samples use `"92MHz"` and
 /// `"245MHz"` — and the rates there follow the same constraint but have
-/// not been confirmed against hardware. Read `device/receiverclock`
-/// from the device and pass it here rather than assuming.
+/// not been confirmed against hardware.
+///
+/// **The 1.5 may be wrong for a full V6.** Aaronia's own Remote Config
+/// screenshots show one at a `92MHz` clock with span "Full" and
+/// roughly 92.16 MHz of IQ samples per second — the clock itself, not
+/// two thirds of it. If that is what a full V6 does, every rung this
+/// returns for it is a factor of 1.5 too low, and passing the true
+/// clock does not help, because the ratio is what is in question.
+/// Until a full V6 can be measured, treat this as the ECO's ladder and
+/// take the rate a device reports in its stream metadata over the one
+/// computed here.
 pub fn iq_sample_rates_for_clock(receiver_clock_hz: f64) -> [f64; 10] {
     let top = receiver_clock_hz / 1.5;
     let mut rates = [0.0; 10];

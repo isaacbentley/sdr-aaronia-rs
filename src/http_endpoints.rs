@@ -838,7 +838,21 @@ impl HttpEndpointsClient {
     /// `main` is the typical group, but any subset of the block's
     /// configuration tree may be passed via `config_groups`. Keys are
     /// group names ("main", "device", "calibration"); values are field
-    /// → `serde_json::Value` maps.
+    /// → `serde_json::Value` maps. Several groups in one call are
+    /// applied together.
+    ///
+    /// Enum fields take either the label the device reports or its
+    /// index in that item's `values` list.
+    ///
+    /// **A wrong `receiver_name` is silently accepted.** Naming a block
+    /// that is not in the running mission returns HTTP 200 and changes
+    /// nothing, so this returns `Ok(())` for a write that did not
+    /// happen. The server offers nothing to check against, so resolve
+    /// the name once from [`Self::get_config`] (or
+    /// [`Self::find_iq_demodulator_block_name`]) when the session
+    /// starts, rather than hard-coding a block name and trusting the
+    /// status code. Read the value back afterwards when a write has to
+    /// be certain.
     pub async fn simple_remote_config(
         &self,
         receiver_name: &str,
