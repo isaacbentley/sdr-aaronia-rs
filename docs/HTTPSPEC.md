@@ -590,10 +590,23 @@ Data captured using antennas with location or directional information.
 - `/info` - Device information
 - `/healthstatus` - Device health monitoring
 
-**Remote Configuration** (Requires separate license):
-- `/remoteconfig` - Device parameter configuration
-- **License Required**: "Remote Config" license from Aaronia
-- **Alternative**: Use Native SDK for configuration without HTTP licensing restrictions
+**Remote Configuration** (`/remoteconfig`):
+- Device parameter configuration.
+- Aaronia sells a "Remote Config" license, and this document previously
+  stated that `/remoteconfig` writes fail without it. **That is not what
+  a live system does.** On RTSA-Suite PRO driving a SPECTRAN V6 ECO whose
+  license list contains no Remote Config entry, `PUT /remoteconfig`
+  retuned the device repeatedly, in both the config-tree and simplified
+  forms, returning HTTP 200 with the change applied.
+- What that license actually gates is therefore unconfirmed. It may
+  cover a different feature, or a different edition or version, or
+  parameters other than the ones tested. Treat any claim that
+  `/remoteconfig` writes require it as unverified.
+- The system tested did hold "Block: HTTP Server" and "Block: HTTP
+  Client" licenses, so the HTTP surface itself is licensed separately
+  and may be what actually matters.
+- This crate does not depend on the answer: it tunes through `/control`,
+  which needs no license.
 
 **License Detection Methods**:
 

@@ -979,8 +979,9 @@ impl HttpEndpointsClient {
 
     /// Fetches the complete configuration tree from the `/remoteconfig` endpoint.
     ///
-    /// **LICENSING NOTE**: This endpoint requires a separate "Remote Config" license
-    /// from Aaronia. Without this license, the endpoint may return authorization errors.
+    /// Reads are license-free: this is the documented behaviour and it
+    /// matches live systems, which is why a successful read proves
+    /// nothing about write capability.
     /// See: <https://aaronia.com/en/software-licence-remote-config>
     /// Documentation: <https://rtsa-manual.aaronia.com/en/Content/C_Operation/DDCommandCenter/RemoteConfig.htm>
     pub async fn get_config(&self) -> Result<ConfigResponse> {
@@ -995,8 +996,14 @@ impl HttpEndpointsClient {
 
     /// Updates the device's configuration via the `/remoteconfig` endpoint.
     ///
-    /// **LICENSING NOTE**: This endpoint requires a separate "Remote Config" license
-    /// from Aaronia. Without this license, configuration changes will fail with authorization errors.
+    /// **LICENSING NOTE**: Aaronia sells a "Remote Config" license, and
+    /// this endpoint was long documented as requiring it. Live testing
+    /// contradicts that: a system whose license list contains no Remote
+    /// Config entry accepted `/remoteconfig` writes and applied them
+    /// (SPECTRAN V6 ECO under RTSA-Suite PRO). What the license gates is
+    /// unconfirmed, so treat a failure here as possible but not
+    /// certain, and handle the 401/403 case rather than assuming either
+    /// outcome.
     ///
     /// **Alternatives without that license**: retuning and capture control
     /// go through `/control` ([`Self::configure_capture`]), which needs no
@@ -1084,7 +1091,10 @@ impl HttpEndpointsClient {
     /// `reflevel` parameter by +1 dB and restores it best-effort. If the
     /// restore fails (network drop mid-probe), the device is left with the
     /// adjusted reference level. Only call this when you genuinely need
-    /// proof of `/remoteconfig` write capability. Note that retuning does
+    /// proof of `/remoteconfig` write capability. Note that a system
+    /// without a Remote Config license has been observed accepting those
+    /// writes, so a `NotLicensed` result means "this write did not take
+    /// effect", not "the license is missing". Note that retuning does
     /// **not** — [`Self::configure_capture`] goes through the license-free
     /// `/control` endpoint. (An earlier revision justified this probe by
     /// claiming unlicensed `configure_capture` calls silently no-op; live
