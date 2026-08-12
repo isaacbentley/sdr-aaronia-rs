@@ -134,6 +134,6 @@ pub use unified_source::{
 /// Utilities for DB/linear conversions and string parsing
 pub use utils::{
     IQ_CLOCK_HZ, USABLE_BANDWIDTH_RATIO, db_to_linear, format_frequency, format_sample_rate,
-    iq_sample_rate_for_bandwidth, iq_sample_rates, linear_to_db, nearest_iq_sample_rate,
-    parse_frequency, parse_sample_rate, usable_bandwidth_hz,
+    iq_sample_rate_for_bandwidth, iq_sample_rates, iq_sample_rates_for_clock, linear_to_db,
+    nearest_iq_sample_rate, parse_frequency, parse_sample_rate, usable_bandwidth_hz,
 };

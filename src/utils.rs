@@ -283,7 +283,13 @@ pub fn receiver_clock_for_label(label: &str) -> f64 {
     }
 }
 
-/// Master clock the IQ sample-rate ladder divides down from.
+/// Highest IQ sample rate available with the default receiver clock.
+///
+/// This is the [`DEFAULT_RECEIVER_CLOCK_HZ`] divided by the 1.5 factor
+/// that [`validate_iq_mode`] enforces, and it matches the maximum
+/// measured on a SPECTRAN V6 ECO. A full V6 can select a faster
+/// receiver clock, so use [`iq_sample_rates_for_clock`] when the clock
+/// is known rather than assuming this ceiling.
 pub const IQ_CLOCK_HZ: f64 = 61_440_000.0;
 
 /// Fraction of the sample rate that survives the anti-alias filter.
@@ -301,9 +307,27 @@ pub const USABLE_BANDWIDTH_RATIO: f64 = 0.8;
 /// it got what it asked for will compute every derived frequency
 /// wrongly.
 pub fn iq_sample_rates() -> [f64; 10] {
+    iq_sample_rates_for_clock(DEFAULT_RECEIVER_CLOCK_HZ)
+}
+
+/// The IQ sample rates available at a given receiver clock, highest
+/// first.
+///
+/// The top rate is `receiver_clock_hz / 1.5`, the most that
+/// [`validate_iq_mode`] permits, and each step halves it.
+///
+/// **Measured only at the default clock.** A V6 ECO has a fixed
+/// receiver clock and produced exactly the ladder this returns for
+/// [`DEFAULT_RECEIVER_CLOCK_HZ`], verified rung by rung. A full V6 can
+/// select other clocks — Aaronia's own samples use `"92MHz"` and
+/// `"245MHz"` — and the rates there follow the same constraint but have
+/// not been confirmed against hardware. Read `device/receiverclock`
+/// from the device and pass it here rather than assuming.
+pub fn iq_sample_rates_for_clock(receiver_clock_hz: f64) -> [f64; 10] {
+    let top = receiver_clock_hz / 1.5;
     let mut rates = [0.0; 10];
     for (n, rate) in rates.iter_mut().enumerate() {
-        *rate = IQ_CLOCK_HZ / (1u32 << n) as f64;
+        *rate = top / f64::from(1u32 << n);
     }
     rates
 }
@@ -396,6 +420,22 @@ mod ladder_tests {
     use super::*;
 
     /// The ten rates the device reports in its own decimation enum.
+    /// A V6 with a faster receiver clock reaches higher rates. Aaronia's
+    /// samples select "245MHz", which the constraint puts at 163.84 MHz
+    /// of span. Inferred from the constraint, not measured.
+    #[test]
+    fn faster_clock_raises_the_ceiling() {
+        let fast = iq_sample_rates_for_clock(245_760_000.0);
+        assert!((fast[0] - 163_840_000.0).abs() < 1.0);
+        assert!(
+            fast[0] > iq_sample_rates()[0],
+            "a faster clock must reach further"
+        );
+        for pair in fast.windows(2) {
+            assert!((pair[0] / pair[1] - 2.0).abs() < 1e-9);
+        }
+    }
+
     #[test]
     fn ladder_matches_the_device() {
         let rates = iq_sample_rates();

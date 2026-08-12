@@ -30,6 +30,11 @@ All notable changes to this project will be documented in this file.
   guesses, so the relationships now live in one tested place. Wanting
   8 MHz of spectrum needs 10 MHz of sampling, and
   `iq_sample_rate_for_bandwidth` returns the 15.36 MHz that provides it.
+  `iq_sample_rates_for_clock` covers devices whose receiver clock is not
+  the default: a V6 ECO has a fixed clock and gives the measured ladder,
+  while a full V6 can select a faster one and reach further. Aaronia's
+  samples set `device/receiverclock` to "92MHz" or "245MHz"; only the
+  default has been checked against hardware.
 
 ### Fixed (native SDK)
 - **Sweep mode set the wrong resolution-bandwidth key.** It sent
