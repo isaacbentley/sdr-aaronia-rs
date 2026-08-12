@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.7.4] - 2026-08-12
+
 ### Fixed
 - **The SoapySDR plugin ignored an unrecognised `format=` silently.**
   A device string carrying `format=int16` — the wire name rather than
