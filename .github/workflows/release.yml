@@ -241,6 +241,14 @@ jobs:
 
           cp LICENSE "soapy-aaronia/dist/$stage/" 2>/dev/null || true
           cp soapy-aaronia/README.md "soapy-aaronia/dist/$stage/INSTALL.md"
+          # One-command install: find SoapySDR's module directory, copy the
+          # plugin in, clear the macOS quarantine flag.
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            cp soapy-aaronia/packaging/install.ps1 "soapy-aaronia/dist/$stage/"
+          else
+            cp soapy-aaronia/packaging/install.sh "soapy-aaronia/dist/$stage/"
+            chmod +x "soapy-aaronia/dist/$stage/install.sh"
+          fi
 
           cd soapy-aaronia/dist
           if [ "$RUNNER_OS" == "Windows" ]; then
@@ -293,6 +301,28 @@ jobs:
           echo "--- release body ---"
           cat release-notes.md
 
+      # Render the Homebrew formula against this release's real archives,
+      # so updating the tap is a copy rather than a hand-hashing exercise
+      # that silently ships a wrong checksum.
+      - name: Render Homebrew formula
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mac="artifacts/SoapyAaronia-${version}-macos-arm64.tar.gz"
+          linux="artifacts/SoapyAaronia-${version}-linux-x86_64.tar.gz"
+          for f in "$mac" "$linux"; do
+            if [ ! -f "$f" ]; then
+              echo "missing plugin archive: $f" >&2
+              exit 1
+            fi
+          done
+          sed -e "s/^  version \".*\"/  version \"${version}\"/" \
+              -e "s/REPLACE_WITH_SHA256_OF_MACOS_ARM64_ARCHIVE/$(sha256sum "$mac" | cut -d' ' -f1)/" \
+              -e "s/REPLACE_WITH_SHA256_OF_LINUX_X86_64_ARCHIVE/$(sha256sum "$linux" | cut -d' ' -f1)/" \
+              packaging/homebrew/soapy-aaronia.rb > artifacts/soapy-aaronia.rb
+          echo "--- rendered formula ---"
+          cat artifacts/soapy-aaronia.rb
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -303,6 +333,7 @@ jobs:
             artifacts/*.whl
             artifacts/*.tar.gz
             artifacts/*.zip
+            artifacts/soapy-aaronia.rb
           body_path: release-notes.md
           generate_release_notes: true
 

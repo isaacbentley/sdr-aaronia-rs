@@ -4,7 +4,7 @@ Kept in sync by hand with `src/lib.rs`; maturin packages this file and
 the accompanying `py.typed` marker into the wheel.
 """
 
-from typing import Any, Literal, Optional, Tuple
+from typing import Any, Iterator, List, Literal, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -12,9 +12,15 @@ import numpy.typing as npt
 __all__ = [
     "AaroniaConfig",
     "AaroniaSource",
+    "BlockIterator",
     "AaroniaConnectionError",
     "AaroniaHardwareError",
     "AaroniaTimeoutError",
+    "AaroniaStreamClosed",
+    "open",
+    "sample_rates",
+    "sample_rate_for_bandwidth",
+    "diagnose",
 ]
 
 class AaroniaConnectionError(Exception):
@@ -25,6 +31,14 @@ class AaroniaHardwareError(Exception):
 
 class AaroniaTimeoutError(Exception):
     """A read or control operation timed out."""
+
+class AaroniaStreamClosed(AaroniaConnectionError):
+    """The sample stream ended and will produce no more data.
+
+    Subclasses :class:`AaroniaConnectionError`, so existing handlers
+    still catch it. :meth:`AaroniaSource.blocks` ends the iteration on
+    this and only this.
+    """
 
 WireFormat = Literal["F32", "F16", "I16"]
 ReceiverChannel = Literal["Rx1", "Rx2", "Rx1And2"]
@@ -90,6 +104,20 @@ class AaroniaSource:
     """
 
     def __init__(self) -> None: ...
+    def __enter__(self) -> "AaroniaSource":
+        """Return the already-streaming source."""
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        """Stop streaming. Never suppresses an exception."""
+
+    def blocks(self, count: int) -> "BlockIterator":
+        """Iterate ``count``-sample blocks until the stream closes.
+
+        Ends on ``AaroniaStreamClosed`` or an empty read (a recording
+        running out). Timeouts and connection failures still raise, so
+        a truncated capture is not mistaken for a finished one.
+        """
+
     def start_streaming(self, config: AaroniaConfig) -> None:
         """Connect to the backend selected by ``config`` and start streaming.
 
@@ -141,3 +169,43 @@ class AaroniaSource:
     def last_timestamp_ns(self) -> int:
         """Epoch-nanosecond timestamp of the most recent block.
         HTTP backend only; 0 otherwise."""
+
+class BlockIterator:
+    """Iterator returned by :meth:`AaroniaSource.blocks`."""
+
+    def __iter__(self) -> "BlockIterator": ...
+    def __next__(self) -> npt.NDArray[np.complex64]: ...
+
+def open(
+    url: Optional[str] = None,
+    *,
+    freq: Optional[float] = None,
+    rate: Optional[float] = None,
+    bandwidth: Optional[float] = None,
+    ref_level: Optional[float] = None,
+    file: Optional[str] = None,
+    format: Optional[WireFormat] = None,
+    read_timeout: Optional[float] = None,
+) -> AaroniaSource:
+    """Open a source and start streaming, in one call.
+
+    Give either ``rate`` (an exact sample rate) or ``bandwidth`` (how
+    much spectrum to cover, from which a real rate is chosen); passing
+    both raises ``ValueError``, as does passing both ``url`` and
+    ``file``. With neither ``url`` nor ``file``, connects to
+    ``http://localhost:54664``.
+    """
+
+def sample_rates() -> List[float]:
+    """The IQ sample rates the hardware can run, highest first."""
+
+def sample_rate_for_bandwidth(bandwidth_hz: float) -> float:
+    """The lowest sample rate whose alias-free bandwidth covers
+    ``bandwidth_hz``."""
+
+def diagnose(url: str = "http://localhost:54664") -> List[Tuple[bool, str, str]]:
+    """Check an RTSA-Suite HTTP server.
+
+    Returns ``(ok, message, fix)`` for each check. The
+    ``aaronia-doctor`` console script prints the same results.
+    """

@@ -4,6 +4,53 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.7.0] - 2026-08-12
+
+### Added
+- **`aaronia.open()`, block iteration and context-manager support in
+  Python.** The shortest working program is now three lines. `open()`
+  takes the URL, frequency and either an exact `rate` or the
+  `bandwidth` you want covered, connects, and starts streaming;
+  `for block in src.blocks(65536)` ends when the source runs out
+  instead of raising; and `with` stops the stream even when the body
+  fails, raising a failed teardown only if the body itself succeeded.
+  The old config-object path is unchanged and still the way to reach
+  every option.
+- **`aaronia-doctor`, a command that checks an RTSA server.** It reports
+  whether the server answers, whether the mission has an input carrying
+  IQ, and what rate the device is running, and prints the fix for each
+  failure. The same checks are available as `aaronia.diagnose(url)`,
+  which returns `(ok, message, fix)` tuples, bounded at 20 seconds so a
+  stalled server cannot leave it waiting. Every failure it names is one
+  that otherwise shows up as a timeout with no explanation.
+- **`aaronia.sample_rates()` and `aaronia.sample_rate_for_bandwidth()`**,
+  exposing the crate's rate ladder to Python so a program can ask for a
+  rate the hardware will actually run.
+- **`Error::StreamClosed`**, separating "the stream ended" from "a read
+  failed". Both used to arrive as `Error::Protocol`, so a consumer
+  could not tell a capture that finished from one that was cut short.
+  Rust code matching on `Error::Protocol` for the closed-stream case
+  needs the new variant instead; the enum is `#[non_exhaustive]`, so
+  existing wildcard arms keep compiling. In Python the matching
+  exception is `AaroniaStreamClosed`, a subclass of
+  `AaroniaConnectionError`, so existing handlers are unaffected. It is
+  what lets `blocks()` end a loop on a finished stream while still
+  raising on a timeout or a transport failure, which would otherwise
+  make a truncated capture look like one that simply ran out.
+- **An installer in every SoapySDR release archive.** `install.sh`
+  (`install.ps1` on Windows) finds SoapySDR's module directory, clears
+  the macOS quarantine flag, copies the module in, and confirms it
+  loads. It prints instructions rather than guessing when SoapySDR is
+  missing.
+- **A Homebrew formula for the SoapySDR plugin**, in
+  `packaging/homebrew`. The release workflow renders it against the
+  published archives, checksums included, and attaches it to the
+  release, so updating a tap is a copy.
+
+### Fixed
+- The SoapySDR application guide still listed the old invented sample
+  rates for GQRX. It now describes the real ladder.
+
 ## [v0.6.2] - 2026-08-12
 
 ## [v0.6.1] - 2026-08-12

@@ -23,29 +23,32 @@ it:
 | macOS (Apple silicon) | `SoapyAaronia-<version>-macos-arm64.tar.gz` |
 | Windows x86-64 | `SoapyAaronia-<version>-windows-x86_64.zip` |
 
-Each archive contains the module, these instructions as `INSTALL.md`,
-and the licence.
-
-Find where SoapySDR looks for modules:
+Each archive contains the module, an installer, these instructions as
+`INSTALL.md`, and the licence. Run the installer from the unpacked
+directory:
 
 ```bash
-SoapySDRUtil --info | grep -i "module"
+./install.sh
 ```
 
-Copy the module (`aaroniaSupport.dll` on Windows, `libaaroniaSupport.so`
-elsewhere) into that directory. Alternatively, place it anywhere and set
-`SOAPY_SDR_PLUGIN_PATH` to the containing folder, which requires no
-administrator rights:
+On Windows, in PowerShell:
+
+```powershell
+.\install.ps1
+```
+
+It locates SoapySDR's module directory, clears the macOS quarantine
+flag, copies the module in, and confirms it loads. If SoapySDR is not
+installed or its module directory cannot be found, the installer prints
+what to do by hand instead of guessing.
+
+To install by hand, or to use the module without administrator rights,
+point `SOAPY_SDR_PLUGIN_PATH` at the unpacked directory:
 
 ```bash
+xattr -d com.apple.quarantine libaaroniaSupport.so   # macOS only
 export SOAPY_SDR_PLUGIN_PATH=/path/to/unpacked
 SoapySDRUtil --check=aaronia
-```
-
-On macOS, Gatekeeper quarantines downloaded binaries; clear it once:
-
-```bash
-xattr -d com.apple.quarantine libaaroniaSupport.so
 ```
 
 The Rust library is statically linked, so nothing else needs

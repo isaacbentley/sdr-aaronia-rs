@@ -1137,7 +1137,7 @@ impl AaroniaSource {
                             // collected (see read_samples's identical
                             // handling), else return the tail.
                             if collected == 0 {
-                                return Err(Error::Protocol(
+                                return Err(Error::StreamClosed(
                                     "HTTP sample stream closed (reader task ended)".to_string(),
                                 ));
                             }
@@ -1253,7 +1253,7 @@ impl AaroniaSource {
                             // stream with no way to distinguish "no data
                             // yet" from "stream is dead" — surface it.
                             if collected == 0 {
-                                return Err(Error::Protocol(
+                                return Err(Error::StreamClosed(
                                     "HTTP sample stream closed (reader task ended)".to_string(),
                                 ));
                             }

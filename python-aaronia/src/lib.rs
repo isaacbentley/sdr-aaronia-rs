@@ -45,6 +45,12 @@ create_exception!(
     pyo3::exceptions::PyException,
     "A read or control operation timed out."
 );
+create_exception!(
+    aaronia,
+    AaroniaStreamClosed,
+    AaroniaConnectionError,
+    "The sample stream ended and will produce no more data."
+);
 
 /// Largest single read request, in complex samples (512 MiB of
 /// buffer). Bounds the up-front allocation so a typo'd `count` raises
@@ -77,6 +83,10 @@ fn map_aaronia_err(e: AaroniaError) -> PyErr {
             AaroniaTimeoutError::new_err(msg)
         }
         AaroniaError::Transport(t) if t.is_timeout() => AaroniaTimeoutError::new_err(msg),
+        // Subclasses AaroniaConnectionError, so `except
+        // AaroniaConnectionError` still catches it — but a loop over
+        // blocks can tell "no more data" from "a read failed".
+        AaroniaError::StreamClosed(_) => AaroniaStreamClosed::new_err(msg),
         AaroniaError::Http { .. } | AaroniaError::Transport(_) | AaroniaError::Protocol(_) => {
             AaroniaConnectionError::new_err(msg)
         }
@@ -483,6 +493,40 @@ impl PyAaroniaSource {
         Ok(source.take_overrun())
     }
 
+    /// Enter a `with` block. The source is already streaming.
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// Leave a `with` block, stopping the stream even when the body
+    /// raised.
+    ///
+    /// Never suppresses the body's exception. A failure to stop is
+    /// raised only when the body itself succeeded — otherwise it would
+    /// replace the error that actually explains what went wrong.
+    #[pyo3(signature = (exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        exc_type: Option<Py<PyAny>>,
+        _exc_value: Option<Py<PyAny>>,
+        _traceback: Option<Py<PyAny>>,
+    ) -> PyResult<bool> {
+        let stopped = self.stop_streaming(py);
+        if exc_type.is_none() {
+            stopped?;
+        }
+        Ok(false)
+    }
+
+    /// Iterate fixed-size blocks of samples.
+    ///
+    /// Ends cleanly when the stream closes, rather than raising, so a
+    /// `for` loop terminates the way a reader expects.
+    fn blocks(slf: Py<Self>, count: usize) -> BlockIterator {
+        BlockIterator { source: slf, count }
+    }
+
     /// Total dropped samples reported by the drop detector.
     fn cumulative_drops(&self) -> PyResult<u64> {
         let source = self
@@ -503,6 +547,332 @@ impl PyAaroniaSource {
     }
 }
 
+/// Iterator over fixed-size sample blocks, returned by
+/// [`AaroniaSource.blocks`].
+#[pyclass(name = "BlockIterator")]
+struct BlockIterator {
+    source: Py<PyAaroniaSource>,
+    count: usize,
+}
+
+#[pymethods]
+impl BlockIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let mut source = self.source.borrow_mut(py);
+        match source.read_samples_numpy(py, self.count) {
+            // File playback signals its end with an empty read rather
+            // than an error; without this the loop spins forever on
+            // empty arrays once the recording runs out.
+            Ok(arr) if arr.len()? == 0 => Ok(None),
+            Ok(arr) => Ok(Some(arr.into_any().unbind())),
+            // Only a finished stream ends the loop. Timeouts, transport
+            // failures and protocol errors all propagate: a truncated
+            // capture must not look like one that simply ran out.
+            Err(e) if e.is_instance_of::<AaroniaStreamClosed>(py) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The IQ sample rates the hardware can actually run, highest first.
+///
+/// Anything else is silently adjusted by the device, so a program that
+/// keeps using the rate it asked for computes every derived frequency
+/// against a rate that is not in use.
+#[pyfunction]
+fn sample_rates() -> Vec<f64> {
+    sdr_aaronia_rs::iq_sample_rates().to_vec()
+}
+
+/// The lowest sample rate whose alias-free bandwidth covers
+/// `bandwidth_hz`.
+///
+/// Wanting 8 MHz of spectrum needs 10 MHz of sampling, so this returns
+/// 15.36 MHz, the lowest rate that provides it.
+#[pyfunction]
+fn sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
+    sdr_aaronia_rs::iq_sample_rate_for_bandwidth(bandwidth_hz)
+}
+
+/// Open a source and start streaming, in one call.
+///
+/// Give either `rate` (an exact sample rate) or `bandwidth` (how much
+/// spectrum you want to see, from which a real rate is chosen). Pass
+/// `file` instead of `url` to play back a recording.
+#[pyfunction]
+#[pyo3(signature = (url=None, *, freq=None, rate=None, bandwidth=None, ref_level=None, file=None, format=None, read_timeout=None))]
+#[allow(clippy::too_many_arguments)]
+fn open(
+    py: Python<'_>,
+    url: Option<String>,
+    freq: Option<f64>,
+    rate: Option<f64>,
+    bandwidth: Option<f64>,
+    ref_level: Option<f64>,
+    file: Option<String>,
+    format: Option<&str>,
+    read_timeout: Option<f64>,
+) -> PyResult<Py<PyAaroniaSource>> {
+    if url.is_some() && file.is_some() {
+        return Err(PyValueError::new_err(
+            "give url or file, not both: they select different backends",
+        ));
+    }
+    if rate.is_some() && bandwidth.is_some() {
+        return Err(PyValueError::new_err(
+            "give rate or bandwidth, not both: bandwidth chooses a rate for you",
+        ));
+    }
+
+    let mut cfg = PyAaroniaConfig::new();
+    match (&url, &file) {
+        (Some(u), _) => cfg.set_http_base_url(Some(u.clone())),
+        (None, Some(f)) => cfg.set_file_path(Some(f.clone())),
+        // Neither: the RTSA HTTP server's own default, which is where
+        // it listens on the machine running RTSA-Suite.
+        (None, None) => cfg.set_http_base_url(Some("http://localhost:54664".to_string())),
+    }
+    if let Some(freq) = freq {
+        cfg.set_center_freq(freq);
+    }
+    if let Some(rate) = rate {
+        cfg.set_sample_rate(rate);
+    } else if let Some(bw) = bandwidth {
+        cfg.set_sample_rate(sdr_aaronia_rs::iq_sample_rate_for_bandwidth(bw));
+    }
+    if let Some(dbm) = ref_level {
+        cfg.set_reference_level(dbm);
+    }
+    if let Some(fmt) = format {
+        cfg.set_format(fmt)?;
+    }
+    if let Some(seconds) = read_timeout {
+        cfg.set_read_timeout(seconds)?;
+    }
+
+    let mut source = PyAaroniaSource::new()?;
+    source.start_streaming(py, &cfg)?;
+    Py::new(py, source)
+}
+
+/// How long [`diagnose`] may spend in total before giving up.
+const DIAGNOSE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Check an RTSA-Suite HTTP server and report what is wrong.
+///
+/// Returns a list of `(ok, message, fix)` tuples. Every failure mode
+/// here is one the quickstart documents; the point is that a program can
+/// name the fix instead of a person rereading the guide after a timeout.
+#[pyfunction]
+#[pyo3(signature = (url="http://localhost:54664"))]
+fn diagnose(py: Python<'_>, url: &str) -> PyResult<Vec<(bool, String, String)>> {
+    use sdr_aaronia_rs::http_endpoints::{AuthMethod, HttpEndpointsClient};
+
+    // A diagnostic makes a handful of small requests; a full
+    // multi-threaded runtime is pure overhead for that.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(map_any_err)?;
+    let url = url.to_string();
+
+    py.detach(|| {
+        rt.block_on(async move {
+            let checks = async move {
+                let mut out: Vec<(bool, String, String)> = Vec::new();
+
+                let client = match HttpEndpointsClient::new(url.clone(), AuthMethod::None) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        out.push((
+                            false,
+                            format!("{url} is not a usable URL: {e}"),
+                            "Pass a base URL such as http://localhost:54664".to_string(),
+                        ));
+                        return Ok(out);
+                    }
+                };
+
+                match client.get_info().await {
+                    Ok(info) => out.push((
+                        true,
+                        format!(
+                            "reachable: {} on port {}, mission {:?}",
+                            info.name, info.port, info.mission
+                        ),
+                        String::new(),
+                    )),
+                    Err(e) => {
+                        out.push((
+                            false,
+                            format!("cannot reach {url}: {e}"),
+                            "Start RTSA-Suite, add an HTTP Server block to the mission, and \
+                         check the port. A *.local hostname can also take a moment to \
+                         resolve from a cold start."
+                                .to_string(),
+                        ));
+                        // Nothing else can be checked without a server.
+                        return Ok(out);
+                    }
+                }
+
+                let inputs = match client.get_inputs().await {
+                    Ok(i) => i,
+                    Err(e) => {
+                        out.push((
+                            false,
+                            format!("cannot list inputs: {e}"),
+                            "The server answered /info but not /inputs, which is unusual; \
+                         check the RTSA-Suite version."
+                                .to_string(),
+                        ));
+                        return Ok(out);
+                    }
+                };
+                if inputs.is_empty() {
+                    out.push((
+                        false,
+                        "the server has no inputs".to_string(),
+                        "Connect the device block's output to the HTTP Server block's input \
+                     in the mission."
+                            .to_string(),
+                    ));
+                    return Ok(out);
+                }
+                out.push((
+                    true,
+                    format!("{} input(s): {}", inputs.len(), inputs.join(", ")),
+                    String::new(),
+                ));
+
+                // Does anything actually carry IQ?
+                let mut iq_input = None;
+                let mut saw_any = false;
+                for name in &inputs {
+                    if let Ok(sample) = client.get_sample(Some(name)).await {
+                        saw_any = true;
+                        if sample.payload == sdr_aaronia_rs::http_streaming::PayloadType::Iq {
+                            iq_input = Some((name.clone(), sample));
+                            break;
+                        }
+                    }
+                }
+                match (&iq_input, saw_any) {
+                    (Some((name, sample)), _) => {
+                        let fs = sample.sample_frequency.unwrap_or(0.0);
+                        let usable = sample.end_frequency - sample.start_frequency;
+                        out.push((
+                            true,
+                            format!(
+                                "input {name:?} carries IQ at {:.3} MHz sampling, \
+                             {:.3} MHz usable, centred on {:.3} MHz",
+                                fs / 1e6,
+                                usable / 1e6,
+                                (sample.start_frequency + sample.end_frequency) / 2.0 / 1e6
+                            ),
+                            String::new(),
+                        ));
+
+                        // A rate off the ladder means the device silently chose
+                        // its own, which is worth surfacing. Compare
+                        // proportionally: hardware reports its real clock, not
+                        // the nominal figure — a healthy 15.36 MHz reads back
+                        // as 15.359988 MHz — while a genuinely wrong rate is
+                        // out by tens of percent.
+                        if fs > 0.0 {
+                            let nearest = sdr_aaronia_rs::nearest_iq_sample_rate(fs);
+                            if ((nearest - fs) / nearest).abs() > 0.001 {
+                                out.push((
+                                    false,
+                                    format!(
+                                        "sampling at {:.6} MHz, which is not one of the \
+                                     device's rates",
+                                        fs / 1e6
+                                    ),
+                                    format!(
+                                        "Ask for {:.3} MHz instead, or use \
+                                     aaronia.sample_rate_for_bandwidth()",
+                                        nearest / 1e6
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    (None, true) => out.push((
+                        false,
+                        "no input carries IQ data".to_string(),
+                        "Set the device block to IQ mode. A spectra payload means the \
+                     mission is producing spectra, which the sample APIs do not read."
+                            .to_string(),
+                    )),
+                    (None, false) => out.push((
+                        false,
+                        "inputs exist but none returned a sample".to_string(),
+                        "The mission is probably not running, or the device block's output \
+                     is not connected to the HTTP Server block."
+                            .to_string(),
+                    )),
+                }
+
+                Ok(out)
+            };
+
+            // Each request carries the client's own 30 s timeout, and a
+            // stalled server would otherwise pay that per input. A
+            // diagnostic that hangs is one nobody waits for.
+            match tokio::time::timeout(DIAGNOSE_BUDGET, checks).await {
+                Ok(result) => result,
+                Err(_) => Ok(vec![(
+                    false,
+                    format!(
+                        "checks did not finish within {} seconds",
+                        DIAGNOSE_BUDGET.as_secs()
+                    ),
+                    "The server accepted the connection but stopped responding. \
+                     Restart the RTSA-Suite mission."
+                        .to_string(),
+                )]),
+            }
+        })
+    })
+}
+
+/// Console-script entry point: `aaronia-doctor [url]`.
+#[pyfunction]
+fn doctor_cli(py: Python<'_>) -> PyResult<i32> {
+    let sys = py.import("sys")?;
+    let argv: Vec<String> = sys.getattr("argv")?.extract()?;
+    let url = argv
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "http://localhost:54664".to_string());
+
+    println!("Checking {url}");
+    let findings = diagnose(py, &url)?;
+    let mut failed = false;
+    for (ok, message, fix) in findings {
+        if ok {
+            println!("  ok    {message}");
+        } else {
+            failed = true;
+            println!("  FAIL  {message}");
+            if !fix.is_empty() {
+                println!("        {fix}");
+            }
+        }
+    }
+    if failed {
+        println!(
+            "\nSee https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/QUICKSTART.md"
+        );
+    }
+    Ok(i32::from(failed))
+}
+
 #[pymodule]
 fn aaronia(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // try_init: another Rust extension in the process may already have
@@ -512,6 +882,12 @@ fn aaronia(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PyAaroniaConfig>()?;
     m.add_class::<PyAaroniaSource>()?;
+    m.add_class::<BlockIterator>()?;
+    m.add_function(wrap_pyfunction!(open, m)?)?;
+    m.add_function(wrap_pyfunction!(sample_rates, m)?)?;
+    m.add_function(wrap_pyfunction!(sample_rate_for_bandwidth, m)?)?;
+    m.add_function(wrap_pyfunction!(diagnose, m)?)?;
+    m.add_function(wrap_pyfunction!(doctor_cli, m)?)?;
 
     m.add(
         "AaroniaConnectionError",
@@ -522,6 +898,7 @@ fn aaronia(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<AaroniaHardwareError>(),
     )?;
     m.add("AaroniaTimeoutError", py.get_type::<AaroniaTimeoutError>())?;
+    m.add("AaroniaStreamClosed", py.get_type::<AaroniaStreamClosed>())?;
 
     Ok(())
 }

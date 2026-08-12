@@ -18,6 +18,11 @@ classifiers = [
 # Version comes from python-aaronia/Cargo.toml (single source of truth).
 dynamic = ["version"]
 
+# A real command, so checking a setup needs no code:
+#   aaronia-doctor http://localhost:54664
+[project.scripts]
+aaronia-doctor = "aaronia:doctor_cli"
+
 [project.urls]
 Repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
 Changelog = "https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/CHANGELOG.md"

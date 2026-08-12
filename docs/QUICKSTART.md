@@ -86,30 +86,39 @@ cargo run --example http_iq_quickstart --features http -- 2440e6 15.36e6 http://
 pip install python-aaronia
 ```
 
+Check the server first. The command ships with the package and reports
+what is wrong, and how to fix it:
+
+```bash
+aaronia-doctor http://localhost:54664
+```
+
 ```python
 import aaronia
 
-cfg = aaronia.AaroniaConfig()
-cfg.http_base_url = "http://localhost:54664"
-cfg.center_freq = 2.44e9
-cfg.sample_rate = 15.36e6
-
-src = aaronia.AaroniaSource()
-src.start_streaming(cfg)
-samples = src.read_samples_numpy(65536)   # numpy complex64
-print(samples[:4], src.cumulative_drops())
-src.stop_streaming()
+with aaronia.open("http://localhost:54664", freq=2.44e9, bandwidth=10e6) as src:
+    samples = src.read_samples_numpy(65536)   # numpy complex64
+    print(samples[:4], src.cumulative_drops())
 ```
+
+`bandwidth` picks a sample rate the hardware can run. Pass `rate=` to
+name one exactly, or build an `AaroniaConfig` for the full set of
+options.
 
 ### SoapySDR
 
+Download the plugin archive for your platform from a
+[release](https://github.com/isaacbentley/sdr-aaronia-rs/releases),
+unpack it, and run the bundled installer:
+
 ```bash
+./install.sh
 SoapySDRUtil --probe="driver=aaronia,url=http://localhost:54664"
 ```
 
 [APPS.md](APPS.md) covers GQRX, SDR++ and GNU Radio.
 [../soapy-aaronia/README.md](../soapy-aaronia/README.md) covers
-installing the plugin.
+installing by hand and building from source.
 
 ## 4. Troubleshooting
 

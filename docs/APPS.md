@@ -1,13 +1,19 @@
 # Using a SPECTRAN from existing SDR applications
 
 Any SoapySDR-capable application can drive a SPECTRAN through the
-[`soapy-aaronia`](../soapy-aaronia/README.md) plugin. Install the plugin
-first. Prebuilt binaries are attached to each release. Confirm it is
-visible:
+[`soapy-aaronia`](../soapy-aaronia/README.md) plugin. Install it first:
+download the archive for your platform from a
+[release](https://github.com/isaacbentley/sdr-aaronia-rs/releases),
+unpack it, and run the bundled installer (`./install.sh`, or
+`.\install.ps1` in PowerShell on Windows). It finds SoapySDR's module
+directory, copies the plugin in, and confirms it loads:
 
 ```bash
 SoapySDRUtil --check=aaronia
 ```
+
+The [plugin README](../soapy-aaronia/README.md#install-a-prebuilt-module)
+covers installing by hand and building from source.
 
 Every application below uses the same device string. In most cases the
 RTSA-Suite HTTP server URL is the only argument needed:
@@ -43,11 +49,10 @@ GQRX accepts a device string directly in its configuration dialog:
 driver=aaronia,url=http://localhost:54664
 ```
 
-Select the sample rate from GQRX's list. The plugin advertises 250 kHz,
-500 kHz, 1, 2, 5, 10, 15.36, 20, 30.72 and 61.44 MHz for applications
-that build dropdowns from `listSampleRates`. Rates within the reported
-range also work over HTTP, so a rate absent from the list is not
-necessarily unsupported.
+Select the sample rate from GQRX's list. The plugin advertises the
+device's real ladder: 61.44 MHz halved down to 120 kHz, which the RTSA
+GUI labels Full through 1/512. The hardware produces no other rate, so a
+request in between snaps to the nearest rung and logs a warning.
 
 The single gain element is `REF`, the Aaronia reference level in dBm. It
 is not an amplifier gain: raising it reduces sensitivity. Start near

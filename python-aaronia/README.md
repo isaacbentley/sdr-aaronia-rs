@@ -25,36 +25,65 @@ cd python-aaronia
 maturin develop --release
 ```
 
+Check your setup before writing any code:
+
+```bash
+aaronia-doctor http://localhost:54664
+```
+
+It reports whether the server is reachable, whether the mission has an
+input carrying IQ, and what rate the device is running, and names the
+fix for each failure.
+
 ## Quickstart
 
 ```python
 import aaronia
 
-cfg = aaronia.AaroniaConfig()
-cfg.http_base_url = "http://localhost:54664"  # RTSA-Suite HTTP server block
-cfg.center_freq = 2.44e9                      # Hz
-cfg.sample_rate = 15.36e6                     # Hz
-cfg.format = "F32"                            # wire format: F32, F16, or I16
+with aaronia.open("http://localhost:54664", freq=2.44e9, bandwidth=10e6) as src:
+    for block in src.blocks(65536):           # numpy complex64 arrays
+        process(block)
+```
 
-src = aaronia.AaroniaSource()
-src.start_streaming(cfg)
+`aaronia.open()` connects and starts streaming in one call. `bandwidth`
+asks for that much usable spectrum and picks a sample rate the hardware
+can actually run; pass `rate=` instead to name one exactly. Use
+`file="capture.rtsa"` in place of the URL to play back a recording.
 
+Iterating with `blocks()` ends when the stream closes. To read on your
+own schedule, or for Apache Arrow:
+
+```python
+src = aaronia.open(freq=2.44e9, rate=15.36e6, format="I16")
 samples = src.read_samples_numpy(65536)       # numpy complex64 array
 batch = src.read_samples_arrow(65536)         # pyarrow FixedSizeListArray of [re, im]
-
 src.set_center_frequency(2.41e9)              # live retune, no teardown
-
 print(src.cumulative_drops(), src.take_overrun(), src.last_timestamp_ns())
 src.stop_streaming()
 ```
 
-File playback: set `cfg.file_path = "capture.rtsa"` instead of
-`http_base_url`.
+For full control, build an `AaroniaConfig` and pass it to
+`AaroniaSource.start_streaming()`; `open()` is a shorthand for the
+common fields.
 
 The
 [quickstart](https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/QUICKSTART.md)
 covers configuring the RTSA-Suite HTTP Server block, which everything
 above depends on.
+
+## Sample rates
+
+The device runs a fixed ladder of rates: 61.44 MHz halved down to
+120 kHz. Ask for anything else and it quietly uses the nearest rung,
+leaving your program computing against a rate that is not in use.
+
+```python
+aaronia.sample_rates()                  # every rate, highest first
+aaronia.sample_rate_for_bandwidth(8e6)  # 15.36e6: the lowest rate covering 8 MHz
+```
+
+A rate carries only 80% of itself as alias-free bandwidth, which is why
+8 MHz of spectrum needs 15.36 MHz of sampling.
 
 ## Configuration (`AaroniaConfig`)
 
@@ -92,11 +121,14 @@ silently defaulting.
   enabled, which is the default. The reader reopens the stream,
   re-applies the current tuning, and flags the first read after the gap
   through `take_overrun()`. After five failed attempts the stream ends
-  and reads raise `AaroniaConnectionError`.
+  and reads raise `AaroniaStreamClosed`.
 - **Typed exceptions.** `AaroniaConnectionError` (unreachable endpoint),
   `AaroniaTimeoutError`, `AaroniaHardwareError` (device and SDK errors)
   and `ValueError` (invalid configuration), mapped from the Rust error
   enum with the full cause chain in the message.
+  `AaroniaStreamClosed` subclasses `AaroniaConnectionError` and means
+  the stream finished rather than failed; `blocks()` ends on it, while
+  a timeout or transport failure still raises.
 - **Dual-channel** reads (`receiver_channel = "Rx1And2"` with
   `read_samples_dual_numpy(count)`, returning two time-aligned arrays)
   require the native-SDK backend: Windows or Linux with the Aaronia SDK
@@ -108,6 +140,8 @@ silently defaulting.
 | Method | Purpose |
 | --- | --- |
 | `start_streaming(cfg)` / `stop_streaming()` | Session lifecycle |
+| `with src: ...` | Stops streaming on the way out, including after an exception |
+| `blocks(count)` | Iterate `count`-sample arrays until the stream closes |
 | `read_samples_numpy(count)` | NumPy `complex64` array |
 | `read_samples_arrow(count)` | PyArrow `FixedSizeListArray` of `[re, im]` float32 pairs |
 | `read_samples_dual_numpy(count)` | `(rx1, rx2)` NumPy arrays (dual-channel captures) |
@@ -115,3 +149,12 @@ silently defaulting.
 | `cumulative_drops()` | Total server-reported dropped samples |
 | `take_overrun()` | True once per detected receive-side overrun |
 | `last_timestamp_ns()` | Epoch-ns timestamp of the last received block (HTTP backend; 0 otherwise) |
+
+## Module functions
+
+| Function | Purpose |
+| --- | --- |
+| `open(url=None, *, freq, rate, bandwidth, ref_level, file, format, read_timeout)` | Configure, connect and start streaming in one call |
+| `sample_rates()` | Every sample rate the hardware can run |
+| `sample_rate_for_bandwidth(hz)` | Lowest rate covering that much spectrum |
+| `diagnose(url)` | `(ok, message, fix)` for each setup check; what `aaronia-doctor` prints |

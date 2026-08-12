@@ -23,6 +23,16 @@ pub enum Error {
     #[error("stream protocol error: {0}")]
     Protocol(String),
 
+    /// The sample stream ended and will produce no more data: the
+    /// server closed it, or auto-reconnect gave up.
+    ///
+    /// Distinct from [`Error::Protocol`] because a consumer looping
+    /// over blocks has to tell "there is no more data" apart from "a
+    /// read failed", and the two demand opposite responses. Reported
+    /// once the reader task has stopped.
+    #[error("sample stream closed: {0}")]
+    StreamClosed(String),
+
     /// RTSA capture file format or parsing error.
     #[error("RTSA file format error at 0x{offset:08X}: {reason}")]
     FileFormat {

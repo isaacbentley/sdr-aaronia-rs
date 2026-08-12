@@ -369,9 +369,13 @@ impl HttpSource {
                         Err(Error::Protocol(format!("Stream chunk error: {}", e)))
                     }
                     None => {
-                        // Stream ended, mark as inactive and clean up
+                        // The body finished: no more data is coming.
+                        // Reported as StreamClosed rather than Protocol
+                        // so a caller can tell it apart from a read
+                        // that failed mid-stream, which is the arm
+                        // directly above.
                         warn!("Stream ended unexpectedly");
-                        Err(Error::Protocol("Stream ended".to_string()))
+                        Err(Error::StreamClosed("HTTP response body ended".to_string()))
                     }
                 }
             }

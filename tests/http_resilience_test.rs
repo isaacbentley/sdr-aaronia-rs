@@ -219,7 +219,7 @@ async fn read_honours_configured_timeout() {
         // reader task may report a closed stream instead of stalling.
         // That path is prompt by construction; the timeout bound below
         // still applies to both.
-        Err(Error::Protocol(_)) => {}
+        Err(Error::StreamClosed(_)) => {}
         other => panic!("expected a timeout or closed-stream error, got {other:?}"),
     }
     assert!(
@@ -351,7 +351,7 @@ async fn flapping_server_exhausts_reconnect_budget() {
             n < 1_000_000,
             "the read should not have been satisfied by a flapping server"
         ),
-        Err(Error::Protocol(_)) => {}
+        Err(Error::StreamClosed(_)) => {}
         other => panic!("expected a partial read or closed-stream error, got {other:?}"),
     }
     // 5 attempts of 0.25+0.5+1+2+4 s ≈ 7.75 s, well inside the 30 s read
@@ -410,7 +410,7 @@ async fn auto_reconnect_disabled_keeps_fail_fast() {
     let mut buffer = Vec::new();
     let result = source.read_samples(&mut buffer, 64).await;
     match result {
-        Err(Error::Protocol(_)) => {}
+        Err(Error::StreamClosed(_)) => {}
         // A partial read is equally acceptable here — what must not
         // happen is a silent reconnect.
         Ok(_) => {}

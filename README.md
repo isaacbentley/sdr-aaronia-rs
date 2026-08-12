@@ -102,21 +102,17 @@ pip install python-aaronia
 ```python
 import aaronia
 
-cfg = aaronia.AaroniaConfig()
-cfg.http_base_url = "http://localhost:54664"
-cfg.center_freq = 2.44e9
-cfg.sample_rate = 15.36e6
-
-src = aaronia.AaroniaSource()
-src.start_streaming(cfg)
-samples = src.read_samples_numpy(65536)   # numpy complex64
-src.stop_streaming()
+with aaronia.open("http://localhost:54664", freq=2.44e9, bandwidth=10e6) as src:
+    for block in src.blocks(65536):   # numpy complex64 arrays
+        process(block)
 ```
 
 Reads land in NumPy or PyArrow with one copy out of the receive buffer.
 Blocking calls release the GIL, errors arrive as typed exceptions, and
 the package ships type stubs. Wheels are abi3 for CPython 3.9 and
-later. Full reference: [python-aaronia/README.md](python-aaronia/README.md).
+later. The bundled `aaronia-doctor` command checks a server and names
+the fix for whatever is wrong. Full reference:
+[python-aaronia/README.md](python-aaronia/README.md).
 
 ### SoapySDR: GQRX, SDR++, GNU Radio and others
 
