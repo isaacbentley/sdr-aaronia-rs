@@ -91,7 +91,7 @@ sudo cmake --install soapy-aaronia/build
 | `url` | RTSA-Suite HTTP server URL (default `http://localhost:54664`) |
 | `file` | Play back a recorded `.rtsa` file |
 | `serial` | Select a device by serial via the native-SDK backend (Windows/Linux with the Aaronia SDK; omit `url` to allow SDK auto-detection) |
-| `freq` / `rate` / `ref_level` | Initial center frequency, sample rate, reference level |
+| `freq` / `rate` / `ref_level` | Initial center frequency, sample rate, reference level. `rate` snaps to the device's ladder — see [Sample rates](#sample-rates) |
 | `format` | HTTP wire format. `format=I16`, optionally with `scale=N`, is the low-bandwidth network mode |
 | `rx_channel` | `Rx1` (default), `Rx2`, or `Rx1And2` (native SDK, full V6 only) |
 | `read_timeout` | Seconds the crate's own blocking reads wait (default 30). `readStream` always uses SoapySDR's per-call `timeoutUs`, so this rarely matters here |
@@ -101,6 +101,21 @@ sudo cmake --install soapy-aaronia/build
 import SoapySDR
 sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
 ```
+
+## Sample rates
+
+`listSampleRates` reports the device's real ladder, each rung half the
+one above it, because applications build their dropdowns from it and a
+round number the hardware cannot produce would be silently adjusted.
+`setSampleRate` snaps a request to the nearest rung and logs when it
+has to.
+
+The advertised ladder is a SPECTRAN V6 ECO's: 61.44 MHz down to
+120 kHz, measured rung by rung. A full V6 has a selectable receiver
+clock and reaches higher, by how much is not settled — see [the note in
+HTTPSPEC](../docs/HTTPSPEC.md#unresolved-the-full-v6s-top-rate). On one
+of those, `getSampleRate` while streaming reports what the device is
+actually running, which is the number to trust.
 
 ## Streams
 

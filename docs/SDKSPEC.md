@@ -275,9 +275,11 @@ actually 92.16 MHz, etc. Use `receiver_clock_for_label` to convert.
 | `245MHz` | 245.76 MHz     | README + ConfigTree |
 | `492MHz` | 491.52 MHz     | ConfigTree          |
 
-The eco family runs at a fixed `61.44 MHz` clock and does not expose the
+The eco family runs at a fixed clock and does not expose the
 `device/receiverclock` config key — `configure_iq_receiver` skips the
-write on that family (see `DeviceOpenMode::EcoIqReceiver`).
+write on that family (see `DeviceOpenMode::EcoIqReceiver`) and uses
+`DEFAULT_RECEIVER_CLOCK_HZ`, 92.16 MHz. Its top IQ rate is 61.44 MHz,
+which is that clock over 1.5; do not confuse the two.
 
 ### `read_samples` polling cadence
 

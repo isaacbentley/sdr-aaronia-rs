@@ -141,11 +141,13 @@ different:
 | Where you see it | Example | Meaning |
 | --- | --- | --- |
 | `span_frequency`, and `sampleFrequency` in packet metadata | 15.36 MHz | The sample rate, Fs |
-| `startFrequency`..`endFrequency` in packet metadata | 12.288 MHz | Usable alias-free bandwidth, which measures 0.8 x Fs |
-| The Span control in the RTSA GUI | `1 / 4` | Decimation of the 61.44 MHz clock, so Fs = 61.44 / 4 |
+| `startFrequency`..`endFrequency` in packet metadata | 12.288 MHz | Usable alias-free bandwidth, measured at 0.8 x Fs on a V6 ECO |
+| The Span control in the RTSA GUI | `1 / 4` | Decimation of the top rate, so Fs = 61.44 / 4 on an ECO |
 
-The device runs at 61.44 MHz divided by a power of two, ten rates from
-61.44 MHz down to 120 kHz, shown in the GUI as Full through `1 / 512`.
+The device halves its top rate down a ten-rung ladder, shown in the GUI
+as Full through `1 / 512`. On a V6 ECO that is 61.44 MHz down to
+120 kHz, measured rung by rung. A full V6 has a selectable receiver
+clock and starts higher.
 
 **Pass one of those rates and you get it exactly.** Anything else is
 silently adjusted, and not to the nearest rate: the server reads the

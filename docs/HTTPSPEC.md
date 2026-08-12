@@ -357,7 +357,8 @@ configuration of zones is not supported.
 ```
 
 > **`frequencySpan` is a usable-bandwidth request, not a sample rate.**
-> The device runs at 61.44 MHz divided by a power of two. Given a span
+> The device halves its top rate down a ladder — 61.44 MHz on the V6
+> ECO this was measured against. Given a span
 > it cannot produce, it selects the rate whose alias-free bandwidth
 > (0.8 x Fs) is nearest the request: 2.5 MHz yields Fs = 3.84 MHz,
 > 1.3 MHz yields 1.92 MHz, and 10 MHz yields 15.36 MHz. A value that is

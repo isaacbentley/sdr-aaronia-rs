@@ -226,7 +226,12 @@ impl SampleRateControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        // Capped at the IQ-mode constraint (span * 1.5 <= 92.16 MHz).
+        // Capped at a V6 ECO's top rate, which is the IQ-mode
+        // constraint against its fixed clock (span * 1.5 <= 92.16 MHz).
+        // A full V6 selects a faster receiver clock and exceeds this;
+        // seify has no device handle here to ask, so the ceiling is the
+        // measured one rather than a guess. See
+        // `utils::iq_sample_rates_for_clock`.
         Ok(Range::new(vec![RangeItem::Interval(10e3, 61.44e6)]))
     }
 

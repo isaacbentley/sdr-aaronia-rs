@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+- **The READMEs stated the V6 ECO's sample-rate ladder as if it were
+  every device's.** "The device runs a fixed ladder of rates: 61.44 MHz
+  halved down to 120 kHz" is measured and true for an ECO, but a full
+  V6 selects its receiver clock and starts higher — by how much is the
+  open question the specs already record, and the user-facing pages did
+  not carry it. The Python, SoapySDR, quickstart and applications docs
+  now say whose ladder it is and point at the note, and
+  `iq_sample_rates` says so in its own documentation.
+- The SoapySDR README gained a Sample rates section: why
+  `listSampleRates` reports the real ladder, that `setSampleRate` snaps
+  and logs, and that `getSampleRate` while streaming is the number to
+  trust on hardware the advertised ladder does not describe.
+- SDKSPEC still gave the eco family's clock as 61.44 MHz in a second
+  place, contradicting the correction made elsewhere in the same
+  document. It is 92.16 MHz; 61.44 MHz is the top IQ rate.
+- The same sweep caught the claim in `unified_source`'s own
+  documentation, in the `/control` span note in HTTPSPEC, and in the
+  0.8 usable-bandwidth ratio, all of which read as universal and are
+  measurements from one device. `seify_impl`'s sample-rate range is
+  capped at 61.44 MHz for the same reason and now says so: seify has no
+  device handle at that point to ask for something better.
+
 ## [v0.7.4] - 2026-08-12
 
 ### Fixed

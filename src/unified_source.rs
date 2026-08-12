@@ -88,9 +88,10 @@ const RECONNECT_HEALTHY_AFTER: Duration = Duration::from_secs(30);
 /// metadata.
 ///
 /// A requested sample rate is not necessarily the one you get: the
-/// device runs at 61.44 MHz divided by a power of two and quietly
-/// snaps anything else to that ladder, so asking for 12.288 MHz yields
-/// 15.36 MHz. Reporting the request back to callers made the crate,
+/// device halves its top rate down a ladder and quietly snaps anything
+/// else to a rung, so on a V6 ECO, whose top rate is 61.44 MHz, asking
+/// for 12.288 MHz yields 15.36 MHz. Reporting the request back to
+/// callers made the crate,
 /// and every binding above it, describe a capture that was not
 /// happening. These fields are `0.0` until the first packet arrives.
 #[derive(Debug, Clone, Copy, Default)]
@@ -219,7 +220,8 @@ pub struct AaroniaConfig {
     /// Usable **RX / real-time bandwidth** in Hz: the alias-free RF span
     /// actually captured. Strictly less than the sample rate
     /// `span_frequency` — the anti-alias filter rolls off the remaining
-    /// fraction (e.g. 49.152 MHz usable inside a 61.44 MHz Fs capture).
+    /// fraction, measured at 0.8 of the rate on a V6 ECO (49.152 MHz
+    /// usable inside a 61.44 MHz Fs capture).
     /// `0.0` means "unknown" (a live backend that hasn't reported it);
     /// file sources populate it from the RTSA sub-stream span.
     pub bandwidth_hz: f64,
@@ -1642,9 +1644,9 @@ impl AaroniaSource {
     ///
     /// On HTTP sources the frequency, rate and bandwidth come from the
     /// stream's own metadata once packets are flowing, which is not
-    /// always what was requested: the device snaps a sample rate to
-    /// 61.44 MHz over a power of two. Before the first packet, and on
-    /// other backends, the configured values are reported.
+    /// always what was requested: the device snaps a sample rate to a
+    /// rung of its ladder. Before the first packet, and on other
+    /// backends, the configured values are reported.
     pub fn get_source_info(&self) -> SourceInfo {
         let observed = self
             .http_observed

@@ -311,13 +311,18 @@ pub const IQ_CLOCK_HZ: f64 = 61_440_000.0;
 /// 24.576, 7.68 reports 6.144, and 120 kHz reports 96 kHz.
 pub const USABLE_BANDWIDTH_RATIO: f64 = 0.8;
 
-/// Every IQ sample rate the hardware can run, highest first.
+/// The IQ sample rates available at the default receiver clock,
+/// highest first.
 ///
 /// The device divides [`IQ_CLOCK_HZ`] by powers of two, which the RTSA
 /// GUI shows as Full through `1 / 512`. Nothing between these exists:
 /// a request for any other rate is adjusted, so a caller that assumes
 /// it got what it asked for will compute every derived frequency
 /// wrongly.
+///
+/// This is a V6 ECO's ladder, measured rung by rung. A full V6 selects
+/// its receiver clock and starts higher — pass that clock to
+/// [`iq_sample_rates_for_clock`], and read its caveat first.
 pub fn iq_sample_rates() -> [f64; 10] {
     iq_sample_rates_for_clock(DEFAULT_RECEIVER_CLOCK_HZ)
 }

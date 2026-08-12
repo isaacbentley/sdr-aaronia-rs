@@ -50,9 +50,12 @@ driver=aaronia,url=http://localhost:54664
 ```
 
 Select the sample rate from GQRX's list. The plugin advertises the
-device's real ladder: 61.44 MHz halved down to 120 kHz, which the RTSA
-GUI labels Full through 1/512. The hardware produces no other rate, so a
-request in between snaps to the nearest rung and logs a warning.
+device's real ladder rather than round numbers it cannot produce: on a
+V6 ECO that is 61.44 MHz halved down to 120 kHz, which the RTSA GUI
+labels Full through 1/512. Nothing in between exists, so a request
+between rungs snaps to the nearest and logs a warning. A full V6 has a
+selectable receiver clock and reaches higher; the plugin advertises the
+ECO ladder, so check the rate the device reports if you are on one.
 
 The single gain element is `REF`, the Aaronia reference level in dBm. It
 is not an amplifier gain: raising it reduces sensitivity. Start near
@@ -102,7 +105,9 @@ directly and skip the SoapySDR layer.
 ## General notes
 
 - Sample rate is the Aaronia "span", not the usable RF bandwidth. The
-  alias-free span is smaller, roughly 49 MHz within a 61.44 MHz capture.
+  alias-free span measured 80% of the rate on a V6 ECO — roughly
+  49 MHz within a 61.44 MHz capture — so ask for the rate that covers
+  the bandwidth you need rather than the bandwidth itself.
 - `readStream` honours `timeoutUs` and returns partial reads within the
   deadline, per the SoapySDR contract.
 - Retuning mid-stream is safe and requires no Aaronia licence.

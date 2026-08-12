@@ -73,17 +73,27 @@ above depends on.
 
 ## Sample rates
 
-The device runs a fixed ladder of rates: 61.44 MHz halved down to
-120 kHz. Ask for anything else and it quietly uses the nearest rung,
-leaving your program computing against a rate that is not in use.
+The device runs a ladder of rates rather than a continuous range: each
+rung is half the one above it. Ask for anything else and it quietly
+uses the nearest rung, leaving your program computing against a rate
+that is not in use.
 
 ```python
 aaronia.sample_rates()                  # every rate, highest first
 aaronia.sample_rate_for_bandwidth(8e6)  # 15.36e6: the lowest rate covering 8 MHz
 ```
 
-A rate carries only 80% of itself as alias-free bandwidth, which is why
-8 MHz of spectrum needs 15.36 MHz of sampling.
+A rate carries only 80% of itself as alias-free bandwidth — measured
+at four rates on a V6 ECO — which is why 8 MHz of spectrum needs
+15.36 MHz of sampling.
+
+`sample_rates()` returns the ladder for a SPECTRAN V6 ECO — 61.44 MHz
+down to 120 kHz — which is measured, rung by rung. A full V6 has a
+selectable receiver clock and can go higher, and exactly how much
+higher is not settled; see
+[the note in HTTPSPEC](https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/HTTPSPEC.md#unresolved-the-full-v6s-top-rate).
+On that hardware, take the rate the device reports over the computed
+ladder: it arrives in the stream metadata, and `diagnose()` prints it.
 
 ## Configuration (`AaroniaConfig`)
 
@@ -155,6 +165,6 @@ silently defaulting.
 | Function | Purpose |
 | --- | --- |
 | `open(url=None, *, freq, rate, bandwidth, ref_level, file, format, read_timeout)` | Configure, connect and start streaming in one call |
-| `sample_rates()` | Every sample rate the hardware can run |
+| `sample_rates()` | The V6 ECO's sample rates, highest first (see [Sample rates](#sample-rates)) |
 | `sample_rate_for_bandwidth(hz)` | Lowest rate covering that much spectrum |
 | `diagnose(url)` | `(ok, message, fix)` for each setup check; what `aaronia-doctor` prints |
