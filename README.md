@@ -5,35 +5,37 @@
 [![CI](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/sdr-aaronia-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
-Unified Rust interface for Aaronia Spectran Spectrum Analyzers / SDRs, featuring Python bindings, a SoapySDR plugin, HTTP streaming, and native SDK support.
+One API for Aaronia SPECTRAN analyzers and SDRs, whether the samples
+come from the native SDK, an RTSA-Suite HTTP server, or a recorded file.
+Python bindings and a SoapySDR plugin come from the same engine.
 
 *Disclaimer: This project is not affiliated with Aaronia AG. Aaronia, SPECTRAN, and RTSA-Suite PRO are trademarks of Aaronia AG.*
 
-`sdr-aaronia-rs` provides a unified API for interacting with Aaronia hardware, abstracting away the underlying transport layers. It supports native SDK connections, bidirectional HTTP streaming (RX/TX), and RTSA file sources through a single, consistent interface with deterministic source selection.
+Working with a SPECTRAN usually means choosing a transport first and
+then writing against whatever API that transport exposes. `AaroniaSource`
+removes the choice: point it at a file, a URL, or nothing at all, and it
+selects a backend and presents the same interface either way.
 
-In addition to the Rust crate, this project provides **Python bindings** (via PyO3) with single-copy NumPy/Arrow reads, a **C++ SoapySDR plugin**, and a **Rust-native seify backend**.
+| What you configure | What it uses |
+| --- | --- |
+| `file_path` | Buffered playback of an RTSA capture file |
+| `http_base_url` | HTTP streaming from an RTSA-Suite server block |
+| Neither | The native SDK, falling back to `localhost:54664` |
+| `force_source_type` | Exactly the backend you name |
 
-## Overview
+## What it does
 
-Interfacing with SDR hardware typically requires choosing between proprietary native SDKs, HTTP streaming protocols, or file-based playback. Each approach demands a different API and configuration lifecycle.
-
-`sdr-aaronia-rs` solves this by offering a unified `AaroniaSource` that automatically selects the optimal transport based on your configuration:
-1. **File Path** → Utilizes the buffered RTSA file source.
-2. **HTTP URL** → Utilizes the HTTP streaming source.
-3. **No Target** → Defaults to the native SDK, falling back to `localhost:54664`.
-4. **Explicit Force** → Locks the source to a specific backend.
-
-## Key Features
-
-- **Native SDK Integration:** Direct hardware access via Aaronia RTSA-Suite PRO with zero-copy sample processing, real-time IQ data, and automatic platform library detection. Enforces hardware constraints (e.g., `span * 1.5 ≤ receiverclock`) prior to streaming. Windows and Linux only (`native-sdk` feature); Aaronia does not ship a macOS SDK.
-- **HTTP Streaming (RX & TX):** Supports JSON, Int16, Float16, and Float32 streaming formats over chunked HTTP connections, with Basic Auth and token-based authentication. An HTTP TX sink for transmitting IQ data is available under the `futuresdr` feature.
-- **RTSA File Processing:** Reads RTSA capture files via buffered I/O, including metadata extraction and multi-stream support.
-- **Device Management:** Real-time control of streaming parameters, device health monitoring, input stream enumeration, and hierarchical configuration.
-- **FutureSDR Integration:** Optional `HttpSource` and `HttpSink` flowgraph blocks under the `futuresdr` feature.
-- **Python Data-Science Native:** PyO3 bindings with single-copy reads into NumPy arrays and Apache Arrow buffers (one copy out of the Rust receive buffer per read).
-- **SDR Ecosystem Plugins:** a C++ `SoapySDR` plugin and a Rust-native `seify` backend.
-
-*Note: writes to the HTTP `/remoteconfig` endpoint require a separate Aaronia "Remote Config" license; capture control via `/control`, including retuning, does not. One server behaviour to be aware of: `/control` applies a frequency change only when `frequencyCenter` and `frequencySpan` are both present. A request carrying one of them returns `{"success":true}` and is ignored. The crate always sends the complete tuple.*
+- **Streams IQ and spectra over HTTP** in JSON, Int16, Float16 or
+  Float32, with Basic and token authentication. Retuning mid-stream
+  needs no Aaronia licence, and dropped streams reconnect on their own.
+- **Reads `.rtsa` capture files** through buffered I/O, with metadata
+  extraction and multi-stream support.
+- **Talks to the hardware directly** through the Aaronia SDK on Windows
+  and Linux, including transmit. The SDK is not available for macOS.
+- **Controls and monitors the device**: streaming parameters, health,
+  input enumeration and the configuration tree.
+- **Plugs into FutureSDR** with `HttpSource` and `HttpSink` flowgraph
+  blocks.
 
 ## Installation
 
@@ -51,7 +53,7 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
 ## Quickstart
 
-Specify your RF parameters and `sdr-aaronia-rs` will auto-detect the optimal backend (Native SDK, HTTP Streaming, or RTSA File):
+Set the RF parameters and read:
 
 ```rust,no_run
 use sdr_aaronia_rs::{AaroniaSource, AaroniaConfig};
@@ -59,7 +61,6 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Let the library auto-detect the best backend
     let config = AaroniaConfig::default()
         .center_frequency(446.0e6)     // 446 MHz
         .span_frequency(10.0e6)        // 10 MHz span
@@ -67,7 +68,6 @@ async fn main() -> Result<()> {
 
     let mut source = AaroniaSource::new(config).await?;
 
-    // Read IQ samples through the unified interface
     let mut buffer = Vec::with_capacity(1024);
     let n = source.read_samples(&mut buffer, 1024).await?;
     println!("Received {} IQ samples", n);
@@ -78,12 +78,11 @@ async fn main() -> Result<()> {
 
 ## Usage
 
-The Quickstart above covers the unified API: set RF parameters, read
-samples. [docs/USAGE.md](docs/USAGE.md) has worked examples for the rest:
-the builder pattern, explicit backend selection, wire formats and network
-bandwidth, configuration profiles, device control, FutureSDR integration,
-authentication, and low-level stream access. Its Rust snippets are
-compiled as doctests.
+[docs/USAGE.md](docs/USAGE.md) has worked examples for everything the
+quickstart leaves out: the builder pattern, explicit backend selection,
+wire formats and network bandwidth, configuration profiles, device
+control, FutureSDR integration, authentication and low-level stream
+access. Its Rust snippets are compiled as doctests.
 
 The programs in `examples/` cover the same ground as runnable code, and
 are built by CI:

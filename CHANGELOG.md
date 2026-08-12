@@ -80,9 +80,9 @@ hardware and which have not.
 ### Release
 - Release archives now carry the module, install instructions and the
   licence, and their names state the version, OS and architecture.
-- The Linux module ships stripped of debug symbols, down from about
-  19 MB. The release job checks the stripped module still loads before
-  publishing it.
+- The Linux module ships stripped of debug symbols, 19.1 MB down to
+  15.4 MB. The rest is statically linked Rust, not symbols. The release
+  job checks the stripped module still loads before publishing it.
 - GitHub releases now use this file's entry for the tag as their
   description, with the generated commit list below it.
 
