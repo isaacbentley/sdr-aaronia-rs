@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.6.1] - 2026-08-12
+
 ### Fixed
 - **The SoapySDR plugin advertised sample rates the hardware cannot
   produce.** Seven of the ten rates it listed, 1, 2, 5, 10 and 20 MHz
