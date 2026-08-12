@@ -111,8 +111,22 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
     }
     // format=I16 enables the genuine low-bandwidth HTTP wire mode
     // (int16 from the server), optionally with scale=N.
+    //
+    // Checked here rather than left to the C API, which ignores a value
+    // it does not recognise and returns nothing to say so. A typo would
+    // otherwise stream the default format while the device string
+    // claims something else — and the server is no help either: it
+    // answers an unknown `format=` with the RTSA file format rather
+    // than an error.
     if (args.count("format") != 0) {
-        aaronia_source_builder_stream_format(builder, args.at("format").c_str());
+        const std::string &fmt = args.at("format");
+        if (fmt != "F32" && fmt != "F16" && fmt != "I16") {
+            SoapySDR::logf(SOAPY_SDR_WARNING,
+                           "aaronia: ignoring format=%s; expected F32, F16 or I16",
+                           fmt.c_str());
+        } else {
+            aaronia_source_builder_stream_format(builder, fmt.c_str());
+        }
     }
     if (args.count("scale") != 0) {
         aaronia_source_builder_stream_scale(builder, parseArgDouble(args, "scale"));

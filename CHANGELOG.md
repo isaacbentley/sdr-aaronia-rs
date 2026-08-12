@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **The SoapySDR plugin ignored an unrecognised `format=` silently.**
+  A device string carrying `format=int16` — the wire name rather than
+  the plugin's `I16` — streamed the default format while claiming
+  otherwise. It now warns and continues. The server behaves the same
+  way and worse: an unrecognised `format=` on `/stream` serves the
+  RTSA file format with HTTP 200 rather than an error, so a typo
+  changes the wire format entirely. `raw16`, which Aaronia's own Qt
+  reference client sends, is a working alias for `int16`.
+
 ### Documentation
 - Checked Aaronia's V6 remote control notes (rev 4, May 2026) against
   the hardware. `/remoteconfig` enum fields take an index as well as a
@@ -35,15 +45,36 @@ All notable changes to this project will be documented in this file.
 - SDKSPEC still gave the V6 ECO's receiver clock as 61.44 MHz, which
   0.6.2 corrected in code to 92.16 MHz. 61.44 MHz is the ECO's top IQ
   rate, that clock over 1.5; the document had the two confused.
-- **A marker stream does not look like the categories payload this
-  document described.** Aaronia's example of the Spectrum block's
-  `Marker` output wired to an HTTP Server reports `payload: "spectra"`,
-  zero for all three frequency fields, and `samples` as an array of
-  arrays rather than the flat array a live server produced. Because
-  `PacketMetadata::samples` counts top-level elements, one nested row
-  counts as 1 rather than as the number of categories. No marker source
-  has been available to test, so the counting is documented rather than
-  changed.
+- **A marker stream is not a categories packet**, which the previous
+  draft of this entry got wrong. Aaronia's example declares
+  `payload: "spectra"`, and spectra samples are a 2D array, so its
+  nesting is correct for what it says it is. Its three frequency fields
+  are all zero, so the category names and ranges are the only
+  description of what the numbers mean.
+- Aaronia's endpoint specification (rev 11) settles several things this
+  document had only inferred, and their support answers go further.
+  `/control` takes PUT only, and a command reaches every block that
+  understands it unless `receiverUUID` or `receiverName` scopes it —
+  the specification says such commands cannot be addressed to a block,
+  which their support corrected in 2024. The per-type settings are now
+  listed in full, including `deviceconnect` and `camera`, which this
+  crate does not model. Zones cannot be configured remotely at all.
+  The server starts dropping data once its outbound TCP buffer passes
+  8 MB, which is the mechanism behind most unexplained gaps.
+  `/healthstatus` is organised as `info`, `status`, `health`,
+  `settings` and `components`, the last being how satellites attached
+  over HTTP appear in a local tree.
+- **`status/iqsamples` is the native rate, not the delivered one.** It
+  held at 61.44 MHz while the same device delivered 15.36, then 7.68,
+  then 61.44 MS/s. It looks like a sample rate and is not the one your
+  stream is running at; read `sampleFrequency` from packet metadata.
+  Documented the other fields a V6 ECO reports alongside it.
+- **One HTTP Server and one HTTP Client connection are free**;
+  additional instances and connections are licensed separately, as are
+  Stream Merger and Stream Splitter. Running this crate and a second
+  client against one server at the same time is a second connection —
+  the licence limit most likely to be met in practice, and unrelated to
+  Remote Config.
 
 ## [v0.7.3] - 2026-08-12
 

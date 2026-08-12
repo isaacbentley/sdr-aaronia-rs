@@ -54,7 +54,7 @@ The Aaronia RTSA Vendor SDK provides low-level, high-performance access to Aaron
     *   **Clock Rates** (V6): 46MHz (46.08), 61MHz (61.44), 76MHz (76.80), 92MHz (92.16), 122MHz (122.88), 184MHz (184.32), 245MHz (245.76), 492MHz (491.52) — see the full label table under [Rust Binding Notes](#rust-binding-notes)
     *   **Clock Rates** (V6 ECO): fixed at 92.16 MHz. Its top IQ rate is 61.44 MHz, which is that clock over 1.5 — the two are easy to confuse and this document once recorded the rate as the clock
     *   **Decimation**: Full, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, 1/128, 1/256, 1/512
-    *   **IQ Mode Sample Rate**: equal to `spanfreq` (constraint: `spanfreq ≤ receiverclock / 1.5`). Measured on a V6 ECO. Aaronia's Remote Config screenshots show a full V6 at a 92 MHz clock streaming ~92.16 MHz of IQ, which this constraint would forbid; see [HTTPSPEC](HTTPSPEC.md#unresolved-what-full-means-on-a-full-v6). Unresolved, and untested on a full V6
+    *   **IQ Mode Sample Rate**: equal to `spanfreq` (constraint: `spanfreq ≤ receiverclock / 1.5`). Measured on a V6 ECO, untested on a full V6, and not obviously consistent with Aaronia's own 245 MHz / 250 Msample figures for the V6 — see [HTTPSPEC](HTTPSPEC.md#unresolved-the-full-v6s-top-rate)
 *   **Health Monitoring**: Real-time device status including temperatures, sample rates, power levels, USB statistics, GPS data
 
 The SDK is designed for building custom spectrum analysis applications, SDR integration, and specialized RF measurement tools.
@@ -911,8 +911,12 @@ reads a single stream and deinterleaves it, so it writes `Rx12`.
 | Raw-mode open string | `spectranv6/raw` | `spectranv6eco/rtsa` |
 
 The clock matters beyond configuration: with `span * 1.5 <=
-receiverclock`, a V6 on the fast clock reaches roughly 163 MHz of span
-where the ECO's fixed clock allows 61.44 MHz.
+receiverclock`, a V6 on the `245MHz` clock reaches roughly 163 MHz of
+span where the ECO's fixed clock allows 61.44 MHz. Aaronia advertise
+245 MHz of real-time bandwidth per input, which under this rule would
+need the `492MHz` clock; see
+[HTTPSPEC](HTTPSPEC.md#unresolved-the-full-v6s-top-rate) for why that
+is not settled.
 
 ### Sample rates
 

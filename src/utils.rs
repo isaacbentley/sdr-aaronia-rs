@@ -335,15 +335,16 @@ pub fn iq_sample_rates() -> [f64; 10] {
 /// `"245MHz"` — and the rates there follow the same constraint but have
 /// not been confirmed against hardware.
 ///
-/// **The 1.5 may be wrong for a full V6.** Aaronia's own Remote Config
-/// screenshots show one at a `92MHz` clock with span "Full" and
-/// roughly 92.16 MHz of IQ samples per second — the clock itself, not
-/// two thirds of it. If that is what a full V6 does, every rung this
-/// returns for it is a factor of 1.5 too low, and passing the true
-/// clock does not help, because the ratio is what is in question.
-/// Until a full V6 can be measured, treat this as the ECO's ladder and
-/// take the rate a device reports in its stream metadata over the one
-/// computed here.
+/// **The 1.5 may be wrong for a full V6.** Aaronia advertise 245 MHz of
+/// real-time bandwidth per input and "the full 250M samples of IQ
+/// data", which is the `245MHz` clock label itself rather than the
+/// 163.84 MHz this returns for it. That may simply mean the fastest
+/// rate needs the `492MHz` clock, where 245.76 MHz of span does
+/// satisfy the 1.5 rule; a published Remote Config panel showing a
+/// full V6 at a `92MHz` clock with a 92.16 MHz native rate fits
+/// neither reading. Until one can be measured, treat this as the ECO's
+/// ladder and prefer the rate a device reports in its stream metadata
+/// over the one computed here.
 pub fn iq_sample_rates_for_clock(receiver_clock_hz: f64) -> [f64; 10] {
     let top = receiver_clock_hz / 1.5;
     let mut rates = [0.0; 10];

@@ -161,6 +161,34 @@ http://localhost:54664/stream?format=int16&scale=1000000
 http://localhost:54664/stream?rate_reduction=10
 ```
 
+### An unknown `format` is not an error
+
+`format=` accepts `json`, `int16`, `float16` and `float32`. `raw16` is
+an accepted alias for `int16` — Aaronia's own Qt reference client
+defaults to it — and produces byte-identical framing.
+
+Anything the server does not recognise serves **the RTSA file format**
+instead: a `DSFH` header followed by `STRM`/`ANTA` chunks, with HTTP
+200 and no warning. A typo in `format=` therefore yields a completely
+different wire format rather than an error, and a parser expecting
+JSON-plus-binary will fail somewhere well past the point that would
+have identified the cause. Verified against a live server: `format=`
+with a nonsense value returned `DSFH`.
+
+This crate builds the string from an enum, so it cannot typo, and the
+SoapySDR plugin now warns on an unrecognised `format=` device argument
+rather than silently falling back to the default.
+
+### When the server drops data
+
+The HTTP server block starts dropping data once its outbound TCP
+buffer passes **8 MB**. Nothing announces it; the loss shows up as a
+gap between the timestamps of two adjacent packets, which is what
+`DropDetector` watches for. A slow consumer, a slow link, or a rate
+the network cannot carry all end here, so reducing the wire format
+(`format=int16`) or the rate (`rate_reduction=n`) is the fix rather
+than a larger client-side buffer.
+
 ### Liveness
 
 There is no status endpoint. Aaronia's own remote control notes probe
@@ -259,6 +287,42 @@ packet-metadata object, so `payload`, `minPower`, `maxPower`, and
 `stepFrequency` (the sample rate) is optional; `push: true` marks the packet for immediate transmission.
 
 ### Control Endpoint
+
+`/control` accepts **PUT only**. A GET — which is what a browser does
+with the URL — is not supported.
+
+**A command reaches every block that understands it, unless you scope
+it.** Aaronia's 2022 specification says control commands "are not
+addressed to a specific RTSA block and will be processed from all RTSA
+blocks in the block graph", which is true as a default. Their support
+staff refined it in 2024: `receiverUUID` and `receiverName` "can be
+used to limit the requested setting to individual blocks", and "in some
+cases it may be necessary to specify them". Read the names or UUIDs
+from `/remoteconfig` first if you need to target one block.
+
+These are one-off requests. Aaronia's own words: if they cannot be
+executed, or conflict with the local configuration, the behaviour is
+undefined — nothing reports the conflict.
+
+**The settings each `type` accepts**, per Aaronia support (January
+2024), which goes well beyond the published specification:
+
+| `type` | Settings |
+| :--- | :--- |
+| `capture` | `receiverUUID`, `receiverName`, `frequencyCenter`, `frequencyStart`, `frequencyBins`, `referenceLevel`, `start` — plus `frequencySpan` and `frequencyEnd`, which the specification documents and this crate uses |
+| `deviceconnect` | `receiverUUID`, `receiverName`, `start` — connect or disconnect a device |
+| `streaming` | `receiverUUID`, `receiverName`, `filename`, `start` |
+| `recording` | `receiverUUID`, `receiverName`, `filename`, `start` |
+| `mission` | `save`, `reload`, `load` (with the path in `file`) |
+| `antenna` | `receiverUUID`, `receiverName`, `latitude`+`longitude` (both or neither), `azimuth`+`declination`, `rotate` |
+| `camera` | `receiverUUID`, `receiverName`, `latitude`+`longitude`, `azimuth`+`declination`, `aperture`, `channel`, `altitude`, `start` |
+
+`start`, `rotate`, `save`, `load` and `reload` are booleans. A
+`filename` must be an absolute path **on the machine running
+RTSA-Suite**, with forward slashes.
+
+Zones cannot be configured this way; Aaronia state that remote
+configuration of zones is not supported.
 **URL**: `/control`  
 **Method**: PUT  
 **Description**: Send commands to the RTSA suite
@@ -518,6 +582,28 @@ configuration tree (`HealthStatus` is an alias for `ConfigItem`) rather
 than the typed shape below, which describes the upstream block-health
 fields.
 
+**Subgroups** per health-aware block, per Aaronia's specification:
+`info`, `status`, `health`, `settings`, and `components` — the last a
+recursive list of sub-blocks when satellites are attached over HTTP,
+which is how a remote station's devices show up in a local tree.
+
+**What a V6 ECO actually reports** under `status` and `health`,
+alongside the `info` fields below:
+
+| Item | Example | Meaning |
+| :--- | :--- | :--- |
+| `status/iqsamples` | 61439323 | **Native** IQ rate in Hz, not the delivered one. Measured constant at 61.44 MHz while the same device delivered 15.36, then 7.68, then 61.44 MS/s — it does not follow the decimation setting |
+| `status/usbbuffer` | 0.0625 | USB buffer fill, fraction |
+| `status/adcrange` | 17.16 | ADC headroom in dB |
+| `status/strmtimedist` | 5.96e-06 | Stream time distance in seconds |
+| `health/fronttemp` | 64.7 | Frontend temperature, °C |
+| `health/fpgatemp` | 52.5 | FPGA temperature, °C |
+| `health/boardpower` | 8.975 | Board power draw, W |
+
+`iqsamples` is the one to be careful with: it looks like a sample rate
+and is not the one your stream is running at. Read `sampleFrequency`
+from packet metadata for that.
+
 **Health Status Fields**:
 | Field | Description |
 | :--- | :--- |
@@ -629,9 +715,9 @@ The samples in a category ordered packet have one measurement per category.
 As with histograms, category samples are a flat number array (one value
 per category) — that is what a live server produced.
 
-**Aaronia's own example is not flat.** Their remote control notes show
-the Spectrum block's `Marker` output wired to an HTTP Server, and the
-resulting `/sample` reads:
+**A marker stream is not a categories packet.** Aaronia's remote
+control notes show the Spectrum block's `Marker` output wired to an
+HTTP Server, and the result looks like this:
 
 ```json
 {
@@ -639,25 +725,22 @@ resulting `/sample` reads:
   "startFrequency": 0, "endFrequency": 0, "sampleFrequency": 0,
   "sampleSize": 4, "sampleDepth": 1,
   "categories": [
-    { "name": "Slow Sine(R)",      "startFrequency": 2403000000, "endFrequency": 2405000000 },
-    { "name": "Marker",            "startFrequency": 2412852325.3, "endFrequency": 2412852335.3 }
+    { "name": "Slow Sine(R)", "startFrequency": 2403000000, "endFrequency": 2405000000 },
+    { "name": "Marker",       "startFrequency": 2412852325.3, "endFrequency": 2412852335.3 }
   ],
   "samples": [[-78.6, -57.26, -47.28, -114.25]]
 }
 ```
 
-Three things differ from a spectra stream and are worth knowing before
-parsing one: `payload` reads `spectra` rather than `categories`; the
-three frequency fields are all `0`, so nothing can be derived from
-them; and `samples` is an array *of arrays*, one row of one value per
-category.
+It carries a `categories` array but declares `payload: "spectra"`, and
+spectra samples are a 2D array — one row per frame — so the nesting is
+correct for what it says it is, not a contradiction of the flat
+categories form above. `sampleSize` is the number of values in a row,
+here one per category.
 
-The consequence for this crate: `PacketMetadata::samples` counts
-top-level array elements, so a single nested row counts as **1**, not
-as the number of categories. No marker source has been available to
-test against, so the counting is left as it is rather than changed on
-the strength of a screenshot. Read `categories.len()` when you need the
-number of values in such a packet.
+What is worth knowing before parsing one: all three frequency fields
+are `0`, so nothing can be derived from them, and the category names
+and ranges are the only description of what the numbers mean.
 
 ### Antenna Data
 Data captured using antennas with location or directional information.
@@ -698,25 +781,40 @@ transports drive the same divider. Over HTTP the index works as well as
 the label: writing `3` and reading `/sample` back gave 7.68 MHz, and `2`
 gave 15.36 MHz, which is 61.44 MHz halved that many times on a V6 ECO.
 
-#### Unresolved: what "Full" means on a full V6
+#### Unresolved: the full V6's top rate
 
-The SDK constrains `spanfreq ≤ receiverclock / 1.5`, and a V6 ECO
-follows it exactly: a fixed 92.16 MHz clock, "Full" measured at
-61.44 MHz. `iq_sample_rates_for_clock` takes that ratio as the rule.
+The SDK constrains `spanfreq * 1.5 <= receiverclock`, and a V6 ECO
+follows it: its top IQ rate measures 61.44 MHz against the 92.16 MHz
+clock the crate assumes for it. `iq_sample_rates_for_clock` takes that
+ratio as the rule, so it puts a full V6 on the `245MHz` clock at
+163.84 MHz.
 
-Aaronia's Remote Config screenshots do not agree for the full V6. Both
-the 2021 and the 2022 one show a `Block_Spectran_V6B` with **Receiver
-Clock `92MHz`**, **Span `Full`** and **IQ Samples/s ≈ 92.16 MHz** — the
-clock itself, not two thirds of it. Either the ceiling is the clock on a
-full V6 and only the ECO pays the 1.5, or that counter reports something
-other than the delivered sample rate.
+Aaronia's own figures do not agree. Their endpoint specification closes
+with a note about achieving "the full 250M samples of IQ data", their
+block documentation advertises "a real-time bandwidth of up to 245MHz
+each" for the V6's two inputs, and both round to the 245.76 MHz that
+the `245MHz` clock label denotes — the clock itself, not two thirds of
+it.
 
-Nothing here settles it, and no full V6 has been available to measure.
-Until one is, `iq_sample_rates_for_clock` may understate the top of the
-ladder by 1.5x for a full V6 at a non-default clock. Read the rate the
-device reports in stream metadata rather than trusting the computed
-ladder when it matters. The ECO path, which is what this crate has been
-measured on, is unaffected.
+There is a reading that reconciles them. The clock list runs past
+`245MHz` to `492MHz` (491.52 MHz), and 245.76 MHz of span satisfies the
+1.5 rule against that clock with room to spare. On that reading 245 MHz
+of real-time bandwidth is real but needs the fastest clock, and the
+`245MHz` label tops out at 163.84 MHz exactly as the crate computes.
+
+What does not fit either reading is the Remote Config panel Aaronia
+published in 2021 and again in 2022: a full V6 with the clock set to
+`92MHz` reporting roughly 92.16 MHz of IQ samples per second. That
+counter is not the delivered rate — measured on an ECO, `iqsamples`
+held at 61.44 MHz while the device was actually delivering 15.36 and
+then 7.68 MHz, so it reports the native undecimated rate. Taken at face
+value it says a full V6 at a 92 MHz clock has a native rate of
+92.16 MHz, which the 1.5 rule forbids.
+
+No full V6 has been available to measure, so this stays open. The
+practical guidance is unchanged: the ECO path is verified rung by rung,
+and for anything else read the rate the device reports in its stream
+metadata rather than trusting a computed ladder.
 
 ### Two things that do not carry over
 
@@ -739,6 +837,20 @@ measured on, is unaffected.
 - `/sample` - Sample retrieval
 - `/info` - Device information
 - `/healthstatus` - Device health monitoring
+
+**HTTP Server and Client blocks are themselves licensed, and the free
+tier is one of each.** Aaronia's staff put it plainly in the HTTP
+Server thread: only one HTTP Server instance is included in the free
+RTSA-Suite PRO licence and additional instances must be licensed
+separately, the same going for the HTTP Client, where only one
+connection is free. Stream Merger and Stream Splitter, the blocks that
+would otherwise let several streams share one connection, are not in
+the free licence either.
+
+This is the licence limit most likely to be met in practice: running
+this crate and a second client — a SoapySDR application, say — against
+one server at the same time is a second connection. It has nothing to
+do with the Remote Config licence discussed below.
 
 **Remote Configuration** (`/remoteconfig`):
 - Device parameter configuration.
@@ -902,6 +1014,8 @@ fn parse_iq_int16(data: &[u8], metadata_scale: f32) -> Vec<Complex32> {
 |---------|------|---------|
 | 1.0 | 2025-01-11 | Initial HTTP specification from original documentation |
 | 2.0 | 2025-01-11 | Enhanced with comprehensive streaming protocol specification and implementation guidelines |
+| 2.4 | 2026-08-12 | Added Aaronia support's full `/control` settings list (`deviceconnect`, `camera`, per-type fields, `receiverUUID`/`receiverName` scoping), which supersedes the specification's claim that commands cannot be addressed to a block; documented that an unrecognised `format=` silently serves the RTSA file format and that `raw16` aliases `int16`, both verified live |
+| 2.3 | 2026-08-12 | Folded in Aaronia's endpoint specification (rev 11) and the block forum threads: `/control` broadcasts to every block and is PUT-only, the server drops data past an 8 MB outbound buffer, `/healthstatus` subgroups and the fields a V6 ECO reports, and the one-server/one-client free-licence limit. Measured that `status/iqsamples` is the native rate, not the delivered one. Corrected the marker-stream entry: it declares `payload: "spectra"`, so its nested samples are the spectra form and not a counter-example to flat categories |
 | 2.2 | 2026-08-12 | Verified Aaronia's V6 remote control notes (rev 4) against hardware: enum writes by index, multi-group and non-`main` `simpleconfig` PUTs, the silent no-op on an unknown block name, the ignored receiver name in the config-tree form; documented mission loading and the `type` requirement on `/control`, the absence of a status endpoint, and the unresolved conflict over what "Full" means on a full V6; resolved a contradiction over what the Remote Config licence gates |
 | 2.1 | 2026-08-06 | Live-hardware corrections folded in (two-byte separator, spectra frame counting, `scale` inversion); documented `/samples`, the `/sample` TX push, and the `simpleconfig` PUT form; corrected `limit` semantics, field types, and flat histogram/categories sample arrays; removed decorative icons |
 ---
