@@ -124,6 +124,17 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         int32_t sel = ch == "Rx2" ? 1 : (ch == "Rx1And2" ? 2 : 0);
         aaronia_source_builder_receiver_channel(builder, sel);
     }
+    // read_timeout=<seconds>: only affects the crate's own blocking
+    // reads. readStream always passes SoapySDR's per-call timeoutUs, so
+    // this is a backstop for the non-Soapy paths rather than a knob most
+    // Soapy applications need.
+    if (args.count("read_timeout") != 0) {
+        const double seconds = parseArgDouble(args, "read_timeout");
+        if (seconds > 0.0) {
+            aaronia_source_builder_read_timeout_us(
+                builder, static_cast<uint64_t>(seconds * 1e6));
+        }
+    }
 
     SourceGuard source(aaronia_source_build(builder));
     if (!source.p) {

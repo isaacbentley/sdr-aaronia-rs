@@ -450,6 +450,19 @@ The `sdr-aaronia-rs` workspace also acts as the source of truth for standard SDR
 
 For deep-dive setup instructions and documentation on the C++ side and Bandwidth Optimization tricks, please see the dedicated [PLUGINS.md](PLUGINS.md) document.
 
+## Connection Resilience
+
+Connecting (the `/info` probe and initial tuning PUT) retries transient
+failures — refused connections, unresolved DNS, 5xx/408/429 — up to 4 times
+with exponential backoff, bounded by a 10 s total budget so a wrong hostname
+reports itself promptly; 4xx and config errors fail on the first attempt.
+This matters for `*.local` hostnames, which refuse the first connection from
+a cold process while mDNS resolves.
+
+`AaroniaConfig::read_timeout` (default 30 s) bounds `read_samples`.
+`read_samples_deadline` — and therefore the SoapySDR and seify paths — uses
+its caller's per-call deadline instead.
+
 ## Environment Variables
 
 | Variable | Effect |

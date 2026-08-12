@@ -87,6 +87,10 @@ void aaronia_source_builder_receiver_channel(AaroniaSourceBuilder* builder, int3
 void aaronia_source_builder_stream_format(AaroniaSourceBuilder* builder, const char* format);
 // Server-side integer encode multiplier for integer wire formats.
 void aaronia_source_builder_stream_scale(AaroniaSourceBuilder* builder, double scale);
+// Blocking-read timeout in microseconds (default 30 s). Applies to
+// aaronia_source_read_samples; aaronia_source_read_samples_timeout uses
+// its own per-call deadline. 0 is ignored.
+void aaronia_source_builder_read_timeout_us(AaroniaSourceBuilder* builder, uint64_t timeout_us);
 AaroniaSource* aaronia_source_build(AaroniaSourceBuilder* builder);
 
 // --- AaroniaSource FFI --- //

@@ -406,6 +406,28 @@ pub unsafe extern "C" fn aaronia_source_builder_stream_scale(
     }
 }
 
+/// Set how long a blocking read waits for samples before returning the
+/// timeout code (default 30 s). Affects
+/// [`aaronia_source_read_samples`]; the deadline-taking
+/// [`aaronia_source_read_samples_timeout`] uses its own per-call value.
+/// `0` is ignored (it would make every read time out immediately).
+///
+/// # Safety
+/// `builder` must be a live pointer from [`aaronia_source_builder_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_builder_read_timeout_us(
+    builder: *mut AaroniaSourceBuilder,
+    timeout_us: u64,
+) {
+    unsafe {
+        if let Some(builder) = builder.as_mut()
+            && timeout_us > 0
+        {
+            builder.read_timeout(std::time::Duration::from_micros(timeout_us));
+        }
+    }
+}
+
 /// Consume the builder and asynchronously build an `AaroniaSource`. Returns
 /// an opaque pointer that must later be freed with
 /// [`aaronia_source_free`], or `NULL` on error.

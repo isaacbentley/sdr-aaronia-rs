@@ -47,6 +47,96 @@ pub enum SourceType {
 
 pub use crate::utils::RxChannel;
 
+/// Default blocking-read timeout — see [`AaroniaConfig::read_timeout`].
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Attempts made when first reaching the RTSA server, including the
+/// initial try. Connecting to a freshly-resolved hostname (notably
+/// `*.local` via mDNS) fails on the first attempt often enough that a
+/// single shot made "server not running" the default first impression
+/// even when the server was up.
+const CONNECT_ATTEMPTS: u32 = 4;
+
+/// First backoff after a failed connect attempt; doubles up to
+/// [`CONNECT_BACKOFF_MAX`].
+const CONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
+
+/// Ceiling for the connect backoff.
+const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
+/// Hard ceiling on the total time spent retrying, measured from the
+/// first attempt.
+///
+/// Attempt count alone doesn't bound the wall-clock cost: each attempt
+/// can itself burn the client's 5 s connect timeout (a black-holed
+/// route, rather than a prompt refusal), so 4 attempts plus backoff
+/// could stall an application's startup for ~21 s. A wrong hostname
+/// should report itself quickly; this keeps the worst case predictable
+/// regardless of how slowly individual attempts fail.
+const CONNECT_TOTAL_BUDGET: Duration = Duration::from_secs(10);
+
+/// Whether a failure is worth retrying: transport-level problems (DNS
+/// not yet resolvable, connection refused, timeout) and server-side
+/// 5xx/408/429 are transient. A 4xx (bad request, unauthorized) or a
+/// config error will fail identically on every retry, so those return
+/// immediately rather than burning the backoff budget.
+fn is_retryable(e: &Error) -> bool {
+    match e {
+        Error::Transport(_) => true,
+        Error::Http { status, .. } => {
+            status.is_server_error()
+                || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        _ => false,
+    }
+}
+
+/// Run `op` until it succeeds, retrying transient failures with
+/// exponential backoff. Returns the last error once attempts are
+/// exhausted, so the caller's error message is the real one rather than
+/// a synthetic "gave up".
+async fn retry_connect<F, Fut, T>(what: &str, mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let started = std::time::Instant::now();
+    let mut backoff = CONNECT_BACKOFF_INITIAL;
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        match op().await {
+            Ok(v) => {
+                if attempt > 1 {
+                    info!("{what} succeeded on attempt {attempt}/{CONNECT_ATTEMPTS}");
+                }
+                return Ok(v);
+            }
+            Err(e) if attempt < CONNECT_ATTEMPTS && is_retryable(&e) => {
+                // Stop if the next attempt couldn't finish inside the
+                // budget anyway — slow failures, not just numerous ones,
+                // are what stall a caller's startup.
+                let elapsed = started.elapsed();
+                if elapsed + backoff >= CONNECT_TOTAL_BUDGET {
+                    warn!(
+                        "{what} failed after {elapsed:?} (attempt {attempt}/{CONNECT_ATTEMPTS}); \
+                         retry budget of {CONNECT_TOTAL_BUDGET:?} exhausted: {e}"
+                    );
+                    return Err(e);
+                }
+                warn!(
+                    "{what} failed (attempt {attempt}/{CONNECT_ATTEMPTS}), retrying in {backoff:?}: {e}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(CONNECT_BACKOFF_MAX);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // Only reachable if CONNECT_ATTEMPTS were 0; the final attempt above
+    // always returns.
+    unreachable!("retry loop returns on the final attempt")
+}
+
 /// Configuration for the unified Aaronia source
 #[derive(Debug, Clone)]
 pub struct AaroniaConfig {
@@ -83,6 +173,16 @@ pub struct AaroniaConfig {
     /// (`Rx1`). Ignored by HTTP and file backends (their channel
     /// routing lives in the RTSA Suite mission graph).
     pub receiver_channel: Option<RxChannel>,
+    /// How long a blocking read waits for samples before returning
+    /// [`Error::Io`] with [`std::io::ErrorKind::TimedOut`]. Applies to
+    /// [`AaroniaSource::read_samples`] on HTTP sources; the
+    /// deadline-taking reads ([`AaroniaSource::read_samples_deadline`],
+    /// and therefore the SoapySDR/seify paths) use their caller's
+    /// timeout instead.
+    ///
+    /// Default: 30 s. Lower it for dashboards that would rather show a
+    /// gap than stall; raise it for slow sweeps.
+    pub read_timeout: Duration,
 }
 
 impl Default for AaroniaConfig {
@@ -99,6 +199,7 @@ impl Default for AaroniaConfig {
             stream_format: None,
             stream_scale: None,
             receiver_channel: None,
+            read_timeout: DEFAULT_READ_TIMEOUT,
         }
     }
 }
@@ -205,6 +306,14 @@ impl AaroniaConfig {
     #[must_use]
     pub fn receiver_channel(mut self, channel: RxChannel) -> Self {
         self.receiver_channel = Some(channel);
+        self
+    }
+
+    /// Set how long a blocking read waits before timing out
+    /// (default 30 s) — see [`AaroniaConfig::read_timeout`].
+    #[must_use]
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout;
         self
     }
 }
@@ -489,8 +598,13 @@ impl AaroniaSource {
         let client =
             HttpEndpointsClient::new(base_url.clone(), crate::http_endpoints::AuthMethod::None)?;
 
-        // Test connection immediately
-        (client.test_connection().await).map_err(|e| Error::Protocol(format!("Failed to connect to Aaronia RTSA Suite Pro at {}. Is it running and accessible? Error: {}", base_url, e)))?;
+        // Test connection immediately. Retried: a `*.local` hostname
+        // that mDNS hasn't resolved yet refuses the first connection
+        // from a cold process, which otherwise looks exactly like "the
+        // server isn't running".
+        retry_connect("Connection test", || client.test_connection())
+            .await
+            .map_err(|e| Error::Protocol(format!("Failed to connect to Aaronia RTSA Suite Pro at {}. Is it running and accessible? Error: {}", base_url, e)))?;
 
         // Tune the hardware to the requested frequency *before* opening the
         // stream.  Without this the `/stream` endpoint returns whatever the
@@ -502,15 +616,16 @@ impl AaroniaSource {
             self.config.span_frequency / 1e6,
             self.config.reference_level,
         );
-        client
-            .configure_capture(crate::http_endpoints::CaptureControl {
+        retry_connect("Initial tuning", || {
+            client.configure_capture(crate::http_endpoints::CaptureControl {
                 frequency_center: Some(self.config.center_frequency),
                 frequency_span: Some(self.config.span_frequency),
                 reference_level: Some(self.config.reference_level as f32),
                 control_type: crate::http_endpoints::ControlType::Capture,
                 ..Default::default()
             })
-            .await?;
+        })
+        .await?;
 
         // Create a channel for sending samples from the async task to
         // AaroniaSource. Each item also carries whether the reader
@@ -862,6 +977,8 @@ impl AaroniaSource {
             SourceType::NativeSdk => Err(Error::Config("Native SDK not available".to_string())),
             SourceType::Http => {
                 let start_len = buffer.len();
+                // Read before the `&mut self` borrow of `http_receiver`.
+                let read_timeout = self.config.read_timeout;
                 let receiver = self
                     .http_receiver
                     .as_mut()
@@ -877,7 +994,7 @@ impl AaroniaSource {
                 let mut collected = from_buffer;
                 while collected < max_samples {
                     // If buffer is empty, try to receive more samples from the channel
-                    match tokio::time::timeout(Duration::from_secs(30), receiver.recv()).await {
+                    match tokio::time::timeout(read_timeout, receiver.recv()).await {
                         Ok(Some((mut new_samples, dropped, cum_drops, ts_ns))) => {
                             if dropped {
                                 self.pending_overrun = true;
@@ -1433,6 +1550,13 @@ impl AaroniaSourceBuilder {
     /// integer wire format.
     pub fn stream_scale(&mut self, scale: f64) -> &mut Self {
         self.config.stream_scale = Some(scale);
+        self
+    }
+
+    /// Set how long a blocking read waits before timing out
+    /// (default 30 s) — see [`AaroniaConfig::read_timeout`].
+    pub fn read_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.config.read_timeout = timeout;
         self
     }
 

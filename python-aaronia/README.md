@@ -63,6 +63,7 @@ Every field is readable and writable.
 | `reference_level` | Reference level, dBm |
 | `format` | HTTP wire format: `"F32"`, `"F16"`, or `"I16"` (true low-bandwidth mode) |
 | `receiver_channel` | `"Rx1"` (default), `"Rx2"`, or `"Rx1And2"` (native SDK, full V6) |
+| `read_timeout` | Seconds a blocking read waits before `AaroniaTimeoutError` (default `30.0`) |
 
 Unknown `format`/`receiver_channel` strings raise `ValueError` instead of
 silently defaulting.
@@ -74,8 +75,11 @@ silently defaulting.
   (Not "zero-copy"; one copy is the honest count.)
 - **Blocking calls release the GIL.** Other Python threads keep running;
   `KeyboardInterrupt` is delivered between calls. Reads block until
-  `count` samples arrive or an internal 30 s timeout raises
-  `AaroniaTimeoutError`.
+  `count` samples arrive or `cfg.read_timeout` seconds (default 30)
+  elapse, which raises `AaroniaTimeoutError`.
+- **Connecting retries transient failures** (up to 4 attempts over ~4.5 s),
+  so a cold `*.local` hostname or a server still starting up doesn't fail
+  on the first try.
 - **Typed exceptions.** `AaroniaConnectionError` (unreachable endpoint),
   `AaroniaTimeoutError`, `AaroniaHardwareError` (device/SDK errors),
   `ValueError` (invalid configuration) — mapped from the Rust error

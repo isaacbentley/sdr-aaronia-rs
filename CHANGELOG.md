@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Connect retry with backoff.** Reaching the RTSA server (the `/info`
+  probe and the initial tuning PUT) now retries transient failures up to
+  4 times with exponential backoff (250 ms → 2 s), under a 10 s total
+  budget so that slow-failing attempts can't stall startup. A cold
+  `*.local` hostname refuses the first connection while mDNS resolves,
+  which previously surfaced as "Is it running and accessible?" against a
+  server that was up. 4xx and config errors still fail on the first
+  attempt.
+- **Configurable blocking-read timeout** — `AaroniaConfig::read_timeout`
+  (default 30 s, previously a hard-coded literal), with builder setters,
+  a Python `read_timeout` property (seconds), the C API
+  `aaronia_source_builder_read_timeout_us`, and a `read_timeout=<seconds>`
+  SoapySDR device arg. `read_samples_deadline` (and therefore the
+  SoapySDR and seify paths) continues to use its caller's per-call
+  deadline.
+
+### CI
+- GitHub releases now lead with this file's entry for the tag being
+  released, instead of only an auto-generated commit list (which is
+  still appended). A missing entry degrades to a note rather than
+  failing the release.
+
 ## [v0.5.1] - 2026-08-11
 
 ### Fixed

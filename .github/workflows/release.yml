@@ -233,6 +233,28 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # The release body is the hand-written CHANGELOG entry for this
+      # tag — what actually changed and why — rather than only the
+      # auto-generated commit list (which still gets appended below).
+      - name: Extract changelog section for this tag
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # Read the tag through ENVIRON rather than `awk -v`: -v expands
+          # backslash escapes, so a tag containing one would be silently
+          # mangled before the comparison.
+          TAG="$tag" BARE="${tag#v}" awk '
+            BEGIN { a = "## [" ENVIRON["TAG"] "]"; b = "## [" ENVIRON["BARE"] "]" }
+            index($0, a) == 1 || index($0, b) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          # Never fail the release over a missing section; say so instead.
+          if [ ! -s release-notes.md ]; then
+            printf 'No CHANGELOG entry found for %s.\n' "$tag" > release-notes.md
+          fi
+          echo "--- release body ---"
+          cat release-notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -242,6 +264,7 @@ jobs:
             artifacts/*.so
             artifacts/*.dll
             artifacts/*.dmg
+          body_path: release-notes.md
           generate_release_notes: true
 
   pypi-publish:

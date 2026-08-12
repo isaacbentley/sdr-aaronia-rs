@@ -9,8 +9,8 @@
 //! returned freshly-zeroed memory instead of samples, growing the
 //! scratch buffer without bound. See `read_scratch` below.)
 //!
-//! All blocking work (connect, reads with their internal 30-second
-//! timeout, shutdown) releases the GIL, so other Python threads keep
+//! All blocking work (connect, reads with their `read_timeout`, default
+//! 30 s, shutdown) releases the GIL, so other Python threads keep
 //! running and `KeyboardInterrupt` stays deliverable between calls.
 
 use arrow::array::{Array, FixedSizeListArray};
@@ -24,6 +24,7 @@ use pyo3::prelude::*;
 use sdr_aaronia_rs::http_streaming::StreamFormat;
 use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource, Error as AaroniaError};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
 create_exception!(
@@ -236,6 +237,30 @@ impl PyAaroniaConfig {
     fn get_device_serial(&self) -> Option<String> {
         self.inner.device_serial.clone()
     }
+
+    /// Seconds a blocking read waits for samples before raising
+    /// `AaroniaTimeoutError` (default 30.0). Must be > 0.
+    #[setter]
+    fn set_read_timeout(&mut self, seconds: f64) -> PyResult<()> {
+        // `try_from_secs_f64`, not `from_secs_f64`: the latter panics on
+        // NaN/negative/overflowing input, which would abort the whole
+        // interpreter over a bad assignment.
+        let timeout = Duration::try_from_secs_f64(seconds).map_err(|e| {
+            PyValueError::new_err(format!("read_timeout is not a valid duration: {e}"))
+        })?;
+        if timeout.is_zero() {
+            return Err(PyValueError::new_err(
+                "read_timeout must be greater than zero seconds",
+            ));
+        }
+        self.inner.read_timeout = timeout;
+        Ok(())
+    }
+
+    #[getter]
+    fn get_read_timeout(&self) -> f64 {
+        self.inner.read_timeout.as_secs_f64()
+    }
 }
 
 /// The `(rx1, rx2)` pair returned by `read_samples_dual_numpy`.
@@ -246,8 +271,8 @@ type DualArrays<'py> = (
 
 /// A streaming IQ source. Construct, `start_streaming(config)`, then
 /// call the `read_samples_*` methods; each blocks (GIL released) until
-/// `count` samples arrive or the internal 30-second timeout raises
-/// `AaroniaTimeoutError`.
+/// `count` samples arrive or `config.read_timeout` (default 30 s)
+/// elapses, which raises `AaroniaTimeoutError`.
 #[pyclass(name = "AaroniaSource")]
 struct PyAaroniaSource {
     // Field order matters: `source` must drop before `rt` so the
