@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.7.5] - 2026-08-13
+
 ### Added
 - **`scale` on the Python config and `aaronia.open()`**, the integer
   encode multiplier for the `I16` wire format. Rust, the C API and the
