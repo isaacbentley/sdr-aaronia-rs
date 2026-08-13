@@ -105,6 +105,35 @@ higher is not settled; see
 On that hardware, take the rate the device reports over the computed
 ladder: it arrives in the stream metadata, and `diagnose()` prints it.
 
+## Choosing a wire format
+
+`format` decides what crosses the network, and it matters more than it
+looks. Measured against a live server at 15.36 MS/s over a LAN:
+
+| format | bytes/sample | delivered | drops |
+| --- | --- | --- | --- |
+| `F32` (default) | 8 | 6.5 MS/s | 290 |
+| `F16` | 4 | 15.1 MS/s | 9 |
+| `I16` | 4 | 15.1 MS/s | 12 |
+
+`F32` needs 123 MB/s at that rate and the link could not carry it, so
+most of the capture was dropped. Either half-width format fits.
+
+`I16` has one trap: the server sends `round(value * scale)`, so the
+quantisation step is `1 / scale`, and the default of 16384 gives a step
+of 6.1e-5. A quiet band's noise floor is smaller than that — on the
+same server, **68% of `I16` samples came back exactly zero** while
+`F32` had none. Pass `scale=`, or lower `reference_level` for more
+gain:
+
+```python
+aaronia.open(url, freq=2.44e9, rate=15.36e6, format="I16", scale=1e6)
+```
+
+At `scale=1e6` the zero fraction measured 0.0% and the amplitude
+matched `F32`. `F16` needs no such tuning, which makes it the simpler
+choice when the link is the constraint.
+
 ## Configuration (`AaroniaConfig`)
 
 Every field is readable and writable.
@@ -118,6 +147,7 @@ Every field is readable and writable.
 | `sample_rate` | IQ sample rate, Hz (the Aaronia "span") |
 | `reference_level` | Reference level, dBm |
 | `format` | HTTP wire format: `"F32"`, `"F16"` or `"I16"`. `I16` is the low-bandwidth network mode |
+| `scale` | Integer encode multiplier for `I16` (see below). None uses the server default |
 | `receiver_channel` | `"Rx1"` (default), `"Rx2"`, or `"Rx1And2"` (native SDK, full V6) |
 | `read_timeout` | Seconds a blocking read waits before `AaroniaTimeoutError` (default `30.0`) |
 | `auto_reconnect` | Reconnect the HTTP stream after a drop (default `True`) |
@@ -174,7 +204,7 @@ silently defaulting.
 
 | Function | Purpose |
 | --- | --- |
-| `open(url=None, *, freq, rate, bandwidth, ref_level, file, format, read_timeout)` | Configure, connect and start streaming in one call |
+| `open(url=None, *, freq, rate, bandwidth, ref_level, file, format, scale, read_timeout)` | Configure, connect and start streaming in one call |
 | `sample_rates()` | The V6 ECO's sample rates, highest first (see [Sample rates](#sample-rates)) |
 | `sample_rate_for_bandwidth(hz)` | Lowest rate covering that much spectrum |
 | `diagnose(url)` | `(ok, message, fix)` for each setup check; what `aaronia-doctor` prints |

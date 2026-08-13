@@ -65,6 +65,16 @@ class AaroniaConfig:
     """IQ sample rate in Hz (the Aaronia "span")."""
     reference_level: float
     """Reference level in dBm."""
+    scale: Optional[float]
+    """Integer encode multiplier for the ``I16`` wire format
+    (``/stream?scale=N``), or None for the server default.
+
+    The server encodes ``round(value * scale)``, so the quantisation
+    step is ``1 / scale``. At the default the step is 1/16384, which is
+    coarser than a quiet band's noise floor — measured on a live
+    server, 70% of samples came back exactly zero. Raise it, or raise
+    the gain by lowering ``reference_level``. Must be positive and
+    finite."""
 
     # Transport behaviour. `format` and `receiver_channel` read back as
     # None when unset but only accept a string: assigning None raises
@@ -185,6 +195,7 @@ def open(
     ref_level: Optional[float] = None,
     file: Optional[str] = None,
     format: Optional[WireFormat] = None,
+    scale: Optional[float] = None,
     read_timeout: Optional[float] = None,
 ) -> AaroniaSource:
     """Open a source and start streaming, in one call.

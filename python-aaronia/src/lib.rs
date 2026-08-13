@@ -168,6 +168,34 @@ impl PyAaroniaConfig {
         self.inner.span_frequency
     }
 
+    /// Integer encode multiplier for the `I16` wire format
+    /// (`/stream?scale=N`), or None for the server default.
+    ///
+    /// Worth setting whenever `format` is `"I16"`. The server encodes
+    /// each sample as `round(value * scale)`, so the quantisation step
+    /// is `1 / scale` and anything below half a step becomes zero. At
+    /// the default the step measured 1/16384 on a live server, which
+    /// is coarser than a quiet band's noise floor: 70% of samples came
+    /// back exactly zero. Raising the scale, or raising the gain by
+    /// lowering `reference_level`, keeps the signal above it.
+    #[setter]
+    fn set_scale(&mut self, scale: Option<f64>) -> PyResult<()> {
+        match scale {
+            Some(s) if !s.is_finite() || s <= 0.0 => Err(PyValueError::new_err(format!(
+                "scale must be positive and finite, got {s}"
+            ))),
+            other => {
+                self.inner.stream_scale = other;
+                Ok(())
+            }
+        }
+    }
+
+    #[getter]
+    fn get_scale(&self) -> Option<f64> {
+        self.inner.stream_scale
+    }
+
     #[setter]
     fn set_reference_level(&mut self, dbm: f64) {
         self.inner.reference_level = dbm;
@@ -604,7 +632,7 @@ fn sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
 /// spectrum you want to see, from which a real rate is chosen). Pass
 /// `file` instead of `url` to play back a recording.
 #[pyfunction]
-#[pyo3(signature = (url=None, *, freq=None, rate=None, bandwidth=None, ref_level=None, file=None, format=None, read_timeout=None))]
+#[pyo3(signature = (url=None, *, freq=None, rate=None, bandwidth=None, ref_level=None, file=None, format=None, scale=None, read_timeout=None))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
@@ -615,6 +643,7 @@ fn open(
     ref_level: Option<f64>,
     file: Option<String>,
     format: Option<&str>,
+    scale: Option<f64>,
     read_timeout: Option<f64>,
 ) -> PyResult<Py<PyAaroniaSource>> {
     if url.is_some() && file.is_some() {
@@ -649,6 +678,9 @@ fn open(
     }
     if let Some(fmt) = format {
         cfg.set_format(fmt)?;
+    }
+    if scale.is_some() {
+        cfg.set_scale(scale)?;
     }
     if let Some(seconds) = read_timeout {
         cfg.set_read_timeout(seconds)?;

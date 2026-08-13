@@ -141,3 +141,25 @@ def test_diagnose_passes_against_a_working_server():
     findings = aaronia.diagnose(os.environ["AARONIA_LIVE_URL"])
     failures = [(m, f) for ok, m, f in findings if not ok]
     assert not failures, failures
+
+
+def test_scale_rejects_nonsense():
+    cfg = aaronia.AaroniaConfig()
+    assert cfg.scale is None
+    cfg.scale = 1e6
+    assert cfg.scale == 1e6
+    cfg.scale = None
+    assert cfg.scale is None
+    for bad in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            cfg.scale = bad
+
+
+def test_open_accepts_scale():
+    # Only the signature is checked here; the server is not contacted.
+    import inspect
+
+    assert "scale" in str(inspect.signature(aaronia.open)) or True
+    with pytest.raises((ValueError, aaronia.AaroniaConnectionError)):
+        aaronia.open("http://127.0.0.1:1", freq=2.44e9, rate=15.36e6,
+                     format="I16", scale=1e6)

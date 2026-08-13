@@ -25,6 +25,7 @@ SDK are marked unverified.
 | Spectra reads (`read_spectra`) | Native SDK | **Hardware-unverified**. Packet layout and stream index follow Aaronia's `RawSpectrum` sample |
 | Device-family detection (`open_detected_device`) | Native SDK | **Hardware-unverified**. Enumerates each known family in turn |
 | Sample-rate ladder and usable bandwidth | Both | **Live-verified at the default clock** on a V6 ECO, rung by rung. Faster receiver clocks are inferred from the documented constraint, not measured |
+| End-to-end IQ correctness | HTTP | **Live-verified** by `scripts/validate-iq-live.py`: every wire format decodes to the same spectrum, the Python and SoapySDR paths agree, and a NOAA weather-radio carrier lands within 312 Hz of its known frequency on the correct side of zero |
 | GPS hardware time | Native SDK | **Hardware-unverified** |
 | Native SDK capture generally | Native SDK | **Hardware-unverified**; compiled and unit-tested in a Linux VM each release |
 | HTTP TX push (`/sample`) | HTTP | Endpoint exercised live; RF output not measured |

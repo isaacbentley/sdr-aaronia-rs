@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`scale` on the Python config and `aaronia.open()`**, the integer
+  encode multiplier for the `I16` wire format. Rust, the C API and the
+  SoapySDR plugin all had it; Python did not, so a Python program
+  choosing `I16` for bandwidth had no way out of the trap below.
+- **`scripts/validate-iq-live.py`**, an end-to-end check that the
+  samples an application receives are the ones the device sent, rather
+  than that bytes arrived. Every wire format must decode to the same
+  spectrum, the Python and SoapySDR paths must agree, and a known
+  transmitter must land where it should. Run against a live server it
+  places a NOAA weather-radio carrier within 312 Hz of 162.400 MHz and
+  on the correct side of zero — the one check that catches transposed
+  I and Q, which nothing comparing the radio against itself can see.
+
+### Fixed
+- **`format="I16"` silently discards weak signals at the default
+  scale.** The server sends `round(value * scale)`, so the step is
+  `1 / scale`, and the default of 16384 gives 6.1e-5 — coarser than a
+  quiet band's noise floor. Measured against a live server, **68% of
+  int16 samples came back exactly zero** where float32 had none. At
+  `scale=1e6` the zero fraction was 0.0% and the amplitude matched
+  float32. Documented, with the measurements, in the Python README.
+
 ### Changed
 - **The Homebrew formula is no longer a release asset.** It is uploaded
   as the `homebrew-formula` workflow artifact instead. Homebrew 4 and
@@ -13,6 +36,11 @@ All notable changes to this project will be documented in this file.
   rendered against the published archives so none are computed by hand.
 
 ### Documentation
+- **Wire format is a throughput decision, and the default is the
+  expensive one.** At 15.36 MS/s over a LAN, float32 needs 123 MB/s:
+  measured, it delivered 6.5 MS/s with 290 drops, while float16 and
+  int16 both delivered 15.1 MS/s. The Python README now carries the
+  numbers rather than a general warning.
 - **Measured what the 80% usable-bandwidth figure actually is, and
   explained it in one sentence.** Sample rate and RF bandwidth were
   described as related by a ratio without saying what the ratio was or
