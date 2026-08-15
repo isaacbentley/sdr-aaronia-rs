@@ -208,6 +208,55 @@ pub struct CaptureControl {
     pub control_type: ControlType,
 }
 
+/// How far the read-back `centerfreq0` may sit from the requested value
+/// before [`HttpEndpointsClient::apply_capture_config`] warns. The field's
+/// step is 1 kHz, so one step of slack absorbs any device-side rounding
+/// while still catching a write that did not take (which leaves the old
+/// centre, typically MHz away).
+const CENTERFREQ_CONFIRM_TOLERANCE_HZ: f64 = 1000.0;
+
+/// How far the read-back `reflevel0` may sit from the requested value
+/// before warning. The field's step is 0.5 dB; half a step catches an
+/// ignored write without false-flagging device-side rounding.
+const REFLEVEL_CONFIRM_TOLERANCE_DB: f64 = 0.25;
+
+/// A retune request for [`HttpEndpointsClient::apply_capture_config`].
+///
+/// Each field is applied to the `main` group of the discovered receiver
+/// block via `/remoteconfig` only when it is `Some`; a `None` field is
+/// left untouched on the device. This is deliberately the SPECTRAN V6
+/// field set (`centerfreq0` / `decimation0` / `reflevel0`), the names the
+/// device actually exposes — not the `/control` capture fields
+/// (`frequencyCenter` / `frequencySpan` / `referenceLevel`), which this
+/// device accepts with `success=true` and silently ignores.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CaptureConfig {
+    /// `main/centerfreq0`, in Hz.
+    pub center_freq_hz: Option<f64>,
+    /// `main/decimation0`, the "Span" enum index (0 = Full, 9 = 1 / 512).
+    /// Use [`crate::decimation_index_for_bandwidth`] to derive it from a
+    /// requested span, or [`crate::decimation_index_for_rate`] from a rate.
+    pub decimation_index: Option<usize>,
+    /// `main/reflevel0`, in dBm.
+    pub reflevel_dbm: Option<f64>,
+}
+
+/// The device values [`HttpEndpointsClient::apply_capture_config`] read
+/// back from `/remoteconfig` **after** its write, so a caller can confirm
+/// the write took (a wrong receiver name returns HTTP 200 and changes
+/// nothing). Each field is `None` when the leaf was absent from the block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedCaptureConfig {
+    /// The `Block_*` receiver name the write targeted.
+    pub receiver_name: String,
+    /// `main/centerfreq0` as the device now reports it, in Hz.
+    pub center_freq_hz: Option<f64>,
+    /// `main/decimation0` index as the device now reports it.
+    pub decimation_index: Option<usize>,
+    /// `main/reflevel0` as the device now reports it, in dBm.
+    pub reflevel_dbm: Option<f64>,
+}
+
 /// Defines the command for starting or stopping antenna rotation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AntennaControl {
@@ -912,6 +961,172 @@ impl HttpEndpointsClient {
         })
     }
 
+    /// `GET /remoteconfig` as a raw `serde_json::Value`.
+    ///
+    /// The typed [`Self::get_config`] deserialises into [`ConfigResponse`];
+    /// this keeps the untyped tree so the block-discovery and read-back
+    /// walkers can look up arbitrary leaves by name without every device's
+    /// full schema being modelled.
+    async fn get_remoteconfig_document(&self) -> Result<serde_json::Value> {
+        let url = format!("{}/remoteconfig", self.base_url);
+        let bytes = self
+            .control_request(self.client.get(&url))
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        serde_json::from_slice(&bytes).map_err(|e| Error::Protocol(e.to_string()))
+    }
+
+    /// Discover the mission block whose config carries the leaf `field`
+    /// (e.g. `centerfreq0`) and return its `Block_*` name, suitable as the
+    /// `receiverName` for [`Self::simple_remote_config`] /
+    /// [`Self::apply_capture_config`].
+    ///
+    /// Prefer this over [`Self::find_iq_demodulator_block_name`] whenever
+    /// the write target is known: that helper only matches the
+    /// `Block_IQDemodulator` prefix and returns an error on devices whose
+    /// tuner is a different block category (a SPECTRAN V6 ECO's tuner is
+    /// `Block_Spectran_V6Eco_0`, a `spectrumanalyzer` block, which the
+    /// prefix scan never finds). Matching on the field the write will
+    /// target locates the right block regardless of its category.
+    pub async fn find_block_name_with_field(&self, field: &str) -> Result<String> {
+        let document = self.get_remoteconfig_document().await?;
+        let root_items = document
+            .get("config")
+            .and_then(|c| c.get("items"))
+            .and_then(|i| i.as_array())
+            .ok_or_else(|| {
+                Error::Protocol("/remoteconfig response had no `config.items` array".to_string())
+            })?;
+        find_block_name_carrying_field(root_items, field, None).ok_or_else(|| {
+            Error::Protocol(format!(
+                "no Block_* group carrying `{field}` found in the current mission's config tree"
+            ))
+        })
+    }
+
+    /// Retune the device — centre frequency, span and/or reference level —
+    /// via `/remoteconfig`, then read the values back and confirm the write
+    /// took.
+    ///
+    /// This is the reliable retune path for a SPECTRAN V6 under RTSA-Suite.
+    /// It targets the `main` group's real field names (`centerfreq0`,
+    /// `decimation0`, `reflevel0`), auto-discovers the receiver block via
+    /// [`Self::find_block_name_with_field`], and applies only the `Some`
+    /// fields of `request` (a `None` leaves that device value alone).
+    ///
+    /// **Why the read-back is not optional.** A `/remoteconfig` PUT naming
+    /// a block that is not in the running mission returns HTTP 200 and
+    /// changes nothing (see [`Self::simple_remote_config`]), so the status
+    /// code proves nothing. After writing, this re-reads the block and
+    /// compares each requested field against what the device now reports:
+    /// a match logs at info, a mismatch logs a warning naming the
+    /// requested and actual values. The returned [`AppliedCaptureConfig`]
+    /// carries the read-back so the caller can sync its own state (e.g. the
+    /// processing sample rate) to what the device actually did.
+    ///
+    /// Returns an error only if discovery, the write, or the read-back HTTP
+    /// call itself fails — a write that is silently ignored is reported
+    /// through the warning log and the returned values, not as an `Err`,
+    /// since the device still answered.
+    pub async fn apply_capture_config(
+        &self,
+        request: &CaptureConfig,
+    ) -> Result<AppliedCaptureConfig> {
+        let block = self.find_block_name_with_field("centerfreq0").await?;
+
+        let mut main = serde_json::Map::new();
+        if let Some(hz) = request.center_freq_hz {
+            main.insert("centerfreq0".to_string(), serde_json::json!(hz));
+        }
+        if let Some(idx) = request.decimation_index {
+            // Enum fields take the index directly (see `simple_remote_config`).
+            main.insert("decimation0".to_string(), serde_json::json!(idx));
+        }
+        if let Some(dbm) = request.reflevel_dbm {
+            main.insert("reflevel0".to_string(), serde_json::json!(dbm));
+        }
+
+        if main.is_empty() {
+            // Nothing requested: read the block back so the caller still
+            // learns the current state, but do not PUT an empty group.
+            return self.read_capture_config(&block).await;
+        }
+
+        let mut groups = serde_json::Map::new();
+        groups.insert("main".to_string(), serde_json::Value::Object(main));
+        self.simple_remote_config(&block, groups).await?;
+
+        let applied = self.read_capture_config(&block).await?;
+
+        // Confirm each requested field against the read-back. Center is a
+        // float snapped to the device's frequency step; decimation and
+        // reflevel are exact (an enum index and a 0.5 dB grid).
+        if let Some(want) = request.center_freq_hz {
+            match applied.center_freq_hz {
+                Some(got) if (got - want).abs() <= CENTERFREQ_CONFIRM_TOLERANCE_HZ => {
+                    info!("RTSA {block}: centerfreq0 = {got:.0} Hz (requested {want:.0})");
+                }
+                Some(got) => warn!(
+                    "RTSA {block}: centerfreq0 did not take — requested {want:.0} Hz, device \
+                     reports {got:.0} Hz (wrong receiverName, or the field is locked?)"
+                ),
+                None => warn!("RTSA {block}: centerfreq0 missing from read-back"),
+            }
+        }
+        if let Some(want) = request.decimation_index {
+            match applied.decimation_index {
+                Some(got) if got == want => {
+                    info!("RTSA {block}: decimation0 = {got} (requested {want})");
+                }
+                Some(got) => warn!(
+                    "RTSA {block}: decimation0 did not take — requested index {want}, device \
+                     reports {got}"
+                ),
+                None => warn!("RTSA {block}: decimation0 missing from read-back"),
+            }
+        }
+        if let Some(want) = request.reflevel_dbm {
+            match applied.reflevel_dbm {
+                Some(got) if (got - want).abs() <= REFLEVEL_CONFIRM_TOLERANCE_DB => {
+                    info!("RTSA {block}: reflevel0 = {got} dBm (requested {want})");
+                }
+                Some(got) => warn!(
+                    "RTSA {block}: reflevel0 did not take — requested {want} dBm, device reports \
+                     {got} dBm"
+                ),
+                None => warn!("RTSA {block}: reflevel0 missing from read-back"),
+            }
+        }
+
+        Ok(applied)
+    }
+
+    /// Read `centerfreq0` / `decimation0` / `reflevel0` back from a block's
+    /// subtree in the current `/remoteconfig` tree.
+    async fn read_capture_config(&self, block: &str) -> Result<AppliedCaptureConfig> {
+        let document = self.get_remoteconfig_document().await?;
+        let root_items = document
+            .get("config")
+            .and_then(|c| c.get("items"))
+            .and_then(|i| i.as_array())
+            .ok_or_else(|| {
+                Error::Protocol("/remoteconfig response had no `config.items` array".to_string())
+            })?;
+        let block_items = find_group_items(root_items, block).ok_or_else(|| {
+            Error::Protocol(format!("block `{block}` vanished from the config tree"))
+        })?;
+        Ok(AppliedCaptureConfig {
+            receiver_name: block.to_string(),
+            center_freq_hz: read_config_leaf_value(block_items, "centerfreq0"),
+            decimation_index: read_config_leaf_value(block_items, "decimation0")
+                .map(|v| v as usize),
+            reflevel_dbm: read_config_leaf_value(block_items, "reflevel0"),
+        })
+    }
+
     /// Sends a command to start or stop antenna rotation via the `/control` endpoint.
     pub async fn control_antenna(&self, rotate: bool) -> Result<()> {
         let url = format!("{}/control", self.base_url);
@@ -1430,6 +1645,84 @@ fn find_config_item_by_name_prefix(items: &[serde_json::Value], prefix: &str) ->
         // only scanned the root array missed them.
         if let Some(nested) = item.get("items").and_then(|v| v.as_array())
             && let Some(found) = find_config_item_by_name_prefix(nested, prefix)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Depth-first search for the `Block_*` group whose config subtree
+/// contains a leaf named `field`, returning that block's name.
+///
+/// The tunable fields live at `<Block_*>/config/main/<field>`, so the
+/// `receiverName` a `/remoteconfig` write needs is the enclosing `Block_*`
+/// group — not the `main` group and not the field's own name. `field`
+/// found outside any `Block_*` group is ignored (it cannot be a receiver
+/// name). Pre-order, so the outermost enclosing block wins when the tree
+/// nests them.
+///
+/// This generalises [`find_config_item_by_name_prefix`]: matching on a
+/// field the write will actually target finds the right block whatever its
+/// category, whereas prefix-matching `Block_IQDemodulator` misses devices
+/// whose tuner is, say, a `spectrumanalyzer` block (`Block_Spectran_*`).
+fn find_block_name_carrying_field(
+    items: &[serde_json::Value],
+    field: &str,
+    enclosing_block: Option<&str>,
+) -> Option<String> {
+    for item in items {
+        let name = item.get("name").and_then(|n| n.as_str());
+        if name == Some(field)
+            && let Some(block) = enclosing_block
+        {
+            return Some(block.to_string());
+        }
+        // Descend, tracking the nearest enclosing Block_* ancestor.
+        let next_block = match name {
+            Some(n) if n.starts_with("Block_") => Some(n),
+            _ => enclosing_block,
+        };
+        if let Some(nested) = item.get("items").and_then(|v| v.as_array())
+            && let Some(found) = find_block_name_carrying_field(nested, field, next_block)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Depth-first search for the `items` array of the group named
+/// `group_name`, or the group carrying that name. Returns the group's
+/// child `items`, so a caller can read leaves within one block's subtree.
+fn find_group_items<'a>(
+    items: &'a [serde_json::Value],
+    group_name: &str,
+) -> Option<&'a Vec<serde_json::Value>> {
+    for item in items {
+        if item.get("name").and_then(|n| n.as_str()) == Some(group_name) {
+            return item.get("items").and_then(|v| v.as_array());
+        }
+        if let Some(nested) = item.get("items").and_then(|v| v.as_array())
+            && let Some(found) = find_group_items(nested, group_name)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Depth-first read of the numeric `value` of the leaf named `field`
+/// within a config subtree. Works for `float`/`number`/`integer`/`enum`
+/// items alike, since `serde_json`'s `as_f64` accepts JSON integers — an
+/// `enum`'s value is its index. Returns `None` if the leaf is absent.
+fn read_config_leaf_value(items: &[serde_json::Value], field: &str) -> Option<f64> {
+    for item in items {
+        if item.get("name").and_then(|n| n.as_str()) == Some(field) {
+            return item.get("value").and_then(|v| v.as_f64());
+        }
+        if let Some(nested) = item.get("items").and_then(|v| v.as_array())
+            && let Some(found) = read_config_leaf_value(nested, field)
         {
             return Some(found);
         }
@@ -2133,5 +2426,104 @@ mod tests {
             Some("Block_IQDemodulator_0".to_string()),
             "pre-order traversal should yield the root-level match first"
         );
+    }
+
+    /// A synthetic `/remoteconfig` `config.items` array shaped like a live
+    /// SPECTRAN V6 ECO: the tuner is a `spectrumanalyzer` block with the
+    /// fields nested `Block/config/main`, and a decoy block without
+    /// `centerfreq0` sits ahead of it. Mirrors the tree captured from
+    /// `atc.local` down to the `decimation0` enum labels.
+    fn v6_config_items() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "type": "group",
+                "name": "Block_HttpServer_0",
+                "items": [
+                    { "type": "group", "name": "config", "items": [
+                        { "type": "bool", "name": "run", "value": true }
+                    ]}
+                ]
+            },
+            {
+                "type": "group",
+                "name": "Block_Spectran_V6Eco_0",
+                "items": [
+                    { "type": "group", "name": "config", "items": [
+                        { "type": "group", "name": "main", "items": [
+                            { "type": "float", "name": "centerfreq0", "value": 851_656_250.0 },
+                            { "type": "enum",  "name": "decimation0", "value": 5,
+                              "values": "Full,1 / 2,1 / 4,1 / 8,1 / 16,1 / 32,1 / 64,1 / 128,1 / 256,1 / 512" },
+                            { "type": "float", "name": "reflevel0",  "value": -25.0 }
+                        ]}
+                    ]}
+                ]
+            }
+        ])
+    }
+
+    #[test]
+    fn discovers_block_carrying_centerfreq0() {
+        let tree = v6_config_items();
+        let items = tree.as_array().unwrap();
+        assert_eq!(
+            find_block_name_carrying_field(items, "centerfreq0", None),
+            Some("Block_Spectran_V6Eco_0".to_string()),
+            "discovery must skip the decoy block and find the tuner by its field",
+        );
+        // The legacy prefix scan finds nothing on this device — the reason
+        // the retune silently no-opped before.
+        assert_eq!(
+            find_config_item_by_name_prefix(items, "Block_IQDemodulator"),
+            None,
+            "the old IQ-demodulator prefix cannot match a spectrumanalyzer block",
+        );
+    }
+
+    #[test]
+    fn discovery_returns_none_for_absent_field() {
+        let tree = v6_config_items();
+        let items = tree.as_array().unwrap();
+        assert_eq!(
+            find_block_name_carrying_field(items, "nonesuch", None),
+            None
+        );
+    }
+
+    #[test]
+    fn discovery_ignores_field_outside_any_block() {
+        // A leaf above any `Block_*` group cannot be a receiverName, so it
+        // must not be returned even though the name matches.
+        let tree = serde_json::json!([
+            { "type": "float", "name": "centerfreq0", "value": 1.0 },
+            { "type": "group", "name": "Scene", "items": [
+                { "type": "float", "name": "centerfreq0", "value": 2.0 }
+            ]}
+        ]);
+        let items = tree.as_array().unwrap();
+        assert_eq!(
+            find_block_name_carrying_field(items, "centerfreq0", None),
+            None
+        );
+    }
+
+    #[test]
+    fn reads_capture_leaves_from_block_subtree() {
+        let tree = v6_config_items();
+        let items = tree.as_array().unwrap();
+        let block_items = find_group_items(items, "Block_Spectran_V6Eco_0").unwrap();
+        assert_eq!(
+            read_config_leaf_value(block_items, "centerfreq0"),
+            Some(851_656_250.0)
+        );
+        // An enum leaf reads back as its index.
+        assert_eq!(
+            read_config_leaf_value(block_items, "decimation0"),
+            Some(5.0)
+        );
+        assert_eq!(
+            read_config_leaf_value(block_items, "reflevel0"),
+            Some(-25.0)
+        );
+        assert_eq!(read_config_leaf_value(block_items, "nonesuch"), None);
     }
 }

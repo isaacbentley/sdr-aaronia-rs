@@ -115,6 +115,14 @@ pub struct HttpSource {
     // Shared statistics and drop detection
     shared_stats: Option<std::sync::Arc<std::sync::RwLock<StreamStats>>>,
     drop_detector: DropDetector,
+
+    /// Whether the one-shot device retune in [`Self::configure_rtsa_device`]
+    /// has already run. The tune applies the builder's centre / span /
+    /// reference level on the **first** stream start; subsequent restarts
+    /// (triggered via `shared_stats.restart_pending` after an external
+    /// retune) must only reconnect the `/stream`, never re-push this
+    /// source's now-stale target, which would undo that retune.
+    initial_tune_done: bool,
 }
 
 impl HttpSource {
@@ -235,6 +243,7 @@ impl HttpSource {
             tokio_handle,
             shared_stats: None,
             drop_detector: DropDetector::default(),
+            initial_tune_done: false,
         })
     }
 
@@ -641,31 +650,16 @@ impl HttpSource {
                 // Give device a moment to process the configuration
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                // Tune the hardware to the requested frequency *before* opening the stream.
-                // Uses the unlicensed `/control` endpoint so it is free and always succeeds.
-                info!(
-                    "Tuning HTTP source to center={:.3} MHz, span={:.3} MHz, ref_level={} dBm",
-                    self.current_frequency / 1e6,
-                    self.current_sample_rate / 1e6,
-                    self.reference_level,
-                );
-                match self
-                    .endpoints_client
-                    .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center: Some(self.current_frequency),
-                        frequency_span: Some(self.current_sample_rate),
-                        reference_level: Some(self.reference_level as f32),
-                        control_type: crate::http_endpoints::ControlType::Capture,
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        info!("Successfully tuned RTSA device center frequency and span");
-                    }
-                    Err(e) => {
-                        warn!("Could not tune RTSA device via /control: {}", e);
-                    }
+                // Tune the hardware *before* opening the stream — but only on
+                // the first start. A restart (from `restart_pending`) happens
+                // *after* an external retune, and re-pushing this source's
+                // stale target would undo it; the stream just needs to
+                // reconnect. See `initial_tune_done`.
+                if self.initial_tune_done {
+                    debug!("Skipping device retune on stream restart (already tuned once)");
+                } else {
+                    self.apply_initial_tune().await;
+                    self.initial_tune_done = true;
                 }
 
                 Ok(())
@@ -673,6 +667,83 @@ impl HttpSource {
             Err(e) => {
                 debug!("Could not update RTSA configuration: {}", e);
                 Err(e)
+            }
+        }
+    }
+
+    /// Push this source's centre / span / reference level to the device and
+    /// report what the device actually adopted.
+    ///
+    /// This replaced a `configure_capture` call on the `/control` endpoint,
+    /// which "always succeeds": it logged a successful tune while the device
+    /// never moved, because that endpoint does not carry these fields on a
+    /// Spectran V6. The write now goes through `/remoteconfig` against the
+    /// block that genuinely carries `centerfreq0`, and is read back — a wrong
+    /// receiver name returns HTTP 200 and changes nothing, so the status code
+    /// alone proves nothing.
+    ///
+    /// Span is expressed as the `decimation0` enum index rather than a
+    /// frequency: the device has no span field, only a decimation ladder.
+    ///
+    /// A failure here is logged, not propagated. The stream is still worth
+    /// opening on whatever the device is currently tuned to, and the caller
+    /// gets a warning naming what did not take rather than a silent success.
+    async fn apply_initial_tune(&mut self) {
+        let decimation_index = (self.current_sample_rate > 0.0)
+            .then(|| crate::decimation_index_for_rate(self.current_sample_rate));
+
+        info!(
+            "Tuning RTSA device to center={:.6} MHz, span={:.3} MHz \
+             (decimation index {:?}), ref_level={} dBm",
+            self.current_frequency / 1e6,
+            self.current_sample_rate / 1e6,
+            decimation_index,
+            self.reference_level,
+        );
+
+        let request = crate::http_endpoints::CaptureConfig {
+            center_freq_hz: (self.current_frequency > 0.0).then_some(self.current_frequency),
+            decimation_index,
+            reflevel_dbm: Some(self.reference_level),
+        };
+
+        match self.endpoints_client.apply_capture_config(&request).await {
+            Ok(applied) => {
+                info!(
+                    "RTSA device reports center={:?} Hz, decimation={:?}, \
+                     ref_level={:?} dBm (block {})",
+                    applied.center_freq_hz,
+                    applied.decimation_index,
+                    applied.reflevel_dbm,
+                    applied.receiver_name,
+                );
+
+                // Compare against what was asked for. Tuning is snapped by the
+                // hardware, so an exact match is not required — but a value
+                // that did not move at all means the write was accepted and
+                // discarded, which is the failure this read-back exists to
+                // catch.
+                if let (Some(want), Some(got)) = (request.center_freq_hz, applied.center_freq_hz)
+                    && (want - got).abs() > 1e3
+                {
+                    warn!(
+                        "Centre frequency did not take: asked {:.6} MHz, device reports {:.6} MHz",
+                        want / 1e6,
+                        got / 1e6
+                    );
+                }
+                if let (Some(want), Some(got)) =
+                    (request.decimation_index, applied.decimation_index)
+                    && want != got
+                {
+                    warn!("Span did not take: asked decimation index {want}, device reports {got}");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Could not tune RTSA device via /remoteconfig: {e}. \
+                     Streaming from whatever the device is currently tuned to."
+                );
             }
         }
     }

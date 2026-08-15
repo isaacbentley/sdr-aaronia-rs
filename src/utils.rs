@@ -425,6 +425,54 @@ pub fn iq_sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
         .unwrap_or(IQ_CLOCK_HZ)
 }
 
+/// The IQ sample rate the `decimation0` enum selects at index `index`,
+/// using the default receiver clock.
+///
+/// The RTSA `decimation0` (a.k.a. `main/decimation`) "Span" enum runs
+/// `Full, 1 / 2, 1 / 4, … 1 / 512` at indices `0..=9`, where index `n`
+/// selects `IQ_CLOCK_HZ / 2^n` — the same ladder [`iq_sample_rates`]
+/// returns. Out-of-range indices clamp to the fastest / slowest rung.
+pub fn iq_sample_rate_for_decimation_index(index: usize) -> f64 {
+    let rates = iq_sample_rates();
+    rates[index.min(rates.len() - 1)]
+}
+
+/// The `decimation0` enum index whose IQ sample rate is closest to
+/// `sample_rate_hz`.
+///
+/// Inverse of [`iq_sample_rate_for_decimation_index`]. Use it when the
+/// device rate is already known — adopted from stream metadata, say — and
+/// the matching enum index has to be written back to `decimation0`.
+pub fn decimation_index_for_rate(sample_rate_hz: f64) -> usize {
+    let rates = iq_sample_rates();
+    rates
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (**a - sample_rate_hz)
+                .abs()
+                .total_cmp(&(**b - sample_rate_hz).abs())
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// The `decimation0` enum index that covers `bandwidth_hz` at the lowest
+/// sample rate the hardware runs — the throughput-minimising choice.
+///
+/// This is the index whose rate equals [`iq_sample_rate_for_bandwidth`],
+/// so the device streams at exactly the rate the pipeline expects: the two
+/// must agree, or every frequency derived downstream is wrong. Returns 0
+/// (`Full`) when the request exceeds the hardware ceiling, matching that
+/// function's clamp.
+///
+/// Span on an RTSA device is this enum, **not** a `spanfreq` field (there
+/// is no such field). A wider span means less decimation — a *lower*
+/// index — and index 0 (`Full`) is the widest.
+pub fn decimation_index_for_bandwidth(bandwidth_hz: f64) -> usize {
+    decimation_index_for_rate(iq_sample_rate_for_bandwidth(bandwidth_hz))
+}
+
 /// Hardware constraint for IQ Mode: the configured span frequency
 /// must satisfy `span_freq * 1.5 ≤ receiver_clock`. Misconfigurations cause
 /// the SDK to silently emit corrupted samples; reject them at the API
@@ -503,6 +551,49 @@ mod ladder_tests {
         assert_eq!(nearest_iq_sample_rate(10_000_000.0), 7_680_000.0);
         assert_eq!(nearest_iq_sample_rate(1.0e9), 61_440_000.0);
         assert_eq!(nearest_iq_sample_rate(1.0), 120_000.0);
+    }
+
+    #[test]
+    fn decimation_index_maps_to_the_ladder_rung() {
+        // Index n selects IQ_CLOCK_HZ / 2^n; the enum labels are Full,
+        // 1 / 2, … so index and ladder position are the same thing.
+        assert_eq!(iq_sample_rate_for_decimation_index(0), 61_440_000.0);
+        assert_eq!(iq_sample_rate_for_decimation_index(5), 1_920_000.0); // 1 / 32
+        assert_eq!(iq_sample_rate_for_decimation_index(9), 120_000.0); // 1 / 512
+        // Out-of-range clamps to the slowest rung rather than panicking.
+        assert_eq!(iq_sample_rate_for_decimation_index(99), 120_000.0);
+    }
+
+    #[test]
+    fn index_for_rate_is_the_inverse() {
+        for (idx, rate) in iq_sample_rates().into_iter().enumerate() {
+            assert_eq!(
+                decimation_index_for_rate(rate),
+                idx,
+                "rate {rate} round-trips"
+            );
+        }
+        // A rate off the ladder snaps to the nearest rung's index.
+        assert_eq!(decimation_index_for_rate(2_000_000.0), 5); // nearest 1.92 MS/s
+    }
+
+    /// The index chosen for a span must select the same rate
+    /// `iq_sample_rate_for_bandwidth` reports, or the device would stream
+    /// at a rate the pipeline is not computing against.
+    #[test]
+    fn decimation_index_matches_rate_for_bandwidth() {
+        for want in [50_000.0, 1.0e6, 2.0e6, 5.0e6, 8.0e6, 20.0e6, 49.0e6, 1.0e9] {
+            let idx = decimation_index_for_bandwidth(want);
+            assert_eq!(
+                iq_sample_rate_for_decimation_index(idx),
+                iq_sample_rate_for_bandwidth(want),
+                "index {idx} for {want} Hz must select the covering rate",
+            );
+        }
+        // 8 MHz of spectrum needs 10 MHz sampling -> 15.36 MS/s == index 2.
+        assert_eq!(decimation_index_for_bandwidth(8_000_000.0), 2);
+        // Beyond the hardware, fall back to Full (index 0).
+        assert_eq!(decimation_index_for_bandwidth(1.0e9), 0);
     }
 
     /// Wanting N Hz of spectrum needs N / 0.8 of sampling, rounded up to
