@@ -743,17 +743,42 @@ pub fn rtsa_epoch_seconds(raw: f64) -> f64 {
 /// method call plus a `BufReader` bounds check, which dominates on large
 /// sequential reads.
 fn read_iq_f32<R: Read>(reader: &mut R, count: usize) -> Result<Vec<Complex32>> {
-    let mut bytes = vec![0u8; count * 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes
-        .chunks_exact(8)
-        .map(|c| {
-            Complex32::new(
-                f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-                f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
-            )
-        })
-        .collect())
+    // The wire format is little-endian f32 pairs, and `Complex32` is
+    // `#[repr(C)] { re: f32, im: f32 }`. On a little-endian host those bytes
+    // are already the in-memory representation, so `from_le_bytes` is a no-op
+    // and reading straight into the sample buffer removes both the separate
+    // byte allocation and the whole per-sample decode pass. The native-SDK
+    // path reinterprets its buffer the same way; this is the file mirror of
+    // it. On a big-endian host the bytes must be swapped, so that path keeps
+    // the explicit decode.
+    const _: () = assert!(std::mem::size_of::<Complex32>() == 2 * std::mem::size_of::<f32>());
+
+    #[cfg(target_endian = "little")]
+    {
+        let mut samples = vec![Complex32::new(0.0, 0.0); count];
+        // SAFETY: `samples` owns `count * 8` contiguous bytes (the repr and
+        // size are asserted above), and `read_exact` writes exactly that many
+        // before it returns; any bit pattern is a valid pair of `f32`.
+        let byte_view =
+            unsafe { std::slice::from_raw_parts_mut(samples.as_mut_ptr() as *mut u8, count * 8) };
+        reader.read_exact(byte_view)?;
+        Ok(samples)
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut bytes = vec![0u8; count * 8];
+        reader.read_exact(&mut bytes)?;
+        Ok(bytes
+            .chunks_exact(8)
+            .map(|c| {
+                Complex32::new(
+                    f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                    f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                )
+            })
+            .collect())
+    }
 }
 
 /// Bulk-read `count` little-endian i16 IQ pairs, each component scaled by
@@ -2901,6 +2926,34 @@ impl DsftChunk {
 
 #[cfg(test)]
 mod tests {
+    /// The zero-copy little-endian `read_iq_f32` must decode identically to
+    /// the explicit `from_le_bytes` version. A raw reinterpret is exactly
+    /// where an endianness or layout mistake hides while still producing
+    /// plausible-looking floats.
+    #[test]
+    fn read_iq_f32_round_trips() {
+        let pairs = [
+            (0.0f32, 0.0f32),
+            (1.0, -1.0),
+            (1.5e-3, -2.7e4),
+            (f32::MIN_POSITIVE, 12345.678),
+        ];
+        let mut bytes = Vec::new();
+        for (re, im) in pairs {
+            bytes.extend_from_slice(&re.to_le_bytes());
+            bytes.extend_from_slice(&im.to_le_bytes());
+        }
+
+        let mut cursor = std::io::Cursor::new(bytes);
+        let got = read_iq_f32(&mut cursor, pairs.len()).expect("decode");
+
+        assert_eq!(got.len(), pairs.len());
+        for (g, (re, im)) in got.iter().zip(pairs) {
+            assert_eq!(g.re, re, "re mismatch");
+            assert_eq!(g.im, im, "im mismatch");
+        }
+    }
+
     use super::*;
     use std::io::Cursor;
 
