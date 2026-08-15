@@ -11,6 +11,17 @@ use tracing::{debug, info, trace, warn};
 use crate::http_endpoints::{AuthMethod, HttpEndpointsClient};
 use crate::http_streaming::{DropDetector, StreamFormat, StreamParser};
 
+/// How many of the largest observed packets the sample buffer must be able to
+/// hold, whatever `buffer_size` the caller configured.
+///
+/// One packet is the correctness floor — below it, the per-packet trim
+/// discards samples the consumer was never offered. The rest is headroom:
+/// `work()` drains this buffer and the scheduler does not call it on a clock,
+/// so a couple of packets' slack absorbs ordinary jitter without letting the
+/// buffer grow unbounded (packet size is the device's choice and small — a
+/// few tens of thousands of samples).
+const PACKET_CAPACITY_FACTOR: usize = 4;
+
 /// Stream statistics for monitoring
 #[derive(Debug, Clone)]
 pub struct StreamStats {
@@ -64,6 +75,17 @@ pub struct HttpSource {
 
     // Internal buffer for samples
     sample_buffer: VecDeque<Complex32>,
+
+    /// Largest packet the device has delivered so far, in samples.
+    ///
+    /// The capacity floor tracks this because the trim runs as each packet
+    /// lands, inside the fetch loop. A capacity below one packet therefore
+    /// guillotines every packet on arrival: samples are discarded before the
+    /// consumer is ever offered them, which is not "the consumer can't keep
+    /// up" — it is the buffer throwing away data nobody declined. Learned
+    /// from the stream rather than configured, since the packet size is the
+    /// device's choice and no caller can be expected to guess it.
+    max_packet_samples: usize,
 
     // Advanced streaming configuration
     stream_format: StreamFormat,
@@ -197,6 +219,7 @@ impl HttpSource {
             endpoints_client,
             streaming_client,
             sample_buffer: VecDeque::with_capacity(buffer_size * 2),
+            max_packet_samples: 0,
             stream_format,
             stream_parser,
             input_name,
@@ -479,6 +502,9 @@ impl HttpSource {
             // if the consumer can't keep up, drop the *oldest* samples so
             // the buffer stays bounded and current.
             let packet_samples = packet.samples.len();
+            // Raise the floor *before* trimming, so the packet that widens
+            // it is itself protected rather than being the last casualty.
+            self.max_packet_samples = self.max_packet_samples.max(packet_samples);
             // Bulk `extend` (one reserve) rather than per-element `push_back`.
             self.sample_buffer.extend(packet.samples);
             total_samples_added += packet_samples;
@@ -523,7 +549,16 @@ impl HttpSource {
     /// consumer computing a fill ratio divided by zero. The bare `* 2` was
     /// also the only unguarded one on overflow.
     fn buffer_capacity(&self) -> usize {
-        self.buffer_size.saturating_mul(2).max(1)
+        let configured = self.buffer_size.saturating_mul(2).max(1);
+        // Never sit below a few packets. See `max_packet_samples`: the trim
+        // runs per packet, so a capacity under one packet discards most of
+        // every packet the moment it arrives, no matter how fast the
+        // consumer is. The factor buys headroom for scheduler jitter, since
+        // `work()` is what drains this and it is not called on a clock.
+        let packet_floor = self
+            .max_packet_samples
+            .saturating_mul(PACKET_CAPACITY_FACTOR);
+        configured.max(packet_floor)
     }
 
     /// Get current stream statistics for monitoring
@@ -1165,6 +1200,75 @@ mod tests {
                 "capacity must never be 0 — consumers divide by it (buffer_size={buffer_size})"
             );
         }
+    }
+
+    /// A packet bigger than the configured capacity must not be guillotined
+    /// on arrival.
+    ///
+    /// The trim runs per packet inside the fetch loop, so with a fixed
+    /// `buffer_size * 2` capacity an Aaronia streaming 49k-sample packets into
+    /// a 16384 capacity lost ~75% of *every* packet before the consumer was
+    /// offered any of it. That is not backpressure — the consumer never got
+    /// the chance to decline. Live symptom: 61.4 MS/s at the device, 0.6 MS/s
+    /// reaching the pipeline, and digital decode unable to hold frame sync.
+    #[test]
+    fn capacity_floor_accommodates_a_packet_larger_than_the_configured_size() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .buffer_size(8192) // what bigear configured: capacity 16384
+            .build()
+            .expect("Should create HttpSource");
+
+        let configured_capacity = block.buffer_capacity();
+        assert_eq!(configured_capacity, 16384, "baseline before any packet");
+
+        // A real packet observed from a Spectran V6 at 61.4 MS/s.
+        let packet_samples = 49_152usize;
+        assert!(
+            packet_samples > configured_capacity,
+            "test is meaningless unless the packet exceeds the configured cap"
+        );
+
+        block.max_packet_samples = packet_samples;
+
+        assert!(
+            block.buffer_capacity() >= packet_samples,
+            "one packet must fit whole: capacity {} < packet {}",
+            block.buffer_capacity(),
+            packet_samples
+        );
+        assert_eq!(
+            block.buffer_capacity(),
+            packet_samples * PACKET_CAPACITY_FACTOR,
+            "floor should be several packets, for scheduler jitter"
+        );
+        assert_eq!(
+            block.get_stream_stats().buffer_capacity,
+            block.buffer_capacity(),
+            "reported capacity must still track the enforced one"
+        );
+    }
+
+    /// The floor only ever raises the capacity; a caller who deliberately
+    /// configures a large buffer keeps it.
+    #[test]
+    fn capacity_floor_never_shrinks_a_generous_configured_buffer() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .buffer_size(4_000_000)
+            .build()
+            .expect("Should create HttpSource");
+
+        block.max_packet_samples = 49_152;
+        assert_eq!(
+            block.buffer_capacity(),
+            8_000_000,
+            "configured capacity exceeds the packet floor and must win"
+        );
     }
 
     #[tokio::test]
