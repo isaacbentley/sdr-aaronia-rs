@@ -22,6 +22,26 @@ use crate::http_streaming::{DropDetector, StreamFormat, StreamParser};
 /// few tens of thousands of samples).
 const PACKET_CAPACITY_FACTOR: usize = 4;
 
+/// Free output-port space required before the source's `work()` runs.
+///
+/// Without a floor here the runtime called `work()` whenever the output had
+/// *any* room — an average of 14 samples free, measured at 106,000 calls a
+/// second, each copying a handful of samples and returning. That spin burned
+/// a core and crowded the scheduler, so the downstream pipeline block was run
+/// only ~26 times a second despite having data waiting. Gating on a useful
+/// block turns thousands of near-empty copies into one substantial one.
+const SOURCE_MIN_OUTPUT_SAMPLES: usize = 65536;
+
+/// Most stream chunks one `work()` call will read before yielding.
+///
+/// `fetch_samples` reads exactly one chunk, so a single fetch per `work()`
+/// capped throughput at `chunk_size x work_calls_per_second` regardless of the
+/// link. Looping until the buffer is stocked decouples throughput from the
+/// scheduler's call rate; this bounds the loop so a fast server cannot let one
+/// call monopolise the executor. At ~40,000 samples a chunk this is well over
+/// a full buffer, so the buffer's capacity stops the loop first in practice.
+const MAX_FETCHES_PER_WORK: usize = 16;
+
 /// Stream statistics for monitoring
 #[derive(Debug, Clone)]
 pub struct StreamStats {
@@ -229,8 +249,15 @@ impl HttpSource {
 
         let tokio_handle = tokio::runtime::Handle::try_current().ok();
 
+        // Do not run `work()` until there is a worthwhile block of room
+        // downstream — see `SOURCE_MIN_OUTPUT_SAMPLES`. Set before the port is
+        // connected, which is the only time it takes effect.
+        let mut output: futuresdr::runtime::buffer::DefaultCpuWriter<Complex32> =
+            Default::default();
+        output.set_min_items(SOURCE_MIN_OUTPUT_SAMPLES);
+
         Ok(Self {
-            output: futuresdr::runtime::buffer::DefaultCpuWriter::default(),
+            output,
             base_url,
             endpoints_client,
             streaming_client,
@@ -825,8 +852,23 @@ impl Kernel for HttpSource {
         }
         let o_len = self.output.slice().len();
 
-        // If we don't have enough samples in buffer, try to fetch more
-        if self.sample_buffer.len() < o_len {
+        // Keep the buffer stocked rather than topping it up only when it is
+        // about to run dry. This was `if self.sample_buffer.len() < o_len`,
+        // where `o_len` is the free output space — measured at ~14 samples —
+        // so the source refilled only when nearly empty, then dribbled a
+        // 40,000-sample chunk out a few samples at a time. Between refills the
+        // HTTP socket was not read at all and the server's stream backed up.
+        //
+        // Each `fetch_samples` reads one chunk, so looping until the buffer is
+        // half full pulls several chunks per call and keeps a read
+        // outstanding. `curl` on the same endpoint sustains ~57 MB/s; this
+        // path managed 5.8. (61.44 MS/s stays out of reach regardless: at
+        // 4 bytes a sample that is 2 Gbit/s. The transport ceiling is the
+        // link's ~57 MB/s, roughly 14 MS/s.)
+        let refill_below = (self.buffer_capacity() / 2).max(o_len);
+        let mut fetches = 0usize;
+        while self.sample_buffer.len() < refill_below && fetches < MAX_FETCHES_PER_WORK {
+            fetches += 1;
             let handle = self.tokio_handle.clone();
             let fetch_res = if let Some(handle) = handle {
                 handle.block_on(async { self.fetch_samples().await })
