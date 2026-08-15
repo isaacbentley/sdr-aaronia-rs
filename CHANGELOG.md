@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`work()`'s output copy is two bulk `copy_from_slice` calls** over the
+  deque's contiguous halves instead of a `pop_front` per sample, whose
+  per-element wrap-around check the compiler cannot lift. Factored into
+  `copy_out` and unit-tested, including the wrapped-deque case.
+
+### Documentation
+- **Measured the HTTP transport on WiFi 7 and recorded where the
+  ceiling actually is.** `curl` on `/stream` sustains ~75 MB/s
+  (0.6 Gbit/s) station-to-station at a 2.4 Gbps PHY — both ends on air
+  halves the medium — and the figure is the same for all three wire
+  formats, so the encoding is not the limit. Two parallel connections
+  measured less in aggregate (63.9 vs 74 MB/s), so a single connection
+  is optimal and nothing smarter is available to the client. Against
+  that, the crate's full framing-plus-decode path measures ~3 GB/s and
+  the individual decoders 0.8–10 GS/s: the parser has fortyfold
+  headroom and is never the bottleneck. What the link buys at 4 bytes a
+  sample is ~19 MS/s — the 15.36 MS/s rung fits, 30.72 does not, and
+  full span (246 MB/s) needs a wired path to the RTSA host. Two ignored
+  throughput-meter tests (`decode_throughput_meter`,
+  `framing_throughput_meter`) keep these numbers re-measurable in one
+  command.
+
 ## [v0.7.6] - 2026-08-15
 
 All of this is about the FutureSDR `HttpSource` block (the `futuresdr`

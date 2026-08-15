@@ -1229,6 +1229,149 @@ impl StreamParser {
 
 #[cfg(test)]
 mod tests {
+
+    /// Framing throughput: the full `process_data` path — buffer append,
+    /// JSON metadata parse, separator scan, payload split — fed realistic
+    /// int16 packets in network-sized chunks. Run with
+    /// `cargo test --release --all-features -- --ignored framing_throughput --nocapture`.
+    #[test]
+    #[ignore = "throughput meter, run with --release and --nocapture"]
+    fn framing_throughput_meter() {
+        let n = 49_152usize;
+        // One wire packet: JSON metadata, RS, payload, newline+RS framing
+        // as the server sends it.
+        let header = format!(
+            "{{\"startTime\":1786000000.0,\"endTime\":1786000000.0008,\"startFrequency\":821180250.0,\"endFrequency\":882132250.0,\"sampleFrequency\":61440000.0,\"payload\":\"iq\",\"unit\":\"generic\",\"minPower\":-2,\"maxPower\":2,\"sampleSize\":2,\"sampleDepth\":1,\"scale\":1000000.0,\"samples\":{n}}}"
+        );
+        let payload: Vec<u8> = (0..n * 4).map(|i| (i * 31 % 251) as u8).collect();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(header.as_bytes());
+        wire.push(0x1e);
+        wire.extend_from_slice(&payload);
+        wire.push(b'\n');
+        // ~24 packets, split into 157 KiB chunks like reqwest delivers.
+        let mut stream_bytes = Vec::new();
+        for _ in 0..24 {
+            stream_bytes.extend_from_slice(&wire);
+        }
+        let chunks: Vec<Bytes> = stream_bytes
+            .chunks(157 * 1024)
+            .map(Bytes::copy_from_slice)
+            .collect();
+
+        let mut parser = StreamParser::new(StreamFormat::Int16, Some(1e6)).unwrap();
+        // Warm up.
+        for c in &chunks {
+            let _ = parser.process_data(c).unwrap();
+        }
+        let iters = 60;
+        let t0 = std::time::Instant::now();
+        let mut samples = 0usize;
+        for _ in 0..iters {
+            for c in &chunks {
+                for p in parser.process_data(c).unwrap() {
+                    samples += p.samples.len();
+                }
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        println!(
+            "framing+decode int16   {:8.1} MS/s   {:7.1} MB/s",
+            samples as f64 / dt / 1e6,
+            (iters * stream_bytes.len()) as f64 / dt / 1e6
+        );
+    }
+
+    /// Not a correctness test: a decode-throughput meter for the three IQ
+    /// wire formats, run explicitly with
+    /// `cargo test --release --all-features -- --ignored decode_throughput --nocapture`.
+    /// It exists because the transport ceiling is measurable with `curl`,
+    /// and whether the parser can stay above it decides where optimisation
+    /// effort goes.
+    #[test]
+    #[ignore = "throughput meter, run with --release and --nocapture"]
+    fn decode_throughput_meter() {
+        let parser_i16 = StreamParser::new(StreamFormat::Int16, Some(1e6)).unwrap();
+        let parser_f16 = StreamParser::new(StreamFormat::Float16, None).unwrap();
+        let parser_f32 = StreamParser::new(StreamFormat::Float32, None).unwrap();
+        let bench_meta = |scale: Option<f64>| PacketMetadata {
+            start_time: 0.0,
+            end_time: 0.001,
+            start_time_day: None,
+            end_time_day: None,
+            start_frequency: 0.0,
+            end_frequency: 1e6,
+            sample_frequency: Some(61.44e6),
+            samples: 49_152,
+            unit: "generic".to_string(),
+            payload: PayloadType::Iq,
+            min_power: -100,
+            max_power: 0,
+            sample_depth: None,
+            sample_size: 2,
+            scale,
+            antenna: None,
+            categories: None,
+            compression: None,
+        };
+        let meta_i16 = bench_meta(Some(1e6));
+        let meta_plain = bench_meta(None);
+
+        // 49_152 samples, the packet size a V6 sends at full span.
+        let n = 49_152usize;
+        let payload_4: Vec<u8> = (0..n * 4).map(|i| (i * 31 % 251) as u8).collect();
+        let payload_8: Vec<u8> = (0..n * 8).map(|i| (i * 31 % 251) as u8).collect();
+
+        let run = |name: &str, f: &mut dyn FnMut() -> usize, bytes_per_iter: usize| {
+            // Warm up, then time enough iterations for a stable figure.
+            for _ in 0..20 {
+                f();
+            }
+            let iters = 400;
+            let t0 = std::time::Instant::now();
+            let mut total = 0usize;
+            for _ in 0..iters {
+                total += f();
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            println!(
+                "{name:<22} {:8.1} MS/s   {:7.1} MB/s",
+                total as f64 / dt / 1e6,
+                (iters * bytes_per_iter) as f64 / dt / 1e6
+            );
+        };
+
+        run(
+            "int16 decode",
+            &mut || {
+                parser_i16
+                    .parse_iq_samples(&meta_i16, &payload_4)
+                    .unwrap()
+                    .len()
+            },
+            payload_4.len(),
+        );
+        run(
+            "float16 decode",
+            &mut || {
+                parser_f16
+                    .parse_iq_samples(&meta_plain, &payload_4)
+                    .unwrap()
+                    .len()
+            },
+            payload_4.len(),
+        );
+        run(
+            "float32 decode",
+            &mut || {
+                parser_f32
+                    .parse_iq_samples(&meta_plain, &payload_8)
+                    .unwrap()
+                    .len()
+            },
+            payload_8.len(),
+        );
+    }
     use super::*;
 
     fn iq_packet_bytes(samples: &[i16], scale: Option<f64>) -> Vec<u8> {

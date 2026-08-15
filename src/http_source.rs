@@ -22,6 +22,32 @@ use crate::http_streaming::{DropDetector, StreamFormat, StreamParser};
 /// few tens of thousands of samples).
 const PACKET_CAPACITY_FACTOR: usize = 4;
 
+/// Move as many samples as fit from the front of `buffer` into `out`,
+/// returning how many moved.
+///
+/// This is `work()`'s output copy, and it runs once per scheduler call at
+/// whatever rate the stream sustains — so it is two bulk `copy_from_slice`
+/// calls over the deque's contiguous halves rather than a `pop_front` per
+/// sample, whose per-element wrap-around check the compiler cannot lift.
+/// The samples the transport can deliver (~19 MS/s at 4 bytes each on the
+/// measured link) are cheap to move this way and expensive one at a time,
+/// and every cycle saved here is one the DSP consumer on the same machine
+/// gets back.
+fn copy_out(buffer: &mut std::collections::VecDeque<Complex32>, out: &mut [Complex32]) -> usize {
+    let n = buffer.len().min(out.len());
+    let (front, back) = buffer.as_slices();
+    let from_front = front.len().min(n);
+    out[..from_front].copy_from_slice(&front[..from_front]);
+    let from_back = n - from_front;
+    if from_back > 0 {
+        out[from_front..n].copy_from_slice(&back[..from_back]);
+    }
+    // Dropping the drain advances the deque's head; `Complex32` is `Copy`,
+    // so no per-element work happens.
+    buffer.drain(..n);
+    n
+}
+
 /// Free output-port space required before the source's `work()` runs.
 ///
 /// Without a floor here the runtime called `work()` whenever the output had
@@ -946,12 +972,17 @@ impl Kernel for HttpSource {
         // 40,000-sample chunk out a few samples at a time. Between refills the
         // HTTP socket was not read at all and the server's stream backed up.
         //
-        // Each `fetch_samples` reads one chunk, so looping until the buffer is
-        // half full pulls several chunks per call and keeps a read
-        // outstanding. `curl` on the same endpoint sustains ~57 MB/s; this
-        // path managed 5.8. (61.44 MS/s stays out of reach regardless: at
-        // 4 bytes a sample that is 2 Gbit/s. The transport ceiling is the
-        // link's ~57 MB/s, roughly 14 MS/s.)
+        // Each `fetch_samples` sweep pulls every queued chunk, and looping
+        // until the buffer is half full keeps the channel drained. The
+        // transport ceiling is the link, not this code: measured with
+        // `curl` on the same endpoint, ~57 MB/s on the original link and
+        // ~75 MB/s (0.6 Gbit/s) station-to-station over WiFi 7 at a
+        // 2.4 Gbps PHY — both ends on air halves the medium, and two
+        // parallel connections measured *less* in aggregate, so one
+        // connection is optimal. At 4 bytes a sample that is ~19 MS/s;
+        // 61.44 MS/s (246 MB/s) needs a wired path. The parser itself
+        // measures ~3 GB/s (`framing_throughput_meter`), so the decode
+        // side never sets the ceiling.
         let refill_below = (self.buffer_capacity() / 2).max(o_len);
         let mut fetches = 0usize;
         while self.sample_buffer.len() < refill_below && fetches < MAX_FETCHES_PER_WORK {
@@ -1015,16 +1046,7 @@ impl Kernel for HttpSource {
         }
 
         let o = self.output.slice();
-        // Copy available samples to output
-        let samples_to_copy = std::cmp::min(self.sample_buffer.len(), o.len());
-        for sample in o.iter_mut().take(samples_to_copy) {
-            // Safe unwrap: samples_to_copy is limited by buffer length
-            *sample = self
-                .sample_buffer
-                .pop_front()
-                .expect("Buffer length verified");
-        }
-
+        let samples_to_copy = copy_out(&mut self.sample_buffer, o);
         self.output.produce(samples_to_copy);
 
         // Log sample production periodically
@@ -1476,6 +1498,44 @@ mod tests {
             block.buffer_capacity(),
             "reported capacity must still track the enforced one"
         );
+    }
+
+    /// `copy_out` must drain exactly what it copies, in order, including
+    /// when the deque has wrapped and its content spans two slices — the
+    /// case a per-sample loop handled implicitly and a bulk copy must
+    /// handle explicitly.
+    #[test]
+    fn copy_out_handles_a_wrapped_deque() {
+        let mut dq: std::collections::VecDeque<Complex32> = std::collections::VecDeque::new();
+        // Force a wrap: fill, drain some, refill past the old tail.
+        for i in 0..8 {
+            dq.push_back(Complex32::new(i as f32, 0.0));
+        }
+        dq.drain(..5);
+        for i in 8..14 {
+            dq.push_back(Complex32::new(i as f32, 0.0));
+        }
+        let (a, b) = dq.as_slices();
+        assert!(
+            !a.is_empty() && !b.is_empty(),
+            "test must exercise the two-slice case; got {} / {}",
+            a.len(),
+            b.len()
+        );
+
+        let mut out = [Complex32::new(-1.0, -1.0); 7];
+        let n = copy_out(&mut dq, &mut out);
+        assert_eq!(n, 7);
+        let got: Vec<f32> = out.iter().map(|c| c.re).collect();
+        assert_eq!(got, vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+        assert_eq!(dq.len(), 2, "copied samples must be drained");
+        assert_eq!(dq.front().unwrap().re, 12.0);
+
+        // Output larger than the deque: takes everything, reports the count.
+        let mut big = [Complex32::new(-1.0, -1.0); 8];
+        let n = copy_out(&mut dq, &mut big);
+        assert_eq!(n, 2);
+        assert!(dq.is_empty());
     }
 
     /// The floor only ever raises the capacity; a caller who deliberately
