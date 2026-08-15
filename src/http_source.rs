@@ -48,14 +48,22 @@ fn copy_out(buffer: &mut std::collections::VecDeque<Complex32>, out: &mut [Compl
     n
 }
 
-/// Free output-port space required before the source's `work()` runs.
+/// This source's share of the output buffer's size, in samples.
 ///
-/// Without a floor here the runtime called `work()` whenever the output had
-/// *any* room — an average of 14 samples free, measured at 106,000 calls a
-/// second, each copying a handful of samples and returning. That spin burned
-/// a core and crowded the scheduler, so the downstream pipeline block was run
-/// only ~26 times a second despite having data waiting. Gating on a useful
-/// block turns thousands of near-empty copies into one substantial one.
+/// **It does not gate `work()`.** That is what the name and the original
+/// comment here claimed, and it is not what `set_min_items` does: in
+/// FutureSDR 0.0.39 the circular buffer reads `min_items` only in
+/// `Writer::connect`, where the buffer is sized `writer.min_items +
+/// reader.min_items - 1` items rounded up to a page. Nothing consults it
+/// afterwards, and the block loop runs `work()` on any buffer notification
+/// regardless of how much room there is. What this constant buys is a
+/// *buffer* big enough that the writer and the reader each get a useful
+/// block without waiting on the other — with the pipeline asking for the
+/// same figure, the connection is 131072 samples, so the source can be
+/// filling one half while the pipeline drains the other.
+///
+/// Spinning on a near-empty output is prevented in `work()` instead, by
+/// only setting `io.call_again` when there is a reason to run again.
 const SOURCE_MIN_OUTPUT_SAMPLES: usize = 65536;
 
 /// Most stream chunks one `work()` call will read before yielding.
@@ -67,6 +75,15 @@ const SOURCE_MIN_OUTPUT_SAMPLES: usize = 65536;
 /// call monopolise the executor. At ~40,000 samples a chunk this is well over
 /// a full buffer, so the buffer's capacity stops the loop first in practice.
 const MAX_FETCHES_PER_WORK: usize = 16;
+
+/// Longest a `work()` call will park waiting for the next stream chunk.
+///
+/// Not a rate limit: the wait ends the moment a chunk arrives, which at any
+/// real stream rate is well under a millisecond. It bounds how long the
+/// block can go without servicing its message inbox, since FutureSDR only
+/// reads that between `work()` calls — so it is a shutdown valve, and short
+/// enough that Ctrl+C and `--duration-secs` stay prompt.
+const CHUNK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Stream statistics for monitoring
 #[derive(Debug, Clone)]
@@ -132,6 +149,12 @@ pub struct HttpSource {
     /// from the stream rather than configured, since the packet size is the
     /// device's choice and no caller can be expected to guess it.
     max_packet_samples: usize,
+    /// Items the connected output buffer holds in total, learned from the
+    /// writer once the flowgraph has wired it up (0 until then, and for the
+    /// unit tests that never connect one). Feeds the `buffer_capacity` floor
+    /// so the retention buffer is never smaller than what the consumer is
+    /// able to take in a single call.
+    downstream_capacity: usize,
 
     // Advanced streaming configuration
     stream_format: StreamFormat,
@@ -161,6 +184,11 @@ pub struct HttpSource {
     /// warrants a log line. See the trim site for why this is rate-limited.
     overflow_samples: u64,
     next_overflow_report: u64,
+    /// Total signal time lost to server-side gaps, and the next drop count
+    /// that warrants a log line. See the report site: this is loss that never
+    /// reached the process, so no sample counter here can show it.
+    stream_gap_seconds: f64,
+    next_gap_report: u64,
     chunk_rx: Option<tokio::sync::mpsc::Receiver<bytes::Bytes>>,
     /// Handle to the reader task, kept so it can be aborted on reconnect or
     /// retune. Dropping the receiver also ends the task (its `send` fails),
@@ -306,6 +334,7 @@ impl HttpSource {
             streaming_client,
             sample_buffer: VecDeque::with_capacity(buffer_size * 2),
             max_packet_samples: 0,
+            downstream_capacity: 0,
             stream_format,
             stream_parser,
             input_name,
@@ -316,6 +345,8 @@ impl HttpSource {
             current_sample_rate: sample_rate,
             overflow_samples: 0,
             next_overflow_report: 1,
+            stream_gap_seconds: 0.0,
+            next_gap_report: 1,
             chunk_rx: None,
             reader_task: None,
             buffer_size,
@@ -481,7 +512,16 @@ impl HttpSource {
         Ok(())
     }
 
-    async fn fetch_samples(&mut self) -> Result<usize> {
+    /// Move every queued chunk into `sample_buffer`, returning how many
+    /// samples were added.
+    ///
+    /// `wait` is what an idle caller should do when the channel is empty:
+    /// `Some(d)` parks on the channel for up to `d`, `None` returns
+    /// immediately. Parking here — rather than on a clock in `work()` — is
+    /// the difference between waking on the next chunk (sub-millisecond at
+    /// any real rate) and sleeping through 50 ms of stream. See the call
+    /// site for the measurement.
+    async fn fetch_samples(&mut self, wait: Option<std::time::Duration>) -> Result<usize> {
         {
             debug!("fetch_samples() called");
         }
@@ -519,6 +559,46 @@ impl HttpSource {
                     break;
                 }
             }
+        }
+
+        // Nothing was queued and the caller has nothing to flush: park on the
+        // channel until the reader task delivers, rather than returning empty
+        // and letting the caller sleep on a clock.
+        //
+        // `recv` is cancel-safe, so losing the race to the timeout cannot
+        // consume a chunk. The timeout is not a rate limit — it is a
+        // shutdown valve, because the block's message loop only runs
+        // between `work()` calls and an unbounded await would defer
+        // `Terminate`.
+        let mut reader_task_ended = false;
+        if chunks.is_empty()
+            && let Some(timeout) = wait
+        {
+            // Scoped so the borrow of `self.chunk_rx` held by the pinned
+            // future is released before anything below touches `&mut self`.
+            // `Some(v)` is "the channel resolved", `None` is "the timeout won".
+            let received: Option<Option<Bytes>> = {
+                use futures::future::Either;
+                let mut recv = std::pin::pin!(rx.recv());
+                match futures::future::select(recv.as_mut(), futures_timer::Delay::new(timeout))
+                    .await
+                {
+                    Either::Left((v, _)) => Some(v),
+                    Either::Right(_) => None,
+                }
+            };
+            match received {
+                Some(Some(chunk)) => chunks.push(chunk),
+                // The reader task ended; same report as `Disconnected`, but
+                // flagged rather than handled here so `cleanup_stream` can
+                // take `&mut self` once the borrow above is gone.
+                Some(None) => reader_task_ended = true,
+                None => {}
+            }
+        }
+        if reader_task_ended {
+            self.cleanup_stream().await;
+            return Err(Error::StreamClosed("stream reader task ended".to_string()));
         }
 
         let mut samples_added = 0usize;
@@ -585,8 +665,39 @@ impl HttpSource {
 
         let mut total_samples_added = 0;
 
+        // Gaps the *server* left in the stream, from the packet timestamps.
+        //
+        // This result used to be discarded, so the only loss the log ever
+        // mentioned was our own capacity trim. That is the less important
+        // half: once the trim is sized to the consumer, a gap here is what
+        // remains, it is invisible in the sample count (the samples were
+        // never sent), and it is exactly the unsignalled discontinuity that
+        // breaks a demodulator's symbol timing. It appears whenever the
+        // device produces more than the link and the RTSA server can carry —
+        // at 4 bytes a sample, 30.7 MS/s is 123 MB/s, past what a gigabit
+        // link delivers — and an operator seeing undecodable digital traffic
+        // needs to know that is why. Same geometric schedule as the trim,
+        // for the same reason.
         for packet in &packets {
-            let _ = self.drop_detector.observe(packet);
+            if let crate::http_streaming::DropResult::Drop { gap_seconds } =
+                self.drop_detector.observe(packet)
+            {
+                self.stream_gap_seconds += gap_seconds;
+                let drops = self.drop_detector.drops();
+                if drops >= self.next_gap_report {
+                    warn!(
+                        "Stream gap: the server has skipped {drops} times \
+                         ({:.2} s of signal in total, {:.3} s this time). The \
+                         samples were never sent, so this is loss upstream of \
+                         this process — the device is producing more than the \
+                         link can carry. Digital decoding cannot survive it: \
+                         every gap is an unsignalled discontinuity to the \
+                         demodulator. Narrow the span or use a faster link.",
+                        self.stream_gap_seconds, gap_seconds,
+                    );
+                    self.next_gap_report = drops.saturating_mul(4);
+                }
+            }
         }
 
         for packet in packets {
@@ -634,8 +745,21 @@ impl HttpSource {
                 // second at wide span and a line each would bury the log.
                 self.overflow_samples = self.overflow_samples.saturating_add(overflow as u64);
                 if self.overflow_samples >= self.next_overflow_report {
+                    // Says what happened, not why. "The consumer is slower
+                    // than the stream" was the only diagnosis offered, and
+                    // now that the buffer is sized to the consumer's reach it
+                    // is usually the wrong one: what remains is the backlog
+                    // the server hands over at connect, which arrives faster
+                    // than real time and is stale by definition. Both causes
+                    // land here and the trim cannot tell them apart, so name
+                    // both rather than assert one.
                     warn!(
-                        "Sample buffer overflow: {} samples dropped so far                          (capacity {}); the consumer is slower than the stream",
+                        "Sample buffer overflow: {} samples dropped so far \
+                         (capacity {}); the oldest were discarded to keep the \
+                         buffer current. Expected in the first moments of a \
+                         stream, where the server delivers its backlog faster \
+                         than real time; sustained, it means the consumer \
+                         cannot keep up",
                         self.overflow_samples, capacity
                     );
                     self.next_overflow_report = self.overflow_samples.saturating_mul(4);
@@ -682,7 +806,17 @@ impl HttpSource {
         let packet_floor = self
             .max_packet_samples
             .saturating_mul(PACKET_CAPACITY_FACTOR);
-        configured.max(packet_floor)
+        // …and never below what the consumer can take in one call, plus a
+        // packet of slack. This floor is the one that mattered live: the
+        // packet floor came to 32768 samples while the downstream buffer had
+        // ~98304 slots free, so the trim discarded 5–9 MS/s that the consumer
+        // was ready to accept. Dropping the oldest samples is the right
+        // behaviour when nothing downstream *can* take them; it is pure loss
+        // when something can.
+        let downstream_floor = self
+            .downstream_capacity
+            .saturating_add(self.max_packet_samples);
+        configured.max(packet_floor).max(downstream_floor)
     }
 
     /// Get current stream statistics for monitoring
@@ -964,6 +1098,14 @@ impl Kernel for HttpSource {
             );
         }
         let o_len = self.output.slice().len();
+        // Learn the connected buffer's size once, for `buffer_capacity`.
+        // `max_items` is `usize::MAX` on an unconnected writer, so guard it.
+        if self.downstream_capacity == 0 {
+            let max = self.output.max_items();
+            if max != usize::MAX {
+                self.downstream_capacity = max;
+            }
+        }
 
         // Keep the buffer stocked rather than topping it up only when it is
         // about to run dry. This was `if self.sample_buffer.len() < o_len`,
@@ -983,29 +1125,49 @@ impl Kernel for HttpSource {
         // 61.44 MS/s (246 MB/s) needs a wired path. The parser itself
         // measures ~3 GB/s (`framing_throughput_meter`), so the decode
         // side never sets the ceiling.
-        let refill_below = (self.buffer_capacity() / 2).max(o_len);
+        //
+        // The target is bounded by `buffer_capacity()`. It was
+        // `(capacity / 2).max(o_len)`, and `o_len` (up to a full downstream
+        // buffer) is normally far above the capacity, so the condition could
+        // never be satisfied by filling the buffer — every call ran the sweep
+        // until the channel ran dry, and the per-packet trim threw away
+        // everything past the newest few packets.
+        let capacity = self.buffer_capacity();
+        let refill_below = (capacity / 2).max(o_len).min(capacity);
         let mut fetches = 0usize;
         while self.sample_buffer.len() < refill_below && fetches < MAX_FETCHES_PER_WORK {
             fetches += 1;
+            // Park on the channel only when there is nothing at all to flush.
+            // With samples in hand, returning promptly and producing them
+            // beats holding them back for a fuller block.
+            //
+            // This replaced a fixed 50 ms `Delay` at the same point, which
+            // was the dominant throughput defect: `work()` drains
+            // `sample_buffer` completely, so the next call nearly always
+            // found it empty, and any momentary gap in the channel cost
+            // 50 ms. Measured live at 15.4 MS/s: ~19 sleeps a second, ~100%
+            // of wall clock asleep, 1.24 MS/s reaching the consumer. While
+            // asleep the reader task filled the 64-chunk channel and blocked
+            // on `send`, so TCP flow control throttled the server and the
+            // stream was lost upstream as well.
+            let wait = if self.sample_buffer.is_empty() {
+                Some(CHUNK_WAIT)
+            } else {
+                None
+            };
             let handle = self.tokio_handle.clone();
             let fetch_res = if let Some(handle) = handle {
-                handle.block_on(async { self.fetch_samples().await })
+                handle.block_on(async { self.fetch_samples(wait).await })
             } else {
-                self.fetch_samples().await
+                self.fetch_samples(wait).await
             };
 
             match fetch_res {
                 Ok(fetched) => {
                     if fetched == 0 {
-                        // The channel was empty. Do not keep iterating: at up
-                        // to MAX_FETCHES_PER_WORK sleeps this loop once held
-                        // work() for 800 ms while samples already in the
-                        // buffer waited to be produced. Flush what exists now;
-                        // sleep only when there is nothing at all to flush, so
-                        // an idle source still cannot spin.
-                        if self.sample_buffer.is_empty() {
-                            futures_timer::Delay::new(std::time::Duration::from_millis(50)).await;
-                        }
+                        // Nothing queued, and the wait above (if any) also
+                        // came up empty: the stream is idle. Flush whatever
+                        // exists and let the next call try again.
                         break;
                     }
                 }
@@ -1059,8 +1221,18 @@ impl Kernel for HttpSource {
             }
         }
 
-        // Request to be called again
-        io.call_again = true;
+        // Ask to run again only when there is a reason to.
+        //
+        // This was unconditional, which made the block spin whenever the
+        // downstream buffer was momentarily full: `work()` returned having
+        // copied nothing and was re-entered immediately, measured at 83,000
+        // calls a second burning a core for no samples. Samples still in
+        // `sample_buffer` mean the output filled up, and the runtime already
+        // wakes this block when the reader consumes, so parking on the inbox
+        // is both cheaper and no slower. An empty buffer is the opposite
+        // case: come straight back and wait on the socket instead, which
+        // `fetch_samples` does with a bounded park rather than a spin.
+        io.call_again = self.sample_buffer.is_empty();
 
         Ok(())
     }
@@ -1731,7 +1903,7 @@ mod tests {
         let mut added = 0;
         for _ in 0..100 {
             added = source
-                .fetch_samples()
+                .fetch_samples(None)
                 .await
                 .expect("the packet should decode");
             if added > 0 {
@@ -1750,6 +1922,115 @@ mod tests {
             s.re,
         );
         assert!((s.im - -1.0).abs() < 1e-6);
+    }
+
+    /// The retention buffer must never be smaller than what the consumer can
+    /// take in one call.
+    ///
+    /// This is the half of the throughput defect that lived in
+    /// `buffer_capacity`. It read `max(buffer_size * 2, max_packet_samples *
+    /// PACKET_CAPACITY_FACTOR)`, which live came to 32768 samples, while the
+    /// connected output buffer held 131072 and typically had ~98304 free.
+    /// Every `fetch_samples` sweep pushed far more than 32768 samples in and
+    /// the per-packet trim dropped the excess — samples the consumer was
+    /// ready to accept, discarded inside the source. Measured live at a
+    /// 15.4 MS/s stream: 5–9 MS/s trimmed away, 1.24 MS/s reaching the DSP.
+    ///
+    /// Dropping the oldest samples is right when nothing downstream *can*
+    /// take them. It is pure loss when something can, and that is what this
+    /// pins.
+    #[test]
+    fn buffer_capacity_covers_what_the_consumer_can_take() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .buffer_size(8192)
+            .build()
+            .expect("Should create HttpSource");
+
+        // What the flowgraph actually wires up: SOURCE_MIN_OUTPUT_SAMPLES on
+        // the writer plus the pipeline's own request on the reader, which
+        // FutureSDR sizes as `writer + reader - 1` rounded up to a page.
+        block.downstream_capacity = 131_072;
+        block.max_packet_samples = 8_192;
+
+        let capacity = block.buffer_capacity();
+        assert!(
+            capacity >= block.downstream_capacity,
+            "capacity {capacity} is below the {} samples the consumer can \
+             take in one call — the trim will discard samples that had a \
+             home downstream",
+            block.downstream_capacity,
+        );
+        // And the refill target `work()` derives from it must be reachable:
+        // `(capacity / 2).max(o_len).min(capacity)` has to be satisfiable by
+        // filling the buffer, or the sweep only ever ends when the channel
+        // runs dry.
+        let o_len = block.downstream_capacity;
+        let refill_below = (capacity / 2).max(o_len).min(capacity);
+        assert!(
+            refill_below <= capacity,
+            "refill target {refill_below} exceeds capacity {capacity}; the \
+             fetch loop can never satisfy it and will over-fetch every call",
+        );
+    }
+
+    /// A waiting `fetch_samples` must return when data arrives, not when the
+    /// clock runs out.
+    ///
+    /// The source used to sleep a fixed 50 ms whenever it found the chunk
+    /// channel momentarily empty. Because `work()` drains `sample_buffer`
+    /// completely, the next call nearly always found it empty, so live this
+    /// fired ~19 times a second — ~100% of wall clock asleep — and the
+    /// stream was sampled in 50 ms strides. Parking on the channel instead
+    /// wakes on the next chunk.
+    #[tokio::test]
+    async fn a_waiting_fetch_wakes_on_the_chunk_not_the_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let header = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":100.0,"endFrequency":200.0,"samples":1,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
+        let mut body = header.as_bytes().to_vec();
+        body.push(30u8);
+        for v in [1000i16, -1000] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let mut source = HttpSourceBuilder::new(&server.uri())
+            .format(StreamFormat::Int16)
+            .input("main")
+            .build()
+            .expect("Should create HttpSource");
+        source
+            .start_stream()
+            .await
+            .expect("mock /stream must accept the request");
+
+        // A generous timeout, so "returned quickly" cannot be the timeout
+        // firing. The chunk is in flight from the reader task.
+        let timeout = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        let added = source
+            .fetch_samples(Some(timeout))
+            .await
+            .expect("the packet should decode");
+        let elapsed = start.elapsed();
+
+        assert_eq!(added, 1, "one IQ pair in the payload");
+        assert!(
+            elapsed < timeout / 2,
+            "waited {elapsed:?} for a chunk that was already on its way; a \
+             wait that tracks the clock rather than the data is the 50 ms \
+             sleep returning",
+        );
     }
 
     #[tokio::test]
