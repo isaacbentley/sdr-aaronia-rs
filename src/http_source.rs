@@ -106,7 +106,15 @@ pub struct HttpSource {
 
     // Configuration
     buffer_size: usize,
-    reference_level: f64,
+    /// Hardware reference level to push, or `None` to leave the device's
+    /// current gain alone.
+    ///
+    /// This used to be a bare `f64` that was pushed unconditionally on every
+    /// start, so simply launching the app overwrote whatever gain the operator
+    /// had set — with the caller's default, not a value they had chosen.
+    /// `None` is what "the user did not ask for a reference level" looks like,
+    /// and `CaptureConfig` leaves `None` fields untouched.
+    reference_level: Option<f64>,
 
     // Authentication
     auth_method: AuthMethod,
@@ -134,7 +142,7 @@ impl HttpSource {
         base_url: String,
         frequency: f64,
         sample_rate: f64,
-        reference_level: f64,
+        reference_level: Option<f64>,
         buffer_size: usize,
         timeout_ms: u64,
     ) -> Result<Self> {
@@ -159,7 +167,7 @@ impl HttpSource {
         base_url: String,
         frequency: f64,
         sample_rate: f64,
-        reference_level: f64,
+        reference_level: Option<f64>,
         buffer_size: usize,
         timeout_ms: u64,
         stream_format: StreamFormat,
@@ -694,7 +702,7 @@ impl HttpSource {
 
         info!(
             "Tuning RTSA device to center={:.6} MHz, span={:.3} MHz \
-             (decimation index {:?}), ref_level={} dBm",
+             (decimation index {:?}), ref_level={:?} dBm",
             self.current_frequency / 1e6,
             self.current_sample_rate / 1e6,
             decimation_index,
@@ -704,7 +712,7 @@ impl HttpSource {
         let request = crate::http_endpoints::CaptureConfig {
             center_freq_hz: (self.current_frequency > 0.0).then_some(self.current_frequency),
             decimation_index,
-            reflevel_dbm: Some(self.reference_level),
+            reflevel_dbm: self.reference_level,
         };
 
         match self.endpoints_client.apply_capture_config(&request).await {
@@ -905,7 +913,7 @@ pub struct HttpSourceBuilder {
     base_url: String,
     frequency: f64,
     sample_rate: f64,
-    reference_level: f64,
+    reference_level: Option<f64>,
     buffer_size: usize,
     timeout_ms: u64,
     stream_format: StreamFormat,
@@ -927,9 +935,11 @@ impl HttpSourceBuilder {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
-            frequency: 100e6,                   // 100 MHz default
-            sample_rate: 1e6,                   // 1 MS/s default
-            reference_level: -20.0,             // -20 dBm default (matches AaroniaConfig)
+            frequency: 100e6, // 100 MHz default
+            sample_rate: 1e6, // 1 MS/s default
+            // `None`, not a number: pushing a default reference level on
+            // every start silently overwrites the operator's gain.
+            reference_level: None,
             buffer_size: 4096,                  // 4k samples default
             timeout_ms: 15000,                  // 15s timeout default
             stream_format: StreamFormat::Int16, // Production default based on reference implementation
@@ -970,7 +980,7 @@ impl HttpSourceBuilder {
     /// Set the initial reference level, in dBm.
     #[must_use]
     pub fn reference_level(mut self, level: f64) -> Self {
-        self.reference_level = level;
+        self.reference_level = Some(level);
         self
     }
 
@@ -1342,6 +1352,23 @@ mod tests {
         );
     }
 
+    /// Setting a reference level explicitly must still reach the device.
+    ///
+    /// The default is `None` so that launching an app does not silently
+    /// change the operator's gain — but an explicit request has to work, or
+    /// the flag would be inert.
+    #[test]
+    fn an_explicit_reference_level_is_carried_through() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let built = HttpSourceBuilder::new("http://localhost:54664")
+            .reference_level(-18.0)
+            .build()
+            .expect("Should build");
+        assert_eq!(built.reference_level, Some(-18.0));
+    }
+
     #[tokio::test]
     async fn test_url_security_validation() {
         // Test IP address validation warnings
@@ -1521,7 +1548,15 @@ mod tests {
 
         assert_eq!(built.current_frequency, 100e6);
         assert_eq!(built.current_sample_rate, 1e6);
-        assert_eq!(built.reference_level, -20.0);
+        // `None`, not a number. A default reference level is pushed to the
+        // hardware on the first stream start, so defaulting it to a value
+        // meant simply launching an app overwrote the operator's receiver
+        // gain with a figure they had never chosen. Absent means "leave the
+        // device's gain alone".
+        assert_eq!(
+            built.reference_level, None,
+            "no reference level unless the caller asks for one"
+        );
         assert_eq!(built.buffer_size, 4096);
         assert_eq!(built.stream_format, StreamFormat::Int16);
         assert!(matches!(built.auth_method, AuthMethod::None));
