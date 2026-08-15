@@ -120,9 +120,26 @@ pub struct HttpSource {
     stream_active: bool,
     current_frequency: f64,
     current_sample_rate: f64,
-    stream_response: Option<
-        Box<dyn futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin>,
-    >,
+    /// Raw stream chunks from the background reader task.
+    ///
+    /// The socket used to be read one chunk per `work()` call, so throughput
+    /// was capped by how often the scheduler ran the block — measured at a
+    /// tenth of what `curl` pulls from the same endpoint, because between
+    /// calls the socket was not read and the server's stream backed up. A
+    /// dedicated task now drains the socket continuously into this bounded
+    /// channel; `work()` only sweeps already-received chunks and parses them.
+    /// The bound provides backpressure: if the consumer falls behind the
+    /// channel fills, the reader blocks on `send`, and TCP flow control does
+    /// the rest — no unbounded memory.
+    /// Total samples dropped by the capacity trim, and the next count that
+    /// warrants a log line. See the trim site for why this is rate-limited.
+    overflow_samples: u64,
+    next_overflow_report: u64,
+    chunk_rx: Option<tokio::sync::mpsc::Receiver<bytes::Bytes>>,
+    /// Handle to the reader task, kept so it can be aborted on reconnect or
+    /// retune. Dropping the receiver also ends the task (its `send` fails),
+    /// but an explicit abort is prompt and unambiguous.
+    reader_task: Option<tokio::task::JoinHandle<()>>,
 
     // Configuration
     buffer_size: usize,
@@ -271,7 +288,10 @@ impl HttpSource {
             stream_active: false,
             current_frequency: frequency,
             current_sample_rate: sample_rate,
-            stream_response: None, // Initialize to None
+            overflow_samples: 0,
+            next_overflow_report: 1,
+            chunk_rx: None,
+            reader_task: None,
             buffer_size,
             reference_level,
             auth_method,
@@ -395,8 +415,39 @@ impl HttpSource {
             )));
         }
 
-        // Store the byte stream
-        self.stream_response = Some(Box::new(response.bytes_stream()));
+        // Spawn a task that drains the socket continuously into a bounded
+        // channel, decoupling the read rate from how often `work()` runs.
+        //
+        // 64 chunks (~10 MB at ~157 KiB each) is enough slack that ordinary
+        // scheduling jitter never stalls the socket, while still bounding
+        // memory and giving real backpressure when the consumer cannot keep
+        // up. The task ends when the stream does, or when the receiver is
+        // dropped on reconnect/retune.
+        let mut stream = response.bytes_stream();
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
+        let task = tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        // `send` awaits when the channel is full — this is the
+                        // backpressure point, and where TCP flow control kicks
+                        // in. A send error means the receiver was dropped, so
+                        // the source is gone and the task should end.
+                        if tx.send(chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Stream chunk error in reader task: {}", e);
+                        break;
+                    }
+                }
+            }
+            debug!("Aaronia stream reader task ended");
+        });
+        self.chunk_rx = Some(rx);
+        self.reader_task = Some(task);
 
         self.stream_active = true;
         info!("Advanced Aaronia HTTP streaming initialized");
@@ -415,56 +466,42 @@ impl HttpSource {
         // helper was replaced by the lower-level `to_sample_*` config
         // operations. Use `sdk_source.rs` for native-SDK streaming.
 
-        // Read from the existing persistent stream
-        if let Some(stream) = &mut self.stream_response {
-            let bytes_result = async {
-                use futures::StreamExt;
-
-                // For continuous streaming, we don't want to timeout waiting for data
-                // The stream should provide data continuously, so we wait indefinitely
-                // Only timeout on connection establishment, not data reception
-                let chunk_result = stream.next().await;
-
-                match chunk_result {
-                    Some(Ok(chunk)) => {
-                        trace!("Received HTTP stream chunk: {} bytes", chunk.len());
-                        Ok(chunk)
-                    }
-                    Some(Err(e)) => {
-                        // Stream error occurred
-                        warn!("Stream chunk error: {}", e);
-                        Err(Error::Protocol(format!("Stream chunk error: {}", e)))
-                    }
-                    None => {
-                        // The body finished: no more data is coming.
-                        // Reported as StreamClosed rather than Protocol
-                        // so a caller can tell it apart from a read
-                        // that failed mid-stream, which is the arm
-                        // directly above.
-                        warn!("Stream ended unexpectedly");
-                        Err(Error::StreamClosed("HTTP response body ended".to_string()))
-                    }
-                }
-            }
-            .await;
-
-            match bytes_result {
-                Ok(bytes) => {
-                    let samples_added = self.process_advanced_stream_data(&bytes)?;
-                    trace!("Added {} samples from stream", samples_added);
-                    Ok(samples_added)
-                }
-                Err(e) => {
-                    // Clean up the failed stream
-                    self.cleanup_stream().await;
-                    Err(e)
-                }
-            }
-        } else {
-            // No active stream - this shouldn't happen if initialize was called
+        // Drain every chunk the reader task has queued, parsing each in turn.
+        // Sweeping all available chunks (rather than one per call) is what
+        // lets a single `work()` move a substantial block, and it keeps the
+        // channel from filling and stalling the socket.
+        let Some(rx) = self.chunk_rx.as_mut() else {
             warn!("No active stream available for reading");
-            Err(Error::Protocol("No active stream".to_string()))
+            return Err(Error::Protocol("No active stream".to_string()));
+        };
+
+        // Collect first, then parse, so the `&mut self` borrow for parsing
+        // does not overlap the `&mut self.chunk_rx` borrow above.
+        let mut chunks: Vec<bytes::Bytes> = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(chunk) => chunks.push(chunk),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    // The reader task ended (stream closed or errored). Report
+                    // it so `work()` reconnects, distinct from a healthy read
+                    // that simply had nothing ready.
+                    if chunks.is_empty() {
+                        self.cleanup_stream().await;
+                        return Err(Error::StreamClosed("stream reader task ended".to_string()));
+                    }
+                    break;
+                }
+            }
         }
+
+        let mut samples_added = 0usize;
+        for chunk in &chunks {
+            trace!("Received HTTP stream chunk: {} bytes", chunk.len());
+            samples_added += self.process_advanced_stream_data(chunk)?;
+        }
+        trace!("Added {} samples from stream", samples_added);
+        Ok(samples_added)
     }
 
     /// Clean up the stream when it fails or ends
@@ -480,7 +517,13 @@ impl HttpSource {
             }
         }
 
-        self.stream_response = None;
+        // End the reader task and drop the channel. Aborting is prompt;
+        // dropping the receiver would also end it (its next `send` fails) but
+        // not until the next chunk arrives.
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
+        self.chunk_rx = None;
         self.stream_active = false;
     }
 
@@ -556,10 +599,21 @@ impl HttpSource {
             if self.sample_buffer.len() > capacity {
                 let overflow = self.sample_buffer.len() - capacity;
                 self.sample_buffer.drain(0..overflow);
-                warn!(
-                    "Sample buffer overflow: dropped {} oldest samples (capacity {})",
-                    overflow, capacity
-                );
+                // Overflow here means the consumer cannot keep up with the
+                // stream — expected and correct at a wide span, where no
+                // consumer can process 61 MS/s of a 49 MHz survey in real
+                // time, so the buffer keeps only the most recent samples.
+                // Counted always; logged on a geometric schedule, because
+                // with the continuous reader this fires thousands of times a
+                // second at wide span and a line each would bury the log.
+                self.overflow_samples = self.overflow_samples.saturating_add(overflow as u64);
+                if self.overflow_samples >= self.next_overflow_report {
+                    warn!(
+                        "Sample buffer overflow: {} samples dropped so far                          (capacity {}); the consumer is slower than the stream",
+                        self.overflow_samples, capacity
+                    );
+                    self.next_overflow_report = self.overflow_samples.saturating_mul(4);
+                }
             }
 
             if packet_samples > 0 {
@@ -631,7 +685,10 @@ impl Drop for HttpSource {
             info!("Dropping HttpSource - stopping stream");
             // Don't use block_on in destructor as it can cause panics during runtime shutdown
             // Just mark as inactive and let the response drop naturally
-            self.stream_response = None;
+            if let Some(task) = self.reader_task.take() {
+                task.abort();
+            }
+            self.chunk_rx = None;
             self.stream_active = false;
             debug!("HttpSource cleanup completed without blocking");
         }
@@ -1561,10 +1618,20 @@ mod tests {
             .start_stream()
             .await
             .expect("mock /stream must accept the request");
-        let added = source
-            .fetch_samples()
-            .await
-            .expect("the packet should decode");
+        // The reader task delivers chunks asynchronously, so drain in a
+        // bounded poll rather than assuming one call synchronously reads the
+        // body — which is how the source is actually driven in `work()`.
+        let mut added = 0;
+        for _ in 0..100 {
+            added = source
+                .fetch_samples()
+                .await
+                .expect("the packet should decode");
+            if added > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         assert_eq!(added, 1, "one IQ pair in the payload");
 
         let s = source.sample_buffer[0];
