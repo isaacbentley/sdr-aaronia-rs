@@ -302,7 +302,12 @@ from `/remoteconfig` first if you need to target one block.
 
 These are one-off requests. Aaronia's own words: if they cannot be
 executed, or conflict with the local configuration, the behaviour is
-undefined — nothing reports the conflict.
+undefined — nothing reports the conflict. That is not theoretical: the
+same device has been measured both honouring and ignoring an identical
+full-tuple capture command in different mission states, answering
+`success=true` both times. A retune that must be provable goes through
+`/remoteconfig` and reads the value back
+(`HttpEndpointsClient::apply_capture_config` does exactly this).
 
 **The settings each `type` accepts**, per Aaronia support (January
 2024), which goes well beyond the published specification:

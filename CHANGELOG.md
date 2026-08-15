@@ -4,6 +4,91 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.7.6] - 2026-08-15
+
+All of this is about the FutureSDR `HttpSource` block (the `futuresdr`
+feature), whose streaming path turned out to be losing most of the
+stream. Found and measured against a live SPECTRAN V6 ECO running a
+49 MHz survey for a trunking decoder.
+
+### Fixed
+- **The sample buffer guillotined every packet bigger than itself.**
+  The capacity trim runs as each packet lands, and with capacity fixed
+  at `buffer_size * 2` a device sending 49k-sample packets into a
+  16384-sample capacity lost ~75% of every packet before the consumer
+  was offered any of it. Measured live: 61.4 MS/s at the device,
+  0.33 MS/s reaching the pipeline, and digital decode unable to hold
+  frame sync. The capacity now floors at four times the largest packet
+  observed, learned from the stream; the floor only ever raises the
+  configured value.
+- **The initial tune could claim success while the device never
+  moved.** `/control` answers `success=true` whether or not any block
+  applies the command — the same device has been measured both
+  honouring and ignoring the identical full-tuple payload in different
+  mission states. The block's start-up tune now writes the real field
+  names (`centerfreq0`, `decimation0`, `reflevel0`) via `/remoteconfig`
+  to the block discovered by walking the config tree, then reads them
+  back and warns about anything that did not take. Where no such block
+  exists (an IQ-demodulator mission exposes different fields), it falls
+  back to the old `/control` capture command and says the result is
+  unverified. The tune is one-shot: stream restarts after an external
+  retune no longer re-push the source's stale target over it.
+- **Launching an app no longer overwrites the operator's gain.** The
+  builder's reference level was a bare number pushed on every start, so
+  merely starting a flowgraph reset the device to the builder default.
+  It is now optional and left untouched unless the caller set one.
+- **`work()` spun.** The runtime ran it whenever the output port had
+  any room — measured at 106,000–390,000 calls a second averaging 14
+  free samples each — burning ~60% of a core and starving the
+  downstream block. The output port now requires a worthwhile block of
+  room before `work()` runs; call rate dropped to ~14/s.
+
+### Changed
+- **The HTTP socket is drained by a dedicated task**, not inside
+  `work()`. The socket used to be read only while the scheduler happened
+  to run the block, which capped throughput at a tenth of what `curl`
+  pulls from the same endpoint. A background task now pushes chunks
+  into a bounded channel (~10 MB), whose fill is the backpressure point:
+  consumer falls behind → channel fills → reader blocks → TCP flow
+  control stops the server. Measured at a 49 MHz span: 1.8 → ~7–9 MS/s.
+  The honest ceiling is the link (~57 MB/s ≈ 14 MS/s as float32);
+  61.44 MS/s over this transport is 2 Gbit/s and not reachable.
+- Buffer-overflow drops are now counted and logged geometrically
+  rather than once per occurrence, which at wide span was 5040 log
+  lines in 25 seconds for one piece of information.
+- File playback decodes little-endian cf32 with a zero-copy read
+  straight into the sample buffer; the explicit per-sample decode
+  remains for big-endian hosts, and a round-trip test pins the two to
+  identical output.
+
+### Fixed (in review, before this release shipped)
+- The refill loop kept iterating through its 50 ms idle sleeps when the
+  channel was empty, holding samples already in the buffer for up to
+  800 ms before producing them. It now flushes immediately and sleeps
+  only when there is nothing to flush.
+- A parse error mid-stream reconnected without reaping the reader task,
+  which on a stalled socket keeps holding a server connection — on the
+  free licence, the one connection the reconnect needs.
+- Two comments overstated the `/control` finding as "this endpoint does
+  not carry these fields on a Spectran V6". Measured today, the same
+  device honours the identical full-tuple payload — the accurate claim
+  is that `success=true` proves nothing either way, which is the reason
+  the verified `/remoteconfig` path exists. Where no `centerfreq0`
+  block is found, the initial tune now falls back to `/control` rather
+  than silently not tuning (an IQ-demodulator mission exposes
+  `centerfreq`, not `centerfreq0`).
+
+### Added
+- `iq_sample_rate_for_decimation_index`, `decimation_index_for_rate`
+  and `decimation_index_for_bandwidth` in `utils`: the RTSA "Span"
+  enum (`Full` … `1 / 512`) mapped onto the sample-rate ladder and
+  back, so a requested span becomes the enum index the device actually
+  takes.
+- `HttpEndpointsClient::apply_capture_config` — retune via
+  `/remoteconfig` with read-back confirmation — plus
+  `find_block_name_with_field`, which discovers the receiver block by
+  the field the write will target instead of assuming its category.
+
 ## [v0.7.5] - 2026-08-13
 
 ### Added

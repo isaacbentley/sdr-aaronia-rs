@@ -767,12 +767,14 @@ impl HttpSource {
     /// report what the device actually adopted.
     ///
     /// This replaced a `configure_capture` call on the `/control` endpoint,
-    /// which "always succeeds": it logged a successful tune while the device
-    /// never moved, because that endpoint does not carry these fields on a
-    /// Spectran V6. The write now goes through `/remoteconfig` against the
-    /// block that genuinely carries `centerfreq0`, and is read back — a wrong
-    /// receiver name returns HTTP 200 and changes nothing, so the status code
-    /// alone proves nothing.
+    /// which "always succeeds": it logged a successful tune in a setup where
+    /// the device never moved. `/control` answers `success=true` whether or
+    /// not any block applies the command — the same device has been measured
+    /// both honouring and ignoring the identical full-tuple payload in
+    /// different mission states — so the write now goes through
+    /// `/remoteconfig` against the block that genuinely carries
+    /// `centerfreq0`, and is read back, because that is the only retune whose
+    /// success can be proven rather than assumed.
     ///
     /// Span is expressed as the `decimation0` enum index rather than a
     /// frequency: the device has no span field, only a decimation ladder.
@@ -832,10 +834,38 @@ impl HttpSource {
                 }
             }
             Err(e) => {
+                // No block carrying `centerfreq0` (an IQ-demodulator mission
+                // exposes `centerfreq`, and other front ends differ), or the
+                // config read failed outright. Fall back to the `/control`
+                // full-tuple capture command, which is broadcast to whatever
+                // block understands it — the pre-0.7.6 behaviour, and the
+                // path Aaronia's own demodulator examples use. It cannot be
+                // verified (`success=true` regardless), so say so instead of
+                // claiming the tune took.
                 warn!(
-                    "Could not tune RTSA device via /remoteconfig: {e}. \
-                     Streaming from whatever the device is currently tuned to."
+                    "Could not tune via /remoteconfig ({e}); falling back to the \
+                     unverified /control capture command"
                 );
+                let fallback = self
+                    .endpoints_client
+                    .configure_capture(crate::http_endpoints::CaptureControl {
+                        frequency_center: Some(self.current_frequency),
+                        frequency_span: Some(self.current_sample_rate),
+                        reference_level: self.reference_level.map(|dbm| dbm as f32),
+                        control_type: crate::http_endpoints::ControlType::Capture,
+                        ..Default::default()
+                    })
+                    .await;
+                match fallback {
+                    Ok(_) => info!(
+                        "/control capture accepted (unverified: the server answers \
+                         success whether or not a block applied it)"
+                    ),
+                    Err(e) => warn!(
+                        "/control capture also failed: {e}. Streaming from whatever \
+                         the device is currently tuned to."
+                    ),
+                }
             }
         }
     }
@@ -936,18 +966,35 @@ impl Kernel for HttpSource {
             match fetch_res {
                 Ok(fetched) => {
                     if fetched == 0 {
-                        // No samples available, sleep briefly to prevent busy-waiting
-                        // Use futures-timer for runtime-agnostic async sleep
-                        futures_timer::Delay::new(std::time::Duration::from_millis(50)).await;
-                        // Don't try to reconfigure - RTSA Suite handles device config
-                    } else {
-                        // Print stream info periodically when receiving data
-                        // self.print_stream_info(); // moved to trace
+                        // The channel was empty. Do not keep iterating: at up
+                        // to MAX_FETCHES_PER_WORK sleeps this loop once held
+                        // work() for 800 ms while samples already in the
+                        // buffer waited to be produced. Flush what exists now;
+                        // sleep only when there is nothing at all to flush, so
+                        // an idle source still cannot spin.
+                        if self.sample_buffer.is_empty() {
+                            futures_timer::Delay::new(std::time::Duration::from_millis(50)).await;
+                        }
+                        break;
                     }
                 }
                 Err(e) => {
                     warn!("Aaronia stream error: {}", e);
                     self.stream_active = false;
+                    // Reap the old reader task before reconnecting. On a parse
+                    // error the task is still running; `start_stream` would
+                    // drop its channel, but a task blocked in `stream.next()`
+                    // on a stalled socket only notices at its next send — and
+                    // meanwhile it holds a server connection, which on the
+                    // free licence (one client) is the very connection the
+                    // reconnect needs. `cleanup_stream` aborts it, and is
+                    // idempotent when the StreamClosed path already ran it.
+                    let handle = self.tokio_handle.clone();
+                    if let Some(h) = handle {
+                        h.block_on(async { self.cleanup_stream().await });
+                    } else {
+                        self.cleanup_stream().await;
+                    }
                     // Try to reconnect after a delay
                     futures_timer::Delay::new(std::time::Duration::from_millis(1000)).await;
                     let handle = self.tokio_handle.clone();

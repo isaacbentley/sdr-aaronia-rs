@@ -227,8 +227,14 @@ const REFLEVEL_CONFIRM_TOLERANCE_DB: f64 = 0.25;
 /// left untouched on the device. This is deliberately the SPECTRAN V6
 /// field set (`centerfreq0` / `decimation0` / `reflevel0`), the names the
 /// device actually exposes — not the `/control` capture fields
-/// (`frequencyCenter` / `frequencySpan` / `referenceLevel`), which this
-/// device accepts with `success=true` and silently ignores.
+/// (`frequencyCenter` / `frequencySpan` / `referenceLevel`).
+///
+/// The distinction that matters: `/control` answers `success=true`
+/// whether or not any block applied the command. The same device has
+/// been measured both honouring a full-tuple `/control` capture and
+/// ignoring one, in different mission states, with identical responses —
+/// so nothing in that reply proves a retune happened. This path exists
+/// because `/remoteconfig` can be read back.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CaptureConfig {
     /// `main/centerfreq0`, in Hz.
