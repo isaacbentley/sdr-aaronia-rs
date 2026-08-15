@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **A link budget, so a span that cannot fit is caught before the
+  capture instead of after it.** The span picks a rate off the
+  decimation ladder and at 4 bytes a sample that rate is a byte rate the
+  path has to sustain: `--span 10M` is 15.36 MS/s and 61.4 MB/s, which
+  measured contiguous over gigabit, while `--span 20M` is 30.72 MS/s and
+  122.9 MB/s, which measured 1024 skips and 1.84 s lost of 35 s. The new
+  `link_budget` module does the arithmetic in both directions —
+  `required_byte_rate` for what a span costs, `max_sustainable_span` for
+  the widest rung a measured rate affords, inverted through the existing
+  ladder rather than a second copy of it — and `measure_link_throughput`
+  measures the path end to end by counting bytes off `/stream`.
+  Deliberately end to end: the bottleneck may be the server, a switch,
+  the air or this host's own ingest, and the NIC's advertised link speed
+  sees none of them.
+
+  The probe discards a 500 ms settle window before counting
+  (`LINK_PROBE_SETTLE`). Without it a probe *lies*: the server hands over
+  its pre-connect backlog faster than real time — measured at ~0.27–0.35 s
+  of signal, all inside a 345 ms window at connect — so counting it reads
+  above the true link rate and waves through a span that cannot fit. Two
+  tests pin this, one driving the settle logic off synthetic instants
+  with a 200 MB/s burst ahead of a 10 MB/s stream, and one showing the
+  same trace measuring six times too fast with the settle window removed.
+  An unreachable server, an idle mission or a stream that stops mid-window
+  is an error and never a rate, because "0 MB/s" would condemn every span
+  on the ladder.
+- **`HttpSource` runs that check passively and warns once**, on the
+  stream it is already reading — no second connection, no cost beyond
+  adding up chunk lengths. It compares the bytes arriving against what
+  the device's own reported rate needs and, if the path is short, names
+  the requested span, the rate it needs, what was measured, and the
+  widest span that would have fitted. Complementary to `DropDetector`,
+  which says the server *did* drop data after the fact; when both fire
+  the gap warning now says so, rather than reading as a second unrelated
+  fault. Silence is the answer whenever the measurement did not happen:
+  a warning never fires on a failed one.
+- **`StreamFormat::iq_bytes_per_sample`**, the one definition of the
+  constant the whole budget turns on. `calculate_binary_size` now reads
+  it instead of carrying its own copy of the same match.
+
 ### Changed
 - **`work()`'s output copy is two bulk `copy_from_slice` calls** over the
   deque's contiguous halves instead of a `pop_front` per sample, whose

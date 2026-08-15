@@ -52,6 +52,31 @@ pub enum StreamFormat {
 }
 
 impl StreamFormat {
+    /// Bytes one IQ sample occupies on the wire in this format.
+    ///
+    /// This is the constant the whole link budget turns on: at 4 bytes a
+    /// sample a 30.72 MS/s stream is 123 MB/s, which is past what a
+    /// gigabit path delivers, and the server drops what it cannot send.
+    /// [`crate::link_budget`] multiplies by it in one direction and
+    /// divides by it in the other; `calculate_binary_size` uses it to
+    /// find where a packet's payload ends. Those must agree, so there is
+    /// one definition.
+    ///
+    /// A *scalar* payload (spectra, histogram, categories) carries one
+    /// value where IQ carries a pair, so it uses half this figure.
+    ///
+    /// [`Self::Json`] is 0: its samples are ASCII decimal and have no
+    /// fixed width, so "how many bytes is a sample" has no answer. Treat
+    /// 0 as "unknown", never as "free".
+    pub fn iq_bytes_per_sample(&self) -> usize {
+        match self {
+            Self::Int16 => 4,   // 2 bytes I + 2 bytes Q
+            Self::Float16 => 4, // 2 bytes I + 2 bytes Q
+            Self::Float32 => 8, // 4 bytes I + 4 bytes Q
+            Self::Json => 0,    // No binary data
+        }
+    }
+
     /// Wire-format name used in the `?format=` query parameter.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -765,12 +790,7 @@ impl StreamParser {
     }
 
     fn calculate_binary_size(&self, metadata: &PacketMetadata) -> Result<usize> {
-        let bytes_per_sample: usize = match self.format {
-            StreamFormat::Int16 => 4,   // 2 bytes I + 2 bytes Q
-            StreamFormat::Float16 => 4, // 2 bytes I + 2 bytes Q
-            StreamFormat::Float32 => 8, // 4 bytes I + 4 bytes Q
-            StreamFormat::Json => 0,    // No binary data
-        };
+        let bytes_per_sample: usize = self.format.iq_bytes_per_sample();
 
         match metadata.payload {
             PayloadType::Iq => {

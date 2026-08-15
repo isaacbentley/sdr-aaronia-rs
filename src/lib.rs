@@ -43,6 +43,9 @@ pub mod http_source;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub mod http_streaming;
+#[cfg(feature = "http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "http")))]
+pub mod link_budget;
 #[cfg(feature = "sdr-source")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sdr-source")))]
 pub mod sdr_source {
@@ -119,6 +122,15 @@ pub use http_source::{HttpSource, HttpSourceBuilder, StreamStats};
 pub use http_streaming::{
     PacketMetadata, PayloadType, StreamFormat, StreamPacket, StreamParser,
     StreamingPerformanceStats,
+};
+/// Link budget: whether the path can carry the span that was asked for
+#[cfg(feature = "http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "http")))]
+pub use link_budget::{
+    LINK_PROBE_SETTLE, ThroughputMeasurement, ThroughputMeter,
+    max_sustainable_sample_rate_for_format, max_sustainable_span, max_sustainable_span_for_format,
+    measure_link_throughput, measure_link_throughput_with, required_byte_rate,
+    required_byte_rate_for_format,
 };
 /// `SdrSource`-trait facade — wraps the unified async source so the
 /// orchestrator can dispatch through `Box<dyn SdrSource>` uniformly.

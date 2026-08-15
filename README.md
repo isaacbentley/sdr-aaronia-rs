@@ -36,6 +36,9 @@ selects a backend and presents the same interface either way.
   input enumeration and the configuration tree.
 - **Plugs into FutureSDR** with `HttpSource` and `HttpSink` flowgraph
   blocks.
+- **Says whether the link can carry the span** before a capture is
+  wasted: `link_budget` measures the path end to end and names the
+  widest span on the device's decimation ladder that fits it.
 
 ## Installation
 

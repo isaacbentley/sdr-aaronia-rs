@@ -111,6 +111,57 @@ let _low_bandwidth = AaroniaConfig::default()
     .low_bandwidth_mode(); // Sets StreamFormat::Int16 and scale=32767.0
 ```
 
+### Will the link carry it?
+
+The span picks a sample rate off the device's decimation ladder, and at
+4 bytes a sample (Int16/Float16) that rate is a byte rate the whole path
+has to sustain. Measured on a SPECTRAN V6 ECO over gigabit: `--span 10M`
+(15.36 MS/s, 61.4 MB/s) came back contiguous, while `--span 20M`
+(30.72 MS/s, 122.9 MB/s) lost 1.84 s of a 35 s capture — dropped by the
+*server*, upstream of the client, and each gap is a discontinuity that
+breaks digital symbol timing.
+
+`link_budget` answers the question before the capture rather than after:
+
+```rust
+use sdr_aaronia_rs::link_budget::{max_sustainable_span, required_byte_rate};
+
+// What a span costs, via the ladder.
+let rate = sdr_aaronia_rs::iq_sample_rate_for_bandwidth(10e6); // 15.36 MS/s
+assert_eq!(required_byte_rate(rate), 61_440_000.0);            // 61.4 MB/s
+
+// What a measured path affords, as a span you can pass to --span.
+assert_eq!(max_sustainable_span(75_000_000.0), 12_288_000.0);  // 12.288 MHz
+```
+
+To measure the path rather than assume it, stream from the server and
+count bytes off the socket. The probe discards an initial settle window
+(`LINK_PROBE_SETTLE`, 500 ms) first, because the RTSA server hands over
+its pre-connect backlog faster than real time — count that and the
+answer comes out *above* the true link rate, which is the one error that
+makes a probe worse than none:
+
+```rust,no_run
+# async fn probe() -> sdr_aaronia_rs::Result<()> {
+use std::time::Duration;
+use sdr_aaronia_rs::link_budget::measure_link_throughput;
+
+let m = measure_link_throughput("http://localhost:54664", Duration::from_secs(3)).await?;
+println!("{m}");                                   // rate, window, settle discarded
+println!("widest span: {} Hz", m.max_sustainable_span_hz());
+# Ok(())
+# }
+```
+
+It measures what the path *delivered*, which is a floor on what it can
+deliver: point the device at or above the span being planned first, and
+check `ThroughputMeasurement::stream_sample_rate` to confirm the path was
+actually loaded. An unreachable server or an idle mission is an error,
+never a rate — "0 MB/s" would condemn every span on the ladder.
+
+The `HttpSource` block runs the same check passively on the stream it is
+already reading, and warns once, naming the span that would have fitted.
+
 ## Reusable configuration profiles
 
 Build your own configuration for specific bands:
