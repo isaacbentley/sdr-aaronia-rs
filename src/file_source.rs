@@ -770,7 +770,9 @@ fn read_iq_f32<R: Read>(reader: &mut R, count: usize) -> Result<Vec<Complex32>> 
         let mut bytes = vec![0u8; count * 8];
         reader.read_exact(&mut bytes)?;
         Ok(bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|c| {
                 Complex32::new(
                     f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
@@ -787,7 +789,9 @@ fn read_iq_i16<R: Read>(reader: &mut R, count: usize, scale: f32) -> Result<Vec<
     let mut bytes = vec![0u8; count * 4];
     reader.read_exact(&mut bytes)?;
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| {
             Complex32::new(
                 i16::from_le_bytes([c[0], c[1]]) as f32 * scale,
@@ -803,7 +807,9 @@ fn read_f32_vec<R: Read>(reader: &mut R, count: usize) -> Result<Vec<f32>> {
     let mut bytes = vec![0u8; count * 4];
     reader.read_exact(&mut bytes)?;
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }

@@ -901,7 +901,7 @@ impl StreamParser {
         let num_samples = data.len() / 4;
         let mut samples = Vec::with_capacity(num_samples);
 
-        for chunk in data.chunks_exact(4) {
+        for chunk in data.as_chunks::<4>().0 {
             let i_raw = i16::from_le_bytes([chunk[0], chunk[1]]);
             let q_raw = i16::from_le_bytes([chunk[2], chunk[3]]);
 
@@ -919,7 +919,7 @@ impl StreamParser {
         let num_samples = data.len() / 4;
         let mut samples = Vec::with_capacity(num_samples);
 
-        for chunk in data.chunks_exact(4) {
+        for chunk in data.as_chunks::<4>().0 {
             let i_raw = f16::from_le_bytes([chunk[0], chunk[1]]);
             let q_raw = f16::from_le_bytes([chunk[2], chunk[3]]);
 
@@ -970,7 +970,7 @@ impl StreamParser {
         #[cfg(not(target_endian = "little"))]
         {
             let mut samples = Vec::with_capacity(num_samples);
-            for chunk in data.chunks_exact(8) {
+            for chunk in data.as_chunks::<8>().0 {
                 let i_val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 let q_val = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
                 samples.push(Complex32::new(i_val, q_val));
@@ -1030,20 +1030,20 @@ impl StreamParser {
         match self.format {
             StreamFormat::Int16 => {
                 let scale = self.int16_decode_scale(metadata);
-                for chunk in data_to_parse.chunks_exact(2) {
+                for chunk in data_to_parse.as_chunks::<2>().0 {
                     let val_raw = i16::from_le_bytes([chunk[0], chunk[1]]);
                     let val = val_raw as f32 * scale;
                     samples.push(Complex32::new(val, 0.0));
                 }
             }
             StreamFormat::Float16 => {
-                for chunk in data_to_parse.chunks_exact(2) {
+                for chunk in data_to_parse.as_chunks::<2>().0 {
                     let val_raw = f16::from_le_bytes([chunk[0], chunk[1]]);
                     samples.push(Complex32::new(val_raw.to_f32(), 0.0));
                 }
             }
             StreamFormat::Float32 => {
-                for chunk in data_to_parse.chunks_exact(4) {
+                for chunk in data_to_parse.as_chunks::<4>().0 {
                     let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                     samples.push(Complex32::new(val, 0.0));
                 }
@@ -1099,7 +1099,7 @@ impl StreamParser {
                     .collect();
 
                 let values = values?;
-                for chunk in values.chunks_exact(2) {
+                for chunk in values.as_chunks::<2>().0 {
                     samples.push(Complex32::new(chunk[0], chunk[1]));
                 }
                 Ok(samples)
