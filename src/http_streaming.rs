@@ -10,8 +10,8 @@ use num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-const ASCII_RECORD_SEPARATOR: u8 = 30;
-const ASCII_LINE_FEED: u8 = 10;
+pub(crate) const ASCII_RECORD_SEPARATOR: u8 = 30;
+pub(crate) const ASCII_LINE_FEED: u8 = 10;
 /// Full-scale int16 encode multiplier assumed when neither the packet
 /// metadata nor the `?scale=N` query supplied one: `int16 = value * 32768`,
 /// decoded as `value = raw / 32768`.
@@ -52,7 +52,19 @@ pub enum StreamFormat {
 }
 
 impl StreamFormat {
-    /// Bytes one IQ sample occupies on the wire in this format.
+    /// The capture default: what [`crate::http_source::HttpSourceBuilder`]
+    /// streams when no format is chosen, what `StreamStats::default`
+    /// reports, and what the link-budget convenience helpers assume
+    /// ([`crate::link_budget::DEFAULT_LINK_FORMAT`]). One definition, so
+    /// those three cannot drift apart — if this ever changes, every
+    /// derived byte-rate figure moves with it.
+    ///
+    /// Distinct from [`crate::http_endpoints::StreamParamsBuilder`]'s
+    /// Float32 default, which serves the lossless direct-streaming path.
+    pub const CAPTURE_DEFAULT: StreamFormat = StreamFormat::Int16;
+
+    /// Bytes one IQ sample occupies on the wire in this format, or
+    /// `None` when the format has no fixed size per sample.
     ///
     /// This is the constant the whole link budget turns on: at 4 bytes a
     /// sample a 30.72 MS/s stream is 123 MB/s, which is past what a
@@ -65,15 +77,16 @@ impl StreamFormat {
     /// A *scalar* payload (spectra, histogram, categories) carries one
     /// value where IQ carries a pair, so it uses half this figure.
     ///
-    /// [`Self::Json`] is 0: its samples are ASCII decimal and have no
-    /// fixed width, so "how many bytes is a sample" has no answer. Treat
-    /// 0 as "unknown", never as "free".
-    pub fn iq_bytes_per_sample(&self) -> usize {
+    /// [`Self::Json`] is `None`: its samples are ASCII decimal and have
+    /// no fixed width, so "how many bytes is a sample" has no answer —
+    /// and the type makes every caller handle that, instead of a `0`
+    /// sentinel that a multiplication would silently read as "free".
+    pub fn iq_bytes_per_sample(&self) -> Option<usize> {
         match self {
-            Self::Int16 => 4,   // 2 bytes I + 2 bytes Q
-            Self::Float16 => 4, // 2 bytes I + 2 bytes Q
-            Self::Float32 => 8, // 4 bytes I + 4 bytes Q
-            Self::Json => 0,    // No binary data
+            Self::Int16 => Some(4),   // 2 bytes I + 2 bytes Q
+            Self::Float16 => Some(4), // 2 bytes I + 2 bytes Q
+            Self::Float32 => Some(8), // 4 bytes I + 4 bytes Q
+            Self::Json => None,       // No binary data
         }
     }
 
@@ -790,7 +803,13 @@ impl StreamParser {
     }
 
     fn calculate_binary_size(&self, metadata: &PacketMetadata) -> Result<usize> {
-        let bytes_per_sample: usize = self.format.iq_bytes_per_sample();
+        // Unreachable for `Json` today — `try_parse_complete_packet`
+        // branches to the pure-JSON path first — but enforced rather than
+        // assumed: a refactor that let JSON through would otherwise frame
+        // zero-length payloads and silently desync the stream.
+        let bytes_per_sample: usize = self.format.iq_bytes_per_sample().ok_or_else(|| {
+            Error::Protocol("JSON streams have no fixed-size binary payload to frame".to_string())
+        })?;
 
         match metadata.payload {
             PayloadType::Iq => {

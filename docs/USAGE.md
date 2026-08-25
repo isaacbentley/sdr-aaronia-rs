@@ -127,11 +127,13 @@ breaks digital symbol timing.
 use sdr_aaronia_rs::link_budget::{max_sustainable_span, required_byte_rate};
 
 // What a span costs, via the ladder.
-let rate = sdr_aaronia_rs::iq_sample_rate_for_bandwidth(10e6); // 15.36 MS/s
-assert_eq!(required_byte_rate(rate), 61_440_000.0);            // 61.4 MB/s
+let rate = sdr_aaronia_rs::iq_sample_rate_for_bandwidth(10e6);       // 15.36 MS/s
+assert_eq!(required_byte_rate(rate), Some(61_440_000.0));            // 61.4 MB/s
 
 // What a measured path affords, as a span you can pass to --span.
-assert_eq!(max_sustainable_span(75_000_000.0), 12_288_000.0);  // 12.288 MHz
+// `None` would mean no rung fits (or no budget can be computed at all,
+// e.g. for the JSON format) — never a 0.0 a comparison could wave through.
+assert_eq!(max_sustainable_span(75_000_000.0), Some(12_288_000.0));  // 12.288 MHz
 ```
 
 To measure the path rather than assume it, stream from the server and
@@ -148,10 +150,15 @@ use sdr_aaronia_rs::link_budget::measure_link_throughput;
 
 let m = measure_link_throughput("http://localhost:54664", Duration::from_secs(3)).await?;
 println!("{m}");                                   // rate, window, settle discarded
-println!("widest span: {} Hz", m.max_sustainable_span_hz());
+println!("widest span: {:?} Hz", m.max_sustainable_span_hz());
 # Ok(())
 # }
 ```
+
+`measure_link_throughput_with` additionally takes the capture's
+`StreamParams` — probe with the same format, input and rate reduction
+the capture will use, or the probe measures a different stream — and the
+settle window, for servers whose connect backlog outlasts the default.
 
 It measures what the path *delivered*, which is a floor on what it can
 deliver: point the device at or above the span being planned first, and
@@ -160,7 +167,11 @@ actually loaded. An unreachable server or an idle mission is an error,
 never a rate — "0 MB/s" would condemn every span on the ladder.
 
 The `HttpSource` block runs the same check passively on the stream it is
-already reading, and warns once, naming the span that would have fitted.
+already reading, comparing the delivered IQ payload against the rate the
+device reports in its packet headers, and warns once per configuration,
+naming a narrower span from the device's own ladder that fits. The
+verdict is also published as `StreamStats::link_budget` on the shared
+stats handle, and is re-measured after a configuration restart.
 
 ## Reusable configuration profiles
 

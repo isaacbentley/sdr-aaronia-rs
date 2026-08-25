@@ -4,6 +4,98 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **The passive link-budget check now judges against the rate the device
+  reports, not the rate the caller asked for.** `current_sample_rate`
+  adopts a new rate only past a 10% hysteresis band (deliberately, to
+  keep the tuning target stable), so the check compared against a
+  *requested* rate the device merely came close to — under the builder's
+  own 1 MS/s default (served by the 0.96 MS/s rung, a 4% gap against a
+  2% tolerance) it warned "this path cannot carry the configured span"
+  on every healthy start. The device-reported rate is now tracked
+  separately, without hysteresis; no rate reported means no verdict. An
+  external mid-measurement retune (RTSA GUI/API, no stream restart)
+  restarts the meter, so mixed-rate bytes are never judged against one
+  rate's requirement.
+- **The passive meter counts decoded IQ payload, once per sweep,
+  instead of raw chunk bytes per chunk.** Per-chunk counting stamped a
+  whole drained batch at one instant, so the first post-settle sweep
+  counted the queued connect backlog at zero elapsed width — inflating
+  the measurement in exactly the case the settle window exists for, and
+  enough to wave through a genuinely short path. Raw bytes also counted
+  JSON headers and any spectra/histogram packets sharing the stream,
+  which under-warned on mixed missions. One payload observation per
+  sweep discards the backlog sweep whole (it becomes the meter's mark)
+  and compares like against like.
+- **A stall no longer dilutes the measurement, and the window's close is
+  exclusive.** The counting window used to run to whenever the next
+  observation happened to arrive, so an 8 s consumer stall averaged dead
+  time into the "sustained" rate and produced a spurious shortfall
+  warning; the observation that crosses the boundary is now excluded in
+  both directions. `ThroughputMeter::finish` also refuses to answer
+  before the window closes, instead of leaving that check as a
+  convention each caller must remember, and the reported settle interval
+  is the one actually discarded rather than the one configured.
+- **A configuration restart re-arms the check; a verdict survives
+  reconnects.** The `restart_pending` retune path never reset the
+  check's once-per-source flags, so a widened span was never measured
+  (the case the check exists for) and gap warnings kept citing a stale
+  verdict about a span no longer configured. The check's state is now a
+  single `LinkCheck` enum — unmeasured / measuring / done — reset to
+  unmeasured on configuration restarts only. A parse error in the sweep
+  that closes the window no longer discards the finished measurement
+  either: the verdict is reported before the error propagates into the
+  reconnect path.
+- **The shortfall remedy is computed from the device's own ladder and
+  format.** The "widest span that fits" now halves down from the
+  device-reported rate, so it is a rung the device actually has —
+  inverting through the default-clock ladder named wrong rungs for a
+  full V6 on a faster receiver clock — and the no-rung-fits fallback
+  computes its figures from the stream format instead of hardcoding
+  int16's "120 kS/s, 0.5 MB/s", which was self-contradictory for
+  float32. Float32 streams are also told that int16 would halve the
+  requirement.
+- **The probe validates its window and probes the capture's stream.**
+  `measure_link_throughput` refuses windows under a new
+  `MIN_PROBE_WINDOW` (100 ms): two adjacent socket-buffer reads
+  microseconds apart would otherwise "measure" gigabytes a second over
+  a link that cannot sustain one. `measure_link_throughput_with` now
+  takes the capture's `StreamParams` (format *and* input,
+  rate-reduction, scale — it used to probe the server's default input
+  at full rate whatever the capture would open) plus an explicit settle
+  window for servers whose connect backlog outlasts the default, and
+  its header sniff parses packet headers only — skipping degenerate
+  zero-rate status headers, logging when it gives up — instead of
+  running the full sample decoder on payloads it then threw away.
+
+### Changed
+- **Byte-rate helpers answer `Option<f64>`, never a `0.0` sentinel.**
+  `required_byte_rate`, `max_sustainable_span` and friends returned
+  `0.0` for "unknown / nothing fits", a convention every comparison site
+  had to remember — `required <= measured` on a garbage rate reads
+  "fits". `None` now makes the compiler enforce it, and
+  `StreamFormat::iq_bytes_per_sample` returns `Option<usize>` (`None`
+  for JSON) for the same reason. New `max_sustainable_sample_rate_below`
+  answers remedy queries anchored to the device's reported rate.
+- **The link-budget verdict is data, not just a log line.** New
+  `LinkBudgetVerdict` (measured rate, requirement, fit span, shortness)
+  is published as `StreamStats::link_budget`, so a GUI or orchestrator
+  can auto-narrow the span without scraping logs; the stream-gap warning
+  restates the verdict's actual figures from it. `StreamFormat` gained
+  `CAPTURE_DEFAULT`, the one definition behind `HttpSourceBuilder`'s
+  default, `StreamStats::default` and `DEFAULT_LINK_FORMAT`, which were
+  three separately written `Int16` literals.
+- **One copy each of the RTSA client plumbing.** The probe re-used
+  hand-rolled copies of the endpoints client's construction, auth
+  application, base-URL validation, `/stream` query serialization and
+  status-to-error mapping — five drift risks (the three reqwest clients
+  had already drifted to three different setting subsets). All are
+  shared now: `AuthMethod::apply_to` owns the `RToken` header,
+  `rtsa_client_builder` owns the client settings (the streaming client
+  gains the keepalive/nodelay/HTTP-1.1 compatibility settings the
+  endpoints client always had), and `StreamParams::build_query_string`
+  serializes every `/stream` URL, including `HttpSource`'s.
+
 ### Added
 - **A link budget, so a span that cannot fit is caught before the
   capture instead of after it.** The span picks a rate off the
@@ -27,7 +119,8 @@ All notable changes to this project will be documented in this file.
   above the true link rate and waves through a span that cannot fit. Two
   tests pin this, one driving the settle logic off synthetic instants
   with a 200 MB/s burst ahead of a 10 MB/s stream, and one showing the
-  same trace measuring six times too fast with the settle window removed.
+  same trace measuring several times too fast with the settle window
+  removed.
   An unreachable server, an idle mission or a stream that stops mid-window
   is an error and never a rate, because "0 MB/s" would condemn every span
   on the ladder.

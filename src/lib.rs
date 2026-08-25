@@ -127,10 +127,10 @@ pub use http_streaming::{
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub use link_budget::{
-    LINK_PROBE_SETTLE, ThroughputMeasurement, ThroughputMeter,
-    max_sustainable_sample_rate_for_format, max_sustainable_span, max_sustainable_span_for_format,
-    measure_link_throughput, measure_link_throughput_with, required_byte_rate,
-    required_byte_rate_for_format,
+    LINK_PROBE_SETTLE, LinkBudgetVerdict, MIN_PROBE_WINDOW, ThroughputMeasurement, ThroughputMeter,
+    max_sustainable_sample_rate_below, max_sustainable_sample_rate_for_format,
+    max_sustainable_span, max_sustainable_span_for_format, measure_link_throughput,
+    measure_link_throughput_with, required_byte_rate, required_byte_rate_for_format,
 };
 /// `SdrSource`-trait facade — wraps the unified async source so the
 /// orchestrator can dispatch through `Box<dyn SdrSource>` uniformly.

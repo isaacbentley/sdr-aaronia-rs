@@ -38,6 +38,27 @@ pub enum AuthMethod {
     None,
 }
 
+impl AuthMethod {
+    /// Apply this authentication method to a request.
+    ///
+    /// The one definition of the RTSA auth headers — in particular the
+    /// `RToken` scheme string, which is not standard HTTP. The endpoints
+    /// client, the streaming source and the link-budget probe all route
+    /// through here, so a future change to the scheme cannot leave one
+    /// of them authenticating the old way.
+    pub fn apply_to(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            AuthMethod::Basic { username, password } => {
+                builder.basic_auth(username, Some(password))
+            }
+            AuthMethod::Token { token } => {
+                builder.header("Authorization", format!("RToken {token}"))
+            }
+            AuthMethod::None => builder,
+        }
+    }
+}
+
 impl std::fmt::Debug for AuthMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -50,6 +71,80 @@ impl std::fmt::Debug for AuthMethod {
             AuthMethod::Token { .. } => write!(f, "AuthMethod::Token {{ token: [REDACTED] }}"),
         }
     }
+}
+
+/// The `reqwest` client settings every RTSA connection shares, with the
+/// connect timeout as the one per-caller knob.
+///
+/// One definition rather than three: the endpoints client, the
+/// `HttpSource` streaming client and the link-budget probe each used to
+/// hand-roll their own builder with a different subset of these
+/// settings, so an "RTSA-compatible" fix landed in one and silently
+/// missed the others.
+///
+/// Deliberately **no** client-level `.timeout(...)`: it would apply to
+/// the whole response body and terminate a long-lived `/stream`
+/// connection mid-flight (this bit us at 120 s). Control-plane calls add
+/// a per-request timeout instead.
+pub(crate) fn rtsa_client_builder(connect_timeout: std::time::Duration) -> reqwest::ClientBuilder {
+    Client::builder()
+        .connect_timeout(connect_timeout)
+        .user_agent(crate::utils::user_agent())
+        // Aggressive TCP optimizations for maximum throughput
+        .tcp_keepalive(std::time::Duration::from_secs(30)) // More frequent keepalives
+        .tcp_nodelay(true) // Disable Nagle algorithm
+        // Optimized connection pooling for RTSA: control + streaming channels
+        .pool_idle_timeout(std::time::Duration::from_secs(300)) // Keep connections during long streams
+        .pool_max_idle_per_host(2) // Control channel + streaming channel
+        // HTTP/1.1 keepalive optimizations for RTSA compatibility
+        .http1_only() // Force HTTP/1.1 since RTSA doesn't support HTTP/2
+        .http1_title_case_headers() // Better compatibility
+}
+
+/// Validate a base URL before any RTSA connection is opened: parseable,
+/// and an `http`/`https` scheme — a client that followed a `file://` URL
+/// would be a very different program. Warns (but does not refuse) when
+/// the host is not obviously local, since an RTSA server normally sits
+/// on the operator's own network.
+///
+/// The one copy of this check: `HttpSource` construction and the
+/// link-budget probe both call it, so a future tightening (scheme, host
+/// policy) cannot apply to one path and not the other.
+pub(crate) fn validate_base_url(base_url: &str) -> Result<url::Url> {
+    let parsed_url = url::Url::parse(base_url)
+        .map_err(|_| Error::Protocol(format!("Invalid base URL format: {}", base_url)))?;
+
+    match parsed_url.scheme() {
+        "http" | "https" => {}
+        _ => {
+            return Err(Error::Protocol(format!(
+                "Only HTTP/HTTPS URLs are allowed, got: {}",
+                parsed_url.scheme()
+            )));
+        }
+    }
+
+    if let Some(host) = parsed_url.host() {
+        match host {
+            url::Host::Ipv4(ip) => {
+                if !ip.is_loopback() && !ip.is_private() {
+                    warn!("Connecting to public IP address {}", ip);
+                }
+            }
+            url::Host::Ipv6(ip) => {
+                if !ip.is_loopback() {
+                    warn!("Connecting to IPv6 address {}", ip);
+                }
+            }
+            url::Host::Domain(domain) => {
+                if !domain.starts_with("localhost") && !domain.ends_with(".local") {
+                    warn!("Connecting to external domain {}", domain);
+                }
+            }
+        }
+    }
+
+    Ok(parsed_url)
 }
 
 /// Represents server information obtained from the `/info` endpoint.
@@ -474,7 +569,11 @@ pub struct StreamParams {
 
 impl StreamParams {
     /// Builds the percent-encoded query string for the stream request.
-    fn build_query_string(&self) -> String {
+    ///
+    /// `pub(crate)` so every `/stream` URL in the crate — the endpoints
+    /// client, `HttpSource`, and the link-budget probe — is serialized by
+    /// this one function and cannot drift.
+    pub(crate) fn build_query_string(&self) -> String {
         let mut ser = url::form_urlencoded::Serializer::new(String::new());
 
         ser.append_pair("format", self.format.as_str());
@@ -619,23 +718,10 @@ impl HttpEndpointsClient {
     /// * `base_url` - The base URL of the Aaronia RTSA device (e.g., "http://127.0.0.1:8080").
     /// * `auth` - The authentication method to use.
     pub fn new(base_url: String, auth: AuthMethod) -> Result<Self> {
-        let client = Client::builder()
-            // NOTE: no client-level `.timeout(...)` — it would apply to the
-            // whole response body and terminate long-lived `/stream`
-            // connections. Control calls get a per-request timeout via
-            // `control_request` instead.
-            .connect_timeout(std::time::Duration::from_secs(5)) // Faster connection establishment
-            .user_agent(crate::utils::user_agent())
-            // Aggressive TCP optimizations for maximum throughput
-            .tcp_keepalive(std::time::Duration::from_secs(30)) // More frequent keepalives
-            .tcp_nodelay(true) // Disable Nagle algorithm
-            // Optimized connection pooling for RTSA: control + streaming channels
-            .pool_idle_timeout(std::time::Duration::from_secs(300)) // Keep connections during long streams
-            .pool_max_idle_per_host(2) // Control channel + streaming channel
-            // HTTP/1.1 pipelining and keepalive optimizations for RTSA compatibility
-            .http1_only() // Force HTTP/1.1 since RTSA doesn't support HTTP/2
-            .http1_title_case_headers() // Better compatibility
-            .build()?;
+        // Shared RTSA client settings; see `rtsa_client_builder` for why
+        // there is no client-level timeout. 5 s connect: fast failure on
+        // an unreachable server.
+        let client = rtsa_client_builder(std::time::Duration::from_secs(5)).build()?;
 
         Ok(Self {
             client,
@@ -655,17 +741,8 @@ impl HttpEndpointsClient {
     }
 
     /// Applies the configured authentication method to a `reqwest::RequestBuilder`.
-    fn apply_auth(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.auth {
-            AuthMethod::Basic { username, password } => {
-                builder = builder.basic_auth(username, Some(password));
-            }
-            AuthMethod::Token { token } => {
-                builder = builder.header("Authorization", format!("RToken {}", token));
-            }
-            AuthMethod::None => {} // No authentication
-        }
-        builder
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        self.auth.apply_to(builder)
     }
 
     /// Auth + per-request timeout for control-plane requests. Use this for
@@ -676,7 +753,14 @@ impl HttpEndpointsClient {
 
     /// Map a non-success response to an error carrying a typed
     /// [`HttpStatusError`], or pass the response through.
-    fn ensure_success(context: &str, response: reqwest::Response) -> Result<reqwest::Response> {
+    ///
+    /// `pub(crate)` so the link-budget probe shares the same
+    /// status-to-error mapping (and any future per-status special-casing)
+    /// instead of carrying its own copy.
+    pub(crate) fn ensure_success(
+        context: &str,
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response> {
         let status = response.status();
         if status.is_success() {
             Ok(response)
