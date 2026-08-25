@@ -1183,24 +1183,29 @@ mod tests {
     /// The unit tests above pin the settle logic against synthetic
     /// instants; this one pins that the probe wires it up — that the
     /// settle window is anchored at the response and that what is
-    /// counted is the steady stream. The server dumps 40 MB at connect
+    /// counted is the steady stream. The server dumps 4 MB at connect
     /// (which on loopback lands in milliseconds, so counting it would
     /// read hundreds of MB/s), goes quiet, and then holds 20 MB/s.
     ///
     /// The quiet gap plus a stretched settle window (passed explicitly —
     /// the parameter exists for servers whose backlog outlasts the
-    /// default) keeps this deterministic on a loaded runner: however
-    /// slowly the client coroutine is scheduled, the backlog has the
-    /// whole gap to finish transiting before the settle window ends.
+    /// default) keeps this deterministic on a loaded runner: the whole
+    /// backlog must transit before the settle window ends, however
+    /// slowly the client is scheduled or the bytes are processed. The
+    /// margins are deliberately fat — a coverage-instrumented CI run was
+    /// measured pushing a 40 MB backlog past a 1 s settle, which put the
+    /// mark on the backlog's tail and the quiet gap *inside* the window,
+    /// reading ~0.5 MB/s off a 20 MB/s stream; 4 MB against 2 s means
+    /// even a client processing at a leisurely 2 MB/s clears it.
     #[tokio::test]
     async fn the_probe_measures_the_steady_rate_not_the_connect_backlog() {
-        let settle = Duration::from_secs(1);
+        let settle = Duration::from_secs(2);
         let url = spawn_bursty_stream_server(
-            40_000_000,
-            Duration::from_millis(1_500),
+            4_000_000,
+            Duration::from_secs(3),
             200_000,
             Duration::from_millis(10),
-            Duration::from_millis(1_500),
+            Duration::from_secs(2),
         )
         .await;
 
@@ -1219,7 +1224,7 @@ mod tests {
 
         assert!(
             m.byte_rate < 40e6,
-            "measured {} B/s — the 40 MB connect backlog is in the answer",
+            "measured {} B/s — the 4 MB connect backlog is in the answer",
             m.byte_rate
         );
         assert!(
@@ -1228,7 +1233,7 @@ mod tests {
             m.byte_rate
         );
         assert!(
-            m.settle_bytes >= 40_000_000,
+            m.settle_bytes >= 4_000_000,
             "the backlog should be reported as discarded, got {}",
             m.settle_bytes
         );
