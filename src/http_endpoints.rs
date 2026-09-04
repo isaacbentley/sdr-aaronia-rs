@@ -96,9 +96,16 @@ pub(crate) fn rtsa_client_builder(connect_timeout: std::time::Duration) -> reqwe
         // Optimized connection pooling for RTSA: control + streaming channels
         .pool_idle_timeout(std::time::Duration::from_secs(300)) // Keep connections during long streams
         .pool_max_idle_per_host(2) // Control channel + streaming channel
-        // HTTP/1.1 keepalive optimizations for RTSA compatibility
-        .http1_only() // Force HTTP/1.1 since RTSA doesn't support HTTP/2
-        .http1_title_case_headers() // Better compatibility
+        // Title-case headers on the HTTP/1.1 path, for RTSA compatibility.
+        //
+        // No `.http1_only()`: RTSA itself speaks only HTTP/1.1, but over
+        // plain `http://` that is what reqwest uses anyway (no ALPN, no
+        // prior-knowledge h2), so forcing it protects nothing — while over
+        // `https://` it breaks streaming through a TLS-terminating proxy
+        // whose ALPN offers only h2, a deployment that previously worked.
+        // Let ALPN negotiate; a direct RTSA TLS endpoint still lands on
+        // HTTP/1.1.
+        .http1_title_case_headers()
 }
 
 /// Validate a base URL before any RTSA connection is opened: parseable,
@@ -568,12 +575,18 @@ pub struct StreamParams {
 }
 
 impl StreamParams {
-    /// Builds the percent-encoded query string for the stream request.
+    /// The full `/stream` URL these parameters select on `base_url`.
     ///
     /// `pub(crate)` so every `/stream` URL in the crate — the endpoints
-    /// client, `HttpSource`, and the link-budget probe — is serialized by
-    /// this one function and cannot drift.
-    pub(crate) fn build_query_string(&self) -> String {
+    /// client, `HttpSource`, and the link-budget probe — is assembled by
+    /// this one function and cannot drift. The query is never empty
+    /// (`format` is always present), so the `?` is unconditional.
+    pub(crate) fn stream_url(&self, base_url: &str) -> String {
+        format!("{}/stream?{}", base_url, self.build_query_string())
+    }
+
+    /// Builds the percent-encoded query string for the stream request.
+    fn build_query_string(&self) -> String {
         let mut ser = url::form_urlencoded::Serializer::new(String::new());
 
         ser.append_pair("format", self.format.as_str());
@@ -1661,12 +1674,7 @@ impl HttpEndpointsClient {
         use crate::http_streaming::StreamParser;
         use futures::stream::StreamExt;
 
-        let mut url = format!("{}/stream", self.base_url);
-        let query_params = params.build_query_string();
-        if !query_params.is_empty() {
-            url.push('?');
-            url.push_str(&query_params);
-        }
+        let url = params.stream_url(&self.base_url);
 
         info!(
             "Starting stream from {} with format: {:?}",

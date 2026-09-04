@@ -10,8 +10,8 @@ use num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-pub(crate) const ASCII_RECORD_SEPARATOR: u8 = 30;
-pub(crate) const ASCII_LINE_FEED: u8 = 10;
+const ASCII_RECORD_SEPARATOR: u8 = 30;
+const ASCII_LINE_FEED: u8 = 10;
 /// Full-scale int16 encode multiplier assumed when neither the packet
 /// metadata nor the `?scale=N` query supplied one: `int16 = value * 32768`,
 /// decoded as `value = raw / 32768`.
@@ -378,6 +378,61 @@ impl StreamingSdrConfig {
     /// Get bandwidth in MHz
     pub fn bandwidth_mhz(&self) -> f64 {
         self.bandwidth / 1e6
+    }
+}
+
+/// Outcome of [`scan_packet_header`]: a complete header, or how much of
+/// the buffer is spent while waiting for more data.
+pub(crate) enum HeaderScan {
+    /// A complete header, ending `consumed` bytes into the buffer
+    /// (terminator included); the bytes before it are spent. Boxed
+    /// because the metadata is ~an order of magnitude wider than the
+    /// other variant, which is the common case while a header arrives.
+    Header(Box<PacketMetadata>, usize),
+    /// No complete header in the buffer. The first `skippable` bytes can
+    /// never begin one — every candidate there has already failed — and
+    /// may be discarded; anything after may be a header still arriving.
+    Incomplete { skippable: usize },
+}
+
+/// Scan `buf` for the first complete packet JSON header, decoding no
+/// payload.
+///
+/// The same framing and resync discipline as
+/// `StreamParser::try_parse_complete_packet`, kept beside it so a
+/// framing fix lands in both (the two-byte `\n\x1e` separator was
+/// hardware-verified once already): a candidate is a separator-terminated
+/// segment starting at a `{`, and a candidate that fails to parse
+/// resyncs **one byte past its `{`** — binary payloads contain separator
+/// bytes, so a real header can share a segment with a stray `{`, and a
+/// coarser skip would jump straight over it.
+///
+/// This is the header-only path the link-budget probe uses to learn the
+/// device's rate without buffering or decoding payloads.
+pub(crate) fn scan_packet_header(buf: &[u8]) -> HeaderScan {
+    let mut pos = 0;
+    loop {
+        let Some(start) = buf[pos..].iter().position(|&b| b == b'{') else {
+            // No candidate start remains; a header must begin at a `{`,
+            // so the whole buffer is spent.
+            return HeaderScan::Incomplete {
+                skippable: buf.len(),
+            };
+        };
+        let start = pos + start;
+        let segment = &buf[start..];
+        let Some(end) = segment
+            .iter()
+            .position(|&b| b == ASCII_RECORD_SEPARATOR || b == ASCII_LINE_FEED)
+        else {
+            // A candidate whose terminator has not arrived yet; keep it,
+            // spend everything before it.
+            return HeaderScan::Incomplete { skippable: start };
+        };
+        match serde_json::from_slice::<PacketMetadata>(&segment[..end]) {
+            Ok(metadata) => return HeaderScan::Header(Box::new(metadata), start + end + 1),
+            Err(_) => pos = start + 1,
+        }
     }
 }
 

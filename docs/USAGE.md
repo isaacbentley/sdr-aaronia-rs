@@ -146,11 +146,14 @@ makes a probe worse than none:
 ```rust,no_run
 # async fn probe() -> sdr_aaronia_rs::Result<()> {
 use std::time::Duration;
-use sdr_aaronia_rs::link_budget::measure_link_throughput;
+use sdr_aaronia_rs::link_budget::{DEFAULT_LINK_FORMAT, measure_link_throughput};
 
 let m = measure_link_throughput("http://localhost:54664", Duration::from_secs(3)).await?;
 println!("{m}");                                   // rate, window, settle discarded
-println!("widest span: {:?} Hz", m.max_sustainable_span_hz());
+println!(
+    "widest span: {:?} Hz",
+    m.max_sustainable_span_hz(DEFAULT_LINK_FORMAT)
+);
 # Ok(())
 # }
 ```

@@ -67,6 +67,45 @@ All notable changes to this project will be documented in this file.
   its header sniff parses packet headers only — skipping degenerate
   zero-rate status headers, logging when it gives up — instead of
   running the full sample decoder on payloads it then threw away.
+- **Rate tracking and the meter listen only to IQ packets.** A
+  spectra/histogram header carries no `sampleFrequency`, so the parser
+  derives a *frame* rate orders of magnitude below the IQ rate; on a
+  mixed mission that ping-ponged the device-rate tracker (restarting the
+  check on every interleaved packet, so it never finished) and handed it
+  a nonsense yardstick. The meter also counted those packets' scalars at
+  IQ byte width — half their wire cost — inflating the measured rate.
+  Both trackers and the byte count now key on the packet's payload type,
+  and a sweep that decodes no IQ does not observe at all.
+- **A failed measurement re-arms the check instead of retiring it.** A
+  window that closed without a usable count, or before the device ever
+  reported a rate, used to become "checked, no verdict" — permanently,
+  on no evidence, so the configuration streamed unjudged forever. It now
+  starts a fresh window, reserving the no-verdict terminal state for
+  configurations that genuinely cannot be measured. A device retune
+  arriving *after* the verdict re-arms too (the verdict described the
+  old rate's budget), and `ThroughputMeter::finish` refuses a window
+  that actually observed less than half its configured span — a couple
+  of packets plus a stray late closing observation say nothing about
+  what the path sustains.
+- **`rate_reduction: Some(0)` no longer reads as "no decimation".** The
+  measurable gate accepted `n <= 1`; zero is a value this crate never
+  sends and the device would refuse, so it now reads as unmeasurable
+  rather than as a pass-through.
+- **The shared client builder no longer forces HTTP/1.1.** The probe's
+  `.http1_only()` was hoisted into `rtsa_client_builder` by the
+  consolidation, where it also governed the endpoints and streaming
+  clients — breaking streaming through a TLS-terminating proxy whose
+  ALPN offers only h2, a deployment that previously worked. Over plain
+  `http://` reqwest speaks HTTP/1.1 anyway, so the pin protected
+  nothing; the compatibility settings stay and ALPN negotiates.
+- **The header sniff scans each byte once and resyncs like the
+  parser.** The probe's rate sniff re-scanned its whole accumulation on
+  every chunk (quadratic in the bytes fed, on a stream that is nearly
+  all payload) and resynced a failed header parse past the separator
+  where the stream parser resyncs one byte past the `{` — binary
+  payloads contain separator bytes, so the two could disagree about
+  which header speaks first. It now drains bytes as they are ruled out
+  and frames headers with the parser's own scan.
 
 ### Changed
 - **Byte-rate helpers answer `Option<f64>`, never a `0.0` sentinel.**
@@ -93,8 +132,18 @@ All notable changes to this project will be documented in this file.
   shared now: `AuthMethod::apply_to` owns the `RToken` header,
   `rtsa_client_builder` owns the client settings (the streaming client
   gains the keepalive/nodelay/HTTP-1.1 compatibility settings the
-  endpoints client always had), and `StreamParams::build_query_string`
+  endpoints client always had), and `StreamParams::stream_url`
   serializes every `/stream` URL, including `HttpSource`'s.
+- **`LinkBudgetVerdict::judge` is the verdict's one producer.**
+  Requirement, shortness-against-tolerance and the remedy rung were
+  assembled by hand at each caller; the constructor now owns that
+  arithmetic (so the struct's invariants — fit fields populated only on
+  a shortfall, span matching the fit rate — hold by construction), the
+  verdict carries `bytes_per_sample` for report text, and
+  `ThroughputMeasurement::max_sustainable_span_hz` takes the stream
+  format instead of silently assuming int16. The no-rung-fits warning
+  cites the device ladder's actual last rung rather than a hardcoded
+  1/512.
 
 ### Added
 - **A link budget, so a span that cannot fit is caught before the

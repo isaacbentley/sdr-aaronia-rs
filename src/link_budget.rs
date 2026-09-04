@@ -47,9 +47,7 @@ use crate::http_endpoints::{
     AuthMethod, HttpEndpointsClient, StreamParams, StreamParamsBuilder, rtsa_client_builder,
     validate_base_url,
 };
-use crate::http_streaming::{
-    ASCII_LINE_FEED, ASCII_RECORD_SEPARATOR, PacketMetadata, StreamFormat, StreamingSdrConfig,
-};
+use crate::http_streaming::{StreamFormat, StreamingSdrConfig};
 use crate::utils::{iq_sample_rates, usable_bandwidth_hz};
 use crate::{Error, Result};
 
@@ -171,16 +169,29 @@ pub fn max_sustainable_sample_rate_for_format(
     }
     iq_sample_rates()
         .into_iter()
-        .filter(|rate| {
-            required_byte_rate_for_format(*rate, format)
-                .is_some_and(|needed| needed <= measured_byte_rate_hz)
-        })
+        .filter(|rate| rung_fits(*rate, format, measured_byte_rate_hz))
         // The ladder is ordered fastest-first, so the first match is the
-        // answer; folding over `max` rather than taking `next()` keeps
+        // answer; reducing over `max` rather than taking `next()` keeps
         // this correct if that order ever changes.
-        .fold(None, |best: Option<f64>, rate| {
-            Some(best.map_or(rate, |b| b.max(rate)))
-        })
+        .reduce(f64::max)
+}
+
+/// Whether the `rate_hz` rung's stream fits `measured_byte_rate_hz` in
+/// `format` — the one predicate behind every "widest rung" search here.
+fn rung_fits(rate_hz: f64, format: StreamFormat, measured_byte_rate_hz: f64) -> bool {
+    required_byte_rate_for_format(rate_hz, format)
+        .is_some_and(|needed| needed <= measured_byte_rate_hz)
+}
+
+/// The decimation ladder whose top rung is `device_rate_hz`.
+///
+/// The device's own reported rate sits on its ladder by definition, and
+/// every RTSA ladder halves rung to rung from a top of `clock / 1.5` —
+/// so this is [`crate::utils::iq_sample_rates_for_clock`] fed the clock
+/// that puts the device's rate on top, rather than a second copy of the
+/// ladder arithmetic that could drift from the tested one.
+pub(crate) fn device_ladder(device_rate_hz: f64) -> [f64; 10] {
+    crate::utils::iq_sample_rates_for_clock(device_rate_hz * 1.5)
 }
 
 /// The fastest rate at or below `device_rate_hz`, reachable by halving
@@ -210,12 +221,12 @@ pub fn max_sustainable_sample_rate_below(
     {
         return None;
     }
-    (0..10u32)
-        .map(|halvings| device_rate_hz / f64::from(1u32 << halvings))
-        .find(|rate| {
-            required_byte_rate_for_format(*rate, format)
-                .is_some_and(|needed| needed <= measured_byte_rate_hz)
-        })
+    device_ladder(device_rate_hz)
+        .into_iter()
+        .filter(|rate| rung_fits(*rate, format, measured_byte_rate_hz))
+        // As above: reduce over `max` rather than trusting the ladder's
+        // fastest-first order.
+        .reduce(f64::max)
 }
 
 /// The widest span on the default-clock decimation ladder that fits
@@ -287,13 +298,20 @@ impl ThroughputMeasurement {
         self.byte_rate / 1e6
     }
 
-    /// The widest span this measurement proves the path can carry, in Hz
-    /// — see [`max_sustainable_span`], and note "proves": if the device
-    /// was streaming narrower than the link could carry, this is a floor
-    /// on the answer rather than the answer. `None` when nothing on the
-    /// ladder fits.
-    pub fn max_sustainable_span_hz(&self) -> Option<f64> {
-        max_sustainable_span(self.byte_rate)
+    /// The widest span this measurement proves the path can carry, in Hz,
+    /// for a capture in `format` — see [`max_sustainable_span_for_format`],
+    /// and note "proves": if the device was streaming narrower than the
+    /// link could carry, this is a floor on the answer rather than the
+    /// answer. `None` when nothing on the ladder fits.
+    ///
+    /// The format is a parameter because a measurement does not know what
+    /// it was probed in, and the answer doubles or halves with the bytes
+    /// per sample: a 75 MB/s path carries the 15.36 MS/s rung in `int16`
+    /// but only 7.68 MS/s in `float32`. Pass the format the capture will
+    /// use — normally the same one handed to
+    /// [`measure_link_throughput_with`].
+    pub fn max_sustainable_span_hz(&self, format: StreamFormat) -> Option<f64> {
+        max_sustainable_span_for_format(self.byte_rate, format)
     }
 }
 
@@ -326,6 +344,11 @@ pub struct LinkBudgetVerdict {
     pub sample_rate: f64,
     /// Wire format the requirement was computed for.
     pub format: StreamFormat,
+    /// Bytes one IQ sample occupies in [`Self::format`] — denormalized
+    /// from the format (which always has an answer here: [`Self::judge`]
+    /// refuses formats that do not) so report text can cite it without
+    /// re-deriving.
+    pub bytes_per_sample: usize,
     /// Bytes a second `sample_rate` requires in `format`.
     pub required_byte_rate: f64,
     /// What the stream delivered, counted as IQ payload bytes.
@@ -341,6 +364,50 @@ pub struct LinkBudgetVerdict {
     pub fit_sample_rate_hz: Option<f64>,
     /// The usable span [`Self::fit_sample_rate_hz`] delivers, in Hz.
     pub fit_span_hz: Option<f64>,
+}
+
+impl LinkBudgetVerdict {
+    /// Judge a measurement against the rate the device reported.
+    ///
+    /// The one place the verdict arithmetic lives: shortness is measured
+    /// against `required * tolerance` (tolerance just under 1.0 absorbs
+    /// measurement quantisation, not link slack), and the remedy rung is
+    /// halved down from the device's own rate so it exists on its ladder.
+    /// `HttpSource`'s passive check routes through here, and a caller of
+    /// [`measure_link_throughput_with`] can too, instead of re-deriving
+    /// shortness and remedy by hand — the struct's invariants (fit fields
+    /// populated only when short, span matching the fit rate) hold only
+    /// because this is the only producer.
+    ///
+    /// `None` when no requirement can be computed — a non-positive rate,
+    /// or a format with no fixed bytes per sample — since judging against
+    /// nothing would be the "failed measurement becomes a verdict"
+    /// mistake this module exists to prevent.
+    pub fn judge(
+        sample_rate_hz: f64,
+        format: StreamFormat,
+        measured: ThroughputMeasurement,
+        tolerance: f64,
+    ) -> Option<Self> {
+        let required = required_byte_rate_for_format(sample_rate_hz, format)?;
+        let bytes_per_sample = format.iq_bytes_per_sample()?;
+        let short = measured.byte_rate < required * tolerance;
+        let fit_sample_rate_hz = if short {
+            max_sustainable_sample_rate_below(sample_rate_hz, measured.byte_rate, format)
+        } else {
+            None
+        };
+        Some(Self {
+            sample_rate: sample_rate_hz,
+            format,
+            bytes_per_sample,
+            required_byte_rate: required,
+            measured,
+            short,
+            fit_sample_rate_hz,
+            fit_span_hz: fit_sample_rate_hz.map(usable_bandwidth_hz),
+        })
+    }
 }
 
 /// Counts bytes against a wall clock, discarding an initial settle
@@ -364,11 +431,12 @@ pub struct ThroughputMeter {
     last: Option<Instant>,
     discarded_bytes: u64,
     counted_bytes: u64,
-    /// When an observation at or past `mark + window` closed the
-    /// counting window. Primary state, not a derivable flag: the closing
-    /// observation is excluded from the count (see [`Self::observe`]),
-    /// so it leaves no trace in `mark`/`last`.
-    closed_at: Option<Instant>,
+    /// Whether an observation at or past `mark + window` has closed the
+    /// counting window. A bare flag rather than the closing instant: the
+    /// closing observation is excluded from the count (see
+    /// [`Self::observe`]), so storing its time would only invite window
+    /// arithmetic against a value the design deliberately throws away.
+    closed: bool,
 }
 
 impl ThroughputMeter {
@@ -392,7 +460,7 @@ impl ThroughputMeter {
             last: None,
             discarded_bytes: 0,
             counted_bytes: 0,
-            closed_at: None,
+            closed: false,
         }
     }
 
@@ -414,7 +482,7 @@ impl ThroughputMeter {
     /// is counted is exactly the bytes that arrived between the mark and
     /// the last counted observation, over exactly that interval.
     pub fn observe(&mut self, at: Instant, bytes: usize) -> bool {
-        if self.closed_at.is_some() {
+        if self.closed {
             return true;
         }
         let bytes = bytes as u64;
@@ -429,19 +497,19 @@ impl ThroughputMeter {
             }
             Some(mark) => {
                 if at.saturating_duration_since(mark) >= self.window {
-                    self.closed_at = Some(at);
+                    self.closed = true;
                 } else {
                     self.counted_bytes = self.counted_bytes.saturating_add(bytes);
                     self.last = Some(at);
                 }
             }
         }
-        self.closed_at.is_some()
+        self.closed
     }
 
     /// Whether the counting window has closed.
     pub fn is_complete(&self) -> bool {
-        self.closed_at.is_some()
+        self.closed
     }
 
     /// The measurement, or `None` if there is not enough of one.
@@ -449,17 +517,25 @@ impl ThroughputMeter {
     /// `None` until the window has closed — a partial count is not a
     /// measurement, and the check is enforced here rather than left as a
     /// convention every caller must remember to pair with
-    /// [`Self::is_complete`]. Also `None` when nothing arrived between
-    /// the mark and the close, or when a single counted observation
-    /// spans no interval. A caller must not turn any of those into
-    /// "0 MB/s" — see the constraint at the top of
-    /// [`measure_link_throughput`].
+    /// [`Self::is_complete`]. Also `None` when no bytes were counted
+    /// (zero-byte observations still advance the clock, and "the stream
+    /// delivered nothing" is a failed measurement, not a rate of zero),
+    /// and `None` when the counted interval covers less than half the
+    /// configured window: excluding the boundary-crossing observation
+    /// means a burst-then-stall stream can close the window having
+    /// observed only a few milliseconds of kernel-buffer drain, and a
+    /// rate computed from that would be the socket-buffer artifact
+    /// [`MIN_PROBE_WINDOW`] refuses at the front door. A caller must not
+    /// turn any of these into "0 MB/s" — see the constraint at the top
+    /// of [`measure_link_throughput`].
     pub fn finish(&self) -> Option<ThroughputMeasurement> {
-        self.closed_at?;
+        if !self.closed || self.counted_bytes == 0 {
+            return None;
+        }
         let mark = self.mark?;
         let last = self.last?;
         let window = last.saturating_duration_since(mark);
-        if window.is_zero() {
+        if window.is_zero() || window < self.window / 2 {
             return None;
         }
         Some(ThroughputMeasurement {
@@ -473,40 +549,58 @@ impl ThroughputMeter {
     }
 }
 
-/// Scan a buffered stream prefix for an RTSA packet JSON header
-/// reporting a positive sample rate, without decoding any payload.
+/// Incremental header sniff: feed stream chunks, learn the rate the
+/// device is streaming at.
 ///
-/// Wire format: `{JSON}` terminated by a record separator or line feed
-/// (see `StreamParser::try_parse_complete_packet` for the full framing).
-/// The rate is in the header, at the *front* of each packet, so there is
-/// no reason to buffer and decode a complete payload to learn it — the
-/// probe used to run the full parser here, allocating and converting
-/// megabytes of samples it then threw away.
-///
-/// Zero-rate headers (status packets with `startTime == endTime` and no
-/// `sampleFrequency`) are skipped rather than ending the search: the
-/// yardstick a caller wants is the rate the device streams at, and a
-/// degenerate early header must not read as "not an RTSA stream".
-fn sniff_stream_sample_rate(buf: &[u8]) -> Option<f64> {
-    let mut rest = buf;
-    loop {
-        // `?`: no candidate header start, or a header whose terminator
-        // has not arrived yet — either way, nothing to report from what
-        // is buffered so far.
-        let start = rest.iter().position(|&b| b == b'{')?;
-        let segment = &rest[start..];
-        let end = segment
-            .iter()
-            .position(|&b| b == ASCII_RECORD_SEPARATOR || b == ASCII_LINE_FEED)?;
-        if let Ok(metadata) = serde_json::from_slice::<PacketMetadata>(&segment[..end]) {
-            let rate = StreamingSdrConfig::from_metadata(&metadata).sample_rate;
-            if rate > 0.0 {
-                return Some(rate);
+/// Framing lives in [`crate::http_streaming::scan_packet_header`] — the
+/// stream parser's own header scan — so this holds only what is probe
+/// policy: skip zero-rate headers (status packets with
+/// `startTime == endTime` and no `sampleFrequency` must not read as "not
+/// an RTSA stream"), spend the [`PROBE_HEADER_SCAN_BYTES`] budget, and
+/// keep no more buffered than a possibly-unfinished header — spent bytes
+/// are dropped as they are ruled out, so each byte is scanned once
+/// rather than the whole accumulation being rescanned per chunk.
+struct RateSniffer {
+    /// Bytes not yet ruled out as (the start of) a header.
+    buf: Vec<u8>,
+    /// Total bytes ever fed, for the give-up budget.
+    fed: usize,
+}
+
+impl RateSniffer {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            fed: 0,
+        }
+    }
+
+    /// Feed one chunk; `Some(rate)` once a header reports a positive
+    /// sample rate.
+    fn feed(&mut self, chunk: &[u8]) -> Option<f64> {
+        self.buf.extend_from_slice(chunk);
+        self.fed += chunk.len();
+        loop {
+            match crate::http_streaming::scan_packet_header(&self.buf) {
+                crate::http_streaming::HeaderScan::Header(metadata, consumed) => {
+                    self.buf.drain(..consumed);
+                    let rate = StreamingSdrConfig::from_metadata(&metadata).sample_rate;
+                    if rate > 0.0 {
+                        return Some(rate);
+                    }
+                    // A zero-rate header: keep scanning what remains.
+                }
+                crate::http_streaming::HeaderScan::Incomplete { skippable } => {
+                    self.buf.drain(..skippable);
+                    return None;
+                }
             }
         }
-        // Not a header (a `{` inside binary payload), or a zero-rate
-        // one: resync past it, exactly as the stream parser does.
-        rest = &segment[end + 1..];
+    }
+
+    /// Whether the scan budget is spent with no rate found.
+    fn budget_spent(&self) -> bool {
+        self.fed > PROBE_HEADER_SCAN_BYTES
     }
 }
 
@@ -597,7 +691,7 @@ pub async fn measure_link_throughput_with(
     // via the one shared builder.
     let client = rtsa_client_builder(Duration::from_secs(5)).build()?;
 
-    let url = format!("{}/stream?{}", base_url, params.build_query_string());
+    let url = params.stream_url(base_url);
 
     info!(
         "Measuring link throughput from {url}: discarding {:.2} s of connect backlog, \
@@ -611,11 +705,10 @@ pub async fn measure_link_throughput_with(
         HttpEndpointsClient::ensure_success(&format!("Link throughput probe of {url}"), response)?;
 
     let mut meter = ThroughputMeter::new(settle, duration);
-    // Header-sniff buffer: scanned for the first packet header reporting
-    // the device's rate, then dropped. `None` once the rate is known or
-    // the scan budget is spent, so the steady-state loop does nothing
-    // but count.
-    let mut sniff_buf: Option<Vec<u8>> = Some(Vec::new());
+    // Header sniff: learns the device's rate from packet headers, then
+    // is dropped. `None` once the rate is known or the scan budget is
+    // spent, so the steady-state loop does nothing but count.
+    let mut sniffer: Option<RateSniffer> = Some(RateSniffer::new());
     let mut stream_sample_rate = None;
     let mut stream_ended = false;
 
@@ -637,20 +730,19 @@ pub async fn measure_link_throughput_with(
             Ok(Ok(Some(chunk))) => chunk,
         };
 
-        if let Some(buf) = sniff_buf.as_mut() {
-            buf.extend_from_slice(&chunk);
-            let found = sniff_stream_sample_rate(buf);
-            let budget_spent = buf.len() > PROBE_HEADER_SCAN_BYTES;
+        if let Some(s) = sniffer.as_mut() {
+            let found = s.feed(&chunk);
+            let budget_spent = s.budget_spent();
             if found.is_some() {
                 stream_sample_rate = found;
-                sniff_buf = None;
+                sniffer = None;
             } else if budget_spent {
                 debug!(
                     "No RTSA packet header with a positive sample rate in the first \
                      {PROBE_HEADER_SCAN_BYTES} bytes from {url}; measuring bytes only \
                      (stream_sample_rate will be None)"
                 );
-                sniff_buf = None;
+                sniffer = None;
             }
         }
 
@@ -1020,15 +1112,38 @@ mod tests {
         let mut meter =
             ThroughputMeter::starting_at(t0, Duration::from_millis(500), Duration::from_secs(2));
         meter.observe(t0 + Duration::from_millis(600), 600_000); // mark
+        // A healthy second of stream: 6 MB every 100 ms — 60 MB/s.
+        for tick in 7..=16u64 {
+            meter.observe(t0 + Duration::from_millis(tick * 100), 6_000_000);
+        }
+        // The consumer goes away for 8 seconds, then observes again.
+        assert!(meter.observe(t0 + Duration::from_millis(9_600), 6_000_000));
+        let m = meter.finish().expect("complete");
+        // 60 MB over the 1.0 s actually observed — 60 MB/s, not
+        // 66 MB / 9.0 s ≈ 7 MB/s.
+        assert!((m.byte_rate - 60e6).abs() < 1.0, "got {} B/s", m.byte_rate);
+        assert_eq!(m.window, Duration::from_millis(1_000));
+    }
+
+    /// A window that closed after observing less than half its
+    /// configured span is a failed measurement, not a rate: a couple of
+    /// packets and then silence until a stray late observation slams the
+    /// window shut says nothing about what the path sustains, and the
+    /// stall-tolerant counting above would otherwise happily rate-ify
+    /// those 200 ms.
+    #[test]
+    fn a_window_observed_too_thinly_is_not_a_measurement() {
+        let t0 = Instant::now();
+        let mut meter =
+            ThroughputMeter::starting_at(t0, Duration::from_millis(500), Duration::from_secs(2));
+        meter.observe(t0 + Duration::from_millis(600), 600_000); // mark
         meter.observe(t0 + Duration::from_millis(700), 6_000_000);
         meter.observe(t0 + Duration::from_millis(800), 6_000_000);
-        // The consumer goes away for 8 seconds, then observes again.
+        // Nothing more until an observation far past the window's end
+        // closes it: only 200 ms of a 2 s window was actually observed.
         assert!(meter.observe(t0 + Duration::from_millis(9_000), 6_000_000));
-        let m = meter.finish().expect("complete");
-        // 12 MB over the 200 ms actually observed — 60 MB/s, not
-        // 12 MB / 8.4 s ≈ 1.4 MB/s.
-        assert!((m.byte_rate - 60e6).abs() < 1.0, "got {} B/s", m.byte_rate);
-        assert_eq!(m.window, Duration::from_millis(200));
+        assert!(meter.is_complete());
+        assert!(meter.finish().is_none());
     }
 
     /// Once complete the meter is frozen: a late chunk arriving while
@@ -1066,13 +1181,18 @@ mod tests {
         assert!((m.megabytes_per_second() - 57.3).abs() < 1e-9);
         // 57.3 MB/s is short of the 61.44 the stream needed, and the
         // advice reflects it.
-        assert_eq!(m.max_sustainable_span_hz(), Some(6_144_000.0));
+        assert_eq!(
+            m.max_sustainable_span_hz(DEFAULT_LINK_FORMAT),
+            Some(6_144_000.0)
+        );
     }
 
     /// A serialized RTSA packet header, as the wire carries it, followed
-    /// by the LF+RS separator the live server sends.
+    /// by the LF+RS separator the live server sends (0x0A, 0x1E — spelled
+    /// as the wire bytes here because the parser's own names for them are
+    /// its implementation detail).
     fn wire_header(sample_frequency: Option<f64>, start_time: f64, end_time: f64) -> Vec<u8> {
-        let metadata = PacketMetadata {
+        let metadata = crate::http_streaming::PacketMetadata {
             start_time,
             end_time,
             start_time_day: None,
@@ -1093,8 +1213,8 @@ mod tests {
             compression: None,
         };
         let mut bytes = serde_json::to_vec(&metadata).expect("serializable");
-        bytes.push(ASCII_LINE_FEED);
-        bytes.push(ASCII_RECORD_SEPARATOR);
+        bytes.push(0x0A);
+        bytes.push(0x1E);
         bytes
     }
 
@@ -1104,23 +1224,26 @@ mod tests {
     /// first.
     #[test]
     fn the_header_sniff_finds_the_rate_and_skips_degenerate_headers() {
-        let mut stream = vec![0x00, b'{', 0x7F, ASCII_RECORD_SEPARATOR, 0x42];
+        let mut stream = vec![0x00, b'{', 0x7F, 0x1E, 0x42];
         // A status-ish header: no sampleFrequency and zero duration, so
         // its derived rate is 0.0 — it must not end the search.
         stream.extend_from_slice(&wire_header(None, 100.0, 100.0));
         stream.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // its "payload"
         stream.extend_from_slice(&wire_header(Some(15_360_000.0), 100.0, 100.001));
 
-        assert_eq!(sniff_stream_sample_rate(&stream), Some(15_360_000.0));
+        assert_eq!(RateSniffer::new().feed(&stream), Some(15_360_000.0));
 
-        // No header at all, and a header whose terminator has not
-        // arrived yet: nothing to report, not a wrong answer.
-        assert_eq!(sniff_stream_sample_rate(b"not this protocol"), None);
+        // No header at all: nothing to report, not a wrong answer.
+        assert_eq!(RateSniffer::new().feed(b"not this protocol"), None);
+
+        // A header whose terminator has not arrived yet reports nothing —
+        // and the sniffer is incremental, so the rest of the header
+        // landing in a later chunk completes the find.
         let complete = wire_header(Some(1e6), 0.0, 1.0);
-        assert_eq!(
-            sniff_stream_sample_rate(&complete[..complete.len() - 8]),
-            None
-        );
+        let (first, rest) = complete.split_at(complete.len() - 8);
+        let mut sniffer = RateSniffer::new();
+        assert_eq!(sniffer.feed(first), None);
+        assert_eq!(sniffer.feed(rest), Some(1e6));
     }
 
     /// Stream from a socket the way the RTSA server does: a backlog
