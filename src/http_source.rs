@@ -120,6 +120,13 @@ const LINK_BUDGET_TOLERANCE: f64 = 0.98;
 /// question: has the device actually moved?
 const RATE_CHANGE_BAND: f64 = 0.1;
 
+/// Whether `current` differs from `previous` by more than
+/// [`RATE_CHANGE_BAND`] — the one spelling of "the device has retuned",
+/// shared by both rate trackers. `previous` must be positive.
+fn rate_moved(previous: f64, current: f64) -> bool {
+    (current - previous).abs() / previous > RATE_CHANGE_BAND
+}
+
 /// Stream statistics for monitoring
 #[derive(Debug, Clone)]
 pub struct StreamStats {
@@ -138,7 +145,8 @@ pub struct StreamStats {
     /// current configuration — the predictive complement to
     /// `dropped_packets`, carrying the measured rate, the requirement,
     /// and the widest span that fits. `None` until the check completes,
-    /// and reset to `None` when a configuration restart re-arms it.
+    /// and reset to `None` whenever the check re-arms — on a
+    /// configuration restart, or on a device retune past the verdict.
     pub link_budget: Option<crate::link_budget::LinkBudgetVerdict>,
 }
 
@@ -178,9 +186,12 @@ enum LinkCheck {
     /// Counting bytes on the live stream.
     Measuring(crate::link_budget::ThroughputMeter),
     /// Verdict delivered — at most once per configuration. `None` means
-    /// the window closed without a usable measurement or comparison
-    /// rate: checked, nothing honest to say, and no repeat on
-    /// reconnect.
+    /// the configuration admits no honest measurement at all (see
+    /// [`HttpSource::link_check_measurable`]): checked, nothing to say,
+    /// and no repeat on reconnect. A window that merely closed without
+    /// a usable count or a device-reported rate is *not* `Done(None)` —
+    /// it re-arms, in [`HttpSource::report_link_budget`]. A device
+    /// retune past `Done` re-arms too: the verdict was for the old rate.
     Done(Option<crate::link_budget::LinkBudgetVerdict>),
 }
 
@@ -190,7 +201,15 @@ impl LinkCheck {
     /// apart between the arm sites (stream start, mid-stream retune,
     /// missing-data re-arm).
     fn armed() -> Self {
-        LinkCheck::Measuring(crate::link_budget::ThroughputMeter::new(
+        Self::armed_at(std::time::Instant::now())
+    }
+
+    /// [`Self::armed`] with the settle window anchored at `opened` — so a
+    /// test driving the meter on synthetic instants arms it the way the
+    /// stream does, rather than with its own copy of the two durations.
+    fn armed_at(opened: std::time::Instant) -> Self {
+        LinkCheck::Measuring(crate::link_budget::ThroughputMeter::starting_at(
+            opened,
             crate::link_budget::LINK_PROBE_SETTLE,
             LINK_CHECK_WINDOW,
         ))
@@ -371,6 +390,9 @@ impl HttpSource {
         // Security: validate scheme and warn on non-local hosts — the one
         // shared implementation, also used by the link-budget probe.
         crate::http_endpoints::validate_base_url(&base_url)?;
+        // And the one place `rate_reduction(0)` is caught, before it can
+        // reach the wire or silently disarm the link check.
+        crate::http_endpoints::StreamParams::validate_rate_reduction(rate_reduction)?;
 
         // Create HTTP endpoints client for advanced control
         let endpoints_client = HttpEndpointsClient::new(base_url.clone(), auth_method.clone())?;
@@ -534,7 +556,10 @@ impl HttpSource {
         info!("Received HTTP response status: {}", response.status());
         // The shared status-to-error mapping, so a failed stream open is
         // the same typed `Error::Http` a failed probe or control call is.
-        let response = HttpEndpointsClient::ensure_success("Stream request", response)?;
+        let response = HttpEndpointsClient::ensure_success(
+            &format!("Stream request to {stream_url}"),
+            response,
+        )?;
 
         // Spawn a task that drains the socket continuously into a bounded
         // channel, decoupling the read rate from how often `work()` runs.
@@ -751,12 +776,9 @@ impl HttpSource {
     ///
     /// Two things rule it out: a format with no fixed bytes per sample
     /// (no byte requirement exists to compare against), and server-side
-    /// decimation with any factor other than exactly 1 — the wire then
-    /// carries fewer bytes than the device rate implies, so the check
-    /// would cry wolf on a healthy link. `Some(0)` is not "no
-    /// decimation": it is a value this crate never sends and the device
-    /// would refuse, so it reads as unmeasurable rather than as a
-    /// pass-through.
+    /// decimation by any factor but 1 — the wire then carries fewer
+    /// bytes than the device rate implies, so the check would cry wolf
+    /// on a healthy link. (`0` never gets here: construction rejects it.)
     fn link_check_measurable(&self) -> bool {
         self.stream_format.iq_bytes_per_sample().is_some()
             && self.rate_reduction.is_none_or(|n| n == 1)
@@ -793,32 +815,43 @@ impl HttpSource {
         }
 
         let finished = meter.finish();
-        // No usable measurement, or no device-reported rate to judge it
-        // against (`current_sample_rate` is seeded from the caller's
-        // *request* and must not stand in) — start a fresh window
-        // instead of retiring the check: the configuration has not been
-        // measured, and the next window may have both halves.
-        let (Some(mut measured), Some(rate)) = (finished, self.link_device_rate) else {
-            self.link_check = LinkCheck::armed();
-            return;
-        };
-        measured.stream_sample_rate = Some(rate);
-
+        let usable_count = finished.is_some();
         // `judge` owns the arithmetic: requirement, shortness against the
         // tolerance, and a remedy rung halved down from the device's own
         // rate — so it exists on its ladder whatever the receiver clock
         // (the default-clock ladder would name wrong rungs on a full V6).
-        let Some(verdict) = crate::link_budget::LinkBudgetVerdict::judge(
-            rate,
-            self.stream_format,
-            measured,
-            LINK_BUDGET_TOLERANCE,
-        ) else {
-            // No byte requirement exists for this format; nothing honest
-            // to say now or on any later window.
-            self.link_check = LinkCheck::Done(None);
+        // It is judged against the device-reported rate: `current_sample_rate`
+        // is seeded from the caller's *request* and must not stand in.
+        let verdict = finished
+            .zip(self.link_device_rate)
+            .and_then(|(mut measured, rate)| {
+                measured.stream_sample_rate = Some(rate);
+                crate::link_budget::LinkBudgetVerdict::judge(
+                    rate,
+                    self.stream_format,
+                    measured,
+                    LINK_BUDGET_TOLERANCE,
+                )
+            });
+        // No verdict this window — no usable measurement, or no
+        // device-reported rate to judge it against — starts a fresh
+        // window instead of retiring the check: the configuration has
+        // not been measured, and the next window may have both halves.
+        // (`judge` refusing what arming admitted cannot happen, and
+        // re-arming is the right answer to it anyway.) Logged, because
+        // this can repeat for as long as the stream stays in that state,
+        // and an operator waiting for a verdict that never comes should
+        // be able to see why.
+        let Some(verdict) = verdict else {
+            debug!(
+                "Link-budget window closed without a verdict (usable IQ count: \
+                 {usable_count}, device-reported rate: {:?}); re-arming for a fresh window",
+                self.link_device_rate,
+            );
+            self.link_check = LinkCheck::armed();
             return;
         };
+        let rate = verdict.sample_rate;
         let bytes_per_sample = verdict.bytes_per_sample;
         let required = verdict.required_byte_rate;
 
@@ -912,18 +945,24 @@ impl HttpSource {
     /// `samples / duration` does not, and must not reset the meter on
     /// every packet.
     fn note_device_rate(&mut self, inferred_rate: f64) {
-        if inferred_rate <= 0.0 {
+        // Finite as well as positive: a corrupt header can derive `+inf`
+        // (a denormal duration), which would be stored as a rate no
+        // later retune could clear — `(x - inf) / inf` is NaN.
+        if !inferred_rate.is_finite() || inferred_rate <= 0.0 {
             return;
         }
         if let Some(previous) = self.link_device_rate
-            && (inferred_rate - previous).abs() / previous > RATE_CHANGE_BAND
+            && rate_moved(previous, inferred_rate)
         {
-            let rearm = match &self.link_check {
-                LinkCheck::Measuring(_) => true,
-                LinkCheck::Done(_) => self.link_check_measurable(),
-                LinkCheck::Unmeasured => false,
-            };
-            if rearm {
+            // A running measurement and a delivered verdict both re-arm.
+            // `Done(None)` does not: it means the configuration admits no
+            // measurement at all, which a retune does not change. Nor
+            // does `Unmeasured`, which has nothing to restart — the
+            // stream start arms it.
+            if matches!(
+                self.link_check,
+                LinkCheck::Measuring(_) | LinkCheck::Done(Some(_))
+            ) {
                 debug!(
                     "Device rate changed {:.0} -> {:.0} Hz; restarting the link-budget \
                      check for the new configuration",
@@ -1086,9 +1125,7 @@ impl HttpSource {
                 self.note_device_rate(inferred_rate);
                 if inferred_rate > 0.0
                     && (self.current_sample_rate <= 0.0
-                        || (inferred_rate - self.current_sample_rate).abs()
-                            / self.current_sample_rate
-                            > RATE_CHANGE_BAND)
+                        || rate_moved(self.current_sample_rate, inferred_rate))
                 {
                     debug!(
                         "Sample rate updated from metadata: {:.0} -> {:.0} Hz",
@@ -2448,11 +2485,7 @@ mod tests {
         block.link_device_rate = (device_rate_hz > 0.0).then_some(device_rate_hz);
 
         let t0 = std::time::Instant::now();
-        block.link_check = LinkCheck::Measuring(crate::link_budget::ThroughputMeter::starting_at(
-            t0,
-            crate::link_budget::LINK_PROBE_SETTLE,
-            LINK_CHECK_WINDOW,
-        ));
+        block.link_check = LinkCheck::armed_at(t0);
         for tick in 0..1_000u64 {
             let at = t0 + std::time::Duration::from_millis(tick * 10);
             let LinkCheck::Measuring(meter) = &mut block.link_check else {
@@ -2613,11 +2646,17 @@ mod tests {
         let (mut block, _t0) = source_with_link_measurement(15_360_000.0, 614_400);
         block.note_device_rate(15_400_000.0);
         assert!(matches!(&block.link_check, LinkCheck::Measuring(m) if m.is_complete()));
+    }
 
-        // A retune *after* the verdict re-arms too: the verdict described
-        // the old configuration's budget, and the new rate deserves its
-        // own single check rather than streaming unjudged behind a stale
-        // "checked" flag.
+    /// A retune *after* the verdict re-arms too: the verdict described
+    /// the old configuration's budget, and the new rate deserves its own
+    /// single check rather than streaming unjudged behind a stale
+    /// "checked" flag.
+    #[test]
+    fn a_retune_after_the_verdict_rearms_the_check() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
         let (mut block, _t0) = source_with_link_measurement(15_360_000.0, 614_400);
         block.report_link_budget();
         assert!(matches!(&block.link_check, LinkCheck::Done(Some(_))));
@@ -2625,6 +2664,155 @@ mod tests {
         assert!(
             matches!(&block.link_check, LinkCheck::Measuring(m) if !m.is_complete()),
             "a retune past Done must start a fresh measurement for the new rate",
+        );
+        assert!(
+            block.get_stream_stats().link_budget.is_none(),
+            "the old verdict must not be published against the new rate",
+        );
+    }
+
+    /// `rate_reduction(0)` is not "no reduction" — it is a value the
+    /// server would refuse — so it is rejected at construction rather
+    /// than sent on and left to silently disarm the link check.
+    #[test]
+    fn rate_reduction_zero_is_rejected_at_build() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let err = HttpSourceBuilder::new("http://localhost:54664")
+            .rate_reduction(0)
+            .build()
+            .err()
+            .expect("rate_reduction(0) must not build");
+        assert!(matches!(err, Error::Config(_)), "{err}");
+
+        let source = HttpSourceBuilder::new("http://localhost:54664")
+            .rate_reduction(1)
+            .build()
+            .expect("rate_reduction(1) is no reduction");
+        assert!(source.link_check_measurable());
+    }
+
+    /// A retune only re-arms a check that can measure. `Done(None)` is
+    /// reserved for configurations with no honest byte requirement —
+    /// server-side decimation here — and stays put: re-arming it would
+    /// start the measurement the arm site had already ruled out. And a
+    /// check that has not been armed yet has nothing to restart; the
+    /// stream start will arm it. Both still track the new rate, so the
+    /// next arm judges against what the device actually streams.
+    #[test]
+    fn a_retune_does_not_rearm_an_unmeasurable_or_unarmed_check() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let mut decimated = HttpSourceBuilder::new("http://localhost:54664")
+            .format(StreamFormat::Int16)
+            .rate_reduction(4)
+            .build()
+            .expect("Should create HttpSource");
+        assert!(!decimated.link_check_measurable());
+        decimated.link_device_rate = Some(15_360_000.0);
+        decimated.link_check = LinkCheck::Done(None);
+        decimated.note_device_rate(30_720_000.0);
+        assert!(
+            matches!(decimated.link_check, LinkCheck::Done(None)),
+            "an unmeasurable configuration must not be re-armed by a retune",
+        );
+        assert_eq!(decimated.link_device_rate, Some(30_720_000.0));
+
+        let mut unarmed = HttpSourceBuilder::new("http://localhost:54664")
+            .format(StreamFormat::Int16)
+            .build()
+            .expect("Should create HttpSource");
+        assert!(matches!(unarmed.link_check, LinkCheck::Unmeasured));
+        unarmed.link_device_rate = Some(15_360_000.0);
+        unarmed.note_device_rate(30_720_000.0);
+        assert!(
+            matches!(unarmed.link_check, LinkCheck::Unmeasured),
+            "a check that was never armed has nothing to restart",
+        );
+        assert_eq!(unarmed.link_device_rate, Some(30_720_000.0));
+    }
+
+    /// One serialized RTSA int16 IQ packet as the wire carries it: JSON
+    /// header, the live server's LF+RS separator, then `pairs` zeroed
+    /// little-endian int16 IQ pairs.
+    fn int16_iq_packet(sample_frequency: f64, start: f64, end: f64, pairs: usize) -> Vec<u8> {
+        let mut out = format!(
+            r#"{{"startTime":{start},"endTime":{end},"startFrequency":95e6,"endFrequency":105e6,"sampleFrequency":{sample_frequency},"samples":{pairs},"unit":"volt","payload":"iq","minPower":-120,"maxPower":0,"sampleSize":2}}"#
+        )
+        .into_bytes();
+        out.extend_from_slice(&[0x0A, 0x1E]);
+        out.extend_from_slice(&vec![0u8; pairs * 4]);
+        out
+    }
+
+    /// One serialized int16 spectra packet: a single frame of `bins`
+    /// zeroed int16 scalars. No `sampleFrequency`, as the live server
+    /// sends them, so the parser derives `samples / duration` — one
+    /// frame over the packet's span, a frame rate.
+    fn int16_spectra_packet(start: f64, end: f64, bins: usize) -> Vec<u8> {
+        let mut out = format!(
+            r#"{{"startTime":{start},"endTime":{end},"startFrequency":95e6,"endFrequency":105e6,"samples":1,"unit":"dbm","payload":"spectra","minPower":-120,"maxPower":0,"sampleSize":{bins}}}"#
+        )
+        .into_bytes();
+        out.extend_from_slice(&[0x0A, 0x1E]);
+        out.extend_from_slice(&vec![0u8; bins * 2]);
+        out
+    }
+
+    /// The link check listens to IQ packets only. A spectra packet's
+    /// header carries no `sampleFrequency`, so the parser derives a
+    /// *frame* rate from it — 100 Hz here, against a 15.36 MS/s IQ
+    /// stream. Handed to the device-rate tracker, that "retune" would
+    /// restart the measurement on every interleaved packet; handed to the
+    /// meter, its scalars would be counted as IQ payload at twice their
+    /// wire width. Neither may happen, and the consumer still gets the
+    /// samples.
+    #[test]
+    fn spectra_packets_feed_neither_the_rate_tracker_nor_the_meter() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .format(StreamFormat::Int16)
+            .build()
+            .expect("Should create HttpSource");
+        block.link_check = LinkCheck::armed();
+
+        let iq = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 4));
+        let counts = block
+            .process_advanced_stream_data(&iq)
+            .expect("the IQ packet parses");
+        assert_eq!(
+            counts,
+            (4, 4),
+            "IQ samples count for the consumer and the meter"
+        );
+        assert_eq!(block.link_device_rate, Some(15_360_000.0));
+        assert_eq!(block.current_sample_rate, 15_360_000.0);
+
+        let spectra = Bytes::from(int16_spectra_packet(100.001, 100.011, 4));
+        let counts = block
+            .process_advanced_stream_data(&spectra)
+            .expect("the spectra packet parses");
+        assert_eq!(
+            counts,
+            (4, 0),
+            "spectra scalars reach the consumer but are not IQ payload",
+        );
+        assert_eq!(
+            block.link_device_rate,
+            Some(15_360_000.0),
+            "a spectra frame rate is not a device retune",
+        );
+        assert_eq!(
+            block.current_sample_rate, 15_360_000.0,
+            "nor is it the stream's sample rate",
+        );
+        assert!(
+            matches!(block.link_check, LinkCheck::Measuring(_)),
+            "the check stays armed through interleaved spectra",
         );
     }
 
@@ -2646,11 +2834,7 @@ mod tests {
             .expect("Should create HttpSource");
         block.link_device_rate = Some(15_360_000.0);
         let t0 = std::time::Instant::now();
-        block.link_check = LinkCheck::Measuring(crate::link_budget::ThroughputMeter::starting_at(
-            t0,
-            crate::link_budget::LINK_PROBE_SETTLE,
-            LINK_CHECK_WINDOW,
-        ));
+        block.link_check = LinkCheck::armed_at(t0);
         for tick in 0..80u64 {
             let LinkCheck::Measuring(meter) = &mut block.link_check else {
                 panic!("armed");

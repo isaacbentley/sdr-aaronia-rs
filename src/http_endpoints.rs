@@ -102,10 +102,16 @@ pub(crate) fn rtsa_client_builder(connect_timeout: std::time::Duration) -> reqwe
         // plain `http://` that is what reqwest uses anyway (no ALPN, no
         // prior-knowledge h2), so forcing it protects nothing — while over
         // `https://` it breaks streaming through a TLS-terminating proxy
-        // whose ALPN offers only h2, a deployment that previously worked.
-        // Let ALPN negotiate; a direct RTSA TLS endpoint still lands on
-        // HTTP/1.1.
+        // whose ALPN offers only h2. Let ALPN negotiate; a direct RTSA TLS
+        // endpoint still lands on HTTP/1.1.
         .http1_title_case_headers()
+        // And when ALPN does land on h2, do not let its flow control be
+        // the link: hyper's default 2 MiB stream window caps a stream at
+        // window / RTT (~84 MB/s at 25 ms, under the 123 MB/s a 30.72 MS/s
+        // int16 stream needs), which the link-budget check would then
+        // measure and blame on the path. The adaptive window sizes itself
+        // to the bandwidth-delay product instead.
+        .http2_adaptive_window(true)
 }
 
 /// Validate a base URL before any RTSA connection is opened: parseable,
@@ -583,6 +589,33 @@ impl StreamParams {
     /// (`format` is always present), so the `?` is unconditional.
     pub(crate) fn stream_url(&self, base_url: &str) -> String {
         format!("{}/stream?{}", base_url, self.build_query_string())
+    }
+
+    /// Refuse parameter values the server would reject or misread,
+    /// before any connection is opened.
+    ///
+    /// The builders accept any integer for `rate_reduction`, so this is
+    /// where `0` is caught: it is not "no reduction" — that is `1`, or
+    /// omitting the parameter — and sending it on would fail the stream
+    /// open with an opaque HTTP error, or worse, be read by the server
+    /// in some way this crate does not model. Every `/stream` opener
+    /// (`HttpEndpointsClient::start_stream`, `HttpSource`, the
+    /// link-budget probe) calls this, so the value cannot reach the wire.
+    pub fn validate(&self) -> crate::Result<()> {
+        Self::validate_rate_reduction(self.rate_reduction)
+    }
+
+    /// The `rate_reduction` half of [`Self::validate`], for a caller that
+    /// holds the factor before it holds a `StreamParams`.
+    pub(crate) fn validate_rate_reduction(factor: Option<u32>) -> crate::Result<()> {
+        if factor == Some(0) {
+            return Err(crate::Error::Config(
+                "rate_reduction must be at least 1: 0 is not \"no reduction\" (that is 1, or \
+                 leaving it unset) but a value the server would refuse"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Builds the percent-encoded query string for the stream request.
@@ -1674,6 +1707,7 @@ impl HttpEndpointsClient {
         use crate::http_streaming::StreamParser;
         use futures::stream::StreamExt;
 
+        params.validate()?;
         let url = params.stream_url(&self.base_url);
 
         info!(
@@ -1685,7 +1719,8 @@ impl HttpEndpointsClient {
         // timeout would cover the whole streamed body and kill the
         // connection mid-stream.
         let request = self.apply_auth(self.client.get(&url));
-        let response = Self::ensure_success("Stream request", request.send().await?)?;
+        let response =
+            Self::ensure_success(&format!("Stream request to {url}"), request.send().await?)?;
 
         // Get the byte stream
         let byte_stream = response.bytes_stream();

@@ -10,8 +10,11 @@ use num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-const ASCII_RECORD_SEPARATOR: u8 = 30;
-const ASCII_LINE_FEED: u8 = 10;
+/// The two packet-header terminators the wire uses — see
+/// [`scan_packet_header`] for the framing they define. Crate-visible so
+/// tests that hand-build wire packets spell the framing in its own terms.
+pub(crate) const ASCII_RECORD_SEPARATOR: u8 = 30;
+pub(crate) const ASCII_LINE_FEED: u8 = 10;
 /// Full-scale int16 encode multiplier assumed when neither the packet
 /// metadata nor the `?scale=N` query supplied one: `int16 = value * 32768`,
 /// decoded as `value = raw / 32768`.
@@ -329,6 +332,26 @@ pub struct StreamingSdrConfig {
     pub samples_per_packet: u64,
 }
 
+impl PacketMetadata {
+    /// The rate this packet reports, in Hz: `sampleFrequency` when the
+    /// header carries it, else `samples / duration`, else `0.0`.
+    ///
+    /// The fallback is only a *sample* rate for an IQ packet. A spectra
+    /// or histogram header counts frames in `samples`, so there it is a
+    /// frame rate — orders of magnitude below the IQ rate — and a
+    /// consumer wanting the device's IQ rate must check `payload` first.
+    /// The zero-duration guard keeps a degenerate status header (equal
+    /// start and end times) from producing Inf/NaN.
+    pub fn sample_rate(&self) -> f64 {
+        let duration = self.end_time - self.start_time;
+        self.sample_frequency.unwrap_or(if duration > 0.0 {
+            self.samples as f64 / duration
+        } else {
+            0.0
+        })
+    }
+}
+
 impl StreamingSdrConfig {
     /// Create SDR config from packet metadata
     pub fn from_metadata(metadata: &PacketMetadata) -> Self {
@@ -336,14 +359,7 @@ impl StreamingSdrConfig {
         let bandwidth = metadata.end_frequency - metadata.start_frequency;
         let duration = metadata.end_time - metadata.start_time;
         let duration_ms = duration * 1000.0;
-        // Derive the rate from packet timing only when the duration is a
-        // sane positive number — a zero/negative duration would otherwise
-        // produce Inf/NaN here.
-        let sample_rate = metadata.sample_frequency.unwrap_or(if duration > 0.0 {
-            metadata.samples as f64 / duration
-        } else {
-            0.0
-        });
+        let sample_rate = metadata.sample_rate();
         let antenna_name = metadata
             .antenna
             .as_ref()
@@ -384,32 +400,57 @@ impl StreamingSdrConfig {
 /// Outcome of [`scan_packet_header`]: a complete header, or how much of
 /// the buffer is spent while waiting for more data.
 pub(crate) enum HeaderScan {
-    /// A complete header, ending `consumed` bytes into the buffer
-    /// (terminator included); the bytes before it are spent. Boxed
-    /// because the metadata is ~an order of magnitude wider than the
-    /// other variant, which is the common case while a header arrives.
-    Header(Box<PacketMetadata>, usize),
+    /// A complete header. Boxed because the metadata is ~an order of
+    /// magnitude wider than the other variant, which is the common case
+    /// while a header arrives.
+    Header {
+        metadata: Box<PacketMetadata>,
+        /// The header's JSON text, as a byte range of the scanned buffer.
+        json: std::ops::Range<usize>,
+        /// Where the payload begins: past the terminator, and past the
+        /// record separator that follows a line feed on the real wire.
+        /// Everything before it is spent.
+        payload_start: usize,
+        /// `{`-candidates that failed to parse as a header on the way.
+        rejected: usize,
+    },
     /// No complete header in the buffer. The first `skippable` bytes can
     /// never begin one — every candidate there has already failed — and
     /// may be discarded; anything after may be a header still arriving.
-    Incomplete { skippable: usize },
+    Incomplete { skippable: usize, rejected: usize },
 }
 
 /// Scan `buf` for the first complete packet JSON header, decoding no
 /// payload.
 ///
-/// The same framing and resync discipline as
-/// `StreamParser::try_parse_complete_packet`, kept beside it so a
-/// framing fix lands in both (the two-byte `\n\x1e` separator was
-/// hardware-verified once already): a candidate is a separator-terminated
-/// segment starting at a `{`, and a candidate that fails to parse
-/// resyncs **one byte past its `{`** — binary payloads contain separator
-/// bytes, so a real header can share a segment with a stray `{`, and a
-/// coarser skip would jump straight over it.
+/// **The one framing implementation**: `StreamParser` frames every
+/// packet through here, and the link-budget probe's header sniff uses it
+/// to learn the device's rate without buffering or decoding payloads.
 ///
-/// This is the header-only path the link-budget probe uses to learn the
-/// device's rate without buffering or decoding payloads.
+/// Wire format: `{JSON}<sep>[PAYLOAD]`, where `<sep>` is a record
+/// separator (`0x1E`) or a line feed (`0x0A`). Verified against live
+/// SpectranV6 hardware (float32/int16, iq and spectra payloads): the
+/// real wire format is `{json}\n\x1e<binary>` — the JSON line ends with
+/// LF and the payload is prefixed with RS, i.e. **two** separator bytes.
+/// Treating the LF as the sole separator shifted every binary payload by
+/// one byte and decoded pure garbage. A lone LF or lone RS is still
+/// accepted for spec-conservative peers; and *exactly* one of each — an
+/// earlier revision skipped a *run* of separator bytes, which swallowed
+/// payloads whose first byte happened to be `0x1E`/`0x0A`.
+///
+/// **Resync**: a candidate is a `{` followed by a terminator; valid JSON
+/// cannot contain a raw `0x1E`/`0x0A` (control characters must be
+/// escaped), so a terminated candidate either parses now or never will.
+/// One that fails was not a header (mid-stream corruption, or a brace
+/// inside a lost packet's binary data), and the scan resyncs **one byte
+/// past its `{`** — binary payloads contain separator bytes too, so a
+/// real header can share a terminator with a stray `{` ahead of it, and
+/// a coarser skip would jump straight over it. Every candidate between
+/// one terminator and the next shares that terminator, so it is found
+/// once per region rather than once per candidate: the scan is linear
+/// in the buffer, whatever the brace density of the garbage.
 pub(crate) fn scan_packet_header(buf: &[u8]) -> HeaderScan {
+    let mut rejected = 0;
     let mut pos = 0;
     loop {
         let Some(start) = buf[pos..].iter().position(|&b| b == b'{') else {
@@ -417,22 +458,49 @@ pub(crate) fn scan_packet_header(buf: &[u8]) -> HeaderScan {
             // so the whole buffer is spent.
             return HeaderScan::Incomplete {
                 skippable: buf.len(),
+                rejected,
             };
         };
         let start = pos + start;
-        let segment = &buf[start..];
-        let Some(end) = segment
+        let Some(end) = buf[start..]
             .iter()
             .position(|&b| b == ASCII_RECORD_SEPARATOR || b == ASCII_LINE_FEED)
         else {
             // A candidate whose terminator has not arrived yet; keep it,
             // spend everything before it.
-            return HeaderScan::Incomplete { skippable: start };
+            return HeaderScan::Incomplete {
+                skippable: start,
+                rejected,
+            };
         };
-        match serde_json::from_slice::<PacketMetadata>(&segment[..end]) {
-            Ok(metadata) => return HeaderScan::Header(Box::new(metadata), start + end + 1),
-            Err(_) => pos = start + 1,
+        let end = start + end;
+
+        // Every `{` in `start..end` is a candidate ending at `end`.
+        let mut candidate = start;
+        loop {
+            if let Ok(metadata) = serde_json::from_slice::<PacketMetadata>(&buf[candidate..end]) {
+                let mut payload_start = end + 1;
+                if buf[end] == ASCII_LINE_FEED
+                    && buf.get(payload_start) == Some(&ASCII_RECORD_SEPARATOR)
+                {
+                    payload_start += 1;
+                }
+                return HeaderScan::Header {
+                    metadata: Box::new(metadata),
+                    json: candidate..end,
+                    payload_start,
+                    rejected,
+                };
+            }
+            rejected += 1;
+            match buf[candidate + 1..end].iter().position(|&b| b == b'{') {
+                Some(next) => candidate += 1 + next,
+                None => break,
+            }
         }
+        // Nothing in this region was a header; the terminator is spent
+        // with it.
+        pos = end + 1;
     }
 }
 
@@ -718,143 +786,92 @@ impl StreamParser {
 
     /// Parse one complete packet from the front of the buffer, if present.
     ///
-    /// Wire format: `{JSON_METADATA}<sep>[BINARY]`, where `<sep>` is
-    /// exactly one byte — record separator (`0x1E`) or line feed (`0x0A`).
-    /// (Exactly one: an earlier revision skipped a *run* of separator
-    /// bytes, which swallowed binary payloads whose first byte happened to
-    /// be `0x1E`/`0x0A` and shifted every subsequent sample by one byte.)
-    /// For the pure-JSON stream format there is no binary section; the
-    /// sample values live in the JSON document itself.
-    ///
-    /// **Resync**: if a separator-terminated segment starting at a `{`
-    /// fails to parse as packet metadata, that `{` was not a packet header
-    /// (mid-stream corruption, or a brace inside a lost packet's binary
-    /// data). We skip past it and rescan instead of stalling forever —
-    /// a single corrupt packet must not poison the rest of the stream.
+    /// Framing — the header's extent, the one- or two-byte separator, and
+    /// the resync past a `{` that is not a header — is
+    /// [`scan_packet_header`]'s; this adds the payload: sized from the
+    /// header and awaited for the binary formats, carried inside the
+    /// header document for the pure-JSON format. Nothing is consumed
+    /// until the whole packet is buffered, so a payload whose second
+    /// separator byte has not arrived yet is not mis-framed: the re-scan
+    /// after the next chunk sees it.
     fn try_parse_complete_packet(&mut self) -> Result<Option<StreamPacket>> {
-        loop {
-            // Look for JSON start; anything before it is inter-packet
-            // garbage (e.g. remnants of a packet we resynced past).
-            let json_start = match self.pending().iter().position(|&b| b == b'{') {
-                Some(p) => p,
-                None => {
-                    // Nothing but garbage buffered — drop it all.
-                    self.buffer.clear();
-                    self.consumed = 0;
-                    return Ok(None);
+        let (metadata, json, payload_start) = match scan_packet_header(self.pending()) {
+            HeaderScan::Incomplete {
+                skippable,
+                rejected,
+            } => {
+                self.counters.parse_errors += rejected as u64;
+                // Spent bytes are a cheap offset bump (no memmove), so
+                // walking through a corrupt region stays linear overall.
+                self.consume_buffer(skippable);
+                // Bound how long an unterminated header is waited for.
+                if self.pending().len() > Self::MAX_JSON_BUFFER {
+                    return Err(Error::Protocol(format!(
+                        "packet JSON header exceeded {} bytes without terminating",
+                        Self::MAX_JSON_BUFFER
+                    )));
                 }
-            };
-
-            let sep_offset = match self.pending()[json_start..]
-                .iter()
-                .position(|&b| b == ASCII_RECORD_SEPARATOR || b == ASCII_LINE_FEED)
-            {
-                Some(p) => p,
-                None => {
-                    // JSON header still incomplete. Bound how long we wait.
-                    if self.pending().len() - json_start > Self::MAX_JSON_BUFFER {
-                        return Err(Error::Protocol(format!(
-                            "packet JSON header exceeded {} bytes without terminating",
-                            Self::MAX_JSON_BUFFER
-                        )));
-                    }
-                    return Ok(None);
-                }
-            };
-            let json_end = json_start + sep_offset;
-            // Separator handling, verified against live SpectranV6 hardware
-            // (float32/int16, iq and spectra payloads): the real wire format
-            // is `{json}\n\x1e<binary>` — the JSON line ends with LF and the
-            // binary section is prefixed with RS, i.e. TWO separator bytes.
-            // Treating the LF as the sole separator shifted every binary
-            // payload by one byte and decoded pure garbage. A lone LF or
-            // lone RS is still accepted for spec-conservative peers. (If the
-            // RS hasn't arrived yet we don't mis-parse: nothing is consumed
-            // until the full payload is buffered, so the re-parse after the
-            // next chunk sees it.)
-            let mut binary_start = json_end + 1;
-            if self.pending()[json_end] == ASCII_LINE_FEED
-                && self.pending().get(binary_start) == Some(&ASCII_RECORD_SEPARATOR)
-            {
-                binary_start += 1;
-            }
-
-            // The segment is separator-terminated, so it is complete: it
-            // either parses now or never will. Valid JSON cannot contain a
-            // raw 0x1E/0x0A byte (control characters must be escaped), so
-            // the separator cannot sit inside a still-incomplete document.
-            let json_data = &self.pending()[json_start..json_end];
-
-            // Pure-JSON streams carry the sample values inside the header
-            // document, so that path (and only that path) pays for a full
-            // `serde_json::Value` DOM. Binary streams — the throughput
-            // formats — deserialize `PacketMetadata` straight from the bytes,
-            // avoiding a per-packet DOM allocation + reparse on the hot path.
-            if self.format == StreamFormat::Json {
-                let parsed = serde_json::from_slice::<serde_json::Value>(json_data)
-                    .ok()
-                    .and_then(|v| PacketMetadata::deserialize(&v).ok().map(|m| (m, v)));
-                let (metadata, json_value) = match parsed {
-                    Some(parsed) => parsed,
-                    None => {
-                        // Not a packet header — resync past this `{`. The
-                        // consumption is a cheap offset bump (no memmove), so
-                        // walking byte-by-byte through a corrupt region stays
-                        // linear overall.
-                        self.counters.parse_errors += 1;
-                        self.consume_buffer(json_start + 1);
-                        continue;
-                    }
-                };
-                let samples = self.parse_json_samples(&metadata, &json_value)?;
-                let mut metadata = metadata;
-                // The wire `samples` field holds the raw array length; for
-                // IQ payloads each Complex32 comes from two entries.
-                // Reconcile so downstream stats see the pair-aware count.
-                metadata.samples = samples.len() as u64;
-                self.counters.packets_parsed += 1;
-                self.counters.samples_decoded += samples.len() as u64;
-                self.consume_buffer(binary_start);
-                return Ok(Some(StreamPacket::new(metadata, samples)));
-            }
-
-            // Binary formats: deserialize the header straight into
-            // `PacketMetadata` — no throwaway `Value` DOM per packet. A
-            // non-header `{` (mid-stream corruption) fails to parse and we
-            // resync, exactly as the JSON path does.
-            let metadata = match serde_json::from_slice::<PacketMetadata>(json_data) {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    self.counters.parse_errors += 1;
-                    self.consume_buffer(json_start + 1);
-                    continue;
-                }
-            };
-
-            let expected_bytes = self.calculate_binary_size(&metadata)?;
-            if expected_bytes > Self::MAX_BINARY_PAYLOAD {
-                return Err(Error::Protocol(format!(
-                    "packet declares a binary payload of {} bytes (cap: {})",
-                    expected_bytes,
-                    Self::MAX_BINARY_PAYLOAD
-                )));
-            }
-            let binary_end = binary_start + expected_bytes;
-
-            if self.pending().len() < binary_end {
                 return Ok(None);
             }
+            HeaderScan::Header {
+                metadata,
+                json,
+                payload_start,
+                rejected,
+            } => {
+                self.counters.parse_errors += rejected as u64;
+                (*metadata, json, payload_start)
+            }
+        };
 
-            let samples = {
-                let binary_data = &self.pending()[binary_start..binary_end];
-                self.parse_binary_samples(&metadata, binary_data)?
-            };
+        // Pure-JSON streams carry the sample values inside the header
+        // document, so that path (and only that path) pays for a full
+        // `serde_json::Value` DOM. Binary streams — the throughput formats
+        // — never build one: the header the scan deserialized is the
+        // packet's metadata as is.
+        if self.format == StreamFormat::Json {
+            // The scan just parsed this text as `PacketMetadata`, so it is
+            // valid JSON; the error arm is unreachable but not worth a
+            // panic path.
+            let json_value = serde_json::from_slice::<serde_json::Value>(&self.pending()[json])
+                .map_err(|e| {
+                    Error::Protocol(format!("packet header is not a JSON document: {e}"))
+                })?;
+            let samples = self.parse_json_samples(&metadata, &json_value)?;
+            let mut metadata = metadata;
+            // The wire `samples` field holds the raw array length; for IQ
+            // payloads each Complex32 comes from two entries. Reconcile so
+            // downstream stats see the pair-aware count.
+            metadata.samples = samples.len() as u64;
             self.counters.packets_parsed += 1;
             self.counters.samples_decoded += samples.len() as u64;
-            let packet = StreamPacket::new(metadata, samples);
-            self.consume_buffer(binary_end);
-            return Ok(Some(packet));
+            self.consume_buffer(payload_start);
+            return Ok(Some(StreamPacket::new(metadata, samples)));
         }
+
+        let expected_bytes = self.calculate_binary_size(&metadata)?;
+        if expected_bytes > Self::MAX_BINARY_PAYLOAD {
+            return Err(Error::Protocol(format!(
+                "packet declares a binary payload of {} bytes (cap: {})",
+                expected_bytes,
+                Self::MAX_BINARY_PAYLOAD
+            )));
+        }
+        let binary_end = payload_start + expected_bytes;
+
+        if self.pending().len() < binary_end {
+            return Ok(None);
+        }
+
+        let samples = {
+            let binary_data = &self.pending()[payload_start..binary_end];
+            self.parse_binary_samples(&metadata, binary_data)?
+        };
+        self.counters.packets_parsed += 1;
+        self.counters.samples_decoded += samples.len() as u64;
+        let packet = StreamPacket::new(metadata, samples);
+        self.consume_buffer(binary_end);
+        Ok(Some(packet))
     }
 
     fn calculate_binary_size(&self, metadata: &PacketMetadata) -> Result<usize> {
@@ -1467,6 +1484,137 @@ mod tests {
         );
     }
     use super::*;
+
+    /// A minimal int16 IQ header for `n` pairs, without its terminator.
+    fn scan_header(n: usize) -> Vec<u8> {
+        format!(
+            r#"{{"startTime":0.0,"endTime":0.001,"startFrequency":95e6,"endFrequency":105e6,"sampleFrequency":15360000.0,"samples":{n},"unit":"volt","payload":"iq","minPower":-120,"maxPower":0,"sampleSize":2}}"#
+        )
+        .into_bytes()
+    }
+
+    /// The scan's framing contract on the hardware-verified wire format:
+    /// the header's text, both separator bytes spent, and the payload
+    /// starting right after them. A lone terminator of either kind is
+    /// still accepted, and consumes exactly one byte — a payload whose
+    /// first byte is `0x1E` must not be eaten as a second separator.
+    #[test]
+    fn the_scan_frames_the_two_byte_separator_and_lone_terminators() {
+        let header = scan_header(2);
+        let mut wire = header.clone();
+        wire.extend_from_slice(&[ASCII_LINE_FEED, ASCII_RECORD_SEPARATOR, 1, 2, 3]);
+        let HeaderScan::Header {
+            metadata,
+            json,
+            payload_start,
+            rejected,
+        } = scan_packet_header(&wire)
+        else {
+            panic!("a complete header must be found");
+        };
+        assert_eq!(metadata.samples, 2);
+        assert_eq!(&wire[json], &header[..]);
+        assert_eq!(payload_start, header.len() + 2);
+        assert_eq!(rejected, 0);
+
+        for lone in [ASCII_LINE_FEED, ASCII_RECORD_SEPARATOR] {
+            let mut wire = header.clone();
+            wire.extend_from_slice(&[lone, ASCII_RECORD_SEPARATOR, 0x42]);
+            let HeaderScan::Header { payload_start, .. } = scan_packet_header(&wire) else {
+                panic!("a complete header must be found");
+            };
+            // LF+RS is the two-byte separator; RS+RS is a lone RS and a
+            // payload that happens to start with 0x1E.
+            let expected = if lone == ASCII_LINE_FEED {
+                header.len() + 2
+            } else {
+                header.len() + 1
+            };
+            assert_eq!(payload_start, expected, "lone terminator {lone:#04x}");
+        }
+    }
+
+    /// A stray `{` from binary payload ahead of a real header shares the
+    /// header's terminator. The resync must step one byte past the stray
+    /// brace, not past the terminator — the coarser skip jumps straight
+    /// over the header.
+    #[test]
+    fn a_stray_brace_sharing_the_terminator_does_not_hide_the_header() {
+        let header = scan_header(4);
+        let mut wire = vec![0x00, b'{', 0x7F, b'{', 0x01];
+        let header_at = wire.len();
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(&[ASCII_LINE_FEED, ASCII_RECORD_SEPARATOR]);
+        let HeaderScan::Header { json, rejected, .. } = scan_packet_header(&wire) else {
+            panic!("the real header must be found");
+        };
+        assert_eq!(json, header_at..header_at + header.len());
+        assert_eq!(rejected, 2, "both stray braces were tried and rejected");
+    }
+
+    /// Regions with no header in them are spent whole, and an
+    /// unterminated candidate is kept while everything before it goes.
+    #[test]
+    fn the_scan_spends_headerless_regions_and_keeps_an_unfinished_candidate() {
+        let mut wire = b"{not a header}\n{nor this}\x1e".to_vec();
+        let junk_len = wire.len();
+        wire.extend_from_slice(&scan_header(1));
+        wire.push(ASCII_RECORD_SEPARATOR);
+        let HeaderScan::Header { json, rejected, .. } = scan_packet_header(&wire) else {
+            panic!("the header after the junk must be found");
+        };
+        assert_eq!(json.start, junk_len);
+        assert_eq!(rejected, 2);
+
+        // The candidate at index 7 has no terminator yet: kept, with the
+        // junk region and the garbage before it spent.
+        let partial = b"{junk}\n\x00{\"startTime\":0.0";
+        let HeaderScan::Incomplete {
+            skippable,
+            rejected,
+        } = scan_packet_header(partial)
+        else {
+            panic!("an unterminated header is not complete");
+        };
+        assert_eq!(skippable, 8);
+        assert_eq!(rejected, 1);
+
+        // No candidate at all: everything is spent.
+        let HeaderScan::Incomplete {
+            skippable,
+            rejected,
+        } = scan_packet_header(b"no brace here")
+        else {
+            panic!("no header without a brace");
+        };
+        assert_eq!(skippable, 13);
+        assert_eq!(rejected, 0);
+        assert!(matches!(
+            scan_packet_header(b""),
+            HeaderScan::Incomplete {
+                skippable: 0,
+                rejected: 0
+            }
+        ));
+    }
+
+    /// Brace-dense garbage without a terminator is the shape that made a
+    /// per-candidate terminator search quadratic; every candidate here
+    /// shares one terminator and is tried exactly once.
+    #[test]
+    fn brace_dense_garbage_is_tried_once_per_candidate() {
+        let braces = 4096;
+        let mut wire = vec![b'{'; braces];
+        wire.push(ASCII_LINE_FEED);
+        let header_at = wire.len();
+        wire.extend_from_slice(&scan_header(1));
+        wire.extend_from_slice(&[ASCII_LINE_FEED, ASCII_RECORD_SEPARATOR]);
+        let HeaderScan::Header { json, rejected, .. } = scan_packet_header(&wire) else {
+            panic!("the header after the garbage must be found");
+        };
+        assert_eq!(json.start, header_at);
+        assert_eq!(rejected, braces);
+    }
 
     fn iq_packet_bytes(samples: &[i16], scale: Option<f64>) -> Vec<u8> {
         let pairs = samples.len() / 2;

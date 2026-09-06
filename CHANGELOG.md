@@ -75,7 +75,10 @@ All notable changes to this project will be documented in this file.
   a nonsense yardstick. The meter also counted those packets' scalars at
   IQ byte width — half their wire cost — inflating the measured rate.
   Both trackers and the byte count now key on the packet's payload type,
-  and a sweep that decodes no IQ does not observe at all.
+  and a sweep that decodes no IQ does not observe at all. The probe's
+  header sniff follows the same rule: `stream_sample_rate` is read from
+  an IQ header, never from a spectra frame rate that happened to come
+  first.
 - **A failed measurement re-arms the check instead of retiring it.** A
   window that closed without a usable count, or before the device ever
   reported a rate, used to become "checked, no verdict" — permanently,
@@ -87,25 +90,39 @@ All notable changes to this project will be documented in this file.
   that actually observed less than half its configured span — a couple
   of packets plus a stray late closing observation say nothing about
   what the path sustains.
-- **`rate_reduction: Some(0)` no longer reads as "no decimation".** The
-  measurable gate accepted `n <= 1`; zero is a value this crate never
-  sends and the device would refuse, so it now reads as unmeasurable
-  rather than as a pass-through.
-- **The shared client builder no longer forces HTTP/1.1.** The probe's
-  `.http1_only()` was hoisted into `rtsa_client_builder` by the
-  consolidation, where it also governed the endpoints and streaming
-  clients — breaking streaming through a TLS-terminating proxy whose
-  ALPN offers only h2, a deployment that previously worked. Over plain
-  `http://` reqwest speaks HTTP/1.1 anyway, so the pin protected
-  nothing; the compatibility settings stay and ALPN negotiates.
-- **The header sniff scans each byte once and resyncs like the
-  parser.** The probe's rate sniff re-scanned its whole accumulation on
-  every chunk (quadratic in the bytes fed, on a stream that is nearly
-  all payload) and resynced a failed header parse past the separator
-  where the stream parser resyncs one byte past the `{` — binary
-  payloads contain separator bytes, so the two could disagree about
-  which header speaks first. It now drains bytes as they are ruled out
-  and frames headers with the parser's own scan.
+- **`rate_reduction(0)` is rejected at the boundary.** Both builders
+  accepted it and sent `?rate_reduction=0` to the server, while the
+  link check's measurable gate read `n <= 1` as "no decimation" and
+  computed a full-rate requirement against a wire the server was
+  decimating by whatever it made of zero. `HttpSourceBuilder::build`,
+  `HttpEndpointsClient::start_stream` and the probe now refuse it with
+  `Error::Config` (new `StreamParams::validate`), and the gate accepts
+  exactly 1.
+- **The shared client builder no longer forces HTTP/1.1.** The
+  consolidation carried the endpoints client's `.http1_only()` (which
+  the probe had copied) into `rtsa_client_builder`, where it also
+  pinned `HttpSource`'s streaming client — which had never had it, and
+  streamed through TLS-terminating proxies whose ALPN offers only h2.
+  Over plain `http://` reqwest speaks HTTP/1.1 regardless, so the pin
+  protected nothing there; over `https://` ALPN now negotiates for
+  every client, control plane included, with HTTP/2's adaptive
+  flow-control window enabled so a negotiated h2 stream is not capped
+  at hyper's default 2 MiB window per round trip — a ceiling the link
+  check would otherwise measure and blame on the path.
+- **One framing implementation, shared by the parser and the probe's
+  header sniff.** The probe's rate sniff re-scanned its whole
+  accumulation on every chunk and resynced a failed header parse past
+  the separator where the stream parser resyncs one byte past the `{`
+  — binary payloads contain separator bytes, so the two could disagree
+  about which header speaks first. `StreamParser` and the sniff now
+  frame packets through the same `scan_packet_header`, which finds each
+  region's terminator once rather than once per `{` candidate (the old
+  loop was quadratic in brace-dense garbage: 256 KiB of `{` took 20 s
+  of a tokio worker), honours the hardware-verified LF+RS two-byte
+  separator, and reports rejected candidates so the parser's
+  `parse_errors` counter is unchanged. The sniff drops bytes as they
+  are ruled out and retains at most one candidate awaiting its
+  terminator.
 
 ### Changed
 - **Byte-rate helpers answer `Option<f64>`, never a `0.0` sentinel.**
@@ -144,8 +161,23 @@ All notable changes to this project will be documented in this file.
   format instead of silently assuming int16. The no-rung-fits warning
   cites the device ladder's actual last rung rather than a hardcoded
   1/512.
+- **`HttpSource`'s stream-open failure is the typed error the rest of
+  the crate returns.** A non-success status on `/stream` is now
+  `Error::Http { status, context }` — the same variant the endpoints
+  client and the probe produce, with `context` naming the stream URL —
+  instead of `Error::Protocol("Stream endpoint returned error: …")`.
+  Anything matching on that text will need the new form.
 
 ### Added
+- **`utils::IQ_RATE_CLOCK_RATIO` and `utils::iq_ladder_from_top`.** The
+  1.5 receiver-clock-cycles-per-sample rule was a bare literal in three
+  places; it has a name now, and the ladder's shape is available
+  without the clock rule for a caller that already holds the top rung
+  — the link budget's device-anchored remedy, which used to reconstruct
+  a clock only to divide it back out (not exact in floating point).
+  `PacketMetadata::sample_rate()` likewise names the rate a header
+  reports (`sampleFrequency`, else `samples / duration`), shared by
+  `StreamingSdrConfig::from_metadata` and the probe's sniff.
 - **A link budget, so a span that cannot fit is caught before the
   capture instead of after it.** The span picks a rate off the
   decimation ladder and at 4 bytes a sample that rate is a byte rate the

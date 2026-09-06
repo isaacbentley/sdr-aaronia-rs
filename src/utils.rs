@@ -295,13 +295,23 @@ pub fn receiver_clock_for_label(label: &str) -> f64 {
     }
 }
 
+/// Receiver clock cycles per IQ sample at the fastest rate: the top of
+/// the decimation ladder is `receiver_clock / IQ_RATE_CLOCK_RATIO`, and
+/// [`validate_iq_mode`] refuses a span wider than that.
+///
+/// One definition, because the same 1.5 governs the ladder's top rung,
+/// the IQ-mode span check, and the link budget's device-anchored remedy
+/// — and because it is a hardware rule that may yet need revising for a
+/// full V6 (see [`iq_sample_rates_for_clock`]).
+pub const IQ_RATE_CLOCK_RATIO: f64 = 1.5;
+
 /// Highest IQ sample rate available with the default receiver clock.
 ///
-/// This is the [`DEFAULT_RECEIVER_CLOCK_HZ`] divided by the 1.5 factor
-/// that [`validate_iq_mode`] enforces, and it matches the maximum
-/// measured on a SPECTRAN V6 ECO. A full V6 can select a faster
-/// receiver clock, so use [`iq_sample_rates_for_clock`] when the clock
-/// is known rather than assuming this ceiling.
+/// This is the [`DEFAULT_RECEIVER_CLOCK_HZ`] divided by
+/// [`IQ_RATE_CLOCK_RATIO`], and it matches the maximum measured on a
+/// SPECTRAN V6 ECO. A full V6 can select a faster receiver clock, so use
+/// [`iq_sample_rates_for_clock`] when the clock is known rather than
+/// assuming this ceiling.
 pub const IQ_CLOCK_HZ: f64 = 61_440_000.0;
 
 /// Fraction of the sample rate that the device declares as usable RF
@@ -343,8 +353,8 @@ pub fn iq_sample_rates() -> [f64; 10] {
 /// The IQ sample rates available at a given receiver clock, highest
 /// first.
 ///
-/// The top rate is `receiver_clock_hz / 1.5`, the most that
-/// [`validate_iq_mode`] permits, and each step halves it.
+/// The top rate is `receiver_clock_hz / IQ_RATE_CLOCK_RATIO`, the most
+/// that [`validate_iq_mode`] permits, and each step halves it.
 ///
 /// **Measured only at the default clock.** A V6 ECO has a fixed
 /// receiver clock and produced exactly the ladder this returns for
@@ -364,10 +374,20 @@ pub fn iq_sample_rates() -> [f64; 10] {
 /// ladder and prefer the rate a device reports in its stream metadata
 /// over the one computed here.
 pub fn iq_sample_rates_for_clock(receiver_clock_hz: f64) -> [f64; 10] {
-    let top = receiver_clock_hz / 1.5;
+    iq_ladder_from_top(receiver_clock_hz / IQ_RATE_CLOCK_RATIO)
+}
+
+/// The decimation ladder whose top rung is `top_hz`: that rate and its
+/// nine successive halvings, highest first.
+///
+/// The ladder's shape without the clock rule — for a caller that already
+/// holds the top rung (a device-reported rate, say) and must not go
+/// through a clock reconstruction whose `× 1.5 / 1.5` round trip is not
+/// exact in floating point.
+pub fn iq_ladder_from_top(top_hz: f64) -> [f64; 10] {
     let mut rates = [0.0; 10];
     for (n, rate) in rates.iter_mut().enumerate() {
-        *rate = top / f64::from(1u32 << n);
+        *rate = top_hz / f64::from(1u32 << n);
     }
     rates
 }
@@ -474,9 +494,9 @@ pub fn decimation_index_for_bandwidth(bandwidth_hz: f64) -> usize {
 }
 
 /// Hardware constraint for IQ Mode: the configured span frequency
-/// must satisfy `span_freq * 1.5 ≤ receiver_clock`. Misconfigurations cause
-/// the SDK to silently emit corrupted samples; reject them at the API
-/// boundary instead.
+/// must satisfy `span_freq * IQ_RATE_CLOCK_RATIO ≤ receiver_clock`.
+/// Misconfigurations cause the SDK to silently emit corrupted samples;
+/// reject them at the API boundary instead.
 pub fn validate_iq_mode(span_freq_hz: f64, receiver_clock_hz: f64) -> Result<()> {
     if !span_freq_hz.is_finite() || span_freq_hz <= 0.0 {
         return Err(Error::Config(format!(
@@ -490,11 +510,11 @@ pub fn validate_iq_mode(span_freq_hz: f64, receiver_clock_hz: f64) -> Result<()>
             receiver_clock_hz
         )));
     }
-    let max_span = receiver_clock_hz / 1.5;
+    let max_span = receiver_clock_hz / IQ_RATE_CLOCK_RATIO;
     if span_freq_hz > max_span {
         return Err(Error::Config(format!(
             "IQ Mode constraint violated: span_frequency {:.3} MHz exceeds \
-             receiver_clock / 1.5 = {:.3} MHz. Lower the span \
+             receiver_clock / {IQ_RATE_CLOCK_RATIO} = {:.3} MHz. Lower the span \
              or raise the receiver clock.",
             span_freq_hz / 1e6,
             max_span / 1e6
