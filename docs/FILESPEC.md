@@ -375,7 +375,7 @@ Contains the actual measurement data.
 | `mPacketStartTime` | `double` | Start time of this chunk relative to stream start. |
 | `mPacketEndTime` | `double` | End time of this chunk relative to stream start. |
 | `mPacketFlags` | `quint32` | Packet flags (`DSPPF_*`). |
-| `mSampleSize` | `quint32` | Size of an individual sample. This crate treats it as the byte stride of one sample when seeking within IQ payloads (8 for float32 IQ); for spectra the vendor dump annotates it as the bin count — the two interpretations have not been reconciled against vendor documentation. |
+| `mSampleSize` | `quint32` | Values per sample, not bytes: 2 for an IQ pair, the bin count for a spectrum. The captures under `tests/` carry 2 (float32 IQ) and 1024 (spectra), the same meaning as the HTTP stream's `sampleSize`. The byte stride of a sample is this count times the width of `mSampleType`. |
 | `mSampleDepth` | `quint32` | Depth of a sample. |
 | `mNumSamples` | `quint32` | Number of samples in this packet. |
 | **Payload** | `binary` | The payload contains the actual sample data, formatted as specified by the header fields. |

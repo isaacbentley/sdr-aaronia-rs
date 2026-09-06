@@ -99,13 +99,13 @@ When using the HTTP backend over a network link, the wire format heavily impacts
 use sdr_aaronia_rs::AaroniaConfig;
 
 // Default (Float32): 8 bytes/sample on the wire. Lossless, zero-copy decode.
-// At 92 MSPS, requires ~740 MB/s network throughput (best for localhost).
+// At the 61.44 MS/s top rate that is ~490 MB/s (best for localhost).
 let _high_fidelity = AaroniaConfig::default()
     .center_frequency(2.4e9);
 
 // Low Bandwidth (Int16): 4 bytes/sample. Halves network traffic.
 // Requires setting both the format and the encode scale factor.
-// At 92 MSPS, requires ~370 MB/s.
+// At 61.44 MS/s, ~246 MB/s.
 let _low_bandwidth = AaroniaConfig::default()
     .center_frequency(2.4e9)
     .low_bandwidth_mode(); // Sets StreamFormat::Int16 and scale=32767.0
@@ -383,7 +383,7 @@ code you can run. CI builds them, so they stay current:
 | Task | Example |
 | --- | --- |
 | HTTP IQ streaming, first samples | [`http_iq_quickstart.rs`](../examples/http_iq_quickstart.rs) |
-| Health checks, input enumeration, recording control, license probing | [`device_control.rs`](../examples/device_control.rs) |
+| Health checks, server info, input enumeration | [`device_control.rs`](../examples/device_control.rs) |
 | Frequency hopping via the `sdr-source` traits | [`channel_hopping.rs`](../examples/channel_hopping.rs) |
 | FutureSDR flowgraph with FM demodulation | [`noaa_scanner.rs`](../examples/noaa_scanner.rs) |
 | Native SDK capture and transmit | [`native_sdk_basic.rs`](../examples/native_sdk_basic.rs), [`native_sdk_transmit.rs`](../examples/native_sdk_transmit.rs) |

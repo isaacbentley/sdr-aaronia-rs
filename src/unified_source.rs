@@ -430,6 +430,9 @@ pub struct AaroniaSource {
     /// reader task. Preferred over the configured values when reporting
     /// state, because the device may not honour a request exactly.
     http_observed: Option<Arc<Mutex<ObservedStream>>>,
+    /// The observed sample rate as `f64` bits, updated by the reader task,
+    /// so per-packet readers (`sample_rate_hz`) take no lock.
+    http_rate_bits: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Tuning the HTTP reader task re-applies after a reconnect. Shared
     /// with the retune setters, which write their *intent* here before
     /// issuing the PUT — so a reconnect racing a user retune re-applies
@@ -514,6 +517,7 @@ impl AaroniaSource {
 
             http_client: None,
             http_observed: None,
+            http_rate_bits: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -781,6 +785,8 @@ impl AaroniaSource {
         let tuning_for_task = tuning.clone();
         let observed = Arc::new(Mutex::new(ObservedStream::default()));
         let observed_for_task = observed.clone();
+        let rate_bits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let rate_bits_for_task = rate_bits.clone();
         let auto_reconnect = self.config.auto_reconnect;
 
         // Spawn a task to continuously read from the HTTP stream and send samples
@@ -799,6 +805,9 @@ impl AaroniaSource {
             // DropDetector can't see it (its timestamp history is reset
             // to avoid attributing the whole outage to one packet).
             let mut flag_overrun_after_gap = false;
+            // Whether any packet has reached the consumer: a failed
+            // *first* connection loses nothing, so it is not a gap.
+            let mut delivered_any = false;
 
             // Outer loop: one iteration per stream connection.
             'reconnect: loop {
@@ -816,7 +825,7 @@ impl AaroniaSource {
                             }
                             tokio::time::sleep(backoff).await;
                             backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                            flag_overrun_after_gap = true;
+                            flag_overrun_after_gap = delivered_any;
                             continue 'reconnect;
                         }
                     };
@@ -840,6 +849,10 @@ impl AaroniaSource {
                                         observed_for_task.lock().unwrap_or_else(|p| p.into_inner());
                                     if cfg.sample_rate > 0.0 {
                                         obs.sample_rate = cfg.sample_rate;
+                                        rate_bits_for_task.store(
+                                            cfg.sample_rate.to_bits(),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                     }
                                     if cfg.center_frequency > 0.0 {
                                         obs.center_frequency = cfg.center_frequency;
@@ -864,6 +877,7 @@ impl AaroniaSource {
                                     info!("Receiver dropped, HTTP streaming task exiting.");
                                     return;
                                 }
+                                delivered_any = true;
                             } else {
                                 warn!(
                                     "HTTP streaming task received non-IQ payload type: {:?}",
@@ -950,6 +964,7 @@ impl AaroniaSource {
 
         self.http_client = Some(client);
         self.http_observed = Some(observed);
+        self.http_rate_bits = Some(rate_bits);
         self.http_tuning = Some(tuning);
         self.http_receiver = Some(receiver); // Store the receiver
         self.http_task = Some(reader_task); // Held so stop/drop can abort it
@@ -1019,14 +1034,23 @@ impl AaroniaSource {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
-                // HTTP streaming is automatically started during initialization
-                // Verify that the receiver channel is still active
-                if self.http_receiver.is_some() {
+                // The reader task is spawned at construction, so the first
+                // start is a no-op. After `stop_streaming` the task is gone
+                // and the receiver is `None`: re-run the HTTP init so a
+                // stop/start cycle (SoapySDR deactivate/activate, seify
+                // deactivate_at/activate_at) reconnects instead of failing.
+                let reader_alive = self.http_receiver.is_some()
+                    && self.http_task.as_ref().is_some_and(|t| !t.is_finished());
+                if reader_alive {
                     info!("HTTP streaming confirmed active");
                 } else {
-                    return Err(Error::Config(
-                        "HTTP streaming not properly initialized".to_string(),
-                    ));
+                    info!("HTTP reader is not running; reconnecting");
+                    if let Some(task) = self.http_task.take() {
+                        task.abort();
+                    }
+                    self.sample_buffer.clear();
+                    self.pending_overrun = false;
+                    self.init_http_source().await?;
                 }
             }
             SourceType::File => {
@@ -1091,9 +1115,9 @@ impl AaroniaSource {
     /// `Error::Io(TimedOut)`. `timeout` of zero performs a non-blocking
     /// drain of already-buffered samples.
     ///
-    /// File and native-SDK backends delegate to their existing reads
-    /// (disk reads don't wait; the SDK path polls with its own short
-    /// internal deadline, looped here until `timeout` expires).
+    /// File reads delegate to the existing read (disk reads don't wait).
+    /// The native-SDK path polls the device with what is left of
+    /// `timeout` on each round, so a zero timeout drains without waiting.
     pub async fn read_samples_deadline(
         &mut self,
         buffer: &mut Vec<Complex32>,
@@ -1163,9 +1187,21 @@ impl AaroniaSource {
             SourceType::NativeSdk => {
                 let start_len = buffer.len();
                 loop {
-                    let n = self
-                        .read_samples(buffer, max_samples - (buffer.len() - start_len))
-                        .await?;
+                    // Bound the SDK poll by what is left of the deadline,
+                    // so a zero timeout drains without waiting as the C
+                    // header promises.
+                    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let want = max_samples - (buffer.len() - start_len);
+                    let n = match self.native_source.as_mut() {
+                        Some(source) => unsafe {
+                            source.read_samples_within(buffer, want, budget)?
+                        },
+                        None => {
+                            return Err(Error::Config(
+                                "Native SDK source not initialized".to_string(),
+                            ));
+                        }
+                    };
                     let total = buffer.len() - start_len;
                     if total >= max_samples
                         || tokio::time::Instant::now() >= deadline
@@ -1262,6 +1298,18 @@ impl AaroniaSource {
                             break;
                         }
                         Err(_) => {
+                            // Samples already moved into `buffer` are not
+                            // put back, so a timeout after a partial block
+                            // returns that block, as `read_samples_deadline`
+                            // does. Erroring here lost everything collected
+                            // so far without flagging a gap.
+                            if collected > 0 {
+                                warn!(
+                                    "Timeout waiting for HTTP samples; returning {} of {} requested",
+                                    collected, max_samples
+                                );
+                                break;
+                            }
                             error!("Timeout waiting for HTTP samples.");
                             return Err(Error::Io(std::io::Error::new(
                                 std::io::ErrorKind::TimedOut,
@@ -1310,7 +1358,9 @@ impl AaroniaSource {
         overrun
     }
 
-    /// Return the cumulative number of dropped packets.
+    /// Number of timestamp gaps the drop detector has seen since the
+    /// source was created: one per gap event, however many samples it
+    /// spanned.
     pub fn cumulative_drops(&self) -> u64 {
         self.cumulative_drops
     }
@@ -1355,6 +1405,7 @@ impl AaroniaSource {
                 // reach a task that no longer exists.
                 self.http_tuning = None;
                 self.http_observed = None;
+                self.http_rate_bits = None;
                 info!("HTTP streaming stopped: reader task aborted, receiver dropped.");
             }
             SourceType::File => {
@@ -1639,6 +1690,30 @@ impl AaroniaSource {
         self.probe_remote_config_license().await
     }
 
+    /// The sample rate in Hz: what the stream reports once packets are
+    /// flowing on HTTP sources, otherwise the configured span. Cheap
+    /// enough to call per packet: a relaxed atomic load, no lock, unlike
+    /// [`Self::get_source_info`].
+    pub fn sample_rate_hz(&self) -> f64 {
+        let observed = self
+            .http_rate_bits
+            .as_ref()
+            .map(|b| f64::from_bits(b.load(std::sync::atomic::Ordering::Relaxed)))
+            .unwrap_or(0.0);
+        if observed > 0.0 {
+            observed
+        } else {
+            self.config.span_frequency
+        }
+    }
+
+    fn observed_stream(&self) -> ObservedStream {
+        self.http_observed
+            .as_ref()
+            .map(|o| *o.lock().unwrap_or_else(|p| p.into_inner()))
+            .unwrap_or_default()
+    }
+
     /// Get information about the current source
     /// Current source state.
     ///
@@ -1648,11 +1723,7 @@ impl AaroniaSource {
     /// rung of its ladder. Before the first packet, and on other
     /// backends, the configured values are reported.
     pub fn get_source_info(&self) -> SourceInfo {
-        let observed = self
-            .http_observed
-            .as_ref()
-            .map(|o| *o.lock().unwrap_or_else(|p| p.into_inner()))
-            .unwrap_or_default();
+        let observed = self.observed_stream();
         let pick = |seen: f64, configured: f64| if seen > 0.0 { seen } else { configured };
         SourceInfo {
             source_type: self.source_type.clone(),
@@ -2055,6 +2126,7 @@ mod tests {
             native_source: None,
             http_client: None,
             http_observed: None,
+            http_rate_bits: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -2133,6 +2205,7 @@ mod tests {
             native_source: None,
             http_client: None,
             http_observed: None,
+            http_rate_bits: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -2163,6 +2236,7 @@ mod tests {
             native_source: None,
             http_client: None,
             http_observed: None,
+            http_rate_bits: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -2195,6 +2269,7 @@ mod tests {
             native_source: None,
             http_client: None,
             http_observed: None,
+            http_rate_bits: None,
             http_tuning: None,
             file_source: None,
             http_receiver: None,
@@ -2372,6 +2447,7 @@ mod tests {
             native_source: None,
             http_client: None,
             http_observed: None,
+            http_rate_bits: None,
             http_tuning: None,
             file_source: None,
             http_receiver: Some(chunk_rx),

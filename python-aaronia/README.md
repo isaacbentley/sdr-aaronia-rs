@@ -196,7 +196,7 @@ silently defaulting.
 | `read_samples_arrow(count)` | PyArrow `FixedSizeListArray` of `[re, im]` float32 pairs |
 | `read_samples_dual_numpy(count)` | `(rx1, rx2)` NumPy arrays (dual-channel captures) |
 | `set_center_frequency(hz)` / `set_sample_rate(hz)` / `set_reference_level(dbm)` | Live retuning |
-| `cumulative_drops()` | Total server-reported dropped samples |
+| `cumulative_drops()` | Timestamp gaps detected in the stream so far (gap events, not samples) |
 | `take_overrun()` | True once per detected receive-side overrun |
 | `last_timestamp_ns()` | Epoch-ns timestamp of the last received block (HTTP backend; 0 otherwise) |
 

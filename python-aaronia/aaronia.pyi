@@ -174,7 +174,7 @@ class AaroniaSource:
         """True once per detected receive-side overrun, then cleared."""
 
     def cumulative_drops(self) -> int:
-        """Total samples the drop detector has attributed to gaps."""
+        """Number of timestamp gaps detected in the stream so far (gap events, not samples)."""
 
     def last_timestamp_ns(self) -> int:
         """Epoch-nanosecond timestamp of the most recent block.

@@ -1492,7 +1492,10 @@ impl HttpEndpointsClient {
         }
 
         // Now test write operations by attempting a safe configuration change.
-        let test_result = self.verify_config_changes("reflevel", 1.0).await;
+        // `reflevel0` in the receiver block is what a V6 exposes; the bare
+        // `reflevel` under a group named `main` matched nothing, so this
+        // probe could never report `Active`.
+        let test_result = self.verify_config_changes("reflevel0", 1.0).await;
 
         match test_result {
             Ok(verification) => {
@@ -1669,29 +1672,23 @@ impl HttpEndpointsClient {
         })
     }
 
-    /// Helper method to apply a parameter change
+    /// Write one `main`-group field of the receiver block that carries it,
+    /// the same way [`Self::apply_capture_config`] does. A PUT naming a
+    /// block that is not in the mission returns 200 and changes nothing,
+    /// so the block is discovered, never assumed.
     async fn apply_parameter_change(&self, parameter: &str, value: f64) -> Result<()> {
-        // Create a config item for the parameter
-        let config_item = if parameter.contains("reflevel") {
-            ConfigItem::Float {
-                name: "reflevel".to_string(),
-                label: "Reference Level".to_string(),
-                flags: String::new(),
-                value,
-                default: -30.0,
-                min: Some(-120.0),
-                max: Some(30.0),
-                step: Some(1.0),
-                unit: Some("dBm".to_string()),
-            }
-        } else {
+        if !parameter.starts_with("reflevel") {
             return Err(Error::Protocol(format!(
                 "Unsupported parameter type: {}",
                 parameter
             )));
-        };
-
-        let _response = self.update_config(1, "main", vec![config_item]).await?;
+        }
+        let block = self.find_block_name_with_field(parameter).await?;
+        let mut main = serde_json::Map::new();
+        main.insert(parameter.to_string(), serde_json::json!(value));
+        let mut groups = serde_json::Map::new();
+        groups.insert("main".to_string(), serde_json::Value::Object(main));
+        self.simple_remote_config(&block, groups).await?;
         Ok(())
     }
 

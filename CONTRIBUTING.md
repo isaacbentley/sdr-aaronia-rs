@@ -120,7 +120,7 @@ open target/llvm-cov/html/index.html   # xdg-open on Linux, start on Windows
 
 ### 7. Criterion Benchmarks (`benches/`)
 
-Three benchmark harnesses track the hot paths across releases. Benchmarks are run on demand to investigate performance implications of a PR.
+Four benchmark harnesses track the hot paths across releases. Benchmarks are run on demand to investigate performance implications of a PR.
 
 ```bash
 cargo bench                                       # Run all benchmarks

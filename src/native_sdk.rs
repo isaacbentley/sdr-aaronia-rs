@@ -454,6 +454,14 @@ type AARTSAAPI_SendPacket = unsafe extern "C" fn(
 
 // === Native SDK Client ===
 
+/// `AARTSAAPI_Init` and `AARTSAAPI_Shutdown` are process-wide (the vendor
+/// header: call Init once at startup and Shutdown before exit), while every
+/// `NativeSdkSource` and `SdkSink` owns its own client. Counting the live
+/// initialisations initialises the SDK on the first client and shuts it
+/// down on the last, rather than tearing it down under a source that is
+/// still streaming because a sibling client was dropped.
+static SDK_LIVE_INITS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
 pub struct NativeSdkClient {
     _lib: Library,
     initialized: std::sync::atomic::AtomicBool,
@@ -645,18 +653,50 @@ impl NativeSdkClient {
 
     pub unsafe fn init_with_path(&self, memory: u32, xml_path: &str) -> Result<()> {
         unsafe {
-            let wide_path = string_to_wide(xml_path)?;
-            let result = (self.init_with_path)(memory, wide_path.as_ptr());
-            check_res(result, "AARTSAAPI_Init_With_Path")?;
+            // Checked under the lock so two initialisations of the same
+            // client cannot both count themselves.
+            let mut live = SDK_LIVE_INITS.lock().unwrap_or_else(|p| p.into_inner());
+            if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+            if *live == 0 {
+                let wide_path = string_to_wide(xml_path)?;
+                let result = (self.init_with_path)(memory, wide_path.as_ptr());
+                check_res(result, "AARTSAAPI_Init_With_Path")?;
+                info!("SDK initialized successfully");
+            } else {
+                debug!(
+                    "SDK already initialized by {} other client(s); sharing it",
+                    *live
+                );
+            }
+            *live += 1;
             self.initialized
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            info!("SDK initialized successfully");
             Ok(())
         }
     }
 
+    /// Release this client's hold on the SDK. `AARTSAAPI_Shutdown` runs
+    /// only when no other client is initialised; a no-op on a client
+    /// that never initialised.
     pub unsafe fn shutdown(&self) -> Result<()> {
         unsafe {
+            if !self
+                .initialized
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+            let mut live = SDK_LIVE_INITS.lock().unwrap_or_else(|p| p.into_inner());
+            *live = live.saturating_sub(1);
+            if *live > 0 {
+                debug!(
+                    "SDK still in use by {} other client(s); not shut down",
+                    *live
+                );
+                return Ok(());
+            }
             let result = (self.shutdown)();
             check_res(result, "AARTSAAPI_Shutdown")?;
             info!("SDK shutdown successfully");
@@ -675,6 +715,11 @@ impl NativeSdkClient {
             let mut handle = AARTSAAPI_Handle { d: ptr::null_mut() };
             let result = (self.open)(&mut handle);
             check_res(result, "AARTSAAPI_Open")?;
+            if handle.d.is_null() {
+                return Err(Error::Sdk(format!(
+                    "AARTSAAPI_Open returned no handle (result 0x{result:08X})"
+                )));
+            }
             debug!("SDK handle opened successfully");
             Ok(handle)
         }
@@ -830,6 +875,13 @@ impl NativeSdkClient {
             );
 
             check_res(result, "AARTSAAPI_OpenDevice")?;
+            // Result codes without the error bit (EMPTY, RETRY, the state
+            // codes) pass `check_res`; only a non-null object is success.
+            if device.d.is_null() {
+                return Err(Error::Sdk(format!(
+                    "AARTSAAPI_OpenDevice({device_type}) returned no device (result 0x{result:08X})"
+                )));
+            }
             info!("Device {} opened successfully", device_type);
             Ok(device)
         }
@@ -894,6 +946,11 @@ impl NativeSdkClient {
             let mut config = AARTSAAPI_Config { d: ptr::null_mut() };
             let result = (self.config_root)(device, &mut config);
             check_res(result, "AARTSAAPI_ConfigRoot")?;
+            if config.d.is_null() {
+                return Err(Error::Sdk(format!(
+                    "AARTSAAPI_ConfigRoot returned no config (result 0x{result:08X})"
+                )));
+            }
             Ok(config)
         }
     }
@@ -910,6 +967,11 @@ impl NativeSdkClient {
             let result = (self.config_find)(device, group, &mut config, wide_path.as_ptr());
 
             check_res(result, "AARTSAAPI_ConfigFind")?;
+            if config.d.is_null() {
+                return Err(Error::Sdk(format!(
+                    "config `{path}` not found (result 0x{result:08X})"
+                )));
+            }
             debug!("Config {} found successfully", path);
             Ok(config)
         }
@@ -1202,11 +1264,11 @@ impl NativeSdkClient {
 
 impl Drop for NativeSdkClient {
     fn drop(&mut self) {
-        if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
-            unsafe {
-                if let Err(e) = self.shutdown() {
-                    error!("Error shutting down SDK during NativeSdkClient drop: {}", e);
-                }
+        // `shutdown` is a no-op unless this client initialised, and only
+        // the last live client actually shuts the SDK down.
+        unsafe {
+            if let Err(e) = self.shutdown() {
+                error!("Error shutting down SDK during NativeSdkClient drop: {}", e);
             }
         }
     }
@@ -1240,6 +1302,16 @@ pub(crate) fn split_device_type<'a>(device_type: &'a str, default_mode: &str) ->
         format!("{family}/{default_mode}")
     };
     (family, open_mode)
+}
+
+/// The open-mode suffix that gives raw IQ on `family`: `raw` on the V6,
+/// `rtsa` on the ECO, which has no `spectranv6eco/raw`.
+pub(crate) fn raw_mode_for_family(family: &str) -> &'static str {
+    if family == "spectranv6eco" {
+        "rtsa"
+    } else {
+        "raw"
+    }
 }
 
 /// How one [`NativeSdkSource::read_samples`] call divides its work between
@@ -1613,6 +1685,10 @@ impl NativeSdkSource {
 
     pub unsafe fn initialize(&mut self) -> Result<()> {
         unsafe {
+            // Idempotent: a second call must not leak the open handle.
+            if self.handle.is_some() {
+                return Ok(());
+            }
             // Initialize SDK with XML path
             let xml_path = get_xml_config_path()
                 .ok_or_else(|| Error::Sdk("Could not determine XML config path".to_string()))?;
@@ -1665,6 +1741,14 @@ impl NativeSdkSource {
         serial_number: &[WideChar],
     ) -> Result<()> {
         unsafe {
+            // Opening over a live device would leave it opened and
+            // streaming with nothing left to stop or close it.
+            if self.device.is_some() {
+                return Err(Error::Sdk(
+                    "a device is already open on this source; stop and drop it before opening another"
+                        .to_string(),
+                ));
+            }
             let handle = self
                 .handle
                 .as_mut()
@@ -1709,6 +1793,12 @@ impl NativeSdkSource {
                         NativeSdkClient::DEVICE_FAMILIES.join(", ")
                     ))
                 })?
+            };
+            // `raw` is the V6's name for the pipeline the ECO calls `rtsa`.
+            let mode = if mode == "raw" {
+                raw_mode_for_family(&family)
+            } else {
+                mode
             };
             let open_string = format!("{family}/{mode}");
             self.open_device(&open_string, serial_number)
@@ -2183,8 +2273,41 @@ impl NativeSdkSource {
                         "spectra packet claims {frames} frames of {bins} bins,                          which exceeds the {MAX_VALUES}-value limit"
                     )));
                 };
+                // `stride` is floats from frame to frame; `size` is the
+                // floats of data in each. They differ when frames are
+                // padded, and a flat copy would then shift every frame
+                // after the first.
+                let Ok(stride) = usize::try_from(packet.stride) else {
+                    return Err(Error::Sdk(format!(
+                        "spectra packet has a negative stride ({})",
+                        packet.stride
+                    )));
+                };
                 out.reserve(total);
-                out.extend_from_slice(std::slice::from_raw_parts(packet.fp32, total));
+                if stride == 0 || stride == bins {
+                    out.extend_from_slice(std::slice::from_raw_parts(packet.fp32, total));
+                } else if stride > bins {
+                    let span = (frames - 1)
+                        .checked_mul(stride)
+                        .and_then(|n| n.checked_add(bins))
+                        .filter(|n| *n <= MAX_VALUES * 2);
+                    if span.is_none() {
+                        return Err(Error::Sdk(format!(
+                            "spectra packet claims {frames} frames at stride {stride}, \
+                             which exceeds the {MAX_VALUES}-value limit"
+                        )));
+                    }
+                    for frame in 0..frames {
+                        out.extend_from_slice(std::slice::from_raw_parts(
+                            packet.fp32.add(frame * stride),
+                            bins,
+                        ));
+                    }
+                } else {
+                    return Err(Error::Sdk(format!(
+                        "spectra packet stride {stride} is smaller than its size {bins}"
+                    )));
+                }
                 Ok(Some(SpectraRead {
                     frames,
                     bins_per_frame: bins,
@@ -2239,6 +2362,22 @@ impl NativeSdkSource {
         &mut self,
         buffer: &mut Vec<Complex32>,
         max_samples: usize,
+    ) -> Result<usize> {
+        unsafe { self.read_samples_within(buffer, max_samples, Self::READ_POLL_DEADLINE) }
+    }
+
+    /// [`Self::read_samples`] with the wait for a packet bounded by
+    /// `poll_budget` instead of [`Self::READ_POLL_DEADLINE`]. A zero
+    /// budget drains carry-over and takes one already-queued packet
+    /// without sleeping.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::read_samples`].
+    pub unsafe fn read_samples_within(
+        &mut self,
+        buffer: &mut Vec<Complex32>,
+        max_samples: usize,
+        poll_budget: std::time::Duration,
     ) -> Result<usize> {
         unsafe {
             if !self.stream_active {
@@ -2297,10 +2436,13 @@ impl NativeSdkSource {
                 match self.client.get_packet(device, 0, 0)? {
                     Some(p) => break Some(p),
                     None => {
-                        if started.elapsed() >= Self::READ_POLL_DEADLINE {
+                        let elapsed = started.elapsed();
+                        if elapsed >= poll_budget {
                             break None;
                         }
-                        std::thread::sleep(Self::READ_POLL_INTERVAL);
+                        // Never sleep past the budget: a sub-interval
+                        // deadline gets the remainder, not a full tick.
+                        std::thread::sleep(Self::READ_POLL_INTERVAL.min(poll_budget - elapsed));
                     }
                 }
             };
@@ -2697,6 +2839,14 @@ impl Drop for NativeSdkSource {
         unsafe {
             if let Err(e) = self.stop_streaming() {
                 error!("Error stopping streaming during drop: {}", e);
+            }
+
+            // Close the device before the handle: an opened device that is
+            // never closed stays exclusively held until the process exits.
+            if let (Some(mut device), Some(handle)) = (self.device.take(), self.handle.as_mut())
+                && let Err(e) = self.client.close_device(handle, &mut device)
+            {
+                error!("Error closing device during drop: {}", e);
             }
 
             if let Some(e) = self

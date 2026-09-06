@@ -656,6 +656,9 @@ pub struct StreamParser {
     /// time resync over a corrupt region doesn't trigger an O(n²) memmove
     /// cascade.
     consumed: usize,
+    /// Bytes of a rejected (over-cap) payload still to arrive. They are
+    /// dropped on receipt rather than buffered or scanned for headers.
+    skip_bytes: usize,
     /// The server-side encode scale requested via `?scale=N`, used as the
     /// fallback when a packet's `scale` field is absent. **Semantics
     /// (verified on live hardware)**: `scale` is the multiplier the server
@@ -677,6 +680,7 @@ impl StreamParser {
             format,
             buffer: Vec::new(),
             consumed: 0,
+            skip_bytes: 0,
             default_encode_scale: scale,
             counters: StatsCounters::default(),
             started_at: Instant::now(),
@@ -701,6 +705,16 @@ impl StreamParser {
     pub fn reset_stats(&mut self) {
         self.counters = StatsCounters::default();
         self.started_at = Instant::now();
+    }
+
+    /// Discard any partially buffered packet. Call this when the
+    /// connection is replaced: a header left over from the old stream
+    /// would otherwise be applied to the new stream's first bytes.
+    /// Counters are kept; use [`Self::reset_stats`] for those.
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.consumed = 0;
+        self.skip_bytes = 0;
     }
 
     /// The wire's encode scale for this packet: the per-packet `scale`
@@ -730,7 +744,13 @@ impl StreamParser {
     /// remaining packets in multi-packet chunks.
     pub fn process_data(&mut self, data: &Bytes) -> Result<Vec<StreamPacket>> {
         self.counters.bytes_processed += data.len() as u64;
-        self.buffer.extend_from_slice(data);
+        // The tail of a rejected payload: drop it without buffering.
+        let skip = self.skip_bytes.min(data.len());
+        self.skip_bytes -= skip;
+        if skip == data.len() {
+            return Ok(Vec::new());
+        }
+        self.buffer.extend_from_slice(&data[skip..]);
 
         let mut completed_packets = Vec::new();
         loop {
@@ -837,7 +857,16 @@ impl StreamParser {
                 .map_err(|e| {
                     Error::Protocol(format!("packet header is not a JSON document: {e}"))
                 })?;
-            let samples = self.parse_json_samples(&metadata, &json_value)?;
+            let samples = match self.parse_json_samples(&metadata, &json_value) {
+                Ok(samples) => samples,
+                Err(e) => {
+                    // The header parsed but the body did not: skip the
+                    // packet so the next call moves on instead of failing
+                    // on the same bytes forever.
+                    self.consume_buffer(payload_start);
+                    return Err(e);
+                }
+            };
             let mut metadata = metadata;
             // The wire `samples` field holds the raw array length; for IQ
             // payloads each Complex32 comes from two entries. Reconcile so
@@ -849,8 +878,23 @@ impl StreamParser {
             return Ok(Some(StreamPacket::new(metadata, samples)));
         }
 
-        let expected_bytes = self.calculate_binary_size(&metadata)?;
+        let expected_bytes = match self.calculate_binary_size(&metadata) {
+            Ok(n) => n,
+            Err(e) => {
+                // Same as the oversized case below: the header is bad,
+                // skip it rather than fail on it forever.
+                self.consume_buffer(payload_start);
+                return Err(e);
+            }
+        };
         if expected_bytes > Self::MAX_BINARY_PAYLOAD {
+            // Drop the header and whatever of the payload has already
+            // arrived, and skip the rest as it streams in, so payload
+            // bytes are neither buffered nor scanned for headers.
+            let buffered = self.pending().len();
+            let payload_already_here = buffered - payload_start;
+            self.skip_bytes = expected_bytes.saturating_sub(payload_already_here);
+            self.consume_buffer(buffered);
             return Err(Error::Protocol(format!(
                 "packet declares a binary payload of {} bytes (cap: {})",
                 expected_bytes,
@@ -865,7 +909,17 @@ impl StreamParser {
 
         let samples = {
             let binary_data = &self.pending()[payload_start..binary_end];
-            self.parse_binary_samples(&metadata, binary_data)?
+            self.parse_binary_samples(&metadata, binary_data)
+        };
+        let samples = match samples {
+            Ok(samples) => samples,
+            Err(e) => {
+                // Header and payload are both buffered, so the whole packet
+                // can be skipped. Leaving it in place made every later call
+                // fail on the same packet while the buffer grew unbounded.
+                self.consume_buffer(binary_end);
+                return Err(e);
+            }
         };
         self.counters.packets_parsed += 1;
         self.counters.samples_decoded += samples.len() as u64;
@@ -1059,45 +1113,48 @@ impl StreamParser {
         use tracing::{debug, warn};
 
         // Handle compression if present
-        let data_to_parse = if let Some(compression_factor) = metadata.compression {
-            if compression_factor > 0 {
-                debug!(
-                    "Decompressing spectrum data: {} bytes with compression factor {}",
-                    data.len(),
-                    compression_factor
-                );
+        let data_to_parse: std::borrow::Cow<'_, [u8]> =
+            if let Some(compression_factor) = metadata.compression {
+                if compression_factor > 0 {
+                    debug!(
+                        "Decompressing spectrum data: {} bytes with compression factor {}",
+                        data.len(),
+                        compression_factor
+                    );
 
-                match self.decompress_spectrum_data(data, compression_factor, metadata) {
-                    Ok(decompressed_data) => {
-                        debug!(
-                            "Successfully decompressed spectrum data: {} -> {} bytes",
-                            data.len(),
-                            decompressed_data.len()
-                        );
-                        decompressed_data
+                    match self.decompress_spectrum_data(data, compression_factor, metadata) {
+                        Ok(decompressed_data) => {
+                            debug!(
+                                "Successfully decompressed spectrum data: {} -> {} bytes",
+                                data.len(),
+                                decompressed_data.len()
+                            );
+                            std::borrow::Cow::Owned(decompressed_data)
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to decompress spectrum data (compression factor {}): {:?}.",
+                                compression_factor, e
+                            );
+                            return Err(e);
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to decompress spectrum data (compression factor {}): {:?}.",
-                            compression_factor, e
-                        );
-                        return Err(e);
-                    }
+                } else {
+                    debug!("Spectrum data is uncompressed (compression factor 0)");
+                    std::borrow::Cow::Borrowed(data)
                 }
             } else {
-                debug!("Spectrum data is uncompressed (compression factor 0)");
-                data.to_vec()
-            }
-        } else {
-            // No compression metadata - assume uncompressed
-            debug!("No compression metadata found - treating as uncompressed spectrum data");
-            data.to_vec()
-        };
+                // No compression metadata - assume uncompressed
+                debug!("No compression metadata found - treating as uncompressed spectrum data");
+                std::borrow::Cow::Borrowed(data)
+            };
 
-        let data_to_parse = &data_to_parse;
+        let data_to_parse: &[u8] = &data_to_parse;
 
         // For spectrum data, convert to complex with real values and zero imaginary
-        let mut samples = Vec::new();
+        // One scalar per sample here, half the bytes of an IQ pair.
+        let bytes_per_scalar = (self.format.iq_bytes_per_sample().unwrap_or(2) / 2).max(1);
+        let mut samples = Vec::with_capacity(data_to_parse.len() / bytes_per_scalar);
 
         match self.format {
             StreamFormat::Int16 => {
@@ -1116,7 +1173,7 @@ impl StreamParser {
             }
             StreamFormat::Float32 => {
                 for chunk in data_to_parse.as_chunks::<4>().0 {
-                    let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    let val = f32::from_le_bytes(*chunk);
                     samples.push(Complex32::new(val, 0.0));
                 }
             }
@@ -1732,6 +1789,40 @@ mod tests {
         let s = &packets[0].samples[0];
         assert!((s.re - 1.0).abs() < 1e-6, "1000 / 1000 = 1.0");
         assert!((s.im - -1.0).abs() < 1e-6);
+    }
+
+    /// A header that parses but whose body cannot be decoded must be
+    /// skipped: leaving it buffered made every later call fail on the
+    /// same bytes while the buffer grew without bound.
+    #[test]
+    fn test_undecodable_packet_is_skipped() {
+        let mut parser = StreamParser::new(StreamFormat::Float32, None).unwrap();
+        // 40M IQ samples at 8 bytes each is 320 MB, over the payload cap.
+        let oversized = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":40000000,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
+        let mut payload = oversized.as_bytes().to_vec();
+        payload.push(ASCII_RECORD_SEPARATOR);
+        assert!(parser.process_data(&Bytes::from(payload)).is_err());
+        assert_eq!(parser.skip_bytes, 320_000_000);
+
+        // The payload is dropped as it arrives, not buffered or scanned.
+        let junk = vec![b'{'; 4096];
+        assert!(parser.process_data(&Bytes::from(junk)).unwrap().is_empty());
+        assert_eq!(parser.skip_bytes, 320_000_000 - 4096);
+        assert!(parser.pending().is_empty());
+        // Fast-forward past the remainder of the payload.
+        parser.skip_bytes = 0;
+
+        // The bad header is gone, so a good packet parses on the next call.
+        let good = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":1,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
+        let mut payload = good.as_bytes().to_vec();
+        payload.push(ASCII_RECORD_SEPARATOR);
+        for v in [0.25f32, -0.25] {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        let packets = parser.process_data(&Bytes::from(payload)).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].samples[0], Complex32::new(0.25, -0.25));
+        assert_eq!(parser.stats().parse_errors, 1);
     }
 
     /// Real Aaronia servers separate the JSON header from the binary

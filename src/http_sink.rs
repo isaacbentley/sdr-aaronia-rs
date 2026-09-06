@@ -53,8 +53,10 @@ impl HttpSinkBuilder {
 
     /// Set the internal buffer size (number of samples per chunk sent via HTTP).
     #[must_use]
+    /// Zero is clamped to one: an empty buffer can never fill, and
+    /// `work` would spin on it forever.
     pub fn buffer_size(mut self, size: usize) -> Self {
-        self.buffer_size = size;
+        self.buffer_size = size.max(1);
         self
     }
 
@@ -125,6 +127,7 @@ impl HttpSink {
         auth_method: AuthMethod,
         streaming_delay: f64,
     ) -> Result<Self> {
+        let buffer_size = buffer_size.max(1);
         let endpoints_client = HttpEndpointsClient::new(base_url, auth_method)?;
 
         let now = SystemTime::now()

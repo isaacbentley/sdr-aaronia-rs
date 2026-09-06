@@ -12,7 +12,7 @@
 class SoapyAaronia < Formula
   desc "SoapySDR plugin for Aaronia SPECTRAN V6 spectrum analyzers"
   homepage "https://github.com/isaacbentley/sdr-aaronia-rs"
-  version "0.7.6"
+  version "0.7.7"
   license "GPL-3.0-or-later"
 
   # Prebuilt modules: the plugin statically links its Rust core, so there

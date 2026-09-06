@@ -4,6 +4,59 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.7.7] - 2026-09-06
+
+### Added
+- **`utils::IQ_RATE_CLOCK_RATIO` and `utils::iq_ladder_from_top`.** The
+  1.5 receiver-clock-cycles-per-sample rule was a bare literal in three
+  places; it has a name now, and the ladder's shape is available
+  without the clock rule for a caller that already holds the top rung
+  — the link budget's device-anchored remedy, which used to reconstruct
+  a clock only to divide it back out (not exact in floating point).
+  `PacketMetadata::sample_rate()` likewise names the rate a header
+  reports (`sampleFrequency`, else `samples / duration`), shared by
+  `StreamingSdrConfig::from_metadata` and the probe's sniff.
+- **A link budget, so a span that cannot fit is caught before the
+  capture instead of after it.** The span picks a rate off the
+  decimation ladder and at 4 bytes a sample that rate is a byte rate the
+  path has to sustain: `--span 10M` is 15.36 MS/s and 61.4 MB/s, which
+  measured contiguous over gigabit, while `--span 20M` is 30.72 MS/s and
+  122.9 MB/s, which measured 1024 skips and 1.84 s lost of 35 s. The new
+  `link_budget` module does the arithmetic in both directions —
+  `required_byte_rate` for what a span costs, `max_sustainable_span` for
+  the widest rung a measured rate affords, inverted through the existing
+  ladder rather than a second copy of it — and `measure_link_throughput`
+  measures the path end to end by counting bytes off `/stream`.
+  Deliberately end to end: the bottleneck may be the server, a switch,
+  the air or this host's own ingest, and the NIC's advertised link speed
+  sees none of them.
+
+  The probe discards a 500 ms settle window before counting
+  (`LINK_PROBE_SETTLE`). Without it a probe *lies*: the server hands over
+  its pre-connect backlog faster than real time — measured at ~0.27–0.35 s
+  of signal, all inside a 345 ms window at connect — so counting it reads
+  above the true link rate and waves through a span that cannot fit. Two
+  tests pin this, one driving the settle logic off synthetic instants
+  with a 200 MB/s burst ahead of a 10 MB/s stream, and one showing the
+  same trace measuring several times too fast with the settle window
+  removed.
+  An unreachable server, an idle mission or a stream that stops mid-window
+  is an error and never a rate, because "0 MB/s" would condemn every span
+  on the ladder.
+- **`HttpSource` runs that check passively and warns once**, on the
+  stream it is already reading — no second connection, no cost beyond
+  adding up chunk lengths. It compares the bytes arriving against what
+  the device's own reported rate needs and, if the path is short, names
+  the requested span, the rate it needs, what was measured, and the
+  widest span that would have fitted. Complementary to `DropDetector`,
+  which says the server *did* drop data after the fact; when both fire
+  the gap warning now says so, rather than reading as a second unrelated
+  fault. Silence is the answer whenever the measurement did not happen:
+  a warning never fires on a failed one.
+- **`StreamFormat::iq_bytes_per_sample`**, the one definition of the
+  constant the whole budget turns on. `calculate_binary_size` now reads
+  it instead of carrying its own copy of the same match.
+
 ### Fixed
 - **The passive link-budget check now judges against the rate the device
   reports, not the rate the caller asked for.** `current_sample_rate`
@@ -123,6 +176,72 @@ All notable changes to this project will be documented in this file.
   `parse_errors` counter is unchanged. The sniff drops bytes as they
   are ruled out and retains at most one candidate awaiting its
   terminator.
+- **An HTTP source starts again after `stop_streaming`.** The reader
+  task is spawned at construction and stopping it left nothing to
+  restart, so a SoapySDR deactivate/activate cycle (and seify's
+  `deactivate_at`/`activate_at`) failed with "HTTP streaming not
+  properly initialized". `start_streaming` now reconnects.
+- **A packet whose body cannot be decoded no longer wedges the stream.**
+  The parser returned the error but left the packet in its buffer, so
+  every later chunk failed on the same bytes while the buffer grew
+  without bound. The packet is now skipped. `HttpSource` also resets the
+  parser and the drop detector on every reconnect, so a retune no longer
+  decodes the new connection's first bytes as the old packet's payload.
+- **`read_samples` returns a partial block on timeout instead of losing
+  it.** Samples already moved into the caller's buffer went out with the
+  error, an unflagged gap through the C and Python APIs.
+- **`IqPacket.sample_rate_hz` reports the rate the device streams.** The
+  `sdr-source` adapter captured the requested rate before the first
+  packet and never looked again, so a rate the device snapped to another
+  ladder rung was mis-stamped for the whole session.
+- **RTSA files: `mSampleSize` counts values per sample, not bytes.** The
+  captures under `tests/` carry 2 for float32 IQ and 1024 for spectra.
+  Seeking within a chunk used it as a byte stride, so a second partial
+  read of a chunk landed mid-sample, and a spectra read returned one
+  scalar per spectrum. Both now use the sample type's width.
+- **The native SDK is shut down by the last client, not the first.**
+  `AARTSAAPI_Shutdown` is process-wide, but each source and sink called
+  it from its own `Drop`, so re-initialising a source, or pairing a
+  source with a sink, tore the SDK down under the survivor.
+- **A bare `spectranv6eco` opens `spectranv6eco/rtsa`.** The ECO has no
+  `/raw` mode; `SdkConfig` appended one anyway. SDKSPEC's mode list said
+  the same and now agrees with its own V6-vs-ECO table.
+- **Clippy passes on Rust 1.98.** The new `chunks_exact_to_as_chunks`
+  lint failed the workspace check at eight decode sites.
+- **The remote-config licence probe can report `Active`.** It looked for
+  a bare `reflevel` under a group named `main`; a V6 exposes `reflevel0`
+  in its receiver block, so the probe always answered `NotLicensed`. It
+  now writes the discovered block, as the retune path does.
+- **`HttpSource` built outside a Tokio runtime errors at build.** It used
+  to panic inside `init()` when it spawned its reader.
+- **`HttpSink` with `buffer_size(0)` no longer spins forever**; the size
+  is clamped to one.
+- **A quiet dwell in hop mode is an empty read**, not a read error
+  counted toward the source-dead bailout.
+- **The first packet after a failed initial connection is not flagged as
+  an overrun**; nothing was lost.
+- **seify: `sample_rate()` reports the observed rate**, and the range
+  starts at the ladder's 120 kS/s floor instead of 10 kHz.
+- **C API: `aaronia_get_error_message` takes an `int`** and answers
+  unknown codes, where an out-of-range enum was undefined behaviour. C
+  callers are unaffected (an enum converts to `int`); a Rust caller of
+  the `ffi` module's function passes `code as i32`.
+- **Native SDK:** `aaronia_source_read_samples_timeout` honours its
+  deadline (it polled for up to 500 ms regardless); spectra reads honour
+  the packet stride; an SDK call that returns no object is an error
+  rather than a null pointer; opening a second device on a live source
+  is refused; the device is closed on drop.
+- **RTSA files:** a negative DSFT stream offset no longer overflows the
+  header search, and `seek_to_sample` works on reverse-order files.
+- **Spectrum decompression caps the output size** taken from packet
+  metadata.
+
+### Performance
+- The stream parser drops an over-cap payload as it arrives instead of
+  buffering it; uncompressed spectra packets decode without a copy;
+  spectra file reads decode in place; the C API reserves the caller's
+  length before a read; `sample_rate_hz` is an atomic load, so stamping
+  it on every packet takes no lock.
 
 ### Changed
 - **Byte-rate helpers answer `Option<f64>`, never a `0.0` sentinel.**
@@ -167,59 +286,6 @@ All notable changes to this project will be documented in this file.
   client and the probe produce, with `context` naming the stream URL —
   instead of `Error::Protocol("Stream endpoint returned error: …")`.
   Anything matching on that text will need the new form.
-
-### Added
-- **`utils::IQ_RATE_CLOCK_RATIO` and `utils::iq_ladder_from_top`.** The
-  1.5 receiver-clock-cycles-per-sample rule was a bare literal in three
-  places; it has a name now, and the ladder's shape is available
-  without the clock rule for a caller that already holds the top rung
-  — the link budget's device-anchored remedy, which used to reconstruct
-  a clock only to divide it back out (not exact in floating point).
-  `PacketMetadata::sample_rate()` likewise names the rate a header
-  reports (`sampleFrequency`, else `samples / duration`), shared by
-  `StreamingSdrConfig::from_metadata` and the probe's sniff.
-- **A link budget, so a span that cannot fit is caught before the
-  capture instead of after it.** The span picks a rate off the
-  decimation ladder and at 4 bytes a sample that rate is a byte rate the
-  path has to sustain: `--span 10M` is 15.36 MS/s and 61.4 MB/s, which
-  measured contiguous over gigabit, while `--span 20M` is 30.72 MS/s and
-  122.9 MB/s, which measured 1024 skips and 1.84 s lost of 35 s. The new
-  `link_budget` module does the arithmetic in both directions —
-  `required_byte_rate` for what a span costs, `max_sustainable_span` for
-  the widest rung a measured rate affords, inverted through the existing
-  ladder rather than a second copy of it — and `measure_link_throughput`
-  measures the path end to end by counting bytes off `/stream`.
-  Deliberately end to end: the bottleneck may be the server, a switch,
-  the air or this host's own ingest, and the NIC's advertised link speed
-  sees none of them.
-
-  The probe discards a 500 ms settle window before counting
-  (`LINK_PROBE_SETTLE`). Without it a probe *lies*: the server hands over
-  its pre-connect backlog faster than real time — measured at ~0.27–0.35 s
-  of signal, all inside a 345 ms window at connect — so counting it reads
-  above the true link rate and waves through a span that cannot fit. Two
-  tests pin this, one driving the settle logic off synthetic instants
-  with a 200 MB/s burst ahead of a 10 MB/s stream, and one showing the
-  same trace measuring several times too fast with the settle window
-  removed.
-  An unreachable server, an idle mission or a stream that stops mid-window
-  is an error and never a rate, because "0 MB/s" would condemn every span
-  on the ladder.
-- **`HttpSource` runs that check passively and warns once**, on the
-  stream it is already reading — no second connection, no cost beyond
-  adding up chunk lengths. It compares the bytes arriving against what
-  the device's own reported rate needs and, if the path is short, names
-  the requested span, the rate it needs, what was measured, and the
-  widest span that would have fitted. Complementary to `DropDetector`,
-  which says the server *did* drop data after the fact; when both fire
-  the gap warning now says so, rather than reading as a second unrelated
-  fault. Silence is the answer whenever the measurement did not happen:
-  a warning never fires on a failed one.
-- **`StreamFormat::iq_bytes_per_sample`**, the one definition of the
-  constant the whole budget turns on. `calculate_binary_size` now reads
-  it instead of carrying its own copy of the same match.
-
-### Changed
 - **`work()`'s output copy is two bulk `copy_from_slice` calls** over the
   deque's contiguous halves instead of a `pop_front` per sample, whose
   per-element wrap-around check the compiler cannot lift. Factored into
@@ -241,6 +307,12 @@ All notable changes to this project will be documented in this file.
   throughput-meter tests (`decode_throughput_meter`,
   `framing_throughput_meter`) keep these numbers re-measurable in one
   command.
+- README and PLUGINS pinned `sdr-aaronia-rs = "0.6"`, a major behind
+  the crate, so nothing they describe resolved. Now `"0.7"`.
+- `cumulative_drops` counts client-detected timestamp gaps; four docs
+  called them server-reported drops. Bandwidth figures now use the
+  61.44 MS/s top rate rather than the 92 MHz clock. The examples table
+  and the QUICKSTART verification link were corrected.
 
 ## [v0.7.6] - 2026-08-15
 

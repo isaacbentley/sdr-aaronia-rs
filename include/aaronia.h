@@ -185,7 +185,9 @@ AaroniaFfiError aaronia_endpoints_client_control_recording(HttpEndpointsClient* 
 // --- General FFI Utilities --- //
 
 void aaronia_string_free(char* s);
-char* aaronia_get_error_message(AaroniaFfiError error_code);
+// Takes the code as an int so any value is safe to pass; unknown codes
+// yield "Unknown error code".
+char* aaronia_get_error_message(int error_code);
 
 // Returns the last error message recorded on the calling thread, or NULL
 // if no error has been recorded since the last successful call. Free the

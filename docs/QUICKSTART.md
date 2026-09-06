@@ -200,14 +200,16 @@ instead of issuing PUTs directly. No Aaronia licence is involved: the
 crate tunes through `/control`, which needs none.
 
 **Network saturation at high sample rates.**
-Float32 requires roughly 740 MB/s at 92 MSPS. On anything other than
+Float32 needs roughly 490 MB/s at the 61.44 MS/s top rate. On anything other than
 localhost, use the `I16` wire format via
 `AaroniaConfig::low_bandwidth_mode()` or the `format=I16` SoapySDR
 device argument to halve that. This changes the wire format itself,
 unlike a client-side `CS16` conversion.
 
 **Dropped samples.**
-`cumulative_drops()` and `take_overrun()` report server-side gaps.
+`cumulative_drops()` counts the timestamp gaps the client has detected
+in the stream (one per gap, however many samples it spanned), and
+`take_overrun()` flags the read that follows one.
 Steady growth means the link or the consumer cannot keep pace. Reduce
 the sample rate, switch to `I16`, or read in larger blocks.
 
@@ -231,5 +233,5 @@ let mut source = AaroniaSource::new(config).await?;
 
 Build with `--features native-sdk`. Aaronia does not ship a macOS SDK,
 so this path is unavailable there. The native-SDK paths are
-hardware-unverified in this project; see the verification table in the
-[README](../README.md).
+hardware-unverified in this project; see the verification table in
+[VERIFICATION.md](VERIFICATION.md).

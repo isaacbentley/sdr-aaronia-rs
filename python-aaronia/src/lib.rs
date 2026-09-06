@@ -555,7 +555,7 @@ impl PyAaroniaSource {
         BlockIterator { source: slf, count }
     }
 
-    /// Total dropped samples reported by the drop detector.
+    /// Number of timestamp gaps the drop detector has seen so far.
     fn cumulative_drops(&self) -> PyResult<u64> {
         let source = self
             .source

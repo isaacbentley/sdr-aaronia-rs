@@ -289,7 +289,17 @@ impl Decompressor {
 
         let coefficients = self.unpack_coefficients(data)?;
         let mut dequantized = self.dequantize(&coefficients, compression_factor)?;
-        let expected_len = num_rows * num_cols;
+        // Dimensions come from packet metadata; cap them like the decoded
+        // coefficient count, or a corrupt header sizes a huge allocation.
+        const MAX_OUTPUT_VALUES: usize = 1 << 24;
+        let expected_len = num_rows
+            .checked_mul(num_cols)
+            .filter(|n| *n <= MAX_OUTPUT_VALUES)
+            .ok_or_else(|| {
+                Error::Protocol(format!(
+                    "decompress: {num_rows} x {num_cols} values exceeds the {MAX_OUTPUT_VALUES} limit"
+                ))
+            })?;
         if dequantized.len() < expected_len {
             tracing::warn!(
                 "decompress: coefficient stream produced {} of {} expected values \

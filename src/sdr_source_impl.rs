@@ -169,7 +169,6 @@ impl SdrSource for AaroniaSdrSource {
                     })?;
                     let source_info = source.get_source_info();
                     info!("Aaronia source: {:?}", source_info);
-                    let actual_sample_rate_f32 = source_info.span_frequency as f32;
                     // For file backends the RTSA metadata is authoritative
                     // for the center frequency — the caller passes a 0.0
                     // placeholder because it can't know the file's tuning up
@@ -232,7 +231,6 @@ impl SdrSource for AaroniaSdrSource {
                             &tx,
                             &stop_thread,
                             block_size,
-                            actual_sample_rate_f32,
                             &pool_rx,
                             &pool_tx,
                         )
@@ -246,7 +244,6 @@ impl SdrSource for AaroniaSdrSource {
                             &tx,
                             &stop_thread,
                             block_size,
-                            actual_sample_rate_f32,
                             &pool_rx,
                             &pool_tx,
                         )
@@ -305,7 +302,6 @@ async fn single_channel_pump(
     tx: &channel::Sender<IqPacket>,
     stop_thread: &AtomicBool,
     block_size: usize,
-    sample_rate_f32: f32,
     pool_rx: &channel::Receiver<Vec<Complex32>>,
     pool_tx: &channel::Sender<Vec<Complex32>>,
 ) -> Result<()> {
@@ -345,10 +341,13 @@ async fn single_channel_pump(
             continue;
         }
         empty_reads = 0;
+        // The rate is read per packet: on HTTP the rate the device actually
+        // streams is only known once packets flow, and may not be the one
+        // asked for (it snaps to the decimation ladder).
         let pkt = IqPacket {
             samples: crate::sdr_source::PooledIqBuffer::new_pooled(raw_buffer, pool_tx.clone()),
             center_frequency_hz: current_freq,
-            sample_rate_hz: sample_rate_f32,
+            sample_rate_hz: source.sample_rate_hz() as f32,
             overrun: source.take_overrun(),
         };
         if tx.send(pkt).is_err() {
@@ -377,7 +376,6 @@ async fn hop_pump(
     tx: &channel::Sender<IqPacket>,
     stop_thread: &AtomicBool,
     block_size: usize,
-    sample_rate_f32: f32,
     pool_rx: &channel::Receiver<Vec<Complex32>>,
     pool_tx: &channel::Sender<Vec<Complex32>>,
 ) -> Result<()> {
@@ -484,6 +482,10 @@ async fn hop_pump(
                     read_errors = 0;
                     v
                 }
+                // A dwell that ends before any samples arrive is an empty
+                // read, not a broken source; the HTTP path reports it as a
+                // timeout rather than `Ok(0)`.
+                Err(crate::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => 0,
                 Err(e) => {
                     read_errors += 1;
                     if read_errors >= READ_ERROR_BAILOUT {
@@ -511,7 +513,7 @@ async fn hop_pump(
             let pkt = IqPacket {
                 samples: crate::sdr_source::PooledIqBuffer::new_pooled(raw_buffer, pool_tx.clone()),
                 center_frequency_hz: channel,
-                sample_rate_hz: sample_rate_f32,
+                sample_rate_hz: source.sample_rate_hz() as f32,
                 overrun: source.take_overrun(),
             };
             if tx.send(pkt).is_err() {

@@ -498,6 +498,11 @@ pub unsafe extern "C" fn aaronia_source_free(ptr: *mut c_void) {
     }
 }
 
+/// Cap on the up-front reservation for a read. The caller's `len` is
+/// untrusted, and `Vec::with_capacity(usize::MAX)` would abort the host
+/// process; larger reads still work, the buffer grows.
+const READ_RESERVE_CAP: usize = 1 << 22;
+
 /// Read up to `len` IQ samples into the caller-provided `buffer`. Returns
 /// the number of samples written, or a negative error code.
 ///
@@ -522,7 +527,7 @@ pub unsafe extern "C" fn aaronia_source_read_samples(
     // SAFETY: ptr is verified non-null above and was created by Box::into_raw in aaronia_source_build.
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    let mut temp_samples = Vec::new();
+    let mut temp_samples = Vec::with_capacity(len.min(READ_RESERVE_CAP));
     let samples_result = ffi_block_on(source.read_samples(&mut temp_samples, len));
 
     match samples_result {
@@ -595,7 +600,7 @@ pub unsafe extern "C" fn aaronia_source_read_samples_timeout(
     // Box::into_raw in aaronia_source_build.
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    let mut temp_samples = Vec::new();
+    let mut temp_samples = Vec::with_capacity(len.min(READ_RESERVE_CAP));
     let timeout = std::time::Duration::from_micros(timeout_us);
     let samples_result =
         ffi_block_on(source.read_samples_deadline(&mut temp_samples, len, timeout));
@@ -653,8 +658,8 @@ pub unsafe extern "C" fn aaronia_source_read_samples_dual(
     }
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    let mut buf1 = Vec::new();
-    let mut buf2 = Vec::new();
+    let mut buf1 = Vec::with_capacity(len.min(READ_RESERVE_CAP));
+    let mut buf2 = Vec::with_capacity(len.min(READ_RESERVE_CAP));
     match ffi_block_on(source.read_samples_dual(&mut buf1, &mut buf2, len)) {
         Ok(Ok(pairs)) => {
             let pairs = pairs.min(len).min(buf1.len()).min(buf2.len());
@@ -1200,17 +1205,21 @@ pub unsafe extern "C" fn aaronia_string_free(s: *mut c_char) {
 /// any thread; the `unsafe` qualifier is required because the returned
 /// pointer transfers ownership to the caller.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_get_error_message(error_code: AaroniaFfiError) -> *mut c_char {
+pub unsafe extern "C" fn aaronia_get_error_message(error_code: std::os::raw::c_int) -> *mut c_char {
+    // Taken as a plain int, not the enum: a C enum is an int and any
+    // value can arrive, while an out-of-range Rust enum is undefined
+    // behaviour before the match runs.
     let message = match error_code {
-        AaroniaFfiError::Success => "Success",
-        AaroniaFfiError::NullPointer => "Null pointer provided",
-        AaroniaFfiError::InvalidString => "Invalid UTF-8 string provided",
-        AaroniaFfiError::InternalError => "Internal Rust error",
-        AaroniaFfiError::BuildFailed => "Failed to build Aaronia source",
-        AaroniaFfiError::ReadError => "Failed to read from Aaronia source",
-        AaroniaFfiError::RuntimeContext => {
+        x if x == AaroniaFfiError::Success as i32 => "Success",
+        x if x == AaroniaFfiError::NullPointer as i32 => "Null pointer provided",
+        x if x == AaroniaFfiError::InvalidString as i32 => "Invalid UTF-8 string provided",
+        x if x == AaroniaFfiError::InternalError as i32 => "Internal Rust error",
+        x if x == AaroniaFfiError::BuildFailed as i32 => "Failed to build Aaronia source",
+        x if x == AaroniaFfiError::ReadError as i32 => "Failed to read from Aaronia source",
+        x if x == AaroniaFfiError::RuntimeContext as i32 => {
             "Called from a thread context that cannot block (current-thread tokio runtime)"
         }
+        _ => "Unknown error code",
     };
     CString::new(message)
         .unwrap_or_else(|_| CString::new("invalid").unwrap())
@@ -1420,6 +1429,15 @@ pub unsafe extern "C" fn aaronia_sink_write_samples(
         return AaroniaFfiError::NullPointer;
     }
 
+    // A length that cannot describe a real buffer (more than isize::MAX
+    // bytes) is a caller bug; refuse it rather than build an invalid slice.
+    if num_samples > isize::MAX as usize / std::mem::size_of::<FfiComplex>() {
+        set_last_error(format!(
+            "num_samples {num_samples} exceeds the maximum slice length"
+        ));
+        return AaroniaFfiError::InternalError;
+    }
+
     let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
     // SAFETY: FfiComplex and Complex32 are both repr(C) {f32, f32};
     // the layout assertion lives next to the FfiComplex definition.
@@ -1502,16 +1520,23 @@ mod tests {
     #[test]
     fn test_ffi_error_message_mapping() {
         unsafe {
-            let msg_ptr = aaronia_get_error_message(AaroniaFfiError::NullPointer);
+            let msg_ptr = aaronia_get_error_message(AaroniaFfiError::NullPointer as i32);
             assert!(!msg_ptr.is_null());
             let msg = CStr::from_ptr(msg_ptr).to_string_lossy();
             assert_eq!(msg, "Null pointer provided");
             aaronia_string_free(msg_ptr);
 
-            let msg_ptr = aaronia_get_error_message(AaroniaFfiError::Success);
+            let msg_ptr = aaronia_get_error_message(AaroniaFfiError::Success as i32);
             assert!(!msg_ptr.is_null());
             let msg = CStr::from_ptr(msg_ptr).to_string_lossy();
             assert_eq!(msg, "Success");
+            aaronia_string_free(msg_ptr);
+
+            // A C caller can pass any int; it must answer, not misbehave.
+            let msg_ptr = aaronia_get_error_message(42);
+            assert!(!msg_ptr.is_null());
+            let msg = CStr::from_ptr(msg_ptr).to_string_lossy();
+            assert_eq!(msg, "Unknown error code");
             aaronia_string_free(msg_ptr);
         }
     }

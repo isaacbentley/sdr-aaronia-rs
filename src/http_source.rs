@@ -411,7 +411,14 @@ impl HttpSource {
         // and every sample is off by a factor of 32768/N.
         let stream_parser = StreamParser::new(stream_format, scale)?;
 
-        let tokio_handle = tokio::runtime::Handle::try_current().ok();
+        // `start_stream` spawns the reader task on Tokio; without a runtime
+        // it would panic inside `init()`. Refuse at build time instead, as
+        // `HttpSink` does.
+        let tokio_handle = Some(tokio::runtime::Handle::try_current().map_err(|_| {
+            crate::Error::Io(std::io::Error::other(
+                "HttpSource must be built inside a Tokio runtime (it spawns its stream reader there)",
+            ))
+        })?);
 
         // Do not run `work()` until there is a worthwhile block of room
         // downstream — see `SOURCE_MIN_OUTPUT_SAMPLES`. Set before the port is
@@ -995,6 +1002,13 @@ impl HttpSource {
         }
         self.chunk_rx = None;
         self.stream_active = false;
+        // The next connection starts a new packet sequence: drop any
+        // partial packet from the old one, or its header would be applied
+        // to the new stream's first bytes, and let the drop detector
+        // re-seed its timestamp history instead of blaming the gap on
+        // the link.
+        self.stream_parser.reset();
+        self.drop_detector.resync();
     }
 
     /// Parse one stream chunk into the sample buffer.

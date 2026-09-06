@@ -12,7 +12,7 @@ To use the Seify plugin, enable the `seify` feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sdr-aaronia-rs = { version = "0.6", features = ["seify"] }
+sdr-aaronia-rs = { version = "0.7", features = ["seify"] }
 ```
 
 Instantiate the device with `AaroniaSeifyDevice::from_args` and use it directly (or via `seify::dev::DynDeviceBackend`). The backend is **not** part of seify's built-in enumeration registry — `seify::enumerate()` will not discover it.
@@ -136,11 +136,11 @@ Both the native Rust API and the Python/C++ bindings expose critical metrics to 
 
 - **Hardware Timestamps**: You can retrieve the precise hardware timestamp (in nanoseconds) of the last received block using `last_timestamp_ns`.
 - **Overruns**: The `take_overrun()` function checks if the internal buffer has overflown since the last check, allowing you to react to drops on the client side.
-- **Cumulative Drops**: The `cumulative_drops()` function reports the total number of blocks dropped by the Aaronia server itself due to network backpressure.
+- **Cumulative Drops**: `cumulative_drops()` counts the timestamp gaps the client's drop detector has seen in the stream. Each is one gap event, however many samples it spanned.
 
 In SoapySDR, you can access these metrics via the `readSensor()` API:
 ```python
-# Check for server-side drops
+# Check for gaps in the stream
 drops = sdr.readSensor("cumulative_drops")
-print(f"Dropped blocks: {drops}")
+print(f"Gaps seen: {drops}")
 ```

@@ -114,7 +114,7 @@ directly and skip the SoapySDR layer.
 - `readStream` honours `timeoutUs` and returns partial reads within the
   deadline, per the SoapySDR contract.
 - Retuning mid-stream is safe and requires no Aaronia licence.
-- Dropped blocks are reported through `readSensor("cumulative_drops")`.
+- Gaps detected in the stream are counted by `readSensor("cumulative_drops")`.
   An overrun sets `SOAPY_SDR_END_ABRUPT` on the affected read.
 - TX is hardware-unverified and exists only when the plugin is built
   against the native SDK on Windows or Linux.

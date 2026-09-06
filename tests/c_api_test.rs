@@ -63,7 +63,7 @@ fn test_c_api_endpoints_client_lifecycle() {
 #[test]
 fn test_aaronia_get_error_message() {
     unsafe {
-        let msg_ptr = aaronia_get_error_message(AaroniaFfiError::NullPointer);
+        let msg_ptr = aaronia_get_error_message(AaroniaFfiError::NullPointer as i32);
         assert!(!msg_ptr.is_null());
         let msg = CStr::from_ptr(msg_ptr).to_string_lossy();
         assert_eq!(msg, "Null pointer provided");

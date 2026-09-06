@@ -215,7 +215,9 @@ impl SampleRateControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(self.tuning.lock().unwrap().sample_rate)
+        // The rate the device streams, once packets flow, not the one
+        // asked for: the device snaps requests to its ladder.
+        Ok(self.source.lock().unwrap().sample_rate_hz())
     }
 
     fn get_sample_rate_range(
@@ -232,7 +234,8 @@ impl SampleRateControl for AaroniaSeifyDevice {
         // seify has no device handle here to ask, so the ceiling is the
         // measured one rather than a guess. See
         // `utils::iq_sample_rates_for_clock`.
-        Ok(Range::new(vec![RangeItem::Interval(10e3, 61.44e6)]))
+        // The floor is the ladder's lowest rung (61.44 MHz / 512).
+        Ok(Range::new(vec![RangeItem::Interval(120e3, 61.44e6)]))
     }
 
     fn set_sample_rate(

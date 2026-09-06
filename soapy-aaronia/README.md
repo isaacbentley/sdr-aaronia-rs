@@ -149,7 +149,8 @@ actually running, which is the number to trust.
   nanoseconds, converted in the integer domain.
 - The single gain element, `REF`, is the Aaronia reference level in dBm.
   It is not an amplifier gain: raising it reduces sensitivity.
-- `readSensor("cumulative_drops")` reports server-side dropped blocks.
+- `readSensor("cumulative_drops")` counts the timestamp gaps the plugin has
+  detected in the stream.
 
 ## Known limitations
 

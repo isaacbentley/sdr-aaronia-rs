@@ -49,7 +49,7 @@ The Aaronia RTSA Vendor SDK provides low-level, high-performance access to Aaron
 *   **Real-time Data Access**: Packet-based streaming of IQ samples and spectrum data with configurable decimation
 *   **Device Modes**: Verified support for multiple operational modes:
     *   **SpectranV6**: `spectranv6/raw`, `spectranv6/iqreceiver`, `spectranv6/iqtransceiver`, `spectranv6/iqtransmitter`, `spectranv6/sweepsa`
-    *   **SpectranV6 ECO**: `spectranv6eco/raw`, `spectranv6eco/iqreceiver`, `spectranv6eco/iqtransceiver`, `spectranv6eco/iqtransmitter`, `spectranv6eco/sweepsa`
+    *   **SpectranV6 ECO**: `spectranv6eco/rtsa` (its raw pipeline; there is no `spectranv6eco/raw`), `spectranv6eco/iqreceiver`, `spectranv6eco/iqtransceiver`, `spectranv6eco/iqtransmitter`, `spectranv6eco/sweepsa`
 *   **Configuration Tree**: Hierarchical configuration system with verified parameters:
     *   **Clock Rates** (V6): 46MHz (46.08), 61MHz (61.44), 76MHz (76.80), 92MHz (92.16), 122MHz (122.88), 184MHz (184.32), 245MHz (245.76), 492MHz (491.52) — see the full label table under [Rust Binding Notes](#rust-binding-notes)
     *   **Clock Rates** (V6 ECO): fixed at 92.16 MHz. Its top IQ rate is 61.44 MHz, which is that clock over 1.5 — the two are easy to confuse and this document once recorded the rate as the clock

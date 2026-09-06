@@ -94,6 +94,13 @@ impl UnifiedSink {
             any(target_os = "windows", target_os = "linux")
         ))]
         {
+            // Re-initialising must not orphan a live backend: stop it so
+            // its device is released before the replacement opens one.
+            if let Some(mut old) = self.backend.take() {
+                if let Err(e) = old.stop_streaming().await {
+                    tracing::warn!("stopping the previous sink backend failed: {e}");
+                }
+            }
             let mut sdk_sink = SdkSink::with_config(self.sdk_config());
             sdk_sink.initialize().await?;
             self.backend = Some(sdk_sink);

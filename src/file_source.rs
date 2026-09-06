@@ -804,14 +804,28 @@ fn read_iq_i16<R: Read>(reader: &mut R, count: usize, scale: f32) -> Result<Vec<
 /// Bulk-read `count` little-endian f32 scalars. See [`read_iq_f32`] for the
 /// bulk-read rationale.
 fn read_f32_vec<R: Read>(reader: &mut R, count: usize) -> Result<Vec<f32>> {
-    let mut bytes = vec![0u8; count * 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    #[cfg(target_endian = "little")]
+    {
+        let mut values = vec![0f32; count];
+        // SAFETY: `values` owns `count * 4` contiguous bytes and `read_exact`
+        // writes exactly that many; any bit pattern is a valid `f32`.
+        let byte_view =
+            unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, count * 4) };
+        reader.read_exact(byte_view)?;
+        Ok(values)
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut bytes = vec![0u8; count * 4];
+        reader.read_exact(&mut bytes)?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
 }
 
 /// All chunks accumulated during a single pass through an RTSA file.
@@ -1524,7 +1538,7 @@ impl RtsaSource {
         }
 
         let scan_start = stream_area_offset;
-        let scan_end = stream_area_offset + 100_000_000;
+        let scan_end = stream_area_offset.saturating_add(100_000_000);
         Self::scan_for_samp_chunks(reader, scan_start, scan_end, &mut state.samp_chunk_offsets)?;
         Ok(())
     }
@@ -1598,7 +1612,7 @@ impl RtsaSource {
                 }
             }
         }
-        Self::find_dsfh_chunk(reader, stream_area_offset * 2)
+        Self::find_dsfh_chunk(reader, stream_area_offset.saturating_mul(2))
     }
 
     fn is_valid_rtsa_chunk_id(id: &[u8; 4]) -> bool {
@@ -1990,15 +2004,38 @@ impl RtsaSource {
                         let samples_in_chunk_before =
                             (self.current_sample_index - chunk_start_sample) as u32;
                         let bytes_to_skip =
-                            samples_in_chunk_before as u64 * samp_chunk.sample_size as u64;
+                            samples_in_chunk_before as u64 * samp_chunk.sample_stride_bytes();
                         let data_start_offset =
                             offset + samp_chunk.header.header_size as u64 + bytes_to_skip;
                         self.reader.seek(SeekFrom::Start(data_start_offset))?;
 
                         let remaining_in_chunk = samp_chunk.num_samples - samples_in_chunk_before;
-                        let to_read = u32::try_from(num_samples)
+                        let mut to_read = u32::try_from(num_samples)
                             .unwrap_or(u32::MAX)
                             .min(remaining_in_chunk);
+                        // Also cap by the bytes the chunk header declares, so
+                        // an `mNumSamples` that disagrees with the chunk size
+                        // can neither read into the next chunk nor size an
+                        // allocation off an untrusted count. Compressed chunks
+                        // are rejected below with their own message.
+                        if samp_chunk.compression == 0 {
+                            let stride = samp_chunk.sample_stride_bytes();
+                            let payload_bytes = (samp_chunk.header.size as u64)
+                                .saturating_sub(samp_chunk.header.header_size as u64)
+                                .saturating_sub(bytes_to_skip);
+                            let fits = payload_bytes.checked_div(stride).unwrap_or(0);
+                            to_read = to_read.min(u32::try_from(fits).unwrap_or(u32::MAX));
+                            if to_read == 0 && num_samples > 0 && remaining_in_chunk > 0 {
+                                return Err(Error::FileFormat {
+                                    offset,
+                                    reason: format!(
+                                        "SAMP chunk at 0x{:08X} declares {} samples but its size \
+                                         holds no complete sample past index {}",
+                                        offset, samp_chunk.num_samples, samples_in_chunk_before
+                                    ),
+                                });
+                            }
+                        }
 
                         let sample_data = match samp_chunk.payload_type {
                             DspStreamPayloadType::DsptIq => {
@@ -2064,8 +2101,11 @@ impl RtsaSource {
                                                 ),
                                             });
                                         }
-                                        let samples =
-                                            read_f32_vec(&mut self.reader, to_read as usize)?;
+                                        // One sample is a whole spectrum of
+                                        // `sample_size` bins.
+                                        let bins =
+                                            to_read as usize * samp_chunk.sample_size as usize;
+                                        let samples = read_f32_vec(&mut self.reader, bins)?;
                                         Some(SampleData::Spectra(samples))
                                     }
                                     _ => None, // Unsupported sample type for Spectra
@@ -2165,13 +2205,19 @@ impl RtsaSource {
                 reason: "Seek position out of bounds.".to_string(),
             });
         }
+        // Reverse-order raw IQ files have no SAMP index; the read path
+        // positions by sample index directly.
+        if self.raw_iq_data_end_offset.is_some() {
+            self.current_sample_index = sample_index;
+            return Ok(());
+        }
         let mut current_total_samples = 0;
         for &(offset, ref samp_chunk) in &self.samp_chunk_offsets {
             if samp_chunk.stream_id == self.iq_stream_id {
                 let chunk_end_sample = current_total_samples + samp_chunk.num_samples as u64;
                 if (current_total_samples..chunk_end_sample).contains(&sample_index) {
                     let samples_into_chunk = sample_index - current_total_samples;
-                    let byte_offset = samples_into_chunk * samp_chunk.sample_size as u64;
+                    let byte_offset = samples_into_chunk * samp_chunk.sample_stride_bytes();
                     let data_start = offset + samp_chunk.header.header_size as u64;
                     self.reader
                         .seek(SeekFrom::Start(data_start + byte_offset))?;
@@ -2457,6 +2503,27 @@ impl StrmChunk {
 }
 
 impl SampChunk {
+    /// Byte width of one value of `sample_type`: 1 for the 8-bit types,
+    /// 2 for the 16-bit types, 4 for the 32-bit types.
+    fn value_bytes(&self) -> u64 {
+        use DspStreamSampleType::*;
+        match self.sample_type {
+            DsStU8 | DsStU8N => 1,
+            DsStU16 | DsStS16 | DsStU16N | DsStS16N => 2,
+            DsStU32 | DsStS32 | DsStF32 | DsStU32N | DsStS32N | DsStF32N => 4,
+            Unknown => 0,
+        }
+    }
+
+    /// Byte stride of one sample in the payload. `mSampleSize` counts the
+    /// values that make up a sample, not bytes: the captures under
+    /// `tests/` carry 2 for float32 IQ (I and Q) and 1024 for spectra
+    /// (bins per spectrum), the same meaning as the HTTP stream's
+    /// `sampleSize`. The stride is that count times the value width.
+    pub fn sample_stride_bytes(&self) -> u64 {
+        self.sample_size as u64 * self.value_bytes()
+    }
+
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32, header_size: u16) -> Result<Self> {
         let stream_id = reader.read_u64::<LittleEndian>()?;
         let sub_stream_id = reader.read_u32::<LittleEndian>()?;
@@ -2924,7 +2991,10 @@ impl DsftChunk {
                 header_size: 20,
             },
             completion_time: reader.read_f64::<LittleEndian>()?,
-            stream_offset: reader.read_u64::<LittleEndian>()?,
+            // `qint64` on disk. A negative value means no stream area, which
+            // the `> 0` guard downstream treats the same as zero; read as
+            // u64 it passed that guard and overflowed the header search.
+            stream_offset: u64::try_from(reader.read_i64::<LittleEndian>()?).unwrap_or(0),
             num_streams: reader.read_u32::<LittleEndian>()?,
         })
     }
@@ -3240,8 +3310,8 @@ mod tests {
             // Packet end time as f64: 1609459201.0
             0x00, 0x00, 0x40, 0x80, 0x99, 0xfb, 0xd7, 0x41,
             // Packet flags as u32: STREAM_START
-            0x01, 0x00, 0x00, 0x00, // Sample size as u32: 8 bytes (4 for I + 4 for Q)
-            0x08, 0x00, 0x00, 0x00, // Sample depth as u32: 32 bits
+            0x01, 0x00, 0x00, 0x00, // Sample size as u32: 2 values (I and Q)
+            0x02, 0x00, 0x00, 0x00, // Sample depth as u32: 32 bits
             0x20, 0x00, 0x00, 0x00, // Num samples as u32: 1024
             0x00, 0x04, 0x00, 0x00,
         ];
@@ -3259,7 +3329,7 @@ mod tests {
         assert_eq!(samp.sample_unit, DspStreamSampleUnit::DssuGeneric);
         assert_eq!(samp.payload_type, DspStreamPayloadType::DsptIq);
         assert_eq!(samp.compression, 0);
-        assert_eq!(samp.sample_size, 8);
+        assert_eq!(samp.sample_size, 2);
         assert_eq!(samp.sample_depth, 32);
         assert_eq!(samp.num_samples, 1024);
         assert!(samp.packet_flags.contains(DspPacketFlags::STREAM_START));
@@ -4428,7 +4498,7 @@ mod tests {
             writer.write_f64::<LittleEndian>(0.0).unwrap(); // packet_start_time
             writer.write_f64::<LittleEndian>(0.0).unwrap(); // packet_end_time
             writer.write_u32::<LittleEndian>(0).unwrap(); // packet_flags
-            writer.write_u32::<LittleEndian>(8).unwrap(); // sample_size: 8
+            writer.write_u32::<LittleEndian>(2).unwrap(); // sample_size: 2 values (I and Q)
             writer.write_u32::<LittleEndian>(32).unwrap(); // sample_depth: 32
             writer.write_u32::<LittleEndian>(num_samples).unwrap(); // num_samples
 

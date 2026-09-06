@@ -40,7 +40,9 @@ pub struct SdkConfig {
     /// mode-qualified (`"spectranv6/raw"`). Enumeration always uses the
     /// bare family — the SDK silently returns zero devices for
     /// mode-qualified enumeration — and opening uses the qualified form,
-    /// defaulting to `<family>/raw` when no mode is given.
+    /// defaulting to the family's raw-IQ mode when none is given
+    /// (`spectranv6/raw`; `spectranv6eco/rtsa`, since the ECO has no
+    /// `/raw`).
     pub device_type: String,
     /// Center frequency in Hz.
     pub center_frequency: f64,
@@ -93,9 +95,20 @@ impl SdkConfig {
     }
 
     /// Mode-qualified open string for `AARTSAAPI_OpenDevice`. Uses the
-    /// configured mode when present, otherwise `<family>/raw`.
+    /// configured mode when present, otherwise the family's raw-IQ mode:
+    /// `spectranv6/raw`, or `spectranv6eco/rtsa` on the ECO, which has
+    /// no `/raw`.
     pub fn device_open_mode(&self) -> String {
-        crate::native_sdk::split_device_type(&self.device_type, "raw").1
+        let family = self.device_family();
+        let raw_mode = crate::native_sdk::raw_mode_for_family(family);
+        let open_mode = crate::native_sdk::split_device_type(&self.device_type, raw_mode).1;
+        // An explicit `/raw` on the ECO is the same request, spelled the
+        // V6 way; map it as `open_detected_device` does.
+        if open_mode == "spectranv6eco/raw" {
+            "spectranv6eco/rtsa".to_string()
+        } else {
+            open_mode
+        }
     }
 }
 
@@ -462,6 +475,23 @@ mod tests {
             assert!(!timeout.is_zero(), "Timeout should not be zero");
             assert!(timeout.as_secs() <= 600, "Timeout should be reasonable");
         }
+    }
+
+    /// The ECO has no `/raw`; its raw pipeline is `rtsa`.
+    #[test]
+    fn bare_family_opens_in_its_raw_mode() {
+        let mut config = SdkConfig::default();
+        config.device_type = "spectranv6".to_string();
+        assert_eq!(config.device_open_mode(), "spectranv6/raw");
+        config.device_type = "spectranv6eco".to_string();
+        assert_eq!(config.device_family(), "spectranv6eco");
+        assert_eq!(config.device_open_mode(), "spectranv6eco/rtsa");
+        // `/raw` spelled the V6 way maps to the ECO's name for it.
+        config.device_type = "spectranv6eco/raw".to_string();
+        assert_eq!(config.device_open_mode(), "spectranv6eco/rtsa");
+        // Any other explicit mode is passed through untouched.
+        config.device_type = "spectranv6eco/iqreceiver".to_string();
+        assert_eq!(config.device_open_mode(), "spectranv6eco/iqreceiver");
     }
 
     #[test]
