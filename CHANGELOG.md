@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [v0.8.1] - 2026-09-07
 
 ### Fixed
 - **SoapySDR TX gate read the arguments, not the backend.** It also
@@ -69,8 +69,10 @@ All notable changes to this project will be documented in this file.
 
 ### Documentation
 - README and PLUGINS pinned `"0.7"` after the breaking 0.8.0; now `"0.8"`.
-  PLUGINS.md's TX section matches the new condition. SDKSPEC records the
-  3.0.3.16655 verification.
+  PLUGINS.md's TX section matches the new condition. SDKSPEC's Verified
+  Architecture and Qt-dependencies sections carry the 3.0.3.16655
+  findings. Two dead CMake debug probes (`test.cmake`,
+  `soapy-aaronia/print.cmake`) are gone.
 
 ## [v0.8.0] - 2026-09-07
 

@@ -178,9 +178,9 @@ stats handle, and is re-measured after a configuration restart.
 
 ### When a gap happens anyway: was it the device?
 
-A gap that arrives despite a link with headroom has more than one cause,
-and the crate asks the device about the one it can settle. On each
-stream-gap report `HttpSource` reads `/healthstatus` and checks the
+A gap has more than one cause, and the crate asks the device about the
+one it can settle. On each stream-gap report `HttpSource` reads
+`/healthstatus` and checks the
 device block's own loss counters — errors, USB overflows and DSP
 overflows, all per-second rates, so the reading describes the moment of
 the gap. If they are nonzero the loss starts at the device and no amount
@@ -231,9 +231,8 @@ println!("sample rates: {:?}", caps.sample_rates());
 
 Every field is optional and independently so, because the answer feeds
 things that must not be guessed. The SoapySDR plugin publishes exactly
-these at probe time — a V6 ECO declares 5.5 MHz–8 GHz and −55…+23 dBm,
-where the plugin previously advertised 10 Hz–6 GHz and −100…+10 dB for
-every model — and falls back per field for a device that cannot answer.
+these at probe time — a V6 ECO declares 5.5 MHz–8 GHz and −55…+23 dBm —
+and falls back per field for a device that cannot answer.
 
 **Clearing the device does not mean you are alone on the server.** One
 of the causes it leaves standing is another client: the HTTP Server block

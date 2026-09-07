@@ -219,7 +219,7 @@ On Windows or Linux with the Aaronia SDK installed, no mission
 configuration is required. On Linux the SDK library also needs nine
 system packages its bundled Qt pulls in — without them it fails to load
 and the HTTP backend is silently used instead; the list is in
-[SDKSPEC](SDKSPEC.md#verified-against-sdk-303-16655-linux).
+[SDKSPEC](SDKSPEC.md#native-sdk-pulls-in-massive-qt--ffmpeg-dependencies).
 
 ```rust,no_run
 use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
