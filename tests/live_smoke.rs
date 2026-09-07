@@ -104,6 +104,26 @@ async fn live_control_plane() {
         refl.max > refl.min,
         "reference-level bounds must be a usable pair: {refl:?}"
     );
+    // The two the plugin used to answer with invented constants.
+    assert!(
+        !caps.clock_sources.is_empty(),
+        "device/sclksource must offer a vocabulary; the plugin reported \
+         \"Internal\", which is not one of its names"
+    );
+    println!(
+        "clock: {:?} selected from {:?}",
+        caps.clock_source, caps.clock_sources
+    );
+    println!("rx antenna: {:?}", caps.rx_antenna);
+    assert!(
+        caps.clock_source.is_some(),
+        "a live device has a clock source"
+    );
+    assert!(
+        caps.rx_antenna.is_some(),
+        "devicemode must name an RX input"
+    );
+
     let rates = caps.sample_rates().expect("a ladder from the device");
     assert_eq!(
         rates.len(),

@@ -144,6 +144,9 @@ private:
     bool _hasRefRange;
     double _refMinDbm, _refMaxDbm, _refStepDb;
     std::vector<double> _sampleRates;
+    std::vector<std::string> _clockSources;
+    std::string _clockSource;
+    std::string _rxAntenna;
 };
 
 #endif // AARONIA_SOAPY_DEVICE_HPP

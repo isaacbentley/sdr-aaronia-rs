@@ -56,6 +56,27 @@ All notable changes to this project will be documented in this file.
   than asserting it.
 
 ### Fixed
+- **The SoapySDR plugin reported the clock source as `Internal`, a name
+  the device does not use, on hardware running off an external 10 MHz
+  reference.** `device/sclksource` offers `Consumer`, `Oscillator`,
+  `GPS`, `PPS`, `10MHz` and three `… Provider` variants; the measured V6
+  ECO is on `10MHz`. An operator who wired a house reference up for
+  frequency accuracy was told the device was free-running.
+  `listClockSources` and `getClockSource` now answer from the device.
+  `setClockSource` still only reads: it accepts the current source as
+  the no-op it is, and warns for anything else naming what the device is
+  actually on. `listAntennas` likewise takes its name from
+  `device/devicemode` — `RX1` on this device, and correct rather than
+  coincidental on a V6 running an RX2 mode.
+- **The SoapySDR plugin could link a stale Rust static library.** The
+  CMake rule produced `libsdr_aaronia_rs.a` through an
+  `add_custom_command(OUTPUT …)` with no `DEPENDS`, so CMake treated the
+  archive as up to date the moment it existed and skipped cargo
+  entirely. Editing Rust sources and rebuilding relinked the module
+  against the old archive — silently, producing a module that looked
+  fine and did not contain the change. It is a custom *target* now,
+  whose command runs every build and which cargo no-ops when nothing
+  moved, which is what the comment there always claimed happened.
 - **`SoapySDRUtil --probe` reported `Timestamps: NO` on a device that
   timestamps every buffer.** `hasHardwareTime("")` answered with the last
   stream timestamp, so it read as "no capability" until a packet had

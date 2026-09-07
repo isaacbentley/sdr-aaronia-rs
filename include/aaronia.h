@@ -86,6 +86,14 @@ typedef struct FfiDeviceCapabilities {
     // struct; NULL and 0 when the device could not be asked.
     size_t        sample_rate_count;
     const double* sample_rates;
+
+    // Stream-clock sources in the device's own vocabulary (a V6 ECO:
+    // Consumer, Oscillator, GPS, PPS, 10MHz, and three "... Provider"
+    // variants). Owned by this struct; NULL and 0 when it did not say.
+    size_t              clock_source_count;
+    const char* const*  clock_sources;
+    const char*         clock_source;   // currently selected; NULL if unknown
+    const char*         rx_antenna;     // e.g. "RX1"; NULL if the mode names none
 } FfiDeviceCapabilities;
 
 // Opaque pointers

@@ -987,6 +987,16 @@ pub struct FfiDeviceCapabilities {
     /// Settable IQ sample rates in Hz, highest first. Owned by this
     /// struct and freed with it; NULL when the count is 0.
     pub sample_rates: *const f64,
+
+    /// Stream-clock sources the device offers, in its own vocabulary.
+    /// Owned by this struct; NULL and 0 when it did not say.
+    pub clock_source_count: usize,
+    pub clock_sources: *const *const c_char,
+    /// The source currently selected. NULL when unknown.
+    pub clock_source: *const c_char,
+    /// RX input the device's mode names, e.g. `"RX1"`. NULL when the
+    /// device names none.
+    pub rx_antenna: *const c_char,
 }
 
 /// Read the attached device's declared capabilities.
@@ -1039,7 +1049,28 @@ pub unsafe extern "C" fn aaronia_source_get_capabilities(
         _ => (std::ptr::null(), 0),
     };
 
+    // A NULL-free array of owned C strings, so the caller can index it
+    // without a second length check per entry.
+    let (clock_sources, clock_source_count) = if caps.clock_sources.is_empty() {
+        (std::ptr::null(), 0)
+    } else {
+        let ptrs: Vec<*const c_char> = caps
+            .clock_sources
+            .iter()
+            .map(|s| owned(Some(s.clone())))
+            .collect();
+        let len = ptrs.len();
+        (
+            Box::into_raw(ptrs.into_boxed_slice()) as *const *const c_char,
+            len,
+        )
+    };
+
     Box::into_raw(Box::new(FfiDeviceCapabilities {
+        clock_source_count,
+        clock_sources,
+        clock_source: owned(caps.clock_source),
+        rx_antenna: owned(caps.rx_antenna),
         model: owned(caps.model),
         serial: owned(caps.serial),
         version: owned(caps.version),
@@ -1070,9 +1101,29 @@ pub unsafe extern "C" fn aaronia_source_capabilities_free(ptr: *mut FfiDeviceCap
         return;
     }
     let caps = unsafe { Box::from_raw(ptr) };
-    for s in [caps.model, caps.serial, caps.version] {
+    for s in [
+        caps.model,
+        caps.serial,
+        caps.version,
+        caps.clock_source,
+        caps.rx_antenna,
+    ] {
         if !s.is_null() {
             unsafe { drop(CString::from_raw(s as *mut c_char)) };
+        }
+    }
+    if !caps.clock_sources.is_null() {
+        // Two levels: each string, then the array of pointers itself.
+        let ptrs = unsafe {
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                caps.clock_sources as *mut *const c_char,
+                caps.clock_source_count,
+            ))
+        };
+        for s in ptrs.iter() {
+            if !s.is_null() {
+                unsafe { drop(CString::from_raw(*s as *mut c_char)) };
+            }
         }
     }
     if !caps.sample_rates.is_null() {
@@ -1630,10 +1681,21 @@ mod tests {
     fn capabilities_free_releases_every_owned_allocation() {
         let rates = vec![61_440_000.0_f64, 30_720_000.0, 15_360_000.0].into_boxed_slice();
         let count = rates.len();
+        let clocks: Vec<*const c_char> = ["Oscillator", "GPS", "10MHz"]
+            .iter()
+            .map(|s| CString::new(*s).unwrap().into_raw() as *const c_char)
+            .collect();
+        let clock_source_count = clocks.len();
+        let clock_sources = Box::into_raw(clocks.into_boxed_slice()) as *const *const c_char;
+
         let caps = Box::into_raw(Box::new(FfiDeviceCapabilities {
             model: CString::new("SPECTRAN V6 ECO").unwrap().into_raw(),
             serial: CString::new("C2-P-03000105").unwrap().into_raw(),
             version: CString::new("0 0.0.36").unwrap().into_raw(),
+            clock_source_count,
+            clock_sources,
+            clock_source: CString::new("10MHz").unwrap().into_raw(),
+            rx_antenna: CString::new("RX1").unwrap().into_raw(),
             has_center_frequency: true,
             center_frequency_min_hz: 5_500_000.0,
             center_frequency_max_hz: 8_000_000_000.0,
@@ -1662,6 +1724,10 @@ mod tests {
             model: ptr::null(),
             serial: ptr::null(),
             version: ptr::null(),
+            clock_source_count: 0,
+            clock_sources: ptr::null(),
+            clock_source: ptr::null(),
+            rx_antenna: ptr::null(),
             has_center_frequency: false,
             center_frequency_min_hz: 0.0,
             center_frequency_max_hz: 0.0,

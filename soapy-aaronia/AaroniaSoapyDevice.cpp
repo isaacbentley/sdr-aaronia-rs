@@ -56,6 +56,11 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
             _sampleRates.assign(caps->sample_rates,
                                 caps->sample_rates + caps->sample_rate_count);
         }
+        for (size_t i = 0; i < caps->clock_source_count; ++i) {
+            if (caps->clock_sources[i]) _clockSources.emplace_back(caps->clock_sources[i]);
+        }
+        if (caps->clock_source) _clockSource = caps->clock_source;
+        if (caps->rx_antenna)   _rxAntenna   = caps->rx_antenna;
         aaronia_source_capabilities_free(caps);
 
         SoapySDR::logf(SOAPY_SDR_INFO,
@@ -437,24 +442,41 @@ long long AaroniaSoapyDevice::getHardwareTime(const std::string &what) const {
 
 // --- Clocking API ---
 std::vector<std::string> AaroniaSoapyDevice::listClockSources(void) const {
+    // The device's own vocabulary, from `device/sclksource`: a V6 ECO
+    // offers Consumer, Oscillator, GPS, PPS, 10MHz and three
+    // "... Provider" variants. "Internal" was not among them — it was
+    // this driver's invention, and it was reported on a device running
+    // off an external 10 MHz house reference.
+    if (!_clockSources.empty()) return _clockSources;
     return {"Internal"};
 }
 
 void AaroniaSoapyDevice::setClockSource(const std::string &source) {
-    if (source != "Internal") {
-        SoapySDR::logf(SOAPY_SDR_WARNING, "setClockSource('%s') not currently supported by Aaronia API bindings", source.c_str());
-    }
+    // Setting the source the device already reports is a no-op, so
+    // accept it: an application that reads the list and writes back
+    // what it found should not be warned at.
+    if (!_clockSource.empty() && source == _clockSource) return;
+    if (_clockSource.empty() && source == "Internal") return;
+    SoapySDR::logf(SOAPY_SDR_WARNING,
+                   "setClockSource('%s'): this driver reports the device's stream "
+                   "clock source but does not change it; the device is on '%s'. "
+                   "Change it in RTSA-Suite (Device > Stream Clock Source).",
+                   source.c_str(),
+                   _clockSource.empty() ? "unknown" : _clockSource.c_str());
 }
 
 std::string AaroniaSoapyDevice::getClockSource(void) const {
-    return "Internal";
+    return _clockSource.empty() ? std::string("Internal") : _clockSource;
 }
 
 std::vector<std::string> AaroniaSoapyDevice::listAntennas(const int direction, const size_t channel) const {
     std::vector<std::string> ant;
     if (channel != 0) return ant;
     if (direction == SOAPY_SDR_RX) {
-        ant.push_back("RX1");
+        // Named by the device's own `devicemode` — "RX1 LO1 SWEEP" on a
+        // V6 ECO, where the mode is read-only. Hardcoding RX1 happened
+        // to be right there and would misname a V6 running an RX2 mode.
+        ant.push_back(_rxAntenna.empty() ? std::string("RX1") : _rxAntenna);
     } else if (direction == SOAPY_SDR_TX && _sink) {
         ant.push_back("TX1");
     }

@@ -571,6 +571,21 @@ pub struct DeviceCapabilities {
     /// measurement, so see [`Self::sample_rates`] before using it as a
     /// ladder top.
     pub native_iq_rate_hz: Option<f64>,
+    /// Every stream-clock source `device/sclksource` offers, in the
+    /// device's own vocabulary — `Consumer`, `Oscillator`, `GPS`,
+    /// `PPS`, `10MHz` and the three `… Provider` variants on a measured
+    /// V6 ECO. Empty when the item is absent.
+    pub clock_sources: Vec<String>,
+    /// The source `sclksource` currently selects. A device running off
+    /// a house 10 MHz reference says `10MHz` here, which is worth
+    /// reporting accurately: an operator who wired that reference up
+    /// for frequency accuracy needs to see it took.
+    pub clock_source: Option<String>,
+    /// The RX input the device's `devicemode` names — `"RX1"` or
+    /// `"RX2"`. Read-only on a V6 ECO, which reports `RX1 LO1 SWEEP`.
+    /// `None` when the mode names no RX input (a TX-only mode) or the
+    /// item is absent.
+    pub rx_antenna: Option<String>,
 }
 
 impl DeviceCapabilities {
@@ -587,6 +602,21 @@ impl DeviceCapabilities {
             caps.reference_level = range_of(config, "reflevel0");
             caps.decimation_steps = enum_values_of(config, "decimation0");
             caps.model = find_group(config, "info").and_then(|i| string_named(i, "title"));
+
+            let (sources, selected) = enum_options(config, "sclksource");
+            caps.clock_sources = sources;
+            caps.clock_source = selected;
+
+            // `devicemode` reads like `"RX1 LO1 SWEEP"` / `"RX2 LO1"` /
+            // `"TX1 LO1"`: the first whitespace-separated token names the
+            // input. Taking the token rather than a substring search
+            // keeps `"RX1 TX1 LO1"` reporting its RX input and not its
+            // TX one.
+            caps.rx_antenna = enum_options(config, "devicemode").1.and_then(|mode| {
+                mode.split_whitespace()
+                    .find(|token| token.starts_with("RX"))
+                    .map(str::to_string)
+            });
         }
 
         if let Some(health) = health {
@@ -671,6 +701,36 @@ fn range_of(item: &ConfigItem, want: &str) -> Option<ValueRange> {
         }
     }
     visit(item, want)
+}
+
+/// Every option the first enum named `want` offers, and the one its
+/// `value` index selects.
+///
+/// The index is the device's own encoding — `sclksource` is `4` for
+/// `10MHz` — so an out-of-range index yields `None` for the selection
+/// rather than a wrong name, while the option list still stands.
+fn enum_options(item: &ConfigItem, want: &str) -> (Vec<String>, Option<String>) {
+    fn visit(item: &ConfigItem, want: &str) -> Option<(Vec<String>, Option<String>)> {
+        match item {
+            ConfigItem::Group { items, .. } => items.iter().find_map(|c| visit(c, want)),
+            ConfigItem::Enum {
+                name,
+                values,
+                value,
+                ..
+            } if name == want => {
+                let options: Vec<String> =
+                    values.split(',').map(|v| v.trim().to_string()).collect();
+                let selected = usize::try_from(*value)
+                    .ok()
+                    .and_then(|i| options.get(i))
+                    .cloned();
+                Some((options, selected))
+            }
+            _ => None,
+        }
+    }
+    visit(item, want).unwrap_or_default()
 }
 
 /// How many options the first enum named `want` offers.
@@ -2400,6 +2460,90 @@ mod tests {
             caps.sample_rates().is_none(),
             "no native rate means no honest ladder top"
         );
+    }
+
+    /// The two the plugin used to answer with constants that were not
+    /// even in the device's vocabulary: it reported the clock source as
+    /// "Internal", a name `sclksource` does not offer, on a device
+    /// running off an external 10 MHz reference.
+    #[test]
+    fn capabilities_read_the_clock_source_and_antenna() {
+        let mut value = live_shaped_config();
+        value["items"][0]["items"][1]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "group", "name": "device", "label": "Device",
+                "flags": "", "items": [
+                    { "type": "enum", "name": "sclksource",
+                      "label": "Stream Clock Source", "flags": "",
+                      "value": 4, "default": 0,
+                      "values": "Consumer,Oscillator,GPS,PPS,10MHz,Oscillator Provider,GPS Provider,PPS Provider" },
+                    { "type": "enum", "name": "devicemode", "label": "Device Mode",
+                      "flags": "readonly", "value": 0, "default": 0,
+                      "values": "RX1 LO1 SWEEP,RX2 LO1 SWEEP,RX1 LO1,RX1 TX1 LO1,TX1 LO1" }
+                ]
+            }));
+
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+
+        assert_eq!(caps.clock_sources.len(), 8);
+        assert_eq!(caps.clock_sources[0], "Consumer");
+        assert_eq!(
+            caps.clock_source.as_deref(),
+            Some("10MHz"),
+            "index 4 selects the external reference, not \"Internal\"",
+        );
+        assert_eq!(caps.rx_antenna.as_deref(), Some("RX1"));
+    }
+
+    /// `devicemode` names the input by its first token. A dual mode has
+    /// to report its RX input and not its TX one, and a TX-only mode
+    /// names no RX input at all.
+    #[test]
+    fn the_antenna_comes_from_the_mode_token() {
+        for (mode_index, want) in [(1_i64, Some("RX2")), (3, Some("RX1")), (4, None)] {
+            let mut value = live_shaped_config();
+            value["items"][0]["items"][1]["items"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "type": "group", "name": "device", "label": "Device",
+                    "flags": "", "items": [
+                        { "type": "enum", "name": "devicemode", "label": "Device Mode",
+                          "flags": "readonly", "value": mode_index, "default": 0,
+                          "values": "RX1 LO1 SWEEP,RX2 LO1 SWEEP,RX1 LO1,RX1 TX1 LO1,TX1 LO1" }
+                    ]
+                }));
+            let config: ConfigItem = serde_json::from_value(value).unwrap();
+            let caps = DeviceCapabilities::from_trees(Some(&config), None);
+            assert_eq!(caps.rx_antenna.as_deref(), want, "mode index {mode_index}");
+        }
+    }
+
+    /// An index past the option list must not name the wrong source.
+    /// The list still stands — a caller can advertise what the device
+    /// offers even when it cannot say which is live.
+    #[test]
+    fn an_out_of_range_enum_index_selects_nothing() {
+        let mut value = live_shaped_config();
+        value["items"][0]["items"][1]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "group", "name": "device", "label": "Device",
+                "flags": "", "items": [
+                    { "type": "enum", "name": "sclksource", "label": "Stream Clock Source",
+                      "flags": "", "value": 99, "default": 0,
+                      "values": "Consumer,Oscillator,GPS" }
+                ]
+            }));
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+
+        assert_eq!(caps.clock_sources.len(), 3);
+        assert_eq!(caps.clock_source, None);
     }
 
     /// A bound is only advertisable as a pair.

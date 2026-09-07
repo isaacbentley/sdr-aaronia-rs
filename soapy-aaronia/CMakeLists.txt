@@ -64,16 +64,25 @@ endif()
 # Build (or refresh) the static lib with the FFI feature set. -p scopes
 # to the root crate so the workspace's python-aaronia member (a pyo3
 # extension) is not dragged into a C++ plugin build.
-add_custom_command(
-    OUTPUT ${RUST_STATIC_LIB}
+#
+# A custom *target*, not a custom command producing ${RUST_STATIC_LIB}.
+# The command form is file-driven: with no DEPENDS, CMake considers the
+# output up to date the moment the .a exists and skips cargo entirely,
+# so editing Rust sources and rebuilding relinked the module against a
+# stale archive — silently, with a plausible-looking module that did not
+# contain the change. A target's COMMAND runs every build instead, and
+# cargo's own dependency tracking makes that a no-op when nothing moved,
+# which is what the previous comment here claimed was already happening.
+#
+# BYPRODUCTS names the archive so Ninja knows what the target writes
+# without making its existence the up-to-date test again.
+add_custom_target(sdr_aaronia_rs_static ALL
     COMMAND cargo build --release -p sdr-aaronia-rs
+    BYPRODUCTS ${RUST_STATIC_LIB}
     WORKING_DIRECTORY ${CARGO_MANIFEST_DIR}
     COMMENT "cargo build --release -p sdr-aaronia-rs (static lib for SoapyAaronia)"
     VERBATIM
-    # No DEPENDS: cargo is its own dependency tracker; the command
-    # reruns each build and no-ops when the crate is up to date.
 )
-add_custom_target(sdr_aaronia_rs_static ALL DEPENDS ${RUST_STATIC_LIB})
 
 # Source files
 set(AaroniaSupport_SOURCES

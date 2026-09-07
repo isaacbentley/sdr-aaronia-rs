@@ -145,10 +145,20 @@ publishes:
 | RF frequency range | `centerfreq0` min/max/step |
 | `REF` gain range | `reflevel0` min/max/step |
 | Sample rates | `status/iqsamples` snapped to a rung, over `decimation0`'s rungs |
+| Clock sources, and the selected one | `device/sclksource` |
+| RX antenna name | `device/devicemode`'s RX token |
 
 A SPECTRAN V6 ECO reports 5.5 MHz–8 GHz and −55…+23 dBm, where this
 plugin used to advertise 10 Hz–6 GHz and −100…+10 dB for every model it
-opened.
+opened. It also reports its stream clock source — `Consumer`,
+`Oscillator`, `GPS`, `PPS`, `10MHz` or one of three `… Provider`
+variants. The plugin used to answer `Internal`, a name the device does
+not use, on hardware running off an external 10 MHz reference.
+
+`setClockSource` is the one thing here that only reads: writing the
+device's current source is accepted as the no-op it is, and any other
+value logs a warning naming what the device is actually on. Change it
+in RTSA-Suite under Device > Stream Clock Source.
 
 Each field falls back independently: a device that answers about
 frequency but not gain still gets its frequency range published, and the
@@ -167,6 +177,15 @@ report the driver's defaults throughout.
   always sends center frequency and span together, because RTSA servers
   ignore capture requests carrying only one of the two. This was
   verified against RTSA-Suite PRO with a SPECTRAN V6 ECO.
+- **RX buffer formats:** `CF32` is native and costs nothing. `CS16` is a
+  client-side conversion at full scale 32767, rounded to nearest and
+  clamped — it is not the wire format (that is the `format=` device
+  argument) and it does not reduce network traffic. Measured against
+  CF32 on the same signal, the scaling is exact: the only difference is
+  quantisation noise, which matters when the signal is weak. At
+  −84 dBFS a capture used 13 of the 32767 available codes and the
+  quantisation noise raised its RMS by 1.8%. Lower the reference level
+  or stay on `CF32` for weak signals.
 - **TX:** `CF32`, single channel, and the device reports a TX channel
   only when two things hold: the module was built against the native SDK
   on Windows or Linux, and the device was opened by `serial=` — the
