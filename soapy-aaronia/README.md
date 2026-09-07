@@ -55,9 +55,8 @@ export SOAPY_SDR_PLUGIN_PATH=/path/to/unpacked
 SoapySDRUtil --check=aaronia
 ```
 
-The Rust library is statically linked, so nothing else needs
-installing. Applications that enumerate plugins at startup, such as
-SDR++ and GQRX, must be launched after `SOAPY_SDR_PLUGIN_PATH` is set.
+Applications that enumerate plugins at startup, such as SDR++ and GQRX,
+must be launched after `SOAPY_SDR_PLUGIN_PATH` is set.
 
 ## Build from source
 
@@ -105,10 +104,8 @@ sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
 ## Sample rates
 
 `listSampleRates` reports the device's real ladder, each rung half the
-one above it, because applications build their dropdowns from it and a
-round number the hardware cannot produce would be silently adjusted.
-`setSampleRate` snaps a request to the nearest rung and logs when it
-has to.
+one above it. `setSampleRate` snaps a request to the nearest rung and
+logs when it has to.
 
 **The rate is not the RF bandwidth.** Every sample reaches you, so a
 waterfall spans the full rate, but only the middle 80% is flat and
@@ -117,53 +114,27 @@ range at every rate. Set the rate whose 80% covers the span you want to
 look at: 15.36 MHz of sampling to see 12 MHz of spectrum. The edges of
 the display are real data, just rolled off.
 
-The ladder comes from the device: its native undecimated rate, halved
-once per rung its decimation setting offers. The reported rate is a
-running measurement — a V6 ECO says 61 411 246 Hz for a nominal
-61 440 000 — so it is snapped to the exact rung it names, because a rate
-advertised to an application has to be one the device can be set to. A
-device that cannot be asked, or reports a rate matching no known
-receiver clock, falls back to the ECO ladder: 61.44 MHz down to 120 kHz,
-measured rung by rung.
-
-A full V6 has a selectable receiver clock and reaches higher, by how
-much is not settled — see [the note in
-HTTPSPEC](../docs/HTTPSPEC.md#unresolved-the-full-v6s-top-rate). On one
-of those, `getSampleRate` while streaming reports what the device is
-actually running, which is the number to trust.
+The ladder comes from the device. A backend that cannot be asked falls
+back to the V6 ECO's: 61.44 MHz down to 120 kHz. A full V6 selects its
+receiver clock and reaches higher, by how much is unsettled — see [the
+note in HTTPSPEC](../docs/HTTPSPEC.md#unresolved-the-full-v6s-top-rate).
+There, `getSampleRate` while streaming is the number to trust.
 
 ## What the probe reports
 
-`SoapySDRUtil --probe` shows what the device declares about itself, not
-constants compiled in for one model. Over the HTTP backend the plugin
-reads `/remoteconfig` and `/healthstatus` once at construction and
-publishes:
+Over the HTTP backend, `SoapySDRUtil --probe` reports the attached
+device rather than defaults: model, serial and firmware version, the
+frequency and gain ranges with their steps, the sample-rate ladder,
+clock sources and the RX antenna. A V6 ECO gives 5.5 MHz–8 GHz and
+−55…+23 dBm.
 
-| Probe field | Device source |
-| --- | --- |
-| `hardware=`, `serial=`, `version=` | `/healthstatus` `info/devname`, `info/serialno`, `info/version` |
-| RF frequency range | `centerfreq0` min/max/step |
-| `REF` gain range | `reflevel0` min/max/step |
-| Sample rates | `status/iqsamples` snapped to a rung, over `decimation0`'s rungs |
-| Clock sources, and the selected one | `device/sclksource` |
-| RX antenna name | `device/devicemode`'s RX token |
+Fields fall back independently, so a device that answers about frequency
+but not gain still gets its frequency range published. The file and
+native-SDK backends report the driver's defaults throughout.
 
-A SPECTRAN V6 ECO reports 5.5 MHz–8 GHz and −55…+23 dBm, where this
-plugin used to advertise 10 Hz–6 GHz and −100…+10 dB for every model it
-opened. It also reports its stream clock source — `Consumer`,
-`Oscillator`, `GPS`, `PPS`, `10MHz` or one of three `… Provider`
-variants. The plugin used to answer `Internal`, a name the device does
-not use, on hardware running off an external 10 MHz reference.
-
-`setClockSource` is the one thing here that only reads: writing the
-device's current source is accepted as the no-op it is, and any other
-value logs a warning naming what the device is actually on. Change it
-in RTSA-Suite under Device > Stream Clock Source.
-
-Each field falls back independently: a device that answers about
-frequency but not gain still gets its frequency range published, and the
-file and native-SDK backends — which have no equivalent surface to ask —
-report the driver's defaults throughout.
+`setClockSource` only reads: it accepts the device's current source and
+warns for anything else. Change it in RTSA-Suite under Device > Stream
+Clock Source.
 
 ## Streams
 
@@ -171,53 +142,32 @@ report the driver's defaults throughout.
   is a client-side conversion. Only the `format=` device argument
   changes what crosses the network.
 - `readStream` honours `timeoutUs` and returns partial reads within the
-  deadline, per the SoapySDR contract. Retuning while streaming is safe,
-  being fully serialised against the reader, and requires no Aaronia
-  licence. The plugin retunes through the RTSA `/control` endpoint and
-  always sends center frequency and span together, because RTSA servers
-  ignore capture requests carrying only one of the two. This was
-  verified against RTSA-Suite PRO with a SPECTRAN V6 ECO.
-- **RX buffer formats:** `CF32` is native and costs nothing. `CS16` is a
-  client-side conversion at full scale 32767, rounded to nearest and
-  clamped — it is not the wire format (that is the `format=` device
-  argument) and it does not reduce network traffic. Measured against
-  CF32 on the same signal, the scaling is exact: the only difference is
-  quantisation noise, which matters when the signal is weak. At
-  −84 dBFS a capture used 13 of the 32767 available codes and the
-  quantisation noise raised its RMS by 1.8%. Lower the reference level
-  or stay on `CF32` for weak signals.
-- **TX:** `CF32`, single channel, and the device reports a TX channel
-  only when two things hold: the module was built against the native SDK
-  on Windows or Linux, and the device was opened by `serial=` — the
-  backend that reaches the SDK. A device opened by `url=` or `file=`
-  streams over a transport with no transmit path, so it reports `0 Tx`
-  and `Full-duplex: NO`, and `setupStream(TX)` is never reached. Bursts
-  are pushed for immediate transmission; timed TX
-  (`SOAPY_SDR_HAS_TIME`) is not supported. The TX path is
-  hardware-unverified.
-
-  The check is on the build and the backend, not on the hardware:
-  a SPECTRAN V6 ECO has no transmitter, and opening one by serial from a
-  native-SDK build would still advertise a TX channel.
+  deadline, per the SoapySDR contract. Retuning while streaming is safe
+  and needs no Aaronia licence.
+- **`CS16` is a client-side conversion**, not a wire format — only the
+  `format=` device argument changes network traffic. It quantises to
+  int16, which costs precision on weak signals: lower the reference
+  level, or stay on `CF32`.
+- **TX** is `CF32`, single channel, and reported only on a native-SDK
+  build opened by `serial=`. Over `url=` or `file=` the probe shows
+  `0 Tx`. Bursts transmit immediately; timed TX (`SOAPY_SDR_HAS_TIME`)
+  is not supported, and the whole path is hardware-unverified. The check
+  is on the build and backend, not the hardware — an ECO has no
+  transmitter but would still advertise TX if opened by serial.
 
 ## Time, gain, sensors
 
-- **Stream timestamps.** Every RTSA packet header carries a start time,
-  so `readStream` returns `SOAPY_SDR_HAS_TIME` with epoch nanoseconds on
-  every buffer, and `hasHardwareTime("")` reports that capability —
-  including before the stream is running, which is when `--probe` asks.
-  `getHardwareTime("")` returns the most recent stream timestamp, and
-  `0` before any packet has arrived; SoapySDR has no way to say "no time
-  yet", so take timestamps from `readStream`'s flagged buffers rather
-  than polling before streaming.
-- `hasHardwareTime("GPS")` is different: it reports a *value*, true only
-  on the native-SDK backend with a valid GPS fix, because a fix may
-  genuinely not exist. `getHardwareTime("GPS")` returns epoch
-  nanoseconds, converted in the integer domain.
+- **Stream timestamps.** Every RTSA packet carries a start time, so
+  `readStream` flags every buffer `SOAPY_SDR_HAS_TIME` with epoch
+  nanoseconds. Take them from there: `getHardwareTime("")` returns the
+  most recent one but `0` before any packet has arrived, and SoapySDR
+  has no way to say "no time yet".
+- `hasHardwareTime("GPS")` reports a value rather than a capability —
+  true only on the native-SDK backend with a valid fix.
+  `getHardwareTime("GPS")` returns epoch nanoseconds.
 - The single gain element, `REF`, is the Aaronia reference level in dBm.
-  It is not an amplifier gain: raising it reduces sensitivity. Its range
-  is the one the device declares for `reflevel0` — −55…+23 dBm on a V6
-  ECO, in 0.5 dB steps.
+  It is not an amplifier gain: raising it reduces sensitivity. Range and
+  step come from the device — −55…+23 dBm in 0.5 dB steps on a V6 ECO.
 - `readSensor("cumulative_drops")` counts the timestamp gaps the plugin has
   detected in the stream.
 

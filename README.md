@@ -54,10 +54,9 @@ waterfall and defeat any digital demodulator.
 | up to 49.1 MHz | 61.44 MS/s | 245.8 MB/s | **2.5GbE** |
 
 **An ECO 100 needs 2.5GbE.** Its 44 MHz of real-time bandwidth only fits on
-the top rung, and that rung costs 245.8 MB/s — past gigabit. Measured over
-2.5GbE: 244.3 MB/s delivered, on a path saturating at 292 MB/s. Stay on a
-4-byte wire format; `float32` doubles the requirement to 491.5 MB/s and
-loses 41 % of the stream.
+the top rung, which costs 245.8 MB/s — past gigabit, and close to the
+292 MB/s a 2.5GbE path measured. That leaves no room for an 8-byte wire
+format: stay on `int16` or `float16`.
 
 Treat the table as a starting point. `link_budget` measures *your* path end
 to end and names the widest span that fits.

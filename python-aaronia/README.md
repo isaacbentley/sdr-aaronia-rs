@@ -90,20 +90,19 @@ as the packet's frequency range at every rate. Outside it, data still
 arrives, attenuated and uncalibrated.
 
 So **to see N Hz of spectrum, sample at N / 0.8**, which is what
-`sample_rate_for_bandwidth()` computes. Aaronia's data sheet quotes a
-more conservative figure still — 44 MHz for the ECO against the
-49.152 MHz it declares at full span — because the analog filter is
-already about 1 dB down at that edge. The
+`sample_rate_for_bandwidth()` computes. Aaronia's data sheet is more
+conservative still — 44 MHz for the ECO against the 49.152 MHz it
+declares at full span — because the analog filter is ~1 dB down by that
+edge. The
 [quickstart](https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/QUICKSTART.md#4-troubleshooting)
 has the measurements.
 
-`sample_rates()` returns the ladder for a SPECTRAN V6 ECO — 61.44 MHz
-down to 120 kHz — which is measured, rung by rung. A full V6 has a
-selectable receiver clock and can go higher, and exactly how much
-higher is not settled; see
+`sample_rates()` returns the V6 ECO's ladder, 61.44 MHz down to 120 kHz.
+A full V6 selects its receiver clock and goes higher, by how much is
+unsettled; see
 [the note in HTTPSPEC](https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/HTTPSPEC.md#unresolved-the-full-v6s-top-rate).
-On that hardware, take the rate the device reports over the computed
-ladder: it arrives in the stream metadata, and `diagnose()` prints it.
+There, trust the rate the device reports in stream metadata, which
+`diagnose()` prints.
 
 ## Choosing a wire format
 
