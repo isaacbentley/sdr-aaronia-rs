@@ -162,15 +162,10 @@ noise floor on a V6 ECO, the response is flat to within 0.5 dB across
 beyond what is declared. At full span it is tighter: the analog filter
 is about 1 dB down by the declared edge and 3 dB down at 0.84 x Fs,
 which is why Aaronia's data sheet quotes 44 MHz of real-time bandwidth
-for the ECO rather than the 49.152 MHz the device declares. Take the
-declared span as the working figure and the data sheet as the
-guaranteed one.
-
-That sweep sees the antenna as well as the receiver, so the full-span
-roll-off is an upper bound on how good the filter is, not a
-measurement of it alone. It is enough to show the declared 80% is
-physically grounded rather than an arbitrary number, which is what the
-figure is used for here.
+for the ECO rather than the 49.152 MHz the device declares. (The sweep
+sees the antenna too, so it bounds the filter rather than isolating
+it.) Take the declared span as the working figure and the data sheet as
+the guaranteed one.
 
 The device halves its top rate down a ten-rung ladder, shown in the GUI
 as Full through `1 / 512`. On a V6 ECO that is 61.44 MHz down to

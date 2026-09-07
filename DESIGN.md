@@ -81,7 +81,7 @@ Hop dwell deadlines come from `sdr_source::DwellController`; per-hop pacing addi
 
 The HTTP reader task (spawned by `init_http_source` in `unified_source.rs`) runs a `DropDetector` over each packet's `start_time`/`end_time` metadata. A timestamp gap larger than the tolerance latches `AaroniaSource::pending_overrun`, which `take_overrun()` reads and clears. `single_channel_pump` and `hop_pump` (`sdr_source_impl.rs`) call `take_overrun()` once per emitted `IqPacket`, so a drop detected anywhere since the last read surfaces as `IqPacket::overrun = true` on the next packet. This is a per-call signal, not a precise per-sample one, since drop timing is lost once chunks merge into the flat `sample_buffer`.
 
-The native-SDK and file backends do not populate this yet (`overrun` is always `false` for them). Native-SDK overrun detection would need to read the overflow/dropped warning bits from the packet `flags` field, which the RX path currently ignores.
+The native-SDK and file backends do not populate this yet (`overrun` is always `false` for them). Native-SDK overrun detection would need the overflow/dropped warning bits from the packet `flags` field. The RX path reads and logs those at debug level, but does not yet latch them into `pending_overrun`.
 
 The Aaronia capture thread (`AaroniaSdrSource::start`) is wrapped in `catch_unwind`: a panic inside the pump loop is logged rather than silently unwinding the thread.
 

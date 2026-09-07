@@ -915,10 +915,10 @@ property of Aaronia AG.
 
 The following come from
 [Aaronia-Open-source/RTSA-API-Samples](https://github.com/Aaronia-Open-source/RTSA-API-Samples),
-read in full. They are vendor code rather than vendor documentation, but
-they are the closest thing to an authoritative statement of how the API
-is meant to be driven, and this crate's native-SDK paths cannot be
-tested here.
+read in full. They are vendor code rather than vendor documentation, and
+the closest thing to an authoritative statement of how the API is meant
+to be driven. No device is available to check them against; see
+[VERIFICATION](VERIFICATION.md) for what has and has not been exercised.
 
 ### Both receivers, two different modes
 

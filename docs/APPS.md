@@ -54,8 +54,9 @@ device's real ladder rather than round numbers it cannot produce: on a
 V6 ECO that is 61.44 MHz halved down to 120 kHz, which the RTSA GUI
 labels Full through 1/512. Nothing in between exists, so a request
 between rungs snaps to the nearest and logs a warning. A full V6 has a
-selectable receiver clock and reaches higher; the plugin advertises the
-ECO ladder, so check the rate the device reports if you are on one.
+selectable receiver clock and reaches higher. The plugin advertises
+whatever ladder the device declares, falling back to the ECO's only
+when the device cannot be asked.
 
 The single gain element is `REF`, the Aaronia reference level in dBm. It
 is not an amplifier gain: raising it reduces sensitivity. Start near
