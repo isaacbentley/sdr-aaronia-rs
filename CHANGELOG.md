@@ -51,6 +51,14 @@ All notable changes to this project will be documented in this file.
   `sdk/` resolves via its parent. Health walker accepts `gpssats`; the
   receive path logs packet warning flags at debug.
 
+### Added
+- **`scripts/sdk-container-test.sh`** loads the real SDK library in an
+  x86-64 Linux container and runs the crate's native-SDK load test
+  against it — no hardware and no x86-64 host needed. Verified against
+  3.0.3.16655: `AARTSAAPI_Version()` reports 1.4 and the default Linux
+  install path is detected with no environment variable. The nine host
+  packages the bundled Qt needs are recorded in SDKSPEC.
+
 ### Performance
 - **No per-read allocation on the hot paths.** The C ABI and seify reads
   allocated a fresh Vec per call — 512 KiB malloc/free hundreds of times

@@ -30,6 +30,18 @@ archive's `sdk/aaroniartsaapi.h`, its `Samples/`, and the stripped
 - **Packet warning flags** (`WARN_OVERFLOW` 0x100, `WARN_DROPPED`
   0x200, `WARN_INACCURATE` 0x400, `TIME_DISCONTINUITY` 0x10000) match
   `native_sdk::tx_flags`; the receive path now logs them at debug.
+- **It loads and runs.** In an x86-64 Linux container (Apple's
+  `container` CLI under Rosetta), `dlopen` succeeds and
+  `AARTSAAPI_Version()` returns `0x00010004` — API 1.4. The library's
+  RUNPATH is `$ORIGIN:$ORIGIN/../lib`, so the Qt 6.9 and HDF5 1.14 the
+  archive bundles in `opt/aaronia-rtsa-suite/lib/` resolve on their own
+  once the tree sits at its install path. What that bundled Qt needs
+  from the host is nine packages a bare system may lack — on Debian:
+  `libusb-1.0-0 libgl1 libglx0 libopengl0 libegl1 libxkbcommon0
+  libpulse0 libglib2.0-0 libdbus-1-3`. Without them the load fails on
+  `libusb-1.0.so.0` and the native backend is silently not selected.
+  `scripts/sdk-container-test.sh` reproduces the whole check from an
+  unpacked archive, hardware not required.
 
 ## Overview
 
