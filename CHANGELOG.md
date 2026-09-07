@@ -2,7 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [v0.8.0] - 2026-09-07
+
+**Breaking:** `StreamStats` gained a `device_health` field, so an
+exhaustive struct literal over it no longer compiles. It is
+`#[non_exhaustive]` now, along with the new `DeviceCapabilities` and
+`DeviceHealthSummary`: these are reports a consumer reads rather than
+builds, and the attribute makes every future field addition free. Only
+the `futuresdr` feature exposes `StreamStats`; the default feature set is
+unaffected.
 
 ### Added
 - **The SoapySDR probe now reports what the device says about itself.**

@@ -127,8 +127,14 @@ fn rate_moved(previous: f64, current: f64) -> bool {
     (current - previous).abs() / previous > RATE_CHANGE_BAND
 }
 
-/// Stream statistics for monitoring
+/// Stream statistics for monitoring.
+///
+/// `#[non_exhaustive]`: a report a consumer reads, never one it builds.
+/// Adding `device_health` to it forced this release's major bump,
+/// because a downstream exhaustive literal stopped compiling; the
+/// attribute costs nothing here and makes the next field free.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamStats {
     pub active: bool,
     pub format: StreamFormat,

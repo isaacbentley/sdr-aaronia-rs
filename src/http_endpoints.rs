@@ -423,6 +423,7 @@ pub type HealthStatus = ConfigItem;
 /// a client can do on its own: it narrows a gap down to the server's
 /// egress or the wire, where a second client is one of the causes.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DeviceHealthSummary {
     /// The block's name in the tree, e.g. `Block_Spectran_V6Eco_0`.
     pub block: String,
@@ -551,6 +552,7 @@ pub struct ValueRange {
 /// carry an item leaves its field `None`, and a caller falls back for
 /// that field alone rather than discarding a whole reading.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct DeviceCapabilities {
     /// Human-readable model, e.g. `"SPECTRAN V6 ECO"` — `/healthstatus`
     /// `info/devname`, else `/remoteconfig` `info/title`.
