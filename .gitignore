@@ -10,15 +10,13 @@ tests/sdk/
 # Local agent configuration/memory
 .agents/
 
-# CMake build directory for SoapySDR plugin
-soapy-aaronia/build/
-python-aaronia/__pycache__/test_basic.cpython-314-pytest-9.1.1.pyc
-python-aaronia/err.txt
-python-aaronia/check_errors.txt
-branch_diff.txt
+# Local CMake build trees for the SoapySDR plugin. Globbed, not a single
+# `build/`: a second tree under any other name (build-test, build-e2e)
+# was committed once already — 33 files of CMakeCache and compiler probe
+# binaries carrying absolute paths from the machine that made them.
+soapy-aaronia/build*/
 
-# Python bindings dev environment and local plugin builds
+# Python bindings dev environment and build output
 python-aaronia/venv/
 python-aaronia/**/__pycache__/
-soapy-aaronia/build/
 dist/
