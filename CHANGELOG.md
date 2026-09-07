@@ -4,694 +4,403 @@ All notable changes to this project will be documented in this file.
 
 ## [v0.8.0] - 2026-09-07
 
-**Breaking:** `StreamStats` gained a `device_health` field, so an
-exhaustive struct literal over it no longer compiles. It is
-`#[non_exhaustive]` now, along with the new `DeviceCapabilities` and
-`DeviceHealthSummary`: these are reports a consumer reads rather than
-builds, and the attribute makes every future field addition free. Only
-the `futuresdr` feature exposes `StreamStats`; the default feature set is
-unaffected.
+**Breaking:** `StreamStats` gained a `device_health` field, so exhaustive
+struct literals over it stop compiling. It is `#[non_exhaustive]` now, with
+the new `DeviceCapabilities` and `DeviceHealthSummary`. Only the `futuresdr`
+feature exposes `StreamStats`.
 
 ### Added
-- **The SoapySDR probe now reports what the device says about itself.**
-  `SoapySDRUtil --probe` published constants compiled in for one model:
-  `hardware=Spectran V6` whatever was attached, a 10 Hz–6 GHz frequency
-  range, and a −100…+10 dB gain range. A SPECTRAN V6 ECO declares
-  5.5 MHz–8 GHz and −55…+23 dBm — too low at one end for any tune to
-  succeed, two whole GHz short at the other, and a gain slider spanning
-  values the device clamps. The plugin now reads `/remoteconfig` and
-  `/healthstatus` once at construction and publishes the model, serial,
-  firmware version, both ranges with their declared steps, and the
-  sample-rate ladder.
+- **The SoapySDR probe reports the attached device, not compiled-in
+  constants.** It reads `/remoteconfig` and `/healthstatus` once at open and
+  publishes model, serial, firmware version, frequency and gain ranges with
+  their steps, clock sources, antenna and the sample-rate ladder. A V6 ECO
+  declares 5.5 MHz–8 GHz and −55…+23 dBm; the constants said 10 Hz–6 GHz and
+  −100…+10 dB.
 
-  The ladder is the part that needed care: `status/iqsamples` is the
-  device's native undecimated rate but it is a *measurement*
-  (61 411 246 Hz for a nominal 61 440 000), so it is snapped to the exact
-  `receiver_clock / 1.5` rung it names — new `utils::snap_to_ladder_top`
-  — before being halved once per rung `decimation0` offers. A rate
-  advertised to an application has to be one the device can be set to.
-  `getSampleRateRange` is now taken from the ends of that same ladder, so
-  it can no longer disagree with `listSampleRates`; its old 10 kHz floor
-  sat below the slowest rung the hardware has.
+  Sample rates come from `status/iqsamples` snapped to an exact
+  `receiver_clock / 1.5` rung — new `utils::snap_to_ladder_top`, because the
+  reported 61 411 246 Hz is a measurement of a nominal 61 440 000 — then
+  halved over `decimation0`'s rungs. `getSampleRateRange` takes its ends
+  from that ladder; its old 10 kHz floor sat below the slowest rung.
 
-  New API: `http_endpoints::DeviceCapabilities` and `ValueRange`,
-  `HttpEndpointsClient::get_device_capabilities()`,
-  `AaroniaSource::device_capabilities()`, and the C entry points
+  New API: `DeviceCapabilities`, `ValueRange`,
+  `HttpEndpointsClient::get_device_capabilities`,
+  `AaroniaSource::device_capabilities`, and the C entry points
   `aaronia_source_get_capabilities` / `aaronia_source_capabilities_free`.
-  Every field is optional and independently so: a device answering about
-  frequency but not gain still gets its frequency range published, and
-  the file and native-SDK backends — which have no equivalent surface to
-  ask — fall back throughout. Nothing here is a guess; a field that
-  cannot be read stays absent.
-- **A stream gap now says whether the device caused it.** `HttpSource`
-  reads `/healthstatus` on each gap report and checks the device block's
-  own loss counters — `status/errors`, `status/usboverflows`,
-  `status/dsboverflows`, all per-second rates, so the reading describes
-  the moment of the gap rather than the run so far. Nonzero and the loss
-  starts at the device, where no amount of network headroom will recover
-  it; zero and the samples went missing downstream, in the server's 8 MB
-  outbound buffer or on the wire. The read is detached rather than
-  awaited: the control-plane timeout is 30 s, and stalling `work()` that
-  long would back the chunk channel up into the very loss being
-  diagnosed. `HttpEndpointsClient::get_device_health()` exposes the same
-  reduction of the health tree, and each reading is published as
+  Fields are independently optional; a backend that cannot answer falls back
+  per field rather than wholesale.
+- **A stream gap says whether the device caused it.** `HttpSource` reads the
+  device's own per-second loss counters (`status/errors`, `usboverflows`,
+  `dsboverflows`) on each gap report. Nonzero: the loss starts at the
+  device. Zero: it went missing downstream, in the server's 8 MB outbound
+  buffer or on the wire, where a second client is one cause. The read is
+  detached — the control-plane timeout is 30 s, and stalling `work()` would
+  cause the loss it diagnoses. Also `get_device_health()` and
   `StreamStats::device_health`.
 
-  What it cannot settle is whether another client is on the same server
-  block. Nothing in the HTTP surface counts connections, so clearing the
-  device narrows a gap to a set of causes that includes contention
-  without singling it out — which is why the warning names it rather
-  than asserting it.
-
 ### Fixed
-- **The SoapySDR plugin reported the clock source as `Internal`, a name
-  the device does not use, on hardware running off an external 10 MHz
-  reference.** `device/sclksource` offers `Consumer`, `Oscillator`,
-  `GPS`, `PPS`, `10MHz` and three `… Provider` variants; the measured V6
-  ECO is on `10MHz`. An operator who wired a house reference up for
-  frequency accuracy was told the device was free-running.
-  `listClockSources` and `getClockSource` now answer from the device.
-  `setClockSource` still only reads: it accepts the current source as
-  the no-op it is, and warns for anything else naming what the device is
-  actually on. `listAntennas` likewise takes its name from
-  `device/devicemode` — `RX1` on this device, and correct rather than
-  coincidental on a V6 running an RX2 mode.
-- **The SoapySDR plugin could link a stale Rust static library.** The
-  CMake rule produced `libsdr_aaronia_rs.a` through an
-  `add_custom_command(OUTPUT …)` with no `DEPENDS`, so CMake treated the
-  archive as up to date the moment it existed and skipped cargo
-  entirely. Editing Rust sources and rebuilding relinked the module
-  against the old archive — silently, producing a module that looked
-  fine and did not contain the change. It is a custom *target* now,
-  whose command runs every build and which cargo no-ops when nothing
-  moved, which is what the comment there always claimed happened.
-- **`SoapySDRUtil --probe` reported `Timestamps: NO` on a device that
-  timestamps every buffer.** `hasHardwareTime("")` answered with the last
-  stream timestamp, so it read as "no capability" until a packet had
-  arrived — and a probe never streams. It is a capability query now:
-  every RTSA packet header carries a start time, `readStream` has always
-  returned `SOAPY_SDR_HAS_TIME` with correct epoch nanoseconds, and an
-  application deciding at setup whether to record timestamps no longer
-  reads the probe as "cannot". `hasHardwareTime("GPS")` is unchanged and
-  still reports a value, since a GPS fix may genuinely not exist.
-- **The SoapySDR plugin advertised a TX channel on every device,
-  including receivers that cannot transmit at all.** `SoapySDRUtil
-  --probe` on a V6 ECO over HTTP reported `1 Tx`, a full TX channel
-  section and `Full-duplex: YES`; an application that believed it failed
-  on the first write. `getNumChannels` did guard on holding a sink, but
-  `aaronia_sink_build` allocates unconditionally — it succeeds on a build
-  carrying no TX code at all, and only `aaronia_sink_initialize` fails —
-  so the guard was never false. A sink is now built only when the new
-  `aaronia_sink_supported()` reports this binary carries the native-SDK
-  TX path *and* the source is that backend, which means a `serial=` open
-  with no `url=`/`file=` overriding it. The probe now reads `0 Tx` and
-  `Full-duplex: NO`.
-
-  Still not a device capability check: a native-SDK build opened by
-  serial against a V6 ECO would advertise TX, since the ECO has no
-  transmitter and nothing here asks the SDK.
-- **Restored a clean CI run.** Three clippy lints had been failing
-  `cargo clippy --workspace --all-features --all-targets` on Linux since
-  v0.7.7 — a collapsible `if let` in `UnifiedSink::initialize`, a needless
-  borrow in `native_sdk`, and a `field_reassign_with_default` in a
-  `sdk_source` unit test. All three sit in code gated to Windows and
-  Linux, so a macOS `cargo clippy` compiles none of it and reports
-  success; only CI's `--all-features` run sees them.
+- **Clock source reported as `Internal`, a name the device does not use, on
+  hardware locked to an external 10 MHz reference.** `device/sclksource`
+  offers `Consumer`, `Oscillator`, `GPS`, `PPS`, `10MHz` and three
+  `… Provider` variants. `listClockSources` and `getClockSource` now answer
+  from the device; `setClockSource` accepts the current source and warns
+  otherwise. `listAntennas` takes its name from `device/devicemode`.
+- **A TX channel was advertised on every device, including receivers that
+  cannot transmit.** `aaronia_sink_build` allocates unconditionally, so the
+  existing `_sink ? 1 : 0` guard was never false and an application failed
+  on the first write. TX now needs the new `aaronia_sink_supported()` and a
+  `serial=` open with no `url=`/`file=`. The probe reads `0 Tx`. Still not a
+  hardware check: a native-SDK build opened by serial against an ECO would
+  advertise TX.
+- **`--probe` reported `Timestamps: NO` on a device that timestamps every
+  buffer.** `hasHardwareTime("")` returned the last timestamp, which is 0
+  until a packet arrives — and a probe never streams. It is a capability
+  query now. `hasHardwareTime("GPS")` still reports a value, since a fix may
+  not exist.
+- **The plugin could link a stale Rust archive.** The CMake rule used
+  `add_custom_command(OUTPUT …)` with no `DEPENDS`, so cargo was skipped
+  whenever the `.a` existed and source edits silently never reached the
+  module. It is a custom target now, run every build.
+- **Three clippy lints left CI red since v0.7.7** — a collapsible `if let`,
+  a needless borrow and a `field_reassign_with_default`, all in code gated
+  to Windows and Linux, which a macOS `cargo clippy` never compiles.
 
 ### Documentation
-- **What several clients on one HTTP Server block cost, measured.** The
-  block accepts any number of concurrent `/stream` clients and serves
-  each one a full copy, so *n* clients cost the server *n* times the
-  egress. Two clients at 15.36 MS/s ran contiguous at 61.8 MB/s each;
-  five saturated the 2.5GbE path at 293.9 MB/s — the same ceiling a
-  single fast stream hits — and the loss fell on an arbitrary two of the
-  five, moving to a different pair on a repeat run. Two consequences a
-  client cannot escape: a clean stream is not evidence of being alone,
-  and a gap is not evidence of company. `/info`, `/healthstatus`,
-  `/remoteconfig` and the `/stream` response headers were all checked and
-  none counts connections.
-- **Corrected the free-licence claim in `docs/HTTPSPEC.md`.** It read
-  that running this crate alongside a second client would meet the
-  one-connection limit. Five simultaneous clients were served on a system
-  holding one HTTP Server block licence, with no error and no refusal:
-  the limit is on block instances in the mission graph, not on
-  connections to one block.
-- **The link a device actually needs, measured.** `link_budget`'s module
-  docs gain a 2.5GbE table beside the gigabit one, and the README a
-  requirements section. A 44 MHz real-time-bandwidth device — an ECO 100 —
-  has to run the 61.44 MS/s rung, and that rung costs 245.8 MB/s at 4 bytes
-  a sample, which gigabit cannot carry; 2.5 Gbps Ethernet is the floor for
-  those devices, and the wire format has to stay at 4 bytes a sample
-  because 8 asks 491.5 MB/s and loses 41 % of the stream. Two controls came
-  out of the same measurement: the path saturates at 292 MB/s, 93 % of
-  2.5GbE line rate, so the wire is the limit and not the server; and two
-  configurations asking the same 245.8 MB/s by different routes — 8 bytes a
-  sample at 30.72 MS/s, 4 bytes at 61.44 — deliver the same 244 MB/s,
-  confirming that only the byte rate matters.
+- **Several clients on one HTTP Server block, measured.** The block serves
+  each connection a full copy and refuses none, so *n* clients cost *n*
+  times the egress. Two at 15.36 MS/s ran contiguous; five saturated 2.5GbE
+  at 293.9 MB/s and the loss fell on an arbitrary two, a different pair on a
+  repeat run. No endpoint counts connections — `/info`, `/healthstatus`,
+  `/remoteconfig` and the `/stream` headers were all checked. So a clean
+  stream is not evidence of being alone, and a gap is not evidence of
+  company.
+- **Corrected HTTPSPEC's free-licence claim.** Five clients were served on a
+  system holding one HTTP Server block licence: the limit is on block
+  instances, not connections to one block.
+- **Link requirements, measured over 2.5GbE.** A 2.5GbE table in
+  `link_budget` and a requirements section in the README. An ECO 100 needs
+  the 61.44 MS/s rung at 245.8 MB/s, past gigabit. The path saturates at
+  292 MB/s, 93 % of line rate, so the wire is the limit and not the server;
+  and two configurations asking 245.8 MB/s by different routes both
+  delivered 244 MB/s, confirming only the byte rate matters.
 
 ## [v0.7.7] - 2026-09-06
 
 ### Added
-- **`utils::IQ_RATE_CLOCK_RATIO` and `utils::iq_ladder_from_top`.** The
-  1.5 receiver-clock-cycles-per-sample rule was a bare literal in three
-  places; it has a name now, and the ladder's shape is available
-  without the clock rule for a caller that already holds the top rung
-  — the link budget's device-anchored remedy, which used to reconstruct
-  a clock only to divide it back out (not exact in floating point).
-  `PacketMetadata::sample_rate()` likewise names the rate a header
-  reports (`sampleFrequency`, else `samples / duration`), shared by
-  `StreamingSdrConfig::from_metadata` and the probe's sniff.
-- **A link budget, so a span that cannot fit is caught before the
-  capture instead of after it.** The span picks a rate off the
-  decimation ladder and at 4 bytes a sample that rate is a byte rate the
-  path has to sustain: `--span 10M` is 15.36 MS/s and 61.4 MB/s, which
-  measured contiguous over gigabit, while `--span 20M` is 30.72 MS/s and
-  122.9 MB/s, which measured 1024 skips and 1.84 s lost of 35 s. The new
-  `link_budget` module does the arithmetic in both directions —
-  `required_byte_rate` for what a span costs, `max_sustainable_span` for
-  the widest rung a measured rate affords, inverted through the existing
-  ladder rather than a second copy of it — and `measure_link_throughput`
-  measures the path end to end by counting bytes off `/stream`.
-  Deliberately end to end: the bottleneck may be the server, a switch,
-  the air or this host's own ingest, and the NIC's advertised link speed
-  sees none of them.
+- **`link_budget`, so a span the path cannot carry is caught before the
+  capture instead of after it.** `required_byte_rate` gives what a span
+  costs, `max_sustainable_span` the widest rung a measured rate affords, and
+  `measure_link_throughput` measures the path end to end off `/stream` — end
+  to end because the bottleneck may be the server, a switch, the air or this
+  host's ingest, and the NIC's link speed sees none of them. Measured over
+  gigabit: `--span 10M` (15.36 MS/s, 61.4 MB/s) ran contiguous; `--span 20M`
+  (30.72 MS/s, 122.9 MB/s) lost 1.84 s of 35 s across 1024 skips.
 
-  The probe discards a 500 ms settle window before counting
-  (`LINK_PROBE_SETTLE`). Without it a probe *lies*: the server hands over
-  its pre-connect backlog faster than real time — measured at ~0.27–0.35 s
-  of signal, all inside a 345 ms window at connect — so counting it reads
-  above the true link rate and waves through a span that cannot fit. Two
-  tests pin this, one driving the settle logic off synthetic instants
-  with a 200 MB/s burst ahead of a 10 MB/s stream, and one showing the
-  same trace measuring several times too fast with the settle window
-  removed.
-  An unreachable server, an idle mission or a stream that stops mid-window
-  is an error and never a rate, because "0 MB/s" would condemn every span
-  on the ladder.
-- **`HttpSource` runs that check passively and warns once**, on the
-  stream it is already reading — no second connection, no cost beyond
-  adding up chunk lengths. It compares the bytes arriving against what
-  the device's own reported rate needs and, if the path is short, names
-  the requested span, the rate it needs, what was measured, and the
-  widest span that would have fitted. Complementary to `DropDetector`,
-  which says the server *did* drop data after the fact; when both fire
-  the gap warning now says so, rather than reading as a second unrelated
-  fault. Silence is the answer whenever the measurement did not happen:
-  a warning never fires on a failed one.
-- **`StreamFormat::iq_bytes_per_sample`**, the one definition of the
-  constant the whole budget turns on. `calculate_binary_size` now reads
-  it instead of carrying its own copy of the same match.
+  The probe discards a 500 ms settle window (`LINK_PROBE_SETTLE`) first.
+  Without it a probe *lies*: the server hands over ~0.27–0.35 s of
+  pre-connect backlog faster than real time, so counting it reads above the
+  true rate and waves through a span that cannot fit. An unreachable server,
+  an idle mission or a stream that stops mid-window is an error and never a
+  rate, since "0 MB/s" would condemn every span on the ladder.
+- **`HttpSource` runs the same check passively and warns once**, on the
+  stream it is already reading — no second connection. It names the span,
+  its requirement, what was measured and the widest span that would have
+  fitted. Complements `DropDetector`; when both fire, the gap warning cites
+  the verdict's figures instead of reading as an unrelated second fault.
+- **`utils::IQ_RATE_CLOCK_RATIO`, `utils::iq_ladder_from_top`,
+  `StreamFormat::iq_bytes_per_sample` and `PacketMetadata::sample_rate()`** —
+  names for constants and rules that had been duplicated literals.
 
 ### Fixed
-- **The passive link-budget check now judges against the rate the device
-  reports, not the rate the caller asked for.** `current_sample_rate`
-  adopts a new rate only past a 10% hysteresis band (deliberately, to
-  keep the tuning target stable), so the check compared against a
-  *requested* rate the device merely came close to — under the builder's
-  own 1 MS/s default (served by the 0.96 MS/s rung, a 4% gap against a
-  2% tolerance) it warned "this path cannot carry the configured span"
-  on every healthy start. The device-reported rate is now tracked
-  separately, without hysteresis; no rate reported means no verdict. An
-  external mid-measurement retune (RTSA GUI/API, no stream restart)
-  restarts the meter, so mixed-rate bytes are never judged against one
-  rate's requirement.
-- **The passive meter counts decoded IQ payload, once per sweep,
-  instead of raw chunk bytes per chunk.** Per-chunk counting stamped a
-  whole drained batch at one instant, so the first post-settle sweep
-  counted the queued connect backlog at zero elapsed width — inflating
-  the measurement in exactly the case the settle window exists for, and
-  enough to wave through a genuinely short path. Raw bytes also counted
-  JSON headers and any spectra/histogram packets sharing the stream,
-  which under-warned on mixed missions. One payload observation per
-  sweep discards the backlog sweep whole (it becomes the meter's mark)
-  and compares like against like.
-- **A stall no longer dilutes the measurement, and the window's close is
-  exclusive.** The counting window used to run to whenever the next
-  observation happened to arrive, so an 8 s consumer stall averaged dead
-  time into the "sustained" rate and produced a spurious shortfall
-  warning; the observation that crosses the boundary is now excluded in
-  both directions. `ThroughputMeter::finish` also refuses to answer
-  before the window closes, instead of leaving that check as a
-  convention each caller must remember, and the reported settle interval
-  is the one actually discarded rather than the one configured.
-- **A configuration restart re-arms the check; a verdict survives
-  reconnects.** The `restart_pending` retune path never reset the
-  check's once-per-source flags, so a widened span was never measured
-  (the case the check exists for) and gap warnings kept citing a stale
-  verdict about a span no longer configured. The check's state is now a
-  single `LinkCheck` enum — unmeasured / measuring / done — reset to
-  unmeasured on configuration restarts only. A parse error in the sweep
-  that closes the window no longer discards the finished measurement
-  either: the verdict is reported before the error propagates into the
-  reconnect path.
-- **The shortfall remedy is computed from the device's own ladder and
-  format.** The "widest span that fits" now halves down from the
-  device-reported rate, so it is a rung the device actually has —
-  inverting through the default-clock ladder named wrong rungs for a
-  full V6 on a faster receiver clock — and the no-rung-fits fallback
-  computes its figures from the stream format instead of hardcoding
-  int16's "120 kS/s, 0.5 MB/s", which was self-contradictory for
-  float32. Float32 streams are also told that int16 would halve the
-  requirement.
-- **The probe validates its window and probes the capture's stream.**
-  `measure_link_throughput` refuses windows under a new
-  `MIN_PROBE_WINDOW` (100 ms): two adjacent socket-buffer reads
-  microseconds apart would otherwise "measure" gigabytes a second over
-  a link that cannot sustain one. `measure_link_throughput_with` now
-  takes the capture's `StreamParams` (format *and* input,
-  rate-reduction, scale — it used to probe the server's default input
-  at full rate whatever the capture would open) plus an explicit settle
-  window for servers whose connect backlog outlasts the default, and
-  its header sniff parses packet headers only — skipping degenerate
-  zero-rate status headers, logging when it gives up — instead of
-  running the full sample decoder on payloads it then threw away.
-- **Rate tracking and the meter listen only to IQ packets.** A
-  spectra/histogram header carries no `sampleFrequency`, so the parser
-  derives a *frame* rate orders of magnitude below the IQ rate; on a
-  mixed mission that ping-ponged the device-rate tracker (restarting the
-  check on every interleaved packet, so it never finished) and handed it
-  a nonsense yardstick. The meter also counted those packets' scalars at
-  IQ byte width — half their wire cost — inflating the measured rate.
-  Both trackers and the byte count now key on the packet's payload type,
-  and a sweep that decodes no IQ does not observe at all. The probe's
-  header sniff follows the same rule: `stream_sample_rate` is read from
-  an IQ header, never from a spectra frame rate that happened to come
-  first.
-- **A failed measurement re-arms the check instead of retiring it.** A
-  window that closed without a usable count, or before the device ever
-  reported a rate, used to become "checked, no verdict" — permanently,
-  on no evidence, so the configuration streamed unjudged forever. It now
-  starts a fresh window, reserving the no-verdict terminal state for
-  configurations that genuinely cannot be measured. A device retune
-  arriving *after* the verdict re-arms too (the verdict described the
-  old rate's budget), and `ThroughputMeter::finish` refuses a window
-  that actually observed less than half its configured span — a couple
-  of packets plus a stray late closing observation say nothing about
-  what the path sustains.
-- **`rate_reduction(0)` is rejected at the boundary.** Both builders
-  accepted it and sent `?rate_reduction=0` to the server, while the
-  link check's measurable gate read `n <= 1` as "no decimation" and
-  computed a full-rate requirement against a wire the server was
-  decimating by whatever it made of zero. `HttpSourceBuilder::build`,
-  `HttpEndpointsClient::start_stream` and the probe now refuse it with
-  `Error::Config` (new `StreamParams::validate`), and the gate accepts
-  exactly 1.
-- **The shared client builder no longer forces HTTP/1.1.** The
-  consolidation carried the endpoints client's `.http1_only()` (which
-  the probe had copied) into `rtsa_client_builder`, where it also
-  pinned `HttpSource`'s streaming client — which had never had it, and
-  streamed through TLS-terminating proxies whose ALPN offers only h2.
-  Over plain `http://` reqwest speaks HTTP/1.1 regardless, so the pin
-  protected nothing there; over `https://` ALPN now negotiates for
-  every client, control plane included, with HTTP/2's adaptive
-  flow-control window enabled so a negotiated h2 stream is not capped
-  at hyper's default 2 MiB window per round trip — a ceiling the link
-  check would otherwise measure and blame on the path.
-- **One framing implementation, shared by the parser and the probe's
-  header sniff.** The probe's rate sniff re-scanned its whole
-  accumulation on every chunk and resynced a failed header parse past
-  the separator where the stream parser resyncs one byte past the `{`
-  — binary payloads contain separator bytes, so the two could disagree
-  about which header speaks first. `StreamParser` and the sniff now
-  frame packets through the same `scan_packet_header`, which finds each
-  region's terminator once rather than once per `{` candidate (the old
-  loop was quadratic in brace-dense garbage: 256 KiB of `{` took 20 s
-  of a tokio worker), honours the hardware-verified LF+RS two-byte
-  separator, and reports rejected candidates so the parser's
-  `parse_errors` counter is unchanged. The sniff drops bytes as they
-  are ruled out and retains at most one candidate awaiting its
-  terminator.
-- **An HTTP source starts again after `stop_streaming`.** The reader
-  task is spawned at construction and stopping it left nothing to
-  restart, so a SoapySDR deactivate/activate cycle (and seify's
-  `deactivate_at`/`activate_at`) failed with "HTTP streaming not
-  properly initialized". `start_streaming` now reconnects.
-- **A packet whose body cannot be decoded no longer wedges the stream.**
-  The parser returned the error but left the packet in its buffer, so
-  every later chunk failed on the same bytes while the buffer grew
-  without bound. The packet is now skipped. `HttpSource` also resets the
-  parser and the drop detector on every reconnect, so a retune no longer
-  decodes the new connection's first bytes as the old packet's payload.
-- **`read_samples` returns a partial block on timeout instead of losing
-  it.** Samples already moved into the caller's buffer went out with the
-  error, an unflagged gap through the C and Python APIs.
-- **`IqPacket.sample_rate_hz` reports the rate the device streams.** The
-  `sdr-source` adapter captured the requested rate before the first
-  packet and never looked again, so a rate the device snapped to another
-  ladder rung was mis-stamped for the whole session.
-- **RTSA files: `mSampleSize` counts values per sample, not bytes.** The
-  captures under `tests/` carry 2 for float32 IQ and 1024 for spectra.
-  Seeking within a chunk used it as a byte stride, so a second partial
-  read of a chunk landed mid-sample, and a spectra read returned one
-  scalar per spectrum. Both now use the sample type's width.
-- **The native SDK is shut down by the last client, not the first.**
-  `AARTSAAPI_Shutdown` is process-wide, but each source and sink called
-  it from its own `Drop`, so re-initialising a source, or pairing a
-  source with a sink, tore the SDK down under the survivor.
-- **A bare `spectranv6eco` opens `spectranv6eco/rtsa`.** The ECO has no
-  `/raw` mode; `SdkConfig` appended one anyway. SDKSPEC's mode list said
-  the same and now agrees with its own V6-vs-ECO table.
-- **Clippy passes on Rust 1.98.** The new `chunks_exact_to_as_chunks`
-  lint failed the workspace check at eight decode sites.
-- **The remote-config licence probe can report `Active`.** It looked for
-  a bare `reflevel` under a group named `main`; a V6 exposes `reflevel0`
-  in its receiver block, so the probe always answered `NotLicensed`. It
-  now writes the discovered block, as the retune path does.
-- **`HttpSource` built outside a Tokio runtime errors at build.** It used
-  to panic inside `init()` when it spawned its reader.
-- **`HttpSink` with `buffer_size(0)` no longer spins forever**; the size
-  is clamped to one.
-- **A quiet dwell in hop mode is an empty read**, not a read error
-  counted toward the source-dead bailout.
-- **The first packet after a failed initial connection is not flagged as
-  an overrun**; nothing was lost.
-- **seify: `sample_rate()` reports the observed rate**, and the range
-  starts at the ladder's 120 kS/s floor instead of 10 kHz.
-- **C API: `aaronia_get_error_message` takes an `int`** and answers
-  unknown codes, where an out-of-range enum was undefined behaviour. C
-  callers are unaffected (an enum converts to `int`); a Rust caller of
-  the `ffi` module's function passes `code as i32`.
-- **Native SDK:** `aaronia_source_read_samples_timeout` honours its
-  deadline (it polled for up to 500 ms regardless); spectra reads honour
-  the packet stride; an SDK call that returns no object is an error
-  rather than a null pointer; opening a second device on a live source
-  is refused; the device is closed on drop.
-- **RTSA files:** a negative DSFT stream offset no longer overflows the
-  header search, and `seek_to_sample` works on reverse-order files.
-- **Spectrum decompression caps the output size** taken from packet
-  metadata.
 
-### Performance
-- The stream parser drops an over-cap payload as it arrives instead of
-  buffering it; uncompressed spectra packets decode without a copy;
-  spectra file reads decode in place; the C API reserves the caller's
-  length before a read; `sample_rate_hz` is an atomic load, so stamping
-  it on every packet takes no lock.
+The link-budget check, all within this release:
+- Judges against the device-reported rate, not the requested one.
+  `current_sample_rate`'s 10 % hysteresis meant the builder's 1 MS/s default
+  (served by the 0.96 MS/s rung, a 4 % gap against a 2 % tolerance) warned on
+  every healthy start. A mid-measurement external retune restarts the meter.
+- Counts decoded IQ payload once per sweep rather than raw chunk bytes.
+  Per-chunk counting stamped a whole drained batch at one instant, inflating
+  the first post-settle sweep; raw bytes also counted JSON headers and any
+  spectra sharing the stream.
+- A consumer stall no longer dilutes the window — an 8 s stall used to
+  average dead time into the sustained rate. The observation crossing the
+  boundary is excluded in both directions, and `finish` refuses to answer
+  before the window closes or when it observed under half its span.
+- A configuration restart re-arms the check; reconnects keep the verdict. A
+  parse error in the closing sweep no longer discards a finished measurement.
+- The remedy halves down from the device's own rate, so it names a rung the
+  device has, and takes its figures from the stream format instead of
+  hardcoding int16's. float32 streams are told int16 halves the requirement.
+- Rate tracking and the meter key on payload type. A spectra header carries
+  no `sampleFrequency`, so it yielded a frame rate that ping-ponged the
+  tracker, and its scalars were counted at IQ byte width.
+- A failed measurement re-arms instead of retiring permanently; the
+  no-verdict state is reserved for configurations that cannot be measured.
+- `measure_link_throughput` refuses windows under `MIN_PROBE_WINDOW`
+  (100 ms) and takes the capture's own `StreamParams` and settle window.
+
+Streaming and parsing:
+- `rate_reduction(0)` is refused with `Error::Config` at all three entry
+  points (new `StreamParams::validate`); it used to reach the server.
+- One framing implementation, `scan_packet_header`, shared by the parser and
+  the probe's sniff. They had disagreed on resync, and the old scan was
+  quadratic in brace-dense garbage — 256 KiB of `{` took 20 s of a tokio
+  worker.
+- An HTTP source starts again after `stop_streaming`; a SoapySDR
+  deactivate/activate cycle used to fail.
+- An undecodable packet is skipped instead of wedging the stream and growing
+  the buffer without bound. `HttpSource` resets parser and drop detector on
+  every reconnect.
+- `read_samples` returns a partial block on timeout instead of losing it — an
+  unflagged gap through the C and Python APIs.
+- `IqPacket.sample_rate_hz` reports the streamed rate, not the requested one.
+- The shared client builder no longer pins HTTP/1.1, so ALPN negotiates over
+  `https://`, with HTTP/2 adaptive flow control — hyper's default 2 MiB
+  window would otherwise have been measured and blamed on the path.
+
+RTSA files, native SDK and API surface:
+- `mSampleSize` counts values per sample, not bytes. Used as a byte stride,
+  a second partial chunk read landed mid-sample and spectra returned one
+  scalar per spectrum.
+- A negative DSFT stream offset no longer overflows the header search;
+  `seek_to_sample` works on reverse-order files; spectrum decompression caps
+  its output size from packet metadata.
+- The native SDK is shut down by the last client, not the first —
+  `AARTSAAPI_Shutdown` is process-wide, and each source and sink called it
+  from its own `Drop`.
+- A bare `spectranv6eco` opens `spectranv6eco/rtsa`; the ECO has no `/raw`.
+- Native SDK: `aaronia_source_read_samples_timeout` honours its deadline (it
+  polled up to 500 ms regardless); spectra reads honour the packet stride; an
+  SDK call returning no object is an error, not a null pointer; a second
+  device open on a live source is refused; the device closes on drop.
+- The remote-config licence probe writes the discovered block, so it finds
+  `reflevel0` in a V6's receiver block and can report `Active` — it always
+  answered `NotLicensed`.
+- `HttpSource` built outside a Tokio runtime errors at build rather than
+  panicking inside `init()`.
+- `aaronia_get_error_message` takes an `int` and answers unknown codes, where
+  an out-of-range enum was undefined behaviour. C callers are unaffected; a
+  Rust caller passes `code as i32`.
+- `HttpSink` clamps `buffer_size(0)` to one; a quiet dwell in hop mode is an
+  empty read, not an error counted toward the source-dead bailout; the first
+  packet after a failed initial connection is not flagged as an overrun;
+  seify reports the observed rate over the ladder's 120 kS/s floor.
+- Clippy passes on Rust 1.98 (`chunks_exact_to_as_chunks`, eight sites).
 
 ### Changed
-- **Byte-rate helpers answer `Option<f64>`, never a `0.0` sentinel.**
-  `required_byte_rate`, `max_sustainable_span` and friends returned
-  `0.0` for "unknown / nothing fits", a convention every comparison site
-  had to remember — `required <= measured` on a garbage rate reads
-  "fits". `None` now makes the compiler enforce it, and
-  `StreamFormat::iq_bytes_per_sample` returns `Option<usize>` (`None`
-  for JSON) for the same reason. New `max_sustainable_sample_rate_below`
-  answers remedy queries anchored to the device's reported rate.
-- **The link-budget verdict is data, not just a log line.** New
-  `LinkBudgetVerdict` (measured rate, requirement, fit span, shortness)
-  is published as `StreamStats::link_budget`, so a GUI or orchestrator
-  can auto-narrow the span without scraping logs; the stream-gap warning
-  restates the verdict's actual figures from it. `StreamFormat` gained
-  `CAPTURE_DEFAULT`, the one definition behind `HttpSourceBuilder`'s
-  default, `StreamStats::default` and `DEFAULT_LINK_FORMAT`, which were
-  three separately written `Int16` literals.
-- **One copy each of the RTSA client plumbing.** The probe re-used
-  hand-rolled copies of the endpoints client's construction, auth
-  application, base-URL validation, `/stream` query serialization and
-  status-to-error mapping — five drift risks (the three reqwest clients
-  had already drifted to three different setting subsets). All are
-  shared now: `AuthMethod::apply_to` owns the `RToken` header,
-  `rtsa_client_builder` owns the client settings (the streaming client
-  gains the keepalive/nodelay/HTTP-1.1 compatibility settings the
-  endpoints client always had), and `StreamParams::stream_url`
-  serializes every `/stream` URL, including `HttpSource`'s.
-- **`LinkBudgetVerdict::judge` is the verdict's one producer.**
-  Requirement, shortness-against-tolerance and the remedy rung were
-  assembled by hand at each caller; the constructor now owns that
-  arithmetic (so the struct's invariants — fit fields populated only on
-  a shortfall, span matching the fit rate — hold by construction), the
-  verdict carries `bytes_per_sample` for report text, and
-  `ThroughputMeasurement::max_sustainable_span_hz` takes the stream
-  format instead of silently assuming int16. The no-rung-fits warning
-  cites the device ladder's actual last rung rather than a hardcoded
-  1/512.
-- **`HttpSource`'s stream-open failure is the typed error the rest of
-  the crate returns.** A non-success status on `/stream` is now
-  `Error::Http { status, context }` — the same variant the endpoints
-  client and the probe produce, with `context` naming the stream URL —
-  instead of `Error::Protocol("Stream endpoint returned error: …")`.
-  Anything matching on that text will need the new form.
-- **`work()`'s output copy is two bulk `copy_from_slice` calls** over the
-  deque's contiguous halves instead of a `pop_front` per sample, whose
-  per-element wrap-around check the compiler cannot lift. Factored into
-  `copy_out` and unit-tested, including the wrapped-deque case.
+- **Byte-rate helpers answer `Option<f64>`, never a `0.0` sentinel** —
+  `required <= measured` on a garbage rate read "fits", a convention every
+  comparison site had to remember. `StreamFormat::iq_bytes_per_sample` is
+  `Option<usize>` (`None` for JSON) for the same reason. New
+  `max_sustainable_sample_rate_below` anchors a remedy to the device's rate.
+- **The verdict is data, not just a log line.** `LinkBudgetVerdict` is
+  published as `StreamStats::link_budget`, so a GUI or orchestrator can
+  auto-narrow a span without scraping logs, and `LinkBudgetVerdict::judge` is
+  its one producer, so the struct's invariants hold by construction.
+  `StreamFormat::CAPTURE_DEFAULT` replaces three separately written `Int16`
+  literals.
+- **One copy each of the RTSA client plumbing.** Construction, auth,
+  base-URL validation, `/stream` query serialization and status-to-error
+  mapping had hand-rolled duplicates in the probe — five drift risks, and the
+  three reqwest clients had already drifted to three setting subsets.
+- **`HttpSource`'s stream-open failure is `Error::Http { status, context }`**,
+  the variant the rest of the crate returns. Code matching the old
+  `Error::Protocol("Stream endpoint returned error: …")` text needs updating.
+- `work()`'s output copy is two bulk `copy_from_slice` calls over the deque's
+  contiguous halves instead of a `pop_front` per sample.
+
+### Performance
+- The parser drops an over-cap payload as it arrives instead of buffering it;
+  uncompressed spectra decode without a copy; spectra file reads decode in
+  place; the C API reserves the caller's length before a read;
+  `sample_rate_hz` is an atomic load, so stamping every packet takes no lock.
 
 ### Documentation
-- **Measured the HTTP transport on WiFi 7 and recorded where the
-  ceiling actually is.** `curl` on `/stream` sustains ~75 MB/s
-  (0.6 Gbit/s) station-to-station at a 2.4 Gbps PHY — both ends on air
-  halves the medium — and the figure is the same for all three wire
+- **The HTTP transport measured on WiFi 7.** `curl` on `/stream` sustains
+  ~75 MB/s (0.6 Gbit/s) station to station at a 2.4 Gbps PHY — both ends on
+  air halves the medium — and the figure is identical for all three wire
   formats, so the encoding is not the limit. Two parallel connections
-  measured less in aggregate (63.9 vs 74 MB/s), so a single connection
-  is optimal and nothing smarter is available to the client. Against
-  that, the crate's full framing-plus-decode path measures ~3 GB/s and
-  the individual decoders 0.8–10 GS/s: the parser has fortyfold
-  headroom and is never the bottleneck. What the link buys at 4 bytes a
-  sample is ~19 MS/s — the 15.36 MS/s rung fits, 30.72 does not, and
-  full span (246 MB/s) needs a wired path to the RTSA host. Two ignored
-  throughput-meter tests (`decode_throughput_meter`,
-  `framing_throughput_meter`) keep these numbers re-measurable in one
-  command.
-- README and PLUGINS pinned `sdr-aaronia-rs = "0.6"`, a major behind
-  the crate, so nothing they describe resolved. Now `"0.7"`.
-- `cumulative_drops` counts client-detected timestamp gaps; four docs
-  called them server-reported drops. Bandwidth figures now use the
-  61.44 MS/s top rate rather than the 92 MHz clock. The examples table
-  and the QUICKSTART verification link were corrected.
+  aggregate *less* (63.9 against 74 MB/s), so one connection is optimal.
+  Against that, the crate's framing-plus-decode path measures ~3 GB/s and the
+  individual decoders 0.8–10 GS/s: fortyfold headroom, never the bottleneck.
+  At 4 bytes a sample the link buys ~19 MS/s — the 15.36 rung fits, 30.72
+  does not, and full span needs a wired path. Two ignored throughput-meter
+  tests keep the numbers re-measurable in one command.
+- README and PLUGINS pinned `sdr-aaronia-rs = "0.6"`, a major behind the
+  crate, so nothing they described resolved. Now `"0.7"`.
+- `cumulative_drops` counts client-detected timestamp gaps; four docs called
+  them server-reported drops. Bandwidth figures use the 61.44 MS/s top rate
+  rather than the 92 MHz clock.
 
 ## [v0.7.6] - 2026-08-15
 
-All of this is about the FutureSDR `HttpSource` block (the `futuresdr`
-feature), whose streaming path turned out to be losing most of the
-stream. Found and measured against a live SPECTRAN V6 ECO running a
-49 MHz survey for a trunking decoder.
-
-### Fixed
-- **The sample buffer guillotined every packet bigger than itself.**
-  The capacity trim runs as each packet lands, and with capacity fixed
-  at `buffer_size * 2` a device sending 49k-sample packets into a
-  16384-sample capacity lost ~75% of every packet before the consumer
-  was offered any of it. Measured live: 61.4 MS/s at the device,
-  0.33 MS/s reaching the pipeline, and digital decode unable to hold
-  frame sync. The capacity now floors at four times the largest packet
-  observed, learned from the stream; the floor only ever raises the
-  configured value.
-- **The initial tune could claim success while the device never
-  moved.** `/control` answers `success=true` whether or not any block
-  applies the command — the same device has been measured both
-  honouring and ignoring the identical full-tuple payload in different
-  mission states. The block's start-up tune now writes the real field
-  names (`centerfreq0`, `decimation0`, `reflevel0`) via `/remoteconfig`
-  to the block discovered by walking the config tree, then reads them
-  back and warns about anything that did not take. Where no such block
-  exists (an IQ-demodulator mission exposes different fields), it falls
-  back to the old `/control` capture command and says the result is
-  unverified. The tune is one-shot: stream restarts after an external
-  retune no longer re-push the source's stale target over it.
-- **Launching an app no longer overwrites the operator's gain.** The
-  builder's reference level was a bare number pushed on every start, so
-  merely starting a flowgraph reset the device to the builder default.
-  It is now optional and left untouched unless the caller set one.
-- **`work()` spun.** The runtime ran it whenever the output port had
-  any room — measured at 106,000–390,000 calls a second averaging 14
-  free samples each — burning ~60% of a core and starving the
-  downstream block. The output port now requires a worthwhile block of
-  room before `work()` runs; call rate dropped to ~14/s.
-
-### Changed
-- **The HTTP socket is drained by a dedicated task**, not inside
-  `work()`. The socket used to be read only while the scheduler happened
-  to run the block, which capped throughput at a tenth of what `curl`
-  pulls from the same endpoint. A background task now pushes chunks
-  into a bounded channel (~10 MB), whose fill is the backpressure point:
-  consumer falls behind → channel fills → reader blocks → TCP flow
-  control stops the server. Measured at a 49 MHz span: 1.8 → ~7–9 MS/s.
-  The honest ceiling is the link (~57 MB/s ≈ 14 MS/s as float32);
-  61.44 MS/s over this transport is 2 Gbit/s and not reachable.
-- Buffer-overflow drops are now counted and logged geometrically
-  rather than once per occurrence, which at wide span was 5040 log
-  lines in 25 seconds for one piece of information.
-- File playback decodes little-endian cf32 with a zero-copy read
-  straight into the sample buffer; the explicit per-sample decode
-  remains for big-endian hosts, and a round-trip test pins the two to
-  identical output.
-
-### Fixed (in review, before this release shipped)
-- The refill loop kept iterating through its 50 ms idle sleeps when the
-  channel was empty, holding samples already in the buffer for up to
-  800 ms before producing them. It now flushes immediately and sleeps
-  only when there is nothing to flush.
-- A parse error mid-stream reconnected without reaping the reader task,
-  which on a stalled socket keeps holding a server connection — on the
-  free licence, the one connection the reconnect needs.
-- Two comments overstated the `/control` finding as "this endpoint does
-  not carry these fields on a Spectran V6". Measured today, the same
-  device honours the identical full-tuple payload — the accurate claim
-  is that `success=true` proves nothing either way, which is the reason
-  the verified `/remoteconfig` path exists. Where no `centerfreq0`
-  block is found, the initial tune now falls back to `/control` rather
-  than silently not tuning (an IQ-demodulator mission exposes
-  `centerfreq`, not `centerfreq0`).
+All of this is the FutureSDR `HttpSource` block (the `futuresdr` feature),
+whose streaming path turned out to be losing most of the stream. Found and
+measured against a live SPECTRAN V6 ECO running a 49 MHz survey.
 
 ### Added
-- `iq_sample_rate_for_decimation_index`, `decimation_index_for_rate`
-  and `decimation_index_for_bandwidth` in `utils`: the RTSA "Span"
-  enum (`Full` … `1 / 512`) mapped onto the sample-rate ladder and
-  back, so a requested span becomes the enum index the device actually
-  takes.
-- `HttpEndpointsClient::apply_capture_config` — retune via
-  `/remoteconfig` with read-back confirmation — plus
-  `find_block_name_with_field`, which discovers the receiver block by
-  the field the write will target instead of assuming its category.
+- `iq_sample_rate_for_decimation_index`, `decimation_index_for_rate` and
+  `decimation_index_for_bandwidth` in `utils`: the RTSA "Span" enum (`Full`
+  … `1 / 512`) mapped onto the sample-rate ladder and back, so a requested
+  span becomes the index the device takes.
+- `HttpEndpointsClient::apply_capture_config` — retune via `/remoteconfig`
+  with read-back confirmation — plus `find_block_name_with_field`, which
+  discovers the receiver block by the field the write targets rather than
+  assuming its category.
+
+### Fixed
+- **The sample buffer guillotined every packet bigger than itself.** With
+  capacity fixed at `buffer_size * 2`, a device sending 49k-sample packets
+  into a 16384-sample capacity lost ~75 % of every packet before the
+  consumer saw any of it. Measured live: 61.4 MS/s at the device, 0.33 MS/s
+  reaching the pipeline, digital decode unable to hold frame sync. Capacity
+  now floors at four times the largest packet observed.
+- **The initial tune could claim success while the device never moved.**
+  `/control` answers `success=true` whether or not a block applies the
+  command. The start-up tune now writes `centerfreq0`, `decimation0` and
+  `reflevel0` via `/remoteconfig` to the block found by walking the config
+  tree, reads them back and warns about anything that did not take. Where no
+  such block exists it falls back to `/control` and says the result is
+  unverified. The tune is one-shot, so a restart after an external retune no
+  longer re-pushes a stale target.
+- **Launching an app no longer overwrites the operator's gain.** The
+  builder's reference level was pushed on every start; it is optional now
+  and left untouched unless set.
+- **`work()` spun.** The runtime ran it whenever the output port had any
+  room — 106,000–390,000 calls a second averaging 14 free samples each,
+  burning ~60 % of a core and starving the downstream block. The port now
+  requires a worthwhile block of room; call rate dropped to ~14/s.
+- The refill loop kept iterating through its 50 ms idle sleeps when the
+  channel was empty, holding buffered samples for up to 800 ms. It flushes
+  immediately and sleeps only with nothing to flush.
+- A parse error mid-stream reconnected without reaping the reader task,
+  which on a stalled socket holds a server connection open.
+
+### Changed
+- **The HTTP socket is drained by a dedicated task**, not inside `work()`.
+  Reading it only when the scheduler ran the block capped throughput at a
+  tenth of what `curl` pulls from the same endpoint. A background task now
+  pushes chunks into a bounded channel (~10 MB) whose fill is the
+  backpressure point: consumer falls behind, channel fills, reader blocks,
+  TCP flow control stops the server. Measured at 49 MHz span: 1.8 → ~7–9
+  MS/s. The ceiling is the link (~57 MB/s ≈ 14 MS/s as float32).
+- Buffer-overflow drops are counted and logged geometrically rather than per
+  occurrence — 5040 log lines in 25 seconds at wide span, for one fact.
+- File playback decodes little-endian cf32 straight into the sample buffer;
+  the per-sample decode remains for big-endian hosts, with a round-trip test
+  pinning the two to identical output.
 
 ## [v0.7.5] - 2026-08-13
 
 ### Added
-- **`scale` on the Python config and `aaronia.open()`**, the integer
-  encode multiplier for the `I16` wire format. Rust, the C API and the
-  SoapySDR plugin all had it; Python did not, so a Python program
-  choosing `I16` for bandwidth had no way out of the trap below.
-- **`scripts/validate-iq-live.py`**, an end-to-end check that the
-  samples an application receives are the ones the device sent, rather
-  than that bytes arrived. Every wire format must decode to the same
-  spectrum, the Python and SoapySDR paths must agree, and a known
-  transmitter must land where it should. Run against a live server it
-  places a NOAA weather-radio carrier within 312 Hz of 162.400 MHz and
-  on the correct side of zero — the one check that catches transposed
-  I and Q, which nothing comparing the radio against itself can see.
+- **`scale` on the Python config and `aaronia.open()`**, the integer encode
+  multiplier for the `I16` wire format. Rust, the C API and the SoapySDR
+  plugin all had it; Python did not, leaving no way out of the trap below.
+- **`scripts/validate-iq-live.py`**, an end-to-end check that the samples an
+  application receives are the ones the device sent. Every wire format must
+  decode to the same spectrum, the Python and SoapySDR paths must agree, and
+  a known transmitter must land where it should. Against a live server it
+  places a NOAA carrier within 312 Hz of 162.400 MHz and on the correct side
+  of zero — the one check that catches transposed I and Q.
 
 ### Fixed
-- **`format="I16"` silently discards weak signals at the default
-  scale.** The server sends `round(value * scale)`, so the step is
-  `1 / scale`, and the default of 16384 gives 6.1e-5 — coarser than a
-  quiet band's noise floor. Measured against a live server, **68% of
-  int16 samples came back exactly zero** where float32 had none. At
-  `scale=1e6` the zero fraction was 0.0% and the amplitude matched
-  float32. Documented, with the measurements, in the Python README.
+- **`format="I16"` silently discards weak signals at the default scale.**
+  The server sends `round(value * scale)`, so the step is `1 / scale`, and
+  the default 16384 gives 6.1e-5 — coarser than a quiet band's noise floor.
+  Measured: **68 % of int16 samples came back exactly zero** where float32
+  had none. At `scale=1e6` the zero fraction was 0.0 % and the amplitude
+  matched float32.
 
 ### Changed
-- **The Homebrew formula is no longer a release asset.** It is uploaded
-  as the `homebrew-formula` workflow artifact instead. Homebrew 4 and
-  later cannot install from a formula URL, so on the release page it
-  was a file no user could act on, listed among ones they can. Its only
-  reader is whoever updates the tap, and the checksums are still
-  rendered against the published archives so none are computed by hand.
+- **The Homebrew formula is no longer a release asset**, but the
+  `homebrew-formula` workflow artifact. Homebrew 4 cannot install from a
+  formula URL, so on the release page it was a file no user could act on.
+  Checksums are still rendered against the published archives.
 
 ### Documentation
-- **Wire format is a throughput decision, and the default is the
-  expensive one.** At 15.36 MS/s over a LAN, float32 needs 123 MB/s:
-  measured, it delivered 6.5 MS/s with 290 drops, while float16 and
-  int16 both delivered 15.1 MS/s. The Python README now carries the
-  numbers rather than a general warning.
-- **Measured what the 80% usable-bandwidth figure actually is, and
-  explained it in one sentence.** Sample rate and RF bandwidth were
-  described as related by a ratio without saying what the ratio was or
-  where it came from. RTSA declares exactly 0.8 x Fs as the packet's
-  frequency range at every rate — a fixed rule, checked at 61.44,
-  15.36, 7.68 and 3.84 MHz — and every sample still arrives, so an FFT
-  spans the whole rate while only that 80% is flat and calibrated.
-  Sweeping the receiver's own noise floor on a V6 ECO confirms it: the
-  response is flat within 0.5 dB across 0.80 of the rate at 15.36 MHz
-  sampling and 0.89 at 7.68 MHz, and at full span the analog filter is
-  about 1 dB down by the declared edge — which is where Aaronia's
-  44 MHz data-sheet figure comes from, against the 49.152 MHz the
-  device itself declares. The guidance readers need is one line: to see
-  N Hz of spectrum, sample at N / 0.8.
-- **The READMEs stated the V6 ECO's sample-rate ladder as if it were
-  every device's.** "The device runs a fixed ladder of rates: 61.44 MHz
-  halved down to 120 kHz" is measured and true for an ECO, but a full
-  V6 selects its receiver clock and starts higher — by how much is the
-  open question the specs already record, and the user-facing pages did
-  not carry it. The Python, SoapySDR, quickstart and applications docs
-  now say whose ladder it is and point at the note, and
-  `iq_sample_rates` says so in its own documentation.
-- The SoapySDR README gained a Sample rates section: why
-  `listSampleRates` reports the real ladder, that `setSampleRate` snaps
-  and logs, and that `getSampleRate` while streaming is the number to
-  trust on hardware the advertised ladder does not describe.
-- SDKSPEC still gave the eco family's clock as 61.44 MHz in a second
-  place, contradicting the correction made elsewhere in the same
-  document. It is 92.16 MHz; 61.44 MHz is the top IQ rate.
-- The same sweep caught the claim in `unified_source`'s own
-  documentation, in the `/control` span note in HTTPSPEC, and in the
-  0.8 usable-bandwidth ratio, all of which read as universal and are
-  measurements from one device. `seify_impl`'s sample-rate range is
-  capped at 61.44 MHz for the same reason and now says so: seify has no
-  device handle at that point to ask for something better.
+- **Wire format is a throughput decision, and the default is the expensive
+  one.** At 15.36 MS/s over a LAN float32 needs 123 MB/s: measured, it
+  delivered 6.5 MS/s with 290 drops, while float16 and int16 both delivered
+  15.1 MS/s. The Python README carries the numbers.
+- **What the 80 % usable-bandwidth figure is.** RTSA declares exactly
+  0.8 × Fs as the packet's frequency range at every rate — checked at 61.44,
+  15.36, 7.68 and 3.84 MHz — and every sample still arrives, so an FFT spans
+  the whole rate while only that 80 % is flat and calibrated. Sweeping a V6
+  ECO's own noise floor confirms it: flat within 0.5 dB across 0.80 of the
+  rate at 15.36 MHz and 0.89 at 7.68 MHz, and at full span the analog filter
+  is ~1 dB down by the declared edge — which is where Aaronia's 44 MHz
+  data-sheet figure comes from, against the 49.152 MHz the device declares.
+  To see N Hz of spectrum, sample at N / 0.8.
+- **The READMEs stated the V6 ECO's ladder as if it were every device's.**
+  61.44 MHz halved to 120 kHz is measured and true for an ECO; a full V6
+  selects its receiver clock and starts higher. The Python, SoapySDR,
+  quickstart and applications docs now say whose ladder it is, as does
+  `iq_sample_rates`. The SoapySDR README gained a Sample rates section.
+- The same sweep caught universal-sounding claims that are one device's
+  measurements, in `unified_source`, HTTPSPEC's `/control` span note and the
+  0.8 ratio. `seify_impl`'s range is capped at 61.44 MHz for the same reason
+  and says so: seify has no device handle there to ask for better.
+- SDKSPEC gave the eco family's clock as 61.44 MHz in a second place. It is
+  92.16 MHz; 61.44 MHz is the top IQ rate.
 
 ## [v0.7.4] - 2026-08-12
 
 ### Fixed
-- **The SoapySDR plugin ignored an unrecognised `format=` silently.**
-  A device string carrying `format=int16` — the wire name rather than
-  the plugin's `I16` — streamed the default format while claiming
-  otherwise. It now warns and continues. The server behaves the same
-  way and worse: an unrecognised `format=` on `/stream` serves the
-  RTSA file format with HTTP 200 rather than an error, so a typo
-  changes the wire format entirely. `raw16`, which Aaronia's own Qt
-  reference client sends, is a working alias for `int16`.
+- **The SoapySDR plugin ignored an unrecognised `format=` silently.** A
+  device string carrying `format=int16` — the wire name rather than the
+  plugin's `I16` — streamed the default format while claiming otherwise. It
+  warns and continues now. The server behaves worse: an unrecognised
+  `format=` on `/stream` serves the RTSA file format with HTTP 200 rather
+  than an error, so a typo changes the wire format entirely. `raw16`, which
+  Aaronia's Qt reference client sends, is a working alias for `int16`.
 
 ### Documentation
-- Checked Aaronia's V6 remote control notes (rev 4, May 2026) against
-  the hardware. `/remoteconfig` enum fields take an index as well as a
-  label; one `simpleconfig` PUT can carry several groups, and groups
-  other than `main` work; and a PUT naming a block that is not in the
-  mission returns 200 and changes nothing, which
-  `simple_remote_config` now warns about since it reports `Ok(())` for
-  a write that did not happen. In the config-tree form the receiver
-  name is ignored altogether — the write is routed by `config.name`.
-- Documented loading a mission over `/control`, and that every
-  `/control` payload needs its `type` or the server answers `400`.
-  Loading a mission is deliberately not exposed by the crate: swapping
-  the mission under a running capture should be a caller's decision,
-  not a side effect.
-- Noted that RTSA-Suite has no status endpoint. Aaronia's own liveness
-  check reads the `404` from `/api/status` as proof the server is up.
+- Checked Aaronia's V6 remote control notes (rev 4, May 2026) against the
+  hardware. `/remoteconfig` enum fields take an index as well as a label;
+  one `simpleconfig` PUT can carry several groups, and groups other than
+  `main` work; a PUT naming a block not in the mission returns 200 and
+  changes nothing, which `simple_remote_config` now warns about since it
+  reported `Ok(())` for a write that did not happen. In the config-tree form
+  the receiver name is ignored — the write is routed by `config.name`.
+- Documented loading a mission over `/control`, and that every `/control`
+  payload needs its `type` or the server answers `400`. Loading a mission is
+  deliberately not exposed: swapping the mission under a running capture
+  should be a caller's decision, not a side effect.
+- RTSA-Suite has no status endpoint; Aaronia's own liveness check reads the
+  `404` from `/api/status` as proof the server is up.
 - **What "Full" means on a full V6 is unresolved.** A V6 ECO follows the
-  SDK's `spanfreq <= receiverclock / 1.5`, measured. Aaronia's Remote
-  Config screenshots show a full V6 at a 92 MHz clock delivering
-  92.16 MHz of IQ samples per second at span "Full" — the clock itself.
-  `iq_sample_rates_for_clock` may therefore understate the top of the
-  ladder by 1.5x for a full V6 at a non-default clock; it says so now.
-  Settling it needs a full V6.
-- HTTPSPEC contradicted itself on the Remote Config licence, asserting
-  in one section that writes need it and in another that a live
-  unlicensed system accepts them. The second is what the hardware does,
-  re-confirmed for centre frequency, decimation, reference level and
-  the preamplifier.
-- SDKSPEC still gave the V6 ECO's receiver clock as 61.44 MHz, which
-  0.6.2 corrected in code to 92.16 MHz. 61.44 MHz is the ECO's top IQ
-  rate, that clock over 1.5; the document had the two confused.
-- **A marker stream is not a categories packet**, which the previous
-  draft of this entry got wrong. Aaronia's example declares
-  `payload: "spectra"`, and spectra samples are a 2D array, so its
-  nesting is correct for what it says it is. Its three frequency fields
-  are all zero, so the category names and ranges are the only
-  description of what the numbers mean.
-- Aaronia's endpoint specification (rev 11) settles several things this
-  document had only inferred, and their support answers go further.
-  `/control` takes PUT only, and a command reaches every block that
-  understands it unless `receiverUUID` or `receiverName` scopes it —
-  the specification says such commands cannot be addressed to a block,
-  which their support corrected in 2024. The per-type settings are now
-  listed in full, including `deviceconnect` and `camera`, which this
-  crate does not model. Zones cannot be configured remotely at all.
-  The server starts dropping data once its outbound TCP buffer passes
-  8 MB, which is the mechanism behind most unexplained gaps.
-  `/healthstatus` is organised as `info`, `status`, `health`,
-  `settings` and `components`, the last being how satellites attached
-  over HTTP appear in a local tree.
-- **`status/iqsamples` is the native rate, not the delivered one.** It
-  held at 61.44 MHz while the same device delivered 15.36, then 7.68,
-  then 61.44 MS/s. It looks like a sample rate and is not the one your
-  stream is running at; read `sampleFrequency` from packet metadata.
-  Documented the other fields a V6 ECO reports alongside it.
-- **One HTTP Server and one HTTP Client connection are free**;
-  additional instances and connections are licensed separately, as are
-  Stream Merger and Stream Splitter. Running this crate and a second
-  client against one server at the same time is a second connection —
-  the licence limit most likely to be met in practice, and unrelated to
-  Remote Config.
+  SDK's `spanfreq <= receiverclock / 1.5`, measured. Aaronia's Remote Config
+  screenshots show a full V6 at a 92 MHz clock delivering 92.16 MHz of IQ
+  samples per second at span "Full" — the clock itself.
+  `iq_sample_rates_for_clock` may therefore understate the top of the ladder
+  by 1.5× for a full V6 at a non-default clock; it says so now.
+- HTTPSPEC contradicted itself on the Remote Config licence. A live
+  unlicensed system accepts writes, re-confirmed for centre frequency,
+  decimation, reference level and the preamplifier.
+- SDKSPEC gave the V6 ECO's receiver clock as 61.44 MHz, which 0.6.2
+  corrected in code to 92.16 MHz. 61.44 MHz is the ECO's top IQ rate.
+- **A marker stream is not a categories packet**, which the previous draft
+  of this entry got wrong. Aaronia's example declares `payload: "spectra"`,
+  and spectra samples are a 2D array, so its nesting is correct. Its three
+  frequency fields are all zero, so the category names and ranges are the
+  only description of what the numbers mean.
+- Folded in Aaronia's endpoint specification (rev 11). `/control` takes PUT
+  only, and a command reaches every block that understands it unless
+  `receiverUUID` or `receiverName` scopes it. Per-type settings are listed
+  in full, including `deviceconnect` and `camera`, which this crate does not
+  model; zones cannot be configured remotely. The server drops data once its
+  outbound TCP buffer passes 8 MB, the mechanism behind most unexplained
+  gaps. `/healthstatus` is organised as `info`, `status`, `health`,
+  `settings` and `components`.
+- **`status/iqsamples` is the native rate, not the delivered one.** It held
+  at 61.44 MHz while the same device delivered 15.36, then 7.68, then
+  61.44 MS/s. Read `sampleFrequency` from packet metadata instead.
+- One HTTP Server and one HTTP Client instance are free; additional
+  instances are licensed separately, as are Stream Merger and Stream
+  Splitter. **This entry originally read that a second concurrent client
+  meets the limit — corrected in v0.8.0**, where five simultaneous clients
+  were served on a one-block licence. The limit is on block instances in the
+  mission graph, not connections to one block.
 
 ## [v0.7.3] - 2026-08-12
 

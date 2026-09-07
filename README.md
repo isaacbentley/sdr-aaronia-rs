@@ -53,16 +53,14 @@ waterfall and defeat any digital demodulator.
 | up to 24.5 MHz | 30.72 MS/s | 122.9 MB/s | gigabit measured 1024 skips; prefer 2.5GbE |
 | up to 49.1 MHz | 61.44 MS/s | 245.8 MB/s | **2.5GbE** |
 
-**A 44 MHz device — an ECO 100 — needs a 2.5 Gbps Ethernet link.** Only the
-top rung covers 44 MHz of real-time bandwidth (30.72 MS/s affords 24.5), and
-that rung costs 245.8 MB/s, which gigabit cannot carry. Measured over
-2.5GbE: 244.3 MB/s delivered against a 245.8 MB/s requirement, on a path
-that saturates at 292 MB/s. Keep to a 4-byte wire format there — `float32`
-doubles the requirement to 491.5 MB/s and loses 41 % of the stream.
+**An ECO 100 needs 2.5GbE.** Its 44 MHz of real-time bandwidth only fits on
+the top rung, and that rung costs 245.8 MB/s — past gigabit. Measured over
+2.5GbE: 244.3 MB/s delivered, on a path saturating at 292 MB/s. Stay on a
+4-byte wire format; `float32` doubles the requirement to 491.5 MB/s and
+loses 41 % of the stream.
 
-`link_budget` measures *your* path end to end and names the widest span that
-fits it, so treat the table as a starting point rather than a substitute for
-measuring.
+Treat the table as a starting point. `link_budget` measures *your* path end
+to end and names the widest span that fits.
 
 ## Installation
 
