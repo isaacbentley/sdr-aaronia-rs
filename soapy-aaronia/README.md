@@ -183,8 +183,17 @@ report the driver's defaults throughout.
 
 ## Time, gain, sensors
 
-- `hasHardwareTime("GPS")` returns true only on the native-SDK backend
-  with a valid GPS fix. `getHardwareTime("GPS")` returns epoch
+- **Stream timestamps.** Every RTSA packet header carries a start time,
+  so `readStream` returns `SOAPY_SDR_HAS_TIME` with epoch nanoseconds on
+  every buffer, and `hasHardwareTime("")` reports that capability —
+  including before the stream is running, which is when `--probe` asks.
+  `getHardwareTime("")` returns the most recent stream timestamp, and
+  `0` before any packet has arrived; SoapySDR has no way to say "no time
+  yet", so take timestamps from `readStream`'s flagged buffers rather
+  than polling before streaming.
+- `hasHardwareTime("GPS")` is different: it reports a *value*, true only
+  on the native-SDK backend with a valid GPS fix, because a fix may
+  genuinely not exist. `getHardwareTime("GPS")` returns epoch
   nanoseconds, converted in the integer domain.
 - The single gain element, `REF`, is the Aaronia reference level in dBm.
   It is not an amplifier gain: raising it reduces sensitivity. Its range

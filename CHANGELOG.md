@@ -56,6 +56,15 @@ All notable changes to this project will be documented in this file.
   than asserting it.
 
 ### Fixed
+- **`SoapySDRUtil --probe` reported `Timestamps: NO` on a device that
+  timestamps every buffer.** `hasHardwareTime("")` answered with the last
+  stream timestamp, so it read as "no capability" until a packet had
+  arrived — and a probe never streams. It is a capability query now:
+  every RTSA packet header carries a start time, `readStream` has always
+  returned `SOAPY_SDR_HAS_TIME` with correct epoch nanoseconds, and an
+  application deciding at setup whether to record timestamps no longer
+  reads the probe as "cannot". `hasHardwareTime("GPS")` is unchanged and
+  still reports a value, since a GPS fix may genuinely not exist.
 - **The SoapySDR plugin advertised a TX channel on every device,
   including receivers that cannot transmit at all.** `SoapySDRUtil
   --probe` on a V6 ECO over HTTP reported `1 Tx`, a full TX channel

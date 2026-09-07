@@ -391,8 +391,22 @@ bool AaroniaSoapyDevice::hasHardwareTime(const std::string &what) const {
         return aaronia_source_get_gps_time(_source, &unused);
     }
     if (what.empty()) {
-        std::lock_guard<std::mutex> lock(_mutex);
-        return aaronia_source_get_last_timestamp_ns(_source) != 0;
+        // A capability, not a current value. Every RTSA packet header
+        // carries startTime/endTime, so this device timestamps its
+        // stream on every backend — unlike GPS above, where a fix may
+        // genuinely not exist, which is what the value test belongs to.
+        //
+        // Answering with the last timestamp instead reported the
+        // capability as absent until a packet had arrived, so
+        // `SoapySDRUtil --probe` — which never streams — printed
+        // "Timestamps: NO" for a device whose every buffer comes back
+        // flagged SOAPY_SDR_HAS_TIME. An application choosing at setup
+        // whether to record timestamps read that as "cannot".
+        //
+        // Whether a timestamp is available *yet* is a separate question
+        // and readStream already answers it per buffer, which is the
+        // signal that governs the data an application actually stamps.
+        return true;
     }
     return false;
 }
@@ -413,7 +427,11 @@ long long AaroniaSoapyDevice::getHardwareTime(const std::string &what) const {
         }
         return 0;
     }
-    // Default: the last stream timestamp.
+    // Default: the last stream timestamp, and `0` before any packet has
+    // arrived. SoapySDR has no way to say "no time yet" here, so a
+    // caller that must not stamp data to 1970 should take its time from
+    // readStream's SOAPY_SDR_HAS_TIME buffers rather than polling this
+    // before the stream is running.
     return aaronia_source_get_last_timestamp_ns(_source);
 }
 
