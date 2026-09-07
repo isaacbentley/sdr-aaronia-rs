@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+- **The link a device actually needs, measured.** `link_budget`'s module
+  docs gain a 2.5GbE table beside the gigabit one, and the README a
+  requirements section. A 44 MHz real-time-bandwidth device — an ECO 100 —
+  has to run the 61.44 MS/s rung, and that rung costs 245.8 MB/s at 4 bytes
+  a sample, which gigabit cannot carry; 2.5 Gbps Ethernet is the floor for
+  those devices, and the wire format has to stay at 4 bytes a sample
+  because 8 asks 491.5 MB/s and loses 41 % of the stream. Two controls came
+  out of the same measurement: the path saturates at 292 MB/s, 93 % of
+  2.5GbE line rate, so the wire is the limit and not the server; and two
+  configurations asking the same 245.8 MB/s by different routes — 8 bytes a
+  sample at 30.72 MS/s, 4 bytes at 61.44 — deliver the same 244 MB/s,
+  confirming that only the byte rate matters.
+
 ## [v0.7.7] - 2026-09-06
 
 ### Added

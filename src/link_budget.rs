@@ -16,6 +16,40 @@
 //! | 10 MHz   | 15.36 MS/s  | 61.4 MB/s  | zero gaps, contiguous stream      |
 //! | 20 MHz   | 30.72 MS/s  | 122.9 MB/s | 1024 skips, 1.84 s lost of 35 s   |
 //!
+//! Measured again over 2.5GbE (USB 2.5GbE adapter, 2500Base-T full
+//! duplex, 0.8 ms RTT), counting bytes off the socket over 30 s:
+//!
+//! | bytes/sample | sample rate | needs      | delivered  | result               |
+//! |--------------|-------------|------------|------------|----------------------|
+//! | 4            | 15.36 MS/s  | 61.4 MB/s  | 60.7 MB/s  | fits                 |
+//! | 4            | 30.72 MS/s  | 122.9 MB/s | 121.0 MB/s | fits                 |
+//! | 4            | 61.44 MS/s  | 245.8 MB/s | 244.3 MB/s | fits                 |
+//! | 8            | 30.72 MS/s  | 245.8 MB/s | 244.4 MB/s | fits                 |
+//! | 8            | 61.44 MS/s  | 491.5 MB/s | 292.0 MB/s | saturated, 41 % lost |
+//!
+//! Two readings worth taking from that. The path saturates at **292 MB/s**,
+//! 93 % of 2.5GbE line rate, so the wire is the limit and not the server.
+//! And the two middle rows reach the same 245.8 MB/s requirement by
+//! different routes — 8 bytes a sample at half the rate, 4 bytes at full —
+//! and deliver the same 244 MB/s: **only the byte rate matters**, which is
+//! the assumption every helper here rests on. The unsaturated rows read
+//! ~1 % under their requirement because the count included stream setup,
+//! which is exactly what [`LINK_PROBE_SETTLE`] exists to discard.
+//!
+//! # A 44 MHz device needs 2.5GbE
+//!
+//! [`usable_bandwidth_hz`] gives 24.576 MHz at the 30.72 MS/s rung and
+//! 49.152 MHz at 61.44 MS/s, so anything wanting more than ~24.5 MHz of
+//! real-time bandwidth — a 44 MHz ECO 100, for instance — has to run the
+//! top rung, and the top rung costs 245.8 MB/s at 4 bytes a sample.
+//! Gigabit cannot carry that: the row above it in the first table already
+//! dropped 1024 times at half the rate. The 2.5GbE measurements are why
+//! those devices want 2.5 Gbps Ethernet and not merely "wired".
+//!
+//! It also has to be a 4-byte wire format. At 8 bytes a sample the top
+//! rung asks 491.5 MB/s, which is past what any 2.5GbE path delivers —
+//! measured, 292 MB/s and 41 % of the stream lost.
+//!
 //! `DropDetector` reports the second row *after* the capture is already
 //! corrupted. This module is the predictive half: measure what the path
 //! delivers, and name the widest span that fits it.
