@@ -1796,7 +1796,7 @@ impl NativeSdkSource {
             };
             // `raw` is the V6's name for the pipeline the ECO calls `rtsa`.
             let mode = if mode == "raw" {
-                raw_mode_for_family(&family)
+                raw_mode_for_family(family)
             } else {
                 mode
             };

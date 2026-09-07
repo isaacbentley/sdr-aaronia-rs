@@ -480,8 +480,10 @@ mod tests {
     /// The ECO has no `/raw`; its raw pipeline is `rtsa`.
     #[test]
     fn bare_family_opens_in_its_raw_mode() {
-        let mut config = SdkConfig::default();
-        config.device_type = "spectranv6".to_string();
+        let mut config = SdkConfig {
+            device_type: "spectranv6".to_string(),
+            ..Default::default()
+        };
         assert_eq!(config.device_open_mode(), "spectranv6/raw");
         config.device_type = "spectranv6eco".to_string();
         assert_eq!(config.device_family(), "spectranv6eco");

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Restored a clean CI run.** Three clippy lints had been failing
+  `cargo clippy --workspace --all-features --all-targets` on Linux since
+  v0.7.7 — a collapsible `if let` in `UnifiedSink::initialize`, a needless
+  borrow in `native_sdk`, and a `field_reassign_with_default` in a
+  `sdk_source` unit test. All three sit in code gated to Windows and
+  Linux, so a macOS `cargo clippy` compiles none of it and reports
+  success; only CI's `--all-features` run sees them.
+
 ### Documentation
 - **The link a device actually needs, measured.** `link_budget`'s module
   docs gain a 2.5GbE table beside the gigabit one, and the README a
