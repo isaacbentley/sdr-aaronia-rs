@@ -417,20 +417,28 @@ impl RxStreamer for AaroniaSeifyRxStreamer {
         } else {
             std::time::Duration::from_millis(100)
         };
-        let mut temp = Vec::with_capacity(buf.len());
-        let read = self
-            .runtime
-            .block_on(source.read_samples_deadline(&mut temp, buf.len(), timeout))
-            .map_err(|e| {
+        // The source's reusable staging buffer rather than a fresh Vec
+        // per read — this runs at the stream rate.
+        let mut temp = source.take_scratch();
+        temp.reserve(buf.len());
+        let outcome =
+            self.runtime
+                .block_on(source.read_samples_deadline(&mut temp, buf.len(), timeout));
+        let read = match outcome {
+            Ok(read) => read,
+            Err(e) => {
+                source.return_scratch(temp);
                 if let crate::Error::Io(ref io_err) = e
                     && io_err.kind() == std::io::ErrorKind::TimedOut
                 {
-                    return seify::Error::Timeout;
+                    return Err(seify::Error::Timeout);
                 }
-                seify::Error::Io(std::io::Error::other(e.to_string()))
-            })?;
+                return Err(seify::Error::Io(std::io::Error::other(e.to_string())));
+            }
+        };
 
         buf[..read].copy_from_slice(&temp[..read]);
+        source.return_scratch(temp);
 
         if source.take_overrun() {
             if read > 0 {

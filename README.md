@@ -68,11 +68,11 @@ Add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
 # By default, includes HTTP, File, native sdr-source trait, and C FFI backend support
-sdr-aaronia-rs = "0.7"
+sdr-aaronia-rs = "0.8"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
 # To enable additional backends, opt into their features (e.g. native-sdk, futuresdr)
-# sdr-aaronia-rs = { version = "0.7", features = ["native-sdk", "futuresdr"] }
+# sdr-aaronia-rs = { version = "0.8", features = ["native-sdk", "futuresdr"] }
 ```
 
 ## Quickstart

@@ -69,6 +69,9 @@ public:
     // Clocking API
     std::vector<std::string> listClockSources(void) const override;
     void setClockSource(const std::string &source) override;
+    // The selected clock source with _mutex already held; shared by
+    // getClockSource and setClockSource so neither re-enters the lock.
+    std::string currentClockSourceLocked(void) const;
     std::string getClockSource(void) const override;
 
     // Antenna API
@@ -147,6 +150,10 @@ private:
     std::vector<std::string> _clockSources;
     std::string _clockSource;
     std::string _rxAntenna;
+    // Which backend the source resolved to. Gates the capabilities
+    // that only one backend has: timestamps come from the HTTP
+    // packet headers and nowhere else.
+    CAaroniaSourceType _sourceType;
 };
 
 #endif // AARONIA_SOAPY_DEVICE_HPP

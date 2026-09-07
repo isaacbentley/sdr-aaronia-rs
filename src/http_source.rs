@@ -161,6 +161,12 @@ pub struct StreamStats {
     /// the mission publishes no block health, so the device can be
     /// neither cleared nor blamed.
     pub device_health: Option<Vec<crate::http_endpoints::DeviceHealthSummary>>,
+    /// The `dropped_packets` count at the gap report whose probe took
+    /// [`Self::device_health`]. Probes are detached and may take up to
+    /// the control-plane timeout, so two can be in flight; this is what
+    /// keeps a slower, older reading from overwriting a newer one, and
+    /// lets a consumer tell how current the counters are.
+    pub device_health_drops: u64,
 }
 
 impl Default for StreamStats {
@@ -179,6 +185,7 @@ impl Default for StreamStats {
             restart_pending: false,
             link_budget: None,
             device_health: None,
+            device_health_drops: 0,
         }
     }
 }
@@ -1022,7 +1029,7 @@ impl HttpSource {
     /// five concurrent clients saturated it at 294 MB/s and the loss
     /// landed on an arbitrary subset of them, so a clean stream is not
     /// evidence of being alone either.
-    fn spawn_gap_health_probe(&self) {
+    fn spawn_gap_health_probe(&self, drops: u64) {
         // No handle means no runtime to spawn on (a unit-constructed
         // block, never started); nothing to do and nothing to report.
         let Some(handle) = self.tokio_handle.clone() else {
@@ -1080,10 +1087,15 @@ impl HttpSource {
                 );
             }
 
+            // Last writer is not necessarily latest: a probe fired at
+            // drops=4 can finish after the one fired at drops=16. Keep
+            // whichever describes the later gap.
             if let Some(shared) = shared
                 && let Ok(mut stats) = shared.write()
+                && stats.device_health_drops <= drops
             {
                 stats.device_health = Some(blocks);
+                stats.device_health_drops = drops;
             }
         });
     }
@@ -1224,7 +1236,7 @@ impl HttpSource {
                     // Ask the device whether the loss is its own. The
                     // answer arrives as its own line, just behind this
                     // one — see `spawn_gap_health_probe`.
-                    self.spawn_gap_health_probe();
+                    self.spawn_gap_health_probe(drops);
                 }
             }
         }
@@ -1327,9 +1339,11 @@ impl HttpSource {
             // being taken.
             let pending = stats.restart_pending;
             let device_health = stats.device_health.take();
+            let device_health_drops = stats.device_health_drops;
             *stats = self.get_stream_stats();
             stats.restart_pending = pending;
             stats.device_health = device_health;
+            stats.device_health_drops = device_health_drops;
         }
 
         Ok((total_samples_added, iq_samples_added))
@@ -1392,6 +1406,7 @@ impl HttpSource {
             // it asynchronously and writes it straight to the shared
             // handle, which carries it across this snapshot.
             device_health: None,
+            device_health_drops: 0,
         }
     }
 }

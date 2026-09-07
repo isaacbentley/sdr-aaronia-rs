@@ -1,5 +1,36 @@
 # Aaronia RTSA Vendor SDK Integration Specification
 
+
+## Verified against SDK 3.0.3.16655 (Linux)
+
+Checked 2026-09-07 against the `aaronia-rtsa-suite-3.0.3.16655-Linux`
+archive's `sdk/aaroniartsaapi.h`, its `Samples/`, and the stripped
+`libAaroniaRTSAAPI.so`:
+
+- **ABI unchanged.** The library exports exactly 34 `AARTSAAPI_*`
+  symbols, and `AARTSAAPI_Packet` is the same 15 fields in the same
+  order the crate's `#[repr(C)]` declaration carries (120 bytes:
+  `cbsize`, `streamID`, `flags`, six doubles, `num`, `total`, `size`,
+  `stride`, `fp32`, `interleave`).
+- **The library moved out of `sdk/`.** This release ships
+  `libAaroniaRTSAAPI.so` and `paths.xml` in the install root
+  (`/opt/aaronia-rtsa-suite/Aaronia-RTSA-Suite-PRO/`), with `sdk/`
+  holding only the header, licence and samples. Detection now checks
+  both layouts; it used to check `sdk/` alone and reported the SDK
+  absent on a standard install.
+- **`gpssats`** is the samples' name for the satellite count under
+  `AARTSAAPI_ConfigHealth`; the HTTP tree calls it `satellites`. The
+  health walker accepts both. No sample reads any temperature name, so
+  `fronttemp` — measured live over HTTP — stands.
+- **`spectranv6eco/raw`** is listed as a valid mode in the samples'
+  Readme, but the SDK's own ECO sample (`RawSpectrumEco.cpp`) opens
+  `spectranv6eco/rtsa`, which is what this crate does for a bare ECO
+  family. Whether `/raw` opens on an ECO is unverified here; the
+  mapping is unchanged until hardware says otherwise.
+- **Packet warning flags** (`WARN_OVERFLOW` 0x100, `WARN_DROPPED`
+  0x200, `WARN_INACCURATE` 0x400, `TIME_DISCONTINUITY` 0x10000) match
+  `native_sdk::tx_flags`; the receive path now logs them at debug.
+
 ## Overview
 
 The Aaronia Real-Time Spectrum Analyzer (RTSA) Vendor Software Development Kit (SDK) provides the foundational libraries and APIs for direct interaction with Aaronia RTSA hardware and software components. This document outlines the expected functionalities, typical architecture, and integration considerations for developers utilizing the official Aaronia SDK, particularly when building higher-level wrappers or applications.

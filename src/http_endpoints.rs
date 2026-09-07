@@ -443,6 +443,16 @@ pub struct DeviceHealthSummary {
     pub dsp_overflows_per_second: Option<f64>,
 }
 
+/// Below this many events a second a loss counter reads as clean.
+///
+/// The counters are decaying rates, not totals: a single USB overflow
+/// minutes ago can leave `usboverflows` at 2e-7 for a long tail. Exact
+/// equality against zero would call that "the device is losing samples"
+/// on every gap report thereafter, steering the operator at the USB path
+/// while the loss is really downstream. Half an event a second is below
+/// anything a live loss produces and above any decay residue.
+const LOSS_RATE_THRESHOLD: f64 = 0.5;
+
 impl DeviceHealthSummary {
     /// One summary per block in the tree that publishes a `status`
     /// subgroup, in tree order.
@@ -495,7 +505,12 @@ impl DeviceHealthSummary {
         if counters.iter().all(Option::is_none) {
             return None;
         }
-        Some(counters.into_iter().flatten().all(|rate| rate == 0.0))
+        Some(
+            counters
+                .into_iter()
+                .flatten()
+                .all(|rate| rate < LOSS_RATE_THRESHOLD),
+        )
     }
 
     /// The block and its counters on one line, for a log message.
@@ -602,8 +617,15 @@ impl DeviceCapabilities {
         if let Some(config) = config {
             caps.center_frequency = range_of(config, "centerfreq0");
             caps.reference_level = range_of(config, "reflevel0");
-            caps.decimation_steps = enum_values_of(config, "decimation0");
-            caps.model = find_group(config, "info").and_then(|i| string_named(i, "title"));
+            caps.decimation_steps = match enum_options(config, "decimation0").0.len() {
+                0 => None,
+                n => Some(n),
+            };
+            // The block that carries `centerfreq0` is the receiver. A
+            // mission lists every block, and the HTTP Server block can
+            // come first — its `info/title` is "HTTP Server".
+            let block = device_block(config, "centerfreq0");
+            caps.model = find_group(block, "info").and_then(|i| string_named(i, "title"));
 
             let (sources, selected) = enum_options(config, "sclksource");
             caps.clock_sources = sources;
@@ -622,6 +644,8 @@ impl DeviceCapabilities {
         }
 
         if let Some(health) = health {
+            // Same anchoring: the block whose status carries `devstate`.
+            let health = device_block(health, "devstate");
             let info = find_group(health, "info");
             // `devname` over `/remoteconfig`'s `title`: same string on a
             // measured V6 ECO, but it is the device's own name for
@@ -655,8 +679,47 @@ impl DeviceCapabilities {
         if steps == 0 {
             return None;
         }
-        let ladder = crate::utils::iq_ladder_from_top(top);
-        Some(ladder.iter().take(steps).copied().collect())
+        Some(crate::utils::iq_ladder_from_top_n(top, steps))
+    }
+}
+
+/// The mission block that owns an item named `marker`, or the whole
+/// tree when none does.
+///
+/// `/remoteconfig` and `/healthstatus` carry one subtree per block, and
+/// a plain first-match walk for a generic name like `info` lands on
+/// whichever block RTSA lists first — on the crate's own captured
+/// mission that is the HTTP Server block. Anchoring on an item only the
+/// receiver carries picks the right subtree regardless of order.
+fn device_block<'a>(tree: &'a ConfigItem, marker: &str) -> &'a ConfigItem {
+    fn carries(item: &ConfigItem, marker: &str) -> bool {
+        match item {
+            ConfigItem::Group { items, .. } => items.iter().any(|c| carries(c, marker)),
+            other => item_name(other) == Some(marker),
+        }
+    }
+    if let ConfigItem::Group { items, .. } = tree
+        && let Some(block) = items
+            .iter()
+            .find(|child| matches!(child, ConfigItem::Group { .. }) && carries(child, marker))
+    {
+        return block;
+    }
+    tree
+}
+
+/// The `name` of a leaf item.
+fn item_name(item: &ConfigItem) -> Option<&str> {
+    match item {
+        ConfigItem::Group { name, .. }
+        | ConfigItem::Bool { name, .. }
+        | ConfigItem::Number { name, .. }
+        | ConfigItem::Float { name, .. }
+        | ConfigItem::Integer { name, .. }
+        | ConfigItem::String { name, .. }
+        | ConfigItem::Enum { name, .. }
+        | ConfigItem::Button { name, .. }
+        | ConfigItem::FrequencyProfiles { name, .. } => Some(name),
     }
 }
 
@@ -691,11 +754,16 @@ fn range_of(item: &ConfigItem, want: &str) -> Option<ValueRange> {
                 step,
                 ..
             } if name == want => {
-                // A bound is only useful as a pair: an item declaring
-                // one side says nothing a caller can advertise.
-                Some(ValueRange {
-                    min: (*min)?,
-                    max: (*max)?,
+                // A bound is only useful as a usable interval. One side
+                // alone says nothing a caller can advertise, and a
+                // degenerate pair — `0..0` from a device block loaded but
+                // not connected — published verbatim leaves a GUI that
+                // clamps its tuning control to the range unable to tune
+                // at all, where the fallback constant would have worked.
+                let (min, max) = ((*min)?, (*max)?);
+                (min.is_finite() && max.is_finite() && min < max).then_some(ValueRange {
+                    min,
+                    max,
                     step: *step,
                 })
             }
@@ -721,33 +789,27 @@ fn enum_options(item: &ConfigItem, want: &str) -> (Vec<String>, Option<String>) 
                 value,
                 ..
             } if name == want => {
-                let options: Vec<String> =
-                    values.split(',').map(|v| v.trim().to_string()).collect();
+                // Trailing commas and empty strings are not options. The
+                // index is still applied to the *unfiltered* positions,
+                // since that is what the device's `value` counts — a
+                // filtered list would shift every entry after a blank.
+                let raw: Vec<&str> = values.split(',').map(str::trim).collect();
                 let selected = usize::try_from(*value)
                     .ok()
-                    .and_then(|i| options.get(i))
-                    .cloned();
+                    .and_then(|i| raw.get(i))
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string());
+                let options: Vec<String> = raw
+                    .into_iter()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 Some((options, selected))
             }
             _ => None,
         }
     }
     visit(item, want).unwrap_or_default()
-}
-
-/// How many options the first enum named `want` offers.
-fn enum_values_of(item: &ConfigItem, want: &str) -> Option<usize> {
-    fn visit(item: &ConfigItem, want: &str) -> Option<usize> {
-        match item {
-            ConfigItem::Group { items, .. } => items.iter().find_map(|c| visit(c, want)),
-            ConfigItem::Enum { name, values, .. } if name == want => {
-                let count = values.split(',').filter(|v| !v.trim().is_empty()).count();
-                (count > 0).then_some(count)
-            }
-            _ => None,
-        }
-    }
-    visit(item, want)
 }
 
 /// First numeric item named `want` among `items`, whatever numeric
@@ -1137,6 +1199,12 @@ impl HttpEndpointsClient {
         // there is no client-level timeout. 5 s connect: fast failure on
         // an unreachable server.
         let client = rtsa_client_builder(std::time::Duration::from_secs(5)).build()?;
+
+        // Every endpoint is `{base_url}/name`, and a trailing slash on
+        // the base makes that `//name` — which the RTSA server answers
+        // with 404, measured on `/info` and `/remoteconfig`, not merely
+        // a proxy somewhere in between.
+        let base_url = base_url.trim_end_matches('/').to_string();
 
         Ok(Self {
             client,
@@ -1732,14 +1800,18 @@ impl HttpEndpointsClient {
     /// result is all-`None` only when both reads fail, which a caller
     /// reads as "this device could not be asked" and falls back from.
     pub async fn get_device_capabilities(&self) -> DeviceCapabilities {
-        let config = match self.get_config().await {
+        // Independent, so in flight together: serially, every SoapySDR
+        // `Device::make` paid a second round trip, and a server that
+        // answered `/info` then stalled hung it for two timeouts.
+        let (config, health) = tokio::join!(self.get_config(), self.get_health_status());
+        let config = match config {
             Ok(config) => Some(config),
             Err(e) => {
                 debug!("device capabilities: /remoteconfig unavailable: {e}");
                 None
             }
         };
-        let health = match self.get_health_status().await {
+        let health = match health {
             Ok(health) => Some(health),
             Err(e) => {
                 debug!("device capabilities: /healthstatus unavailable: {e}");
@@ -2564,6 +2636,124 @@ mod tests {
             caps.reference_level.is_some(),
             "one unusable item must not discard the others"
         );
+    }
+
+    /// A decaying rate counter must not read as loss on its residue.
+    /// One overflow minutes ago leaves 2e-7/s behind; calling that "the
+    /// device is losing samples" steered operators at the USB path while
+    /// the loss was downstream.
+    #[test]
+    fn a_decayed_residue_does_not_read_as_loss() {
+        let health = parse_health(live_shaped_health("Running", 0.0, 2.4e-7, 0.0));
+        let blocks = DeviceHealthSummary::from_health_status(&health);
+        assert_eq!(blocks[0].losing_nothing(), Some(true));
+        // While a live rate is still loss.
+        let health = parse_health(live_shaped_health("Running", 0.0, 3.0, 0.0));
+        let blocks = DeviceHealthSummary::from_health_status(&health);
+        assert_eq!(blocks[0].losing_nothing(), Some(false));
+    }
+
+    /// A range the device declares as `0..0` (a block loaded but not
+    /// connected) must not be published: a GUI that clamps its tuning
+    /// control to it cannot tune at all.
+    #[test]
+    fn a_degenerate_declared_range_is_not_a_capability() {
+        let mut value = live_shaped_config();
+        let main = value["items"][0]["items"][1]["items"][0]["items"]
+            .as_array_mut()
+            .unwrap();
+        main[0]["min"] = serde_json::json!(0);
+        main[0]["max"] = serde_json::json!(0);
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+        assert!(
+            caps.center_frequency.is_none(),
+            "0..0 is not a usable interval"
+        );
+        assert!(caps.reference_level.is_some(), "the other range stands");
+    }
+
+    /// A trailing comma is not an option, and the selected index still
+    /// counts the device's own positions.
+    #[test]
+    fn enum_options_drop_empty_entries_without_shifting_the_index() {
+        let mut value = live_shaped_config();
+        value["items"][0]["items"][1]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "group", "name": "device", "label": "Device",
+                "flags": "", "items": [
+                    { "type": "enum", "name": "sclksource", "label": "Stream Clock Source",
+                      "flags": "", "value": 2, "default": 0,
+                      "values": "Consumer,,GPS,10MHz," }
+                ]
+            }));
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+        assert_eq!(caps.clock_sources, vec!["Consumer", "GPS", "10MHz"]);
+        assert_eq!(
+            caps.clock_source.as_deref(),
+            Some("GPS"),
+            "index 2 is the device's position, blank included",
+        );
+        assert_eq!(caps.decimation_steps, Some(10), "real rungs only");
+    }
+
+    /// Identity comes from the block that owns `centerfreq0`, not the
+    /// first block RTSA lists — which is the HTTP Server on a real
+    /// mission.
+    #[test]
+    fn identity_is_read_from_the_device_block_not_the_first_block() {
+        let mut value = live_shaped_config();
+        let blocks = value["items"].as_array_mut().unwrap();
+        blocks.insert(
+            0,
+            serde_json::json!({
+                "type": "group", "name": "Block_HttpServer_0", "label": "HTTP Server",
+                "flags": "grp_tree_root", "items": [
+                    { "type": "group", "name": "info", "label": "Info", "flags": "", "items": [
+                        { "type": "string", "name": "title", "label": "Title", "flags": "",
+                          "value": "HTTP Server", "default": "HTTP Server", "pattern": null }
+                    ]}
+                ]
+            }),
+        );
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+        assert_eq!(caps.model.as_deref(), Some("SPECTRAN V6 ECO"));
+    }
+
+    /// The ladder is as deep as the device says, not capped at the ten
+    /// a V6 ECO happens to have.
+    #[test]
+    fn the_ladder_is_as_deep_as_the_device_declares() {
+        let mut value = live_shaped_config();
+        let main = value["items"][0]["items"][1]["items"][0]["items"]
+            .as_array_mut()
+            .unwrap();
+        main[1]["values"] = serde_json::json!(
+            "Full,1 / 2,1 / 4,1 / 8,1 / 16,1 / 32,1 / 64,1 / 128,1 / 256,1 / 512,1 / 1024,1 / 2048"
+        );
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let health: HealthStatus =
+            serde_json::from_value(live_shaped_health("Running", 0.0, 0.0, 0.0)).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), Some(&health));
+        let rates = caps.sample_rates().unwrap();
+        assert_eq!(rates.len(), 12);
+        assert_eq!(rates[11], 61_440_000.0 / 2048.0);
+    }
+
+    /// The server answers `//info` with 404, so the base must not end
+    /// in a slash whatever the caller passed.
+    #[test]
+    fn a_trailing_slash_on_the_base_url_is_stripped() {
+        let c = HttpEndpointsClient::new("http://localhost:54664/".to_string(), AuthMethod::None)
+            .unwrap();
+        assert_eq!(c.base_url, "http://localhost:54664");
+        let c = HttpEndpointsClient::new("http://localhost:54664".to_string(), AuthMethod::None)
+            .unwrap();
+        assert_eq!(c.base_url, "http://localhost:54664");
     }
 
     #[test]

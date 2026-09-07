@@ -600,12 +600,16 @@ pub unsafe extern "C" fn aaronia_source_read_samples_timeout(
     // Box::into_raw in aaronia_source_build.
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    let mut temp_samples = Vec::with_capacity(len.min(READ_RESERVE_CAP));
+    // The source's reusable staging buffer, not a fresh Vec per call:
+    // this is the SoapySDR readStream path, called hundreds of times a
+    // second with 512 KiB requests at full rate.
+    let mut temp_samples = source.take_scratch();
+    temp_samples.reserve(len.min(READ_RESERVE_CAP));
     let timeout = std::time::Duration::from_micros(timeout_us);
     let samples_result =
         ffi_block_on(source.read_samples_deadline(&mut temp_samples, len, timeout));
 
-    match samples_result {
+    let result = match samples_result {
         Ok(Ok(samples_to_copy)) => {
             let samples_to_copy = samples_to_copy.min(len).min(temp_samples.len());
             // SAFETY: identical layout argument as in
@@ -632,7 +636,9 @@ pub unsafe extern "C" fn aaronia_source_read_samples_timeout(
             set_last_error(format!("aaronia_source_read_samples_timeout: {}", ctx));
             -1
         }
-    }
+    };
+    source.return_scratch(temp_samples);
+    result
 }
 
 /// Read up to `len` (Rx1, Rx2) sample *pairs* from a dual-channel
@@ -1049,8 +1055,9 @@ pub unsafe extern "C" fn aaronia_source_get_capabilities(
         _ => (std::ptr::null(), 0),
     };
 
-    // A NULL-free array of owned C strings, so the caller can index it
-    // without a second length check per entry.
+    // An array of owned C strings, one slot per option. A slot is NULL
+    // when the name could not be made into a C string (an interior NUL),
+    // so callers check each entry — the C++ plugin does.
     let (clock_sources, clock_source_count) = if caps.clock_sources.is_empty() {
         (std::ptr::null(), 0)
     } else {
@@ -1677,6 +1684,129 @@ mod tests {
     /// and freeing the array as a single `f64` would leak all but its
     /// first element — neither shows up as a test failure anywhere else,
     /// so this is exercised under whatever sanitiser CI runs.
+    #[test]
+    fn ffi_device_capabilities_layout_matches_the_c_header() {
+        // Offsets measured from the C side by compiling include/aaronia.h:
+        //   cc -I include abi_check.c ... && ./abi_check
+        // A mismatch here is silent memory corruption across the ABI, not a
+        // compile error, so the two layouts are pinned against each other.
+        assert_eq!(std::mem::size_of::<FfiDeviceCapabilities>(), 136);
+        assert_eq!(std::mem::align_of::<FfiDeviceCapabilities>(), 8);
+        for (name, got, want) in [
+            (
+                "model",
+                std::mem::offset_of!(FfiDeviceCapabilities, model),
+                0,
+            ),
+            (
+                "serial",
+                std::mem::offset_of!(FfiDeviceCapabilities, serial),
+                8,
+            ),
+            (
+                "version",
+                std::mem::offset_of!(FfiDeviceCapabilities, version),
+                16,
+            ),
+            (
+                "has_center_frequency",
+                std::mem::offset_of!(FfiDeviceCapabilities, has_center_frequency),
+                24,
+            ),
+            (
+                "center_frequency_min_hz",
+                std::mem::offset_of!(FfiDeviceCapabilities, center_frequency_min_hz),
+                32,
+            ),
+            (
+                "center_frequency_max_hz",
+                std::mem::offset_of!(FfiDeviceCapabilities, center_frequency_max_hz),
+                40,
+            ),
+            (
+                "center_frequency_step_hz",
+                std::mem::offset_of!(FfiDeviceCapabilities, center_frequency_step_hz),
+                48,
+            ),
+            (
+                "has_reference_level",
+                std::mem::offset_of!(FfiDeviceCapabilities, has_reference_level),
+                56,
+            ),
+            (
+                "reference_level_min_dbm",
+                std::mem::offset_of!(FfiDeviceCapabilities, reference_level_min_dbm),
+                64,
+            ),
+            (
+                "reference_level_max_dbm",
+                std::mem::offset_of!(FfiDeviceCapabilities, reference_level_max_dbm),
+                72,
+            ),
+            (
+                "reference_level_step_db",
+                std::mem::offset_of!(FfiDeviceCapabilities, reference_level_step_db),
+                80,
+            ),
+            (
+                "sample_rate_count",
+                std::mem::offset_of!(FfiDeviceCapabilities, sample_rate_count),
+                88,
+            ),
+            (
+                "sample_rates",
+                std::mem::offset_of!(FfiDeviceCapabilities, sample_rates),
+                96,
+            ),
+            (
+                "clock_source_count",
+                std::mem::offset_of!(FfiDeviceCapabilities, clock_source_count),
+                104,
+            ),
+            (
+                "clock_sources",
+                std::mem::offset_of!(FfiDeviceCapabilities, clock_sources),
+                112,
+            ),
+            (
+                "clock_source",
+                std::mem::offset_of!(FfiDeviceCapabilities, clock_source),
+                120,
+            ),
+            (
+                "rx_antenna",
+                std::mem::offset_of!(FfiDeviceCapabilities, rx_antenna),
+                128,
+            ),
+        ] {
+            assert_eq!(
+                got, want,
+                "field {name} moved: the C header and this struct disagree"
+            );
+        }
+    }
+
+    /// Same pin for the two structs that predate the capabilities one.
+    /// Offsets measured from C the same way.
+    #[test]
+    fn ffi_info_struct_layouts_match_the_c_header() {
+        assert_eq!(std::mem::size_of::<FfiSourceInfo>(), 48);
+        assert_eq!(std::mem::offset_of!(FfiSourceInfo, source_type), 0);
+        assert_eq!(std::mem::offset_of!(FfiSourceInfo, center_frequency), 8);
+        assert_eq!(std::mem::offset_of!(FfiSourceInfo, span_frequency), 16);
+        assert_eq!(std::mem::offset_of!(FfiSourceInfo, bandwidth_hz), 24);
+        assert_eq!(std::mem::offset_of!(FfiSourceInfo, reference_level), 32);
+        assert_eq!(std::mem::offset_of!(FfiSourceInfo, device_serial), 40);
+
+        assert_eq!(std::mem::size_of::<FfiServerInfo>(), 48);
+        assert_eq!(std::mem::offset_of!(FfiServerInfo, name), 0);
+        assert_eq!(std::mem::offset_of!(FfiServerInfo, version), 8);
+        assert_eq!(std::mem::offset_of!(FfiServerInfo, build), 16);
+        assert_eq!(std::mem::offset_of!(FfiServerInfo, serial), 24);
+        assert_eq!(std::mem::offset_of!(FfiServerInfo, title), 32);
+        assert_eq!(std::mem::offset_of!(FfiServerInfo, mission), 40);
+    }
+
     #[test]
     fn capabilities_free_releases_every_owned_allocation() {
         let rates = vec![61_440_000.0_f64, 30_720_000.0, 15_360_000.0].into_boxed_slice();

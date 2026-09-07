@@ -74,11 +74,27 @@ endif()
 # cargo's own dependency tracking makes that a no-op when nothing moved,
 # which is what the previous comment here claimed was already happening.
 #
-# BYPRODUCTS names the archive so Ninja knows what the target writes
-# without making its existence the up-to-date test again.
+# No BYPRODUCTS: naming the archive there puts it in this build tree's
+# clean rules, so `make clean` here would delete a file in the shared
+# Rust target directory that cargo, python-aaronia and the release
+# tests all link against. `add_dependencies` below already orders the
+# link after this target.
+#
+# TX through the plugin needs the crate's `native-sdk` feature, which
+# is not a default feature — without it `aaronia_sink_supported()` is
+# compile-time false and no build of this plugin can transmit. Opt in:
+#   cmake -S soapy-aaronia -B soapy-aaronia/build -DAARONIA_NATIVE_SDK=ON
+# Windows and Linux only, and the Aaronia SDK must be installed at run
+# time for the backend to be selected.
+option(AARONIA_NATIVE_SDK
+    "Build the Rust library with the native-sdk feature (Windows/Linux; enables TX)"
+    OFF)
+set(CARGO_FEATURES "")
+if (AARONIA_NATIVE_SDK)
+    set(CARGO_FEATURES --features native-sdk)
+endif()
 add_custom_target(sdr_aaronia_rs_static ALL
-    COMMAND cargo build --release -p sdr-aaronia-rs
-    BYPRODUCTS ${RUST_STATIC_LIB}
+    COMMAND cargo build --release -p sdr-aaronia-rs ${CARGO_FEATURES}
     WORKING_DIRECTORY ${CARGO_MANIFEST_DIR}
     COMMENT "cargo build --release -p sdr-aaronia-rs (static lib for SoapyAaronia)"
     VERBATIM

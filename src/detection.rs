@@ -90,16 +90,31 @@ fn sdk_library_name() -> Option<&'static str> {
     None
 }
 
-/// Returns the path to the SDK library file
+/// Returns the path to the SDK library file.
+///
+/// The library's location differs by release. RTSA-Suite PRO
+/// 3.0.3.16655 for Linux ships `libAaroniaRTSAAPI.so` in the install
+/// root beside `paths.xml`, with `sdk/` holding only the header, the
+/// licence and the samples; earlier layouts put it under `sdk/`.
+/// Looking in `sdk/` alone reported the SDK absent on a standard 3.0.3
+/// install, so the native backend was never selected. Both are tried,
+/// and a `SDK_PATH_ENV` pointing at the `sdk/` directory itself is
+/// resolved by also checking its parent.
 pub fn get_sdk_library_path() -> Option<String> {
     let sdk_path = get_sdk_path()?;
     let lib_name = sdk_library_name()?;
-    let lib_path: PathBuf = [sdk_path.as_str(), "sdk", lib_name].iter().collect();
-    if lib_path.exists() {
-        Some(lib_path.to_string_lossy().into_owned())
-    } else {
-        None
+    let root = Path::new(&sdk_path);
+    let mut roots = vec![root.to_path_buf()];
+    if root.file_name().is_some_and(|n| n == "sdk")
+        && let Some(parent) = root.parent()
+    {
+        roots.push(parent.to_path_buf());
     }
+    roots
+        .iter()
+        .flat_map(|r| [r.join(lib_name), r.join("sdk").join(lib_name)])
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Returns the XML configuration directory path

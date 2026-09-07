@@ -166,32 +166,24 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         throw std::runtime_error(err);
     }
 
-    // A sink is built only when this device could actually transmit,
-    // because the device advertises its TX channel count from whether it
-    // holds one. `aaronia_sink_build` allocates unconditionally — it
-    // succeeds on a build with no TX code at all, and only
-    // `aaronia_sink_initialize` fails — so building one always and
-    // testing the pointer advertised a TX channel on every device,
-    // including HTTP-attached receivers with no transmitter anywhere in
-    // the path. Two conditions have to hold:
+    // A sink is built only when the source that was just constructed
+    // is the native-SDK backend — the only one with a transmit path. Ask
+    // the source itself rather than re-deriving the backend from the
+    // arguments: a bare `driver=aaronia` auto-detects the SDK with no
+    // `serial=` at all, and a `serial=` open falls back to HTTP when the
+    // SDK is not installed, so the arguments get both cases wrong. A
+    // live NativeSdk source cannot exist on a build without the TX code
+    // (`AaroniaSource::new` refuses it), so this also covers the
+    // compile-time half without a second check.
     //
-    //   - this build carries the native-SDK TX code, and
-    //   - the *source* is the native-SDK backend. `serial` selects it,
-    //     but only when nothing else already chose a transport: the
-    //     source construction above lets `url` and `file` win over a
-    //     serial that is also present, so testing `serial` alone would
-    //     put TX back on an HTTP device opened as `url=...,serial=...`.
-    //
-    // Neither can be relaxed into "probably fine": what they buy is that
-    // an application sees no TX channel rather than one that throws on
-    // the first write.
-    //
-    // Still not a device capability check. A V6 ECO has no transmitter
-    // and would be advertised as having one on a native-SDK build opened
-    // by serial; settling that needs an SDK query this crate does not yet
-    // make.
-    const bool txPossible = aaronia_sink_supported() && args.count("serial") != 0
-                            && args.count("url") == 0 && args.count("file") == 0;
+    // Still not a hardware check: a V6 ECO has no transmitter and would
+    // be advertised as having one here; settling that needs an SDK
+    // query this crate does not yet make.
+    bool txPossible = false;
+    if (FfiSourceInfo* info = aaronia_source_get_source_info(source.p)) {
+        txPossible = info->source_type == NativeSdk;
+        aaronia_source_info_free(info);
+    }
     SinkGuard sink(nullptr);
     if (txPossible) {
         AaroniaSinkBuilder* sink_builder = aaronia_sink_builder_new();

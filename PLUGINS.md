@@ -12,7 +12,7 @@ To use the Seify plugin, enable the `seify` feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sdr-aaronia-rs = { version = "0.7", features = ["seify"] }
+sdr-aaronia-rs = { version = "0.8", features = ["seify"] }
 ```
 
 Instantiate the device with `AaroniaSeifyDevice::from_args` and use it directly (or via `seify::dev::DynDeviceBackend`). The backend is **not** part of seify's built-in enumeration registry — `seify::enumerate()` will not discover it.
@@ -124,9 +124,11 @@ sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
 
 ## 3. Transmit
 
-TX is available through the SoapySDR plugin only when it is built
-against the native SDK on Windows or Linux. Elsewhere `setupStream` for
-TX fails with a descriptive error. Bursts are sent for immediate
+The plugin reports a TX channel only when the source it opened is the
+native-SDK backend — a build configured with `-DAARONIA_NATIVE_SDK=ON`
+on Windows or Linux, with the Aaronia SDK installed. A device opened
+over `url=` or `file=` has no transmit path and the probe shows `0 Tx`;
+`setupStream(TX)` is never reachable there. Bursts are sent for immediate
 transmission; timed TX is not supported. The whole TX path is
 hardware-unverified. See [docs/VERIFICATION.md](docs/VERIFICATION.md).
 

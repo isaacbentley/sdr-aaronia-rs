@@ -2,6 +2,68 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **SoapySDR TX gate read the arguments, not the backend.** It also
+  required a compile-time feature no CMake build passed, so no shipped
+  plugin could ever report TX. The sink is now built when the constructed
+  source's `source_type` is `NativeSdk` — which covers a bare
+  `driver=aaronia` that auto-detects the SDK, and correctly refuses when
+  a `serial=` open fell back to HTTP because the SDK is not installed.
+  New `-DAARONIA_NATIVE_SDK=ON` builds the Rust library with the feature.
+- **`hasHardwareTime("")` returned true on the file and native-SDK
+  backends**, which never set a timestamp — the 1970 bug the previous
+  fix removed from HTTP, relocated. Gated on the backend now.
+- **`getAntenna` still hardcoded `RX1`/`TX1`** while `listAntennas` had
+  become device-derived, so a V6 in an RX2 mode reported an antenna not
+  in its own list. Both now agree; `getClockSource` likewise always
+  returns a member of `listClockSources`, and `setClockSource` re-reads
+  the device before deciding a request is a no-op instead of comparing
+  against a construction-time cache.
+- **A trailing slash on the base URL produced `//info`, which the RTSA
+  server answers with 404** — every control-plane request failed.
+  Stripped in `HttpEndpointsClient::new`.
+- **`DeviceHealthSummary::losing_nothing` used exact float equality** on
+  counters that decay: a stale 2e-7 errors/s blamed the device on every
+  gap report. A 0.5/s threshold now.
+- **Device identity was read from the first `info` group in the tree**,
+  which on a mission listing the HTTP Server block first reported
+  `hardware=HTTP Server`. Lookups anchor to the block owning
+  `centerfreq0` / `devstate`.
+- **A declared `0..0` range was published as a capability**, leaving a
+  GUI that clamps to it unable to tune. Ranges must be finite with
+  `min < max`.
+- **`enum_options` kept empty entries** (a trailing comma became a blank
+  clock source); it filters them, and `enum_values_of` is gone.
+- **The sample-rate ladder was capped at 10 rungs** whatever the device
+  declared; it is as deep as `decimation0` says
+  (`utils::iq_ladder_from_top_n`). `getSampleRateRange` now returns one
+  zero-width range per rung instead of a continuous span.
+- **`make clean` in the plugin build deleted the shared Rust archive**
+  via `BYPRODUCTS`; removed.
+- **Overlapping stream-gap health probes could overwrite a newer reading
+  with an older one.** Readings carry the drop count they were taken at
+  (`StreamStats::device_health_drops`) and never regress.
+- **SDK detection only looked in `sdk/`**, so RTSA-Suite 3.0.3 for Linux
+  — which ships `libAaroniaRTSAAPI.so` in the install root — was reported
+  absent. Both layouts are checked, and an `AARONIA_SDK_PATH` pointing at
+  `sdk/` resolves via its parent. Health walker accepts `gpssats`; the
+  receive path logs packet warning flags at debug.
+
+### Performance
+- **No per-read allocation on the hot paths.** The C ABI and seify reads
+  allocated a fresh Vec per call — 512 KiB malloc/free hundreds of times
+  a second at full rate; they borrow a scratch buffer held by the source.
+  The Python dual-channel read pre-sizes its two vectors.
+- `get_device_capabilities` issues its two GETs concurrently, halving
+  `Device::make`'s cost and its worst case.
+
+### Documentation
+- README and PLUGINS pinned `"0.7"` after the breaking 0.8.0; now `"0.8"`.
+  PLUGINS.md's TX section matches the new condition. SDKSPEC records the
+  3.0.3.16655 verification.
+
 ## [v0.8.0] - 2026-09-07
 
 **Breaking:** `StreamStats` gained a `device_health` field, so exhaustive

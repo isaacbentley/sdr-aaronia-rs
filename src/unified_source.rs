@@ -465,6 +465,13 @@ pub struct AaroniaSource {
     /// Hardware timestamp (in nanoseconds since UNIX epoch) of the most
     /// recently received sample block.
     last_timestamp_ns: i64,
+    /// Reusable staging buffer for readers that must hand samples to a
+    /// caller-owned slice (the C ABI, seify). Allocating a fresh `Vec`
+    /// per read put a 512 KiB malloc/free on every 65536-sample call at
+    /// 61.44 MS/s — allocator contention and cache eviction exactly where
+    /// a consumer is trying to keep up. Taken with `mem::take` for the
+    /// duration of a read and put back, so its capacity survives.
+    read_scratch: Vec<Complex32>,
 }
 
 impl AaroniaSource {
@@ -525,6 +532,7 @@ impl AaroniaSource {
             pending_overrun: false,
             cumulative_drops: 0,
             last_timestamp_ns: 0,
+            read_scratch: Vec::new(),
         };
 
         // Determine the best source type
@@ -1370,6 +1378,23 @@ impl AaroniaSource {
         self.last_timestamp_ns
     }
 
+    /// Borrow the reusable staging buffer for one read.
+    ///
+    /// Returns it cleared; the caller must hand it back with
+    /// [`Self::return_scratch`] so the capacity is kept for the next
+    /// call. Two-step rather than a `&mut` field because a read borrows
+    /// `self` mutably too.
+    pub fn take_scratch(&mut self) -> Vec<Complex32> {
+        let mut scratch = std::mem::take(&mut self.read_scratch);
+        scratch.clear();
+        scratch
+    }
+
+    /// Hand a buffer from [`Self::take_scratch`] back.
+    pub fn return_scratch(&mut self, scratch: Vec<Complex32>) {
+        self.read_scratch = scratch;
+    }
+
     /// Stop streaming
     pub async fn stop_streaming(&mut self) -> Result<()> {
         info!("⏹ Stopping streaming");
@@ -2167,6 +2192,7 @@ mod tests {
             pending_overrun: false,
             cumulative_drops: 0,
             last_timestamp_ns: 0,
+            read_scratch: Vec::new(),
         };
 
         let detected_type = source
@@ -2246,6 +2272,7 @@ mod tests {
             pending_overrun: false,
             cumulative_drops: 0,
             last_timestamp_ns: 0,
+            read_scratch: Vec::new(),
         };
 
         let result = source.detect_best_source_type().await;
@@ -2277,6 +2304,7 @@ mod tests {
             pending_overrun: false,
             cumulative_drops: 0,
             last_timestamp_ns: 0,
+            read_scratch: Vec::new(),
         };
 
         let detected_type = source
@@ -2310,6 +2338,7 @@ mod tests {
             pending_overrun: false,
             cumulative_drops: 0,
             last_timestamp_ns: 0,
+            read_scratch: Vec::new(),
         };
 
         let detected_type = source
@@ -2488,6 +2517,7 @@ mod tests {
             pending_overrun: false,
             cumulative_drops: 0,
             last_timestamp_ns: 0,
+            read_scratch: Vec::new(),
         };
 
         assert!(!source.take_overrun(), "no chunk received yet");

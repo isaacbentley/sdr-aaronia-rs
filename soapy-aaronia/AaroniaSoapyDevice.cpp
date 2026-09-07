@@ -18,7 +18,8 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
       _rxSetup(false), _txSetup(false), _rxStreamTag(0), _txStreamTag(0),
       _isStreaming(false),
       _hasFreqRange(false), _freqMinHz(0.0), _freqMaxHz(0.0), _freqStepHz(0.0),
-      _hasRefRange(false), _refMinDbm(0.0), _refMaxDbm(0.0), _refStepDb(0.0)
+      _hasRefRange(false), _refMinDbm(0.0), _refMaxDbm(0.0), _refStepDb(0.0),
+      _sourceType(Http)
 {
     (void)args;
     if (!_source) {
@@ -30,6 +31,7 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
         _centerFrequency = info->center_frequency;
         _sampleRate = info->span_frequency;
         _referenceLevel = info->reference_level;
+        _sourceType = info->source_type;
         aaronia_source_info_free(info);
     }
 
@@ -56,8 +58,10 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
             _sampleRates.assign(caps->sample_rates,
                                 caps->sample_rates + caps->sample_rate_count);
         }
-        for (size_t i = 0; i < caps->clock_source_count; ++i) {
-            if (caps->clock_sources[i]) _clockSources.emplace_back(caps->clock_sources[i]);
+        if (caps->clock_sources) {
+            for (size_t i = 0; i < caps->clock_source_count; ++i) {
+                if (caps->clock_sources[i]) _clockSources.emplace_back(caps->clock_sources[i]);
+            }
         }
         if (caps->clock_source) _clockSource = caps->clock_source;
         if (caps->rx_antenna)   _rxAntenna   = caps->rx_antenna;
@@ -411,7 +415,11 @@ bool AaroniaSoapyDevice::hasHardwareTime(const std::string &what) const {
         // Whether a timestamp is available *yet* is a separate question
         // and readStream already answers it per buffer, which is the
         // signal that governs the data an application actually stamps.
-        return true;
+        //
+        // HTTP only: the timestamp is read from the RTSA packet header,
+        // and the file and native-SDK sources never set one — answering
+        // true for them is the 1970 bug again, on two backends.
+        return _sourceType == Http;
     }
     return false;
 }
@@ -447,6 +455,7 @@ std::vector<std::string> AaroniaSoapyDevice::listClockSources(void) const {
     // "... Provider" variants. "Internal" was not among them — it was
     // this driver's invention, and it was reported on a device running
     // off an external 10 MHz house reference.
+    std::lock_guard<std::mutex> lock(_mutex);
     if (!_clockSources.empty()) return _clockSources;
     return {"Internal"};
 }
@@ -455,18 +464,45 @@ void AaroniaSoapyDevice::setClockSource(const std::string &source) {
     // Setting the source the device already reports is a no-op, so
     // accept it: an application that reads the list and writes back
     // what it found should not be warned at.
-    if (!_clockSource.empty() && source == _clockSource) return;
-    if (_clockSource.empty() && source == "Internal") return;
+    // The clock source is the one cached field an operator changes
+    // out of band (in RTSA-Suite, as the warning below says to), so
+    // re-read it before deciding whether this is a no-op: comparing
+    // against the construction-time value warned on the *correct* new
+    // name. Rare and user-initiated, so the two GETs are acceptable.
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (FfiDeviceCapabilities* caps = aaronia_source_get_capabilities(_source)) {
+        if (caps->clock_source) _clockSource = caps->clock_source;
+        if (caps->clock_sources) {
+            _clockSources.clear();
+            for (size_t i = 0; i < caps->clock_source_count; ++i) {
+                if (caps->clock_sources[i]) _clockSources.emplace_back(caps->clock_sources[i]);
+            }
+        }
+        aaronia_source_capabilities_free(caps);
+    }
+    const std::string current = currentClockSourceLocked();
+    if (source == current) return;
     SoapySDR::logf(SOAPY_SDR_WARNING,
                    "setClockSource('%s'): this driver reports the device's stream "
                    "clock source but does not change it; the device is on '%s'. "
                    "Change it in RTSA-Suite (Device > Stream Clock Source).",
-                   source.c_str(),
-                   _clockSource.empty() ? "unknown" : _clockSource.c_str());
+                   source.c_str(), current.c_str());
+}
+
+std::string AaroniaSoapyDevice::currentClockSourceLocked(void) const {
+    // Always a member of listClockSources(). When the device gave a
+    // list but no valid selection, the first entry keeps the contract
+    // rather than "Internal", which would be in neither list.
+    if (!_clockSource.empty()) return _clockSource;
+    if (!_clockSources.empty()) return _clockSources.front();
+    return "Internal";
 }
 
 std::string AaroniaSoapyDevice::getClockSource(void) const {
-    return _clockSource.empty() ? std::string("Internal") : _clockSource;
+    // setClockSource refreshes the cache after construction, so reads
+    // take the lock too.
+    std::lock_guard<std::mutex> lock(_mutex);
+    return currentClockSourceLocked();
 }
 
 std::vector<std::string> AaroniaSoapyDevice::listAntennas(const int direction, const size_t channel) const {
@@ -492,7 +528,11 @@ void AaroniaSoapyDevice::setAntenna(const int direction, const size_t channel, c
 
 std::string AaroniaSoapyDevice::getAntenna(const int direction, const size_t channel) const {
     (void)channel;
-    return direction == SOAPY_SDR_TX ? "TX1" : "RX1";
+    // Must be a member of listAntennas(): applications select the
+    // combo entry matching this, and gr-soapy validates set_antenna
+    // against the list.
+    if (direction == SOAPY_SDR_TX) return _sink ? "TX1" : "";
+    return _rxAntenna.empty() ? std::string("RX1") : _rxAntenna;
 }
 
 void AaroniaSoapyDevice::setFrequency(const int direction, const size_t channel, const std::string &name, const double frequency, const SoapySDR::Kwargs &args) {
@@ -608,15 +648,12 @@ SoapySDR::RangeList AaroniaSoapyDevice::getSampleRateRange(const int direction, 
     (void)direction;
     (void)channel;
     SoapySDR::RangeList ranges;
-    // The ends of the ladder this device actually offers, so the range
-    // and listSampleRates() cannot disagree. The 10 kHz floor this
-    // replaces was below the slowest rung the hardware has (120 kHz on
-    // an ECO), so the range admitted rates no entry in the list matched.
-    const std::vector<double> rates = listSampleRates(SOAPY_SDR_RX, 0);
-    if (!rates.empty()) {
-        ranges.push_back(SoapySDR::Range(rates.back(), rates.front()));
-    } else {
-        ranges.push_back(SoapySDR::Range(10e3, 61.44e6));
+    // One zero-width Range per rung: the ladder is discrete, and a
+    // single span from floor to ceiling advertised 5 MHz as valid only
+    // for setSampleRate to snap it to 3.84 with a warning. This is what
+    // the RangeList form of the API exists for.
+    for (const double rate : listSampleRates(SOAPY_SDR_RX, 0)) {
+        ranges.push_back(SoapySDR::Range(rate, rate));
     }
     return ranges;
 }

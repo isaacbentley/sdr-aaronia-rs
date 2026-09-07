@@ -45,6 +45,7 @@ static void test_null_safe_frees(void) {
     aaronia_endpoints_client_free(NULL);
     aaronia_server_info_free(NULL);
     aaronia_source_info_free(NULL);
+    aaronia_source_capabilities_free(NULL);
     aaronia_string_free(NULL);
     /* Reaching here without crashing is the success criterion. */
     CHECK(1, "all *_free(NULL) returned without UB");
@@ -119,6 +120,31 @@ static void test_endpoints_client_lifecycle(void) {
     CHECK(1, "endpoints client with malformed URL returned without UB");
 }
 
+/* Capability entry points on a NULL source. `get_capabilities` must
+ * answer NULL rather than dereference, and the free that follows must
+ * accept it — the struct owns three C strings plus two heap arrays, so
+ * a partially-populated free is where a double-free would surface. */
+static void test_capabilities_null_source(void) {
+    printf("test_capabilities_null_source:\n");
+    FfiDeviceCapabilities *caps = aaronia_source_get_capabilities(NULL);
+    CHECK(caps == NULL, "get_capabilities(NULL) returned NULL");
+    aaronia_source_capabilities_free(caps);
+    CHECK(1, "capabilities_free of a NULL result returned without UB");
+
+    /* The error string the failed call left behind is caller-owned. */
+    char *err = aaronia_last_error();
+    if (err) aaronia_string_free(err);
+    CHECK(1, "last_error after a failed get_capabilities freed cleanly");
+}
+
+/* Compile-time capability query: no arguments, no state, so the only
+ * thing to check is that it links and answers a valid bool. */
+static void test_sink_supported(void) {
+    printf("test_sink_supported:\n");
+    bool tx = aaronia_sink_supported();
+    CHECK(tx == true || tx == false, "sink_supported returned a valid bool");
+}
+
 int main(void) {
     printf("=== sdr-aaronia-rs ASAN/UBSAN smoke test ===\n");
     test_null_safe_frees();
@@ -126,6 +152,8 @@ int main(void) {
     test_setters_null_builder();
     test_error_message_roundtrip();
     test_endpoints_client_lifecycle();
+    test_capabilities_null_source();
+    test_sink_supported();
     printf("=== %d failure%s ===\n", failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;
 }

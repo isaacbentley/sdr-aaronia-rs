@@ -1612,7 +1612,10 @@ impl NativeSdkSource {
                         "boardpower" => {
                             health.board_power_w = self.read_health_value(device, &mut current);
                         }
-                        "satellites" => {
+                        // `satellites` is the HTTP `/healthstatus` name;
+                        // `gpssats` is what SDK 3.0.3's own samples read
+                        // from `AARTSAAPI_ConfigHealth`. Either way.
+                        "satellites" | "gpssats" => {
                             gps.satellites = self
                                 .read_health_value(device, &mut current)
                                 .map(|v| v as u32);
@@ -2467,6 +2470,27 @@ impl NativeSdkSource {
                     );
                 }
                 // Process IQ data from the packet
+                // The device says when it lost or doubted samples; until
+                // now nothing on the receive path read it. Debug rather
+                // than warn: at full rate this is per packet, and the
+                // consumer-visible signal is the overrun flag and drop
+                // counter, which callers already poll.
+                let warned = packet.flags
+                    & (tx_flags::WARN_OVERFLOW
+                        | tx_flags::WARN_DROPPED
+                        | tx_flags::WARN_INACCURATE
+                        | tx_flags::TIME_DISCONTINUITY);
+                if warned != 0 {
+                    tracing::debug!(
+                        "SDK packet flags 0x{:x}: overflow={} dropped={} inaccurate={} \
+                         time_discontinuity={}",
+                        packet.flags,
+                        packet.flags & tx_flags::WARN_OVERFLOW != 0,
+                        packet.flags & tx_flags::WARN_DROPPED != 0,
+                        packet.flags & tx_flags::WARN_INACCURATE != 0,
+                        packet.flags & tx_flags::TIME_DISCONTINUITY != 0,
+                    );
+                }
                 if !packet.fp32.is_null() && packet.num > 0 && valid_iq_stride {
                     const MAX_SAMPLES: usize = 1 << 24;
                     // Bound-check `packet.num` *before* multiplying so a garbage

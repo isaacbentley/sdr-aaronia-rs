@@ -498,8 +498,11 @@ impl PyAaroniaSource {
         let (rx1, rx2) = py
             .detach(|| {
                 rt.block_on(async {
-                    let mut rx1 = Vec::new();
-                    let mut rx2 = Vec::new();
+                    // Sized up front: from capacity 0 each channel regrows
+                    // several times per read, and the arrays are copied
+                    // out into NumPy afterwards anyway.
+                    let mut rx1 = Vec::with_capacity(count);
+                    let mut rx2 = Vec::with_capacity(count);
                     source.read_samples_dual(&mut rx1, &mut rx2, count).await?;
                     Ok::<_, AaroniaError>((rx1, rx2))
                 })

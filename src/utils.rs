@@ -443,6 +443,19 @@ pub fn iq_ladder_from_top(top_hz: f64) -> [f64; 10] {
     rates
 }
 
+/// The ladder whose top rung is `top_hz`, `rungs` deep: that rate and
+/// its successive halvings, highest first.
+///
+/// For a caller that knows how many rungs the device offers — the
+/// `decimation0` enum lists them — and must not be capped at the ten a
+/// V6 ECO happens to have. A device declaring twelve would otherwise
+/// lose its two slowest rates with no diagnostic. Empty for zero rungs.
+pub fn iq_ladder_from_top_n(top_hz: f64, rungs: usize) -> Vec<f64> {
+    (0..rungs)
+        .map(|n| top_hz / 2f64.powi(i32::try_from(n).unwrap_or(i32::MAX)))
+        .collect()
+}
+
 /// Alias-free bandwidth delivered at `sample_rate_hz`.
 ///
 /// This is the width the stream's `startFrequency`..`endFrequency`
