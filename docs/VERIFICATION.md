@@ -18,16 +18,22 @@ SDK are marked unverified.
 | Connect retry | HTTP | Mock-tested; the mDNS race it addresses did not reproduce on demand |
 | `.rtsa` playback and metadata | File | **Verified against real captures**, byte-compared with the official format specification |
 | seify backend | HTTP | **Live-verified** |
-| SoapySDR plugin RX | HTTP | Verified manually (~9.7 Msps via `SoapySDRUtil`); no automated live test, as a `soapysdr` dev-dependency would make `cargo test` unbuildable without system SoapySDR |
-| Python bindings RX | HTTP | Verified manually (NumPy and Arrow); no automated live test |
+| SoapySDR plugin RX | HTTP | Verified manually: CF32 and CS16 both sustained 15.36 MS/s, the full requested rate, over an 8 s window after the connect backlog. No automated live test, as a `soapysdr` dev-dependency would make `cargo test` unbuildable without system SoapySDR |
+| SoapySDR device reporting (model, serial, ranges, rate ladder, clock source, antenna, timestamps, channel counts) | HTTP | Verified manually against a V6 ECO: every field the probe prints comes from the device, `getAntenna` is a member of `listAntennas`, and `getClockSource` a member of `listClockSources` |
+| Python bindings RX | HTTP | Verified manually: 15.58 MS/s of live IQ into NumPy, mean power matching the SoapySDR path on the same signal to within 3%. Also Arrow. No automated live test |
 | TX (`UnifiedSink`, `aaronia_sink_*`, SoapySDR TX) | Native SDK | **Hardware-unverified**. No TX-licensed device available |
 | Dual-channel RX (`Rx1And2`, `read_samples_dual`) | Native SDK | **Hardware-unverified**. Requires a full V6. Selects `Rx12`, the interleaved single-stream mode, matching how this crate reads |
 | Spectra reads (`read_spectra`) | Native SDK | **Hardware-unverified**. Packet layout and stream index follow Aaronia's `RawSpectrum` sample |
 | Device-family detection (`open_detected_device`) | Native SDK | **Hardware-unverified**. Enumerates each known family in turn |
 | Sample-rate ladder and usable bandwidth | Both | **Live-verified at the default clock** on a V6 ECO, rung by rung. Faster receiver clocks are inferred from the documented constraint, not measured |
 | End-to-end IQ correctness | HTTP | **Live-verified** by `scripts/validate-iq-live.py`: every wire format decodes to the same spectrum, the Python and SoapySDR paths agree, and a NOAA weather-radio carrier lands within 312 Hz of its known frequency on the correct side of zero |
+| Device capability reporting (`get_device_capabilities`) | HTTP | **Live-verified** — the declared centre-frequency and reference-level bounds, the decimation ladder, the clock-source list and the RX input |
+| Stream-gap device-health cross-check (`get_device_health`) | HTTP | **Live-verified** — the device's own loss counters parse and yield a verdict |
+| Link budget and throughput probe (`link_budget`) | HTTP | Measured manually over gigabit and 2.5GbE, rung by rung; no automated live assertion |
+| Several clients on one server block | HTTP | Measured manually at one, two and five concurrent clients; no automated assertion |
 | GPS hardware time | Native SDK | **Hardware-unverified** |
-| Native SDK capture generally | Native SDK | **Hardware-unverified**; compiled and unit-tested in a Linux VM each release |
+| Native SDK library load and symbol resolution | Native SDK | **Verified against the real library** — RTSA-Suite PRO 3.0.3.16655's `libAaroniaRTSAAPI.so` loads in an x86-64 Linux container, all 34 symbols resolve, and `AARTSAAPI_Version()` answers 1.4. Reproduce with `scripts/sdk-container-test.sh`. No device attached |
+| Native SDK capture generally | Native SDK | **Hardware-unverified**; compiled and unit-tested for Linux each release |
 | HTTP TX push (`/sample`) | HTTP | Endpoint exercised live; RF output not measured |
 
 "Live-verified" means an `#[ignore]`d test in
@@ -44,11 +50,12 @@ cargo test --all-features --test live_smoke -- --ignored --nocapture
 Contributions that convert an unverified row, particularly from users
 with a full V6 or a TX licence, are welcome.
 
-Native-SDK entries carry a second qualifier worth stating plainly: they
-are not merely untested, they run on a platform this project cannot
-build on locally. They are compile-checked for Linux and Windows and
-their logic is drawn from Aaronia's published samples, which caught
-three real defects, but nothing has executed them against a device.
+Native-SDK entries carry a second qualifier worth stating plainly. They
+are compile-checked for Linux and Windows, their logic is drawn from
+Aaronia's published samples — which caught three real defects — and the
+library itself now loads and answers in a container, so the ABI and the
+detection path are exercised. What none of that reaches is a device:
+no packet has been read from real hardware through this path.
 
 If you have a full V6 or a TX licence, closing one of these rows is the
 single most valuable contribution you can make to this crate.
