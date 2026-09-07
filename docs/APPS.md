@@ -114,6 +114,9 @@ directly and skip the SoapySDR layer.
 - `readStream` honours `timeoutUs` and returns partial reads within the
   deadline, per the SoapySDR contract.
 - Retuning mid-stream is safe and requires no Aaronia licence.
+- The frequency range, gain range and sample-rate list an application
+  shows come from the device itself over the HTTP backend, so they match
+  the model attached rather than a compiled-in default.
 - Gaps detected in the stream are counted by `readSensor("cumulative_drops")`.
   An overrun sets `SOAPY_SDR_END_ABRUPT` on the affected read.
 - TX is hardware-unverified, and a TX channel is reported only when the

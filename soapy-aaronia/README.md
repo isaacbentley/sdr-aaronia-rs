@@ -117,12 +117,43 @@ range at every rate. Set the rate whose 80% covers the span you want to
 look at: 15.36 MHz of sampling to see 12 MHz of spectrum. The edges of
 the display are real data, just rolled off.
 
-The advertised ladder is a SPECTRAN V6 ECO's: 61.44 MHz down to
-120 kHz, measured rung by rung. A full V6 has a selectable receiver
-clock and reaches higher, by how much is not settled — see [the note in
+The ladder comes from the device: its native undecimated rate, halved
+once per rung its decimation setting offers. The reported rate is a
+running measurement — a V6 ECO says 61 411 246 Hz for a nominal
+61 440 000 — so it is snapped to the exact rung it names, because a rate
+advertised to an application has to be one the device can be set to. A
+device that cannot be asked, or reports a rate matching no known
+receiver clock, falls back to the ECO ladder: 61.44 MHz down to 120 kHz,
+measured rung by rung.
+
+A full V6 has a selectable receiver clock and reaches higher, by how
+much is not settled — see [the note in
 HTTPSPEC](../docs/HTTPSPEC.md#unresolved-the-full-v6s-top-rate). On one
 of those, `getSampleRate` while streaming reports what the device is
 actually running, which is the number to trust.
+
+## What the probe reports
+
+`SoapySDRUtil --probe` shows what the device declares about itself, not
+constants compiled in for one model. Over the HTTP backend the plugin
+reads `/remoteconfig` and `/healthstatus` once at construction and
+publishes:
+
+| Probe field | Device source |
+| --- | --- |
+| `hardware=`, `serial=`, `version=` | `/healthstatus` `info/devname`, `info/serialno`, `info/version` |
+| RF frequency range | `centerfreq0` min/max/step |
+| `REF` gain range | `reflevel0` min/max/step |
+| Sample rates | `status/iqsamples` snapped to a rung, over `decimation0`'s rungs |
+
+A SPECTRAN V6 ECO reports 5.5 MHz–8 GHz and −55…+23 dBm, where this
+plugin used to advertise 10 Hz–6 GHz and −100…+10 dB for every model it
+opened.
+
+Each field falls back independently: a device that answers about
+frequency but not gain still gets its frequency range published, and the
+file and native-SDK backends — which have no equivalent surface to ask —
+report the driver's defaults throughout.
 
 ## Streams
 
@@ -156,7 +187,9 @@ actually running, which is the number to trust.
   with a valid GPS fix. `getHardwareTime("GPS")` returns epoch
   nanoseconds, converted in the integer domain.
 - The single gain element, `REF`, is the Aaronia reference level in dBm.
-  It is not an amplifier gain: raising it reduces sensitivity.
+  It is not an amplifier gain: raising it reduces sensitivity. Its range
+  is the one the device declares for `reflevel0` — −55…+23 dBm on a V6
+  ECO, in 0.5 dB steps.
 - `readSensor("cumulative_drops")` counts the timestamp gaps the plugin has
   detected in the stream.
 

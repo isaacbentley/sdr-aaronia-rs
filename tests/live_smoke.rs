@@ -84,6 +84,37 @@ async fn live_control_plane() {
          now does, check whether it also exposes a connection count"
     );
 
+    // What the device says about itself, which the SoapySDR plugin
+    // advertises instead of compiled-in constants. A live device must
+    // declare bounds for the two settings a client drives; if a firmware
+    // revision renames or drops them, this is where it surfaces rather
+    // than as a probe quietly reverting to the fallbacks.
+    let caps = c.get_device_capabilities().await;
+    println!("capabilities: {caps:#?}");
+    println!("sample rates: {:?}", caps.sample_rates());
+    assert!(caps.model.is_some(), "device must name a model");
+    assert!(caps.serial.is_some(), "device must report a serial");
+    let freq = caps.center_frequency.expect("centerfreq0 declares bounds");
+    assert!(
+        freq.min > 0.0 && freq.max > freq.min,
+        "centre-frequency bounds must be a usable pair: {freq:?}"
+    );
+    let refl = caps.reference_level.expect("reflevel0 declares bounds");
+    assert!(
+        refl.max > refl.min,
+        "reference-level bounds must be a usable pair: {refl:?}"
+    );
+    let rates = caps.sample_rates().expect("a ladder from the device");
+    assert_eq!(
+        rates.len(),
+        caps.decimation_steps.unwrap(),
+        "one rate per decimation rung"
+    );
+    assert!(
+        rates.windows(2).all(|w| w[0] > w[1]),
+        "rates run highest first: {rates:?}"
+    );
+
     // Read-only license check must not touch device state.
     let status = c.detect_remote_config_license().await;
     println!("remote-config (read-only) status: {:?}", status);

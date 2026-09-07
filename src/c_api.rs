@@ -948,6 +948,145 @@ pub unsafe extern "C" fn aaronia_source_info_free(ptr: *mut FfiSourceInfo) {
     }
 }
 
+/// What the device reports about itself, flattened for C.
+///
+/// Optionality is explicit because no numeric sentinel would do: `0.0`
+/// is a legitimate reference level and a legitimate step, so a caller
+/// must be able to tell "the device declares 0" from "the device did
+/// not say". Strings use NULL for absent; the two ranges carry a
+/// `has_` flag; `sample_rate_count == 0` means the ladder could not be
+/// derived.
+#[repr(C)]
+pub struct FfiDeviceCapabilities {
+    /// Model name, e.g. `"SPECTRAN V6 ECO"`. NULL when unknown.
+    pub model: *const c_char,
+    /// Device serial. NULL when unknown.
+    pub serial: *const c_char,
+    /// Firmware/FPGA version string. NULL when unknown.
+    pub version: *const c_char,
+
+    /// Whether the three `center_frequency_*` fields carry a reading.
+    pub has_center_frequency: bool,
+    pub center_frequency_min_hz: f64,
+    pub center_frequency_max_hz: f64,
+    /// Distance between valid centre frequencies, or `0.0` when the
+    /// device declares none.
+    pub center_frequency_step_hz: f64,
+
+    /// Whether the three `reference_level_*` fields carry a reading.
+    pub has_reference_level: bool,
+    pub reference_level_min_dbm: f64,
+    pub reference_level_max_dbm: f64,
+    /// Step between valid reference levels, or `0.0` when undeclared.
+    pub reference_level_step_db: f64,
+
+    /// Entries in [`Self::sample_rates`]; `0` when the device could not
+    /// be asked, which is the signal to fall back to a compiled-in
+    /// ladder rather than advertise none.
+    pub sample_rate_count: usize,
+    /// Settable IQ sample rates in Hz, highest first. Owned by this
+    /// struct and freed with it; NULL when the count is 0.
+    pub sample_rates: *const f64,
+}
+
+/// Read the attached device's declared capabilities.
+///
+/// Blocking: performs two control-plane GETs. Returns NULL only for a
+/// null `ptr` or when called from a current-thread tokio runtime (where
+/// blocking would deadlock); a device that cannot be asked yields a
+/// populated struct whose fields are all absent, so a caller falls back
+/// per field rather than on the whole reading.
+///
+/// Answers for the HTTP backend. The file and native-SDK backends
+/// report everything absent — they have no equivalent surface to ask.
+///
+/// # Safety
+/// `ptr` must be a live pointer from [`aaronia_source_build`], not used
+/// concurrently from another thread. The returned pointer must be freed
+/// exactly once with [`aaronia_source_capabilities_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_get_capabilities(
+    ptr: *mut c_void,
+) -> *mut FfiDeviceCapabilities {
+    clear_last_error();
+    if ptr.is_null() {
+        set_last_error("Null pointer".to_string());
+        return std::ptr::null_mut();
+    }
+    let source = unsafe { &*(ptr as *mut AaroniaSource) };
+    let caps = match ffi_block_on(source.device_capabilities()) {
+        Ok(caps) => caps,
+        Err(e) => {
+            set_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    // A string the device did not report becomes NULL, not "": the
+    // caller has to be able to keep its own default for that field.
+    let owned = |value: Option<String>| -> *const c_char {
+        value
+            .and_then(|s| CString::new(s).ok())
+            .map_or(std::ptr::null(), |s| s.into_raw() as *const c_char)
+    };
+
+    let (sample_rates, sample_rate_count) = match caps.sample_rates() {
+        Some(rates) if !rates.is_empty() => {
+            let boxed = rates.into_boxed_slice();
+            let len = boxed.len();
+            (Box::into_raw(boxed) as *const f64, len)
+        }
+        _ => (std::ptr::null(), 0),
+    };
+
+    Box::into_raw(Box::new(FfiDeviceCapabilities {
+        model: owned(caps.model),
+        serial: owned(caps.serial),
+        version: owned(caps.version),
+        has_center_frequency: caps.center_frequency.is_some(),
+        center_frequency_min_hz: caps.center_frequency.map_or(0.0, |r| r.min),
+        center_frequency_max_hz: caps.center_frequency.map_or(0.0, |r| r.max),
+        center_frequency_step_hz: caps.center_frequency.and_then(|r| r.step).unwrap_or(0.0),
+        has_reference_level: caps.reference_level.is_some(),
+        reference_level_min_dbm: caps.reference_level.map_or(0.0, |r| r.min),
+        reference_level_max_dbm: caps.reference_level.map_or(0.0, |r| r.max),
+        reference_level_step_db: caps.reference_level.and_then(|r| r.step).unwrap_or(0.0),
+        sample_rate_count,
+        sample_rates,
+    }))
+}
+
+/// Free a capabilities struct from [`aaronia_source_get_capabilities`],
+/// including the strings and the sample-rate array it owns.
+///
+/// # Safety
+/// `ptr` must be null or a pointer returned by
+/// [`aaronia_source_get_capabilities`] that has not already been freed.
+/// After this call neither it nor any pointer read out of it may be
+/// used again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_capabilities_free(ptr: *mut FfiDeviceCapabilities) {
+    if ptr.is_null() {
+        return;
+    }
+    let caps = unsafe { Box::from_raw(ptr) };
+    for s in [caps.model, caps.serial, caps.version] {
+        if !s.is_null() {
+            unsafe { drop(CString::from_raw(s as *mut c_char)) };
+        }
+    }
+    if !caps.sample_rates.is_null() {
+        // Reconstitute the same fat pointer `into_raw` split apart;
+        // freeing it as a single `f64` would leak all but the first.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                caps.sample_rates as *mut f64,
+                caps.sample_rate_count,
+            )));
+        }
+    }
+}
+
 // --- Remote Control FFI --- //
 
 /// Construct a new HTTP endpoints client. Returns `NULL` on error or if
@@ -1480,6 +1619,70 @@ pub unsafe extern "C" fn aaronia_sink_write_samples(
 mod tests {
     use super::*;
     use std::ptr;
+
+    /// The capabilities struct owns three C strings and a heap array,
+    /// and the free function has to give every one of them back. A
+    /// missed `sample_rates` would leak the whole ladder on each probe,
+    /// and freeing the array as a single `f64` would leak all but its
+    /// first element — neither shows up as a test failure anywhere else,
+    /// so this is exercised under whatever sanitiser CI runs.
+    #[test]
+    fn capabilities_free_releases_every_owned_allocation() {
+        let rates = vec![61_440_000.0_f64, 30_720_000.0, 15_360_000.0].into_boxed_slice();
+        let count = rates.len();
+        let caps = Box::into_raw(Box::new(FfiDeviceCapabilities {
+            model: CString::new("SPECTRAN V6 ECO").unwrap().into_raw(),
+            serial: CString::new("C2-P-03000105").unwrap().into_raw(),
+            version: CString::new("0 0.0.36").unwrap().into_raw(),
+            has_center_frequency: true,
+            center_frequency_min_hz: 5_500_000.0,
+            center_frequency_max_hz: 8_000_000_000.0,
+            center_frequency_step_hz: 1000.0,
+            has_reference_level: true,
+            reference_level_min_dbm: -55.0,
+            reference_level_max_dbm: 23.0,
+            reference_level_step_db: 0.5,
+            sample_rate_count: count,
+            sample_rates: Box::into_raw(rates) as *const f64,
+        }));
+
+        unsafe {
+            assert_eq!((*caps).sample_rate_count, 3);
+            assert_eq!(*(*caps).sample_rates.add(2), 15_360_000.0);
+            aaronia_source_capabilities_free(caps);
+        }
+    }
+
+    /// The absent case has to free cleanly too: NULL strings and a NULL
+    /// array are what a device that could not be asked produces, and
+    /// that is the common path on a file or native-SDK source.
+    #[test]
+    fn capabilities_free_accepts_an_empty_reading() {
+        let caps = Box::into_raw(Box::new(FfiDeviceCapabilities {
+            model: ptr::null(),
+            serial: ptr::null(),
+            version: ptr::null(),
+            has_center_frequency: false,
+            center_frequency_min_hz: 0.0,
+            center_frequency_max_hz: 0.0,
+            center_frequency_step_hz: 0.0,
+            has_reference_level: false,
+            reference_level_min_dbm: 0.0,
+            reference_level_max_dbm: 0.0,
+            reference_level_step_db: 0.0,
+            sample_rate_count: 0,
+            sample_rates: ptr::null(),
+        }));
+        unsafe { aaronia_source_capabilities_free(caps) };
+        // Null is a no-op, as every free in this ABI is.
+        unsafe { aaronia_source_capabilities_free(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn capabilities_of_a_null_source_are_null() {
+        let caps = unsafe { aaronia_source_get_capabilities(ptr::null_mut()) };
+        assert!(caps.is_null());
+    }
 
     #[test]
     fn test_ffi_builder_lifecycle() {

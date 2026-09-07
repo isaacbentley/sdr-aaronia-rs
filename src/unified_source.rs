@@ -1735,6 +1735,39 @@ impl AaroniaSource {
         }
     }
 
+    /// What the device says about itself: identity, and the bounds it
+    /// declares on centre frequency, reference level and the decimation
+    /// ladder.
+    ///
+    /// The point of asking is that a caller advertising a device's
+    /// limits should state *this* device's, not constants compiled in
+    /// for one model — the SoapySDR plugin publishes exactly these at
+    /// probe time.
+    ///
+    /// Answers only for the HTTP backend, and deliberately without
+    /// requiring a stream: a probe runs before anything is opened, so
+    /// when no client has been built yet this constructs a short-lived
+    /// one from the configured URL rather than returning nothing.
+    /// Everything is `None` for the file and native-SDK backends, and a
+    /// caller falls back per field.
+    pub async fn device_capabilities(&self) -> crate::http_endpoints::DeviceCapabilities {
+        use crate::http_endpoints::{AuthMethod, DeviceCapabilities, HttpEndpointsClient};
+
+        if let Some(client) = &self.http_client {
+            return client.get_device_capabilities().await;
+        }
+        let Some(base_url) = &self.config.http_base_url else {
+            return DeviceCapabilities::default();
+        };
+        match HttpEndpointsClient::new(base_url.clone(), AuthMethod::None) {
+            Ok(client) => client.get_device_capabilities().await,
+            Err(e) => {
+                warn!("device capabilities: could not build a client for {base_url}: {e}");
+                DeviceCapabilities::default()
+            }
+        }
+    }
+
     /// Get the current configuration
     pub fn get_config(&self) -> &AaroniaConfig {
         &self.config

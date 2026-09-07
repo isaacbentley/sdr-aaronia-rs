@@ -295,6 +295,57 @@ pub fn receiver_clock_for_label(label: &str) -> f64 {
     }
 }
 
+/// Every receiver clock [`receiver_clock_for_label`] knows, in Hz.
+///
+/// The same table, as data, for the one caller that needs to search it
+/// rather than resolve a label: [`snap_to_ladder_top`], which is handed
+/// a *measured* rate and has to find the exact rung it belongs to.
+pub const RECEIVER_CLOCKS_HZ: [f64; 8] = [
+    46_080_000.0,
+    61_440_000.0,
+    76_800_000.0,
+    92_160_000.0,
+    122_880_000.0,
+    184_320_000.0,
+    245_760_000.0,
+    491_520_000.0,
+];
+
+/// How far a measured native rate may sit from a ladder top and still be
+/// taken as that rung.
+///
+/// A V6 ECO reports `status/iqsamples` as 61_411_246 against a true
+/// 61_440_000 — 0.047 % low, because the figure is a running measurement
+/// of a real clock and not the clock's nameplate. The nearest other
+/// candidate rung is a factor of 1.25 away (76.8 MHz / 1.5 = 51.2 MHz
+/// against 61.44), so 1 % is wide enough for measurement wander and far
+/// too narrow to reach a neighbour.
+const LADDER_TOP_TOLERANCE: f64 = 0.01;
+
+/// The exact decimation-ladder top rung a *measured* native rate names.
+///
+/// Device-reported rates are measurements: `/healthstatus`'s
+/// `status/iqsamples` is the undecimated rate a V6 ECO is actually
+/// running, and it wanders in the last digits. Feeding it straight to
+/// [`iq_ladder_from_top`] would produce a ladder whose every rung is
+/// slightly wrong — and a sample rate advertised to an application must
+/// be one the device can be *set* to, not one that is 0.05 % off it.
+///
+/// So the measurement is snapped to the nearest `clock / 1.5` from
+/// [`RECEIVER_CLOCKS_HZ`], and `None` when it lands near none of them
+/// (within [`LADDER_TOP_TOLERANCE`]) — an unrecognised clock, or a
+/// reading taken while the device was not running. `None` is the signal
+/// to fall back rather than to publish a guess.
+pub fn snap_to_ladder_top(measured_hz: f64) -> Option<f64> {
+    if !measured_hz.is_finite() || measured_hz <= 0.0 {
+        return None;
+    }
+    RECEIVER_CLOCKS_HZ
+        .iter()
+        .map(|clock| clock / IQ_RATE_CLOCK_RATIO)
+        .find(|top| (measured_hz - top).abs() / top <= LADDER_TOP_TOLERANCE)
+}
+
 /// Receiver clock cycles per IQ sample at the fastest rate: the top of
 /// the decimation ladder is `receiver_clock / IQ_RATE_CLOCK_RATIO`, and
 /// [`validate_iq_mode`] refuses a span wider than that.
@@ -641,6 +692,88 @@ mod ladder_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The measurement a live V6 ECO reports for its own native rate,
+    /// across two readings taken minutes apart. Both must name the same
+    /// exact rung: a ladder built from the raw figure would advertise
+    /// rates 0.05 % off, and every one of them unsettable.
+    #[test]
+    fn a_measured_native_rate_snaps_to_its_exact_rung() {
+        for measured in [61_411_246.421, 61_421_522.294, 61_439_323.0] {
+            assert_eq!(
+                snap_to_ladder_top(measured),
+                Some(61_440_000.0),
+                "{measured} is the 92.16 MHz clock's top rung",
+            );
+        }
+    }
+
+    #[test]
+    fn every_documented_clock_has_a_reachable_top_rung() {
+        for clock in RECEIVER_CLOCKS_HZ {
+            let top = clock / IQ_RATE_CLOCK_RATIO;
+            assert_eq!(
+                snap_to_ladder_top(top),
+                Some(top),
+                "a clock's own top rung must snap to itself",
+            );
+        }
+    }
+
+    /// The point of the tolerance is to absorb measurement wander
+    /// without ever reaching a neighbouring rung. `None` is the caller's
+    /// signal to fall back, so a rate belonging to no known clock must
+    /// not be rounded into one.
+    #[test]
+    fn an_unrecognised_rate_snaps_to_nothing() {
+        assert_eq!(snap_to_ladder_top(50_000_000.0), None);
+        assert_eq!(snap_to_ladder_top(1_000.0), None);
+        // 2 % low: past the 1 % tolerance, so not the 61.44 rung.
+        assert_eq!(snap_to_ladder_top(61_440_000.0 * 0.98), None);
+        // …while 0.5 % low still is.
+        assert_eq!(snap_to_ladder_top(61_440_000.0 * 0.995), Some(61_440_000.0));
+    }
+
+    /// A device that is not running reports 0, and NaN is what a
+    /// malformed reading deserializes to. Neither may become a ladder.
+    #[test]
+    fn a_nonsense_rate_snaps_to_nothing() {
+        assert_eq!(snap_to_ladder_top(0.0), None);
+        assert_eq!(snap_to_ladder_top(-1.0), None);
+        assert_eq!(snap_to_ladder_top(f64::NAN), None);
+        assert_eq!(snap_to_ladder_top(f64::INFINITY), None);
+    }
+
+    /// The snap table and the label table describe the same hardware, so
+    /// every clock in one must be reachable from the other. The labels
+    /// are Aaronia's and are not derivable — most truncate the rate
+    /// ("76MHz" for 76.8) but `492MHz` rounds up from 491.52 — so the
+    /// pairing is spelled out rather than computed.
+    #[test]
+    fn the_clock_table_matches_the_label_table() {
+        const PAIRS: [(&str, f64); 8] = [
+            ("46MHz", 46_080_000.0),
+            ("61MHz", 61_440_000.0),
+            ("76MHz", 76_800_000.0),
+            ("92MHz", 92_160_000.0),
+            ("122MHz", 122_880_000.0),
+            ("184MHz", 184_320_000.0),
+            ("245MHz", 245_760_000.0),
+            ("492MHz", 491_520_000.0),
+        ];
+        for (label, clock) in PAIRS {
+            assert_eq!(receiver_clock_for_label(label), clock, "label {label}");
+            assert!(
+                RECEIVER_CLOCKS_HZ.contains(&clock),
+                "{label} resolves to {clock}, which the snap table is missing",
+            );
+        }
+        assert_eq!(
+            RECEIVER_CLOCKS_HZ.len(),
+            PAIRS.len(),
+            "a clock in the snap table with no label, or vice versa",
+        );
+    }
 
     #[test]
     fn test_rx_channel_config_strings() {

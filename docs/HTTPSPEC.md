@@ -689,6 +689,32 @@ from packet metadata for that.
 | `title` | User-facing block title |
 | `uuid` | Global unique identifier |
 
+#### What the config tree declares about limits
+
+`/remoteconfig`'s numeric items carry `min`, `max` and `step`, and its
+enums carry their full `values` list, so a client can read a device's
+limits instead of compiling in constants for one model. Measured on a
+SPECTRAN V6 ECO:
+
+| Item | Declares |
+| :--- | :--- |
+| `centerfreq0` | `min` 5 500 000, `max` 8e9, `step` 1000, unit `Frequency` |
+| `reflevel0` | `min` -55, `max` 23, `step` 0.5, unit `dBm` |
+| `decimation0` | `values` `Full,1 / 2,…,1 / 512` — ten rungs |
+
+Two of those are worth stating plainly because published clients have
+had them wrong: the ECO tunes from **5.5 MHz**, not from ~0, and it
+reaches **8 GHz**, not 6. Combined with `/healthstatus`'s
+`status/iqsamples` — the native undecimated rate — the decimation list
+gives the full set of settable sample rates.
+
+`iqsamples` is a running measurement (61 411 246 Hz against a nominal
+61 440 000), so snap it to the exact `receiver_clock / 1.5` rung it
+names before treating it as a ladder top; a rate advertised to an
+application must be one the device can be set to.
+`DeviceCapabilities::from_trees` in this crate does all of the above,
+and `HttpEndpointsClient::get_device_capabilities()` performs the reads.
+
 #### User Information (`/user`)
 **URL**: `/user`  
 **Method**: GET  

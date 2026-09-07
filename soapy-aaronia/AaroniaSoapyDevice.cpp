@@ -16,7 +16,9 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
     : _source(source), _sink(sink), _centerFrequency(100e6), _sampleRate(1e6),
       _txSampleRate(0.0), _referenceLevel(-20.0),
       _rxSetup(false), _txSetup(false), _rxStreamTag(0), _txStreamTag(0),
-      _isStreaming(false)
+      _isStreaming(false),
+      _hasFreqRange(false), _freqMinHz(0.0), _freqMaxHz(0.0), _freqStepHz(0.0),
+      _hasRefRange(false), _refMinDbm(0.0), _refMaxDbm(0.0), _refStepDb(0.0)
 {
     (void)args;
     if (!_source) {
@@ -29,6 +31,44 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
         _sampleRate = info->span_frequency;
         _referenceLevel = info->reference_level;
         aaronia_source_info_free(info);
+    }
+
+    // Ask the device what it can do, once, before anything is opened —
+    // a probe queries ranges without ever streaming. Everything here is
+    // best-effort: a null result, or any field the device did not
+    // report, leaves the corresponding getter on its own constant.
+    if (FfiDeviceCapabilities* caps = aaronia_source_get_capabilities(_source)) {
+        if (caps->model)   _model   = caps->model;
+        if (caps->serial)  _serial  = caps->serial;
+        if (caps->version) _version = caps->version;
+
+        _hasFreqRange = caps->has_center_frequency;
+        _freqMinHz    = caps->center_frequency_min_hz;
+        _freqMaxHz    = caps->center_frequency_max_hz;
+        _freqStepHz   = caps->center_frequency_step_hz;
+
+        _hasRefRange  = caps->has_reference_level;
+        _refMinDbm    = caps->reference_level_min_dbm;
+        _refMaxDbm    = caps->reference_level_max_dbm;
+        _refStepDb    = caps->reference_level_step_db;
+
+        if (caps->sample_rates && caps->sample_rate_count > 0) {
+            _sampleRates.assign(caps->sample_rates,
+                                caps->sample_rates + caps->sample_rate_count);
+        }
+        aaronia_source_capabilities_free(caps);
+
+        SoapySDR::logf(SOAPY_SDR_INFO,
+                       "aaronia: device reports %s%s%s, %zu sample rates",
+                       _model.empty() ? "no model" : _model.c_str(),
+                       _serial.empty() ? "" : " serial ",
+                       _serial.empty() ? "" : _serial.c_str(),
+                       _sampleRates.size());
+    } else {
+        SoapySDR::logf(SOAPY_SDR_INFO,
+                       "aaronia: device did not report capabilities (%s); "
+                       "advertising this driver's defaults",
+                       lastErrorOr("no detail").c_str());
     }
 }
 
@@ -55,13 +95,22 @@ std::string AaroniaSoapyDevice::getDriverKey() const {
 }
 
 std::string AaroniaSoapyDevice::getHardwareKey() const {
-    return "Spectran V6";
+    // The device's own name for itself. "Spectran V6" was hardcoded, so
+    // every model reported as the base V6 — a V6 ECO included, which is
+    // a different instrument with a different frequency range and no
+    // transmitter. The constant remains only for a backend that cannot
+    // be asked (file playback, native SDK).
+    return _model.empty() ? std::string("Spectran V6") : _model;
 }
 
 SoapySDR::Kwargs AaroniaSoapyDevice::getHardwareInfo() const {
     SoapySDR::Kwargs info;
     info["driver"] = "Aaronia";
-    info["hardware"] = "Spectran V6";
+    info["hardware"] = getHardwareKey();
+    // Only what the device actually reported: an empty value would show
+    // in --probe as a key the device answered with nothing.
+    if (!_serial.empty())  info["serial"] = _serial;
+    if (!_version.empty()) info["version"] = _version;
     return info;
 }
 
@@ -443,7 +492,15 @@ SoapySDR::RangeList AaroniaSoapyDevice::getFrequencyRange(const int direction, c
     (void)channel;
     (void)name;
     SoapySDR::RangeList ranges;
-    ranges.push_back(SoapySDR::Range(10.0, 6.0e9)); // 10 Hz to 6 GHz (Spectran V6 range)
+    if (_hasFreqRange) {
+        // As declared by centerfreq0. A V6 ECO says 5.5 MHz - 8 GHz,
+        // where the constant below claimed 10 Hz - 6 GHz: too low at one
+        // end for any tune to succeed, and short at the other of two
+        // whole GHz the device can reach.
+        ranges.push_back(SoapySDR::Range(_freqMinHz, _freqMaxHz, _freqStepHz));
+    } else {
+        ranges.push_back(SoapySDR::Range(10.0, 6.0e9));
+    }
     return ranges;
 }
 
@@ -511,23 +568,37 @@ SoapySDR::RangeList AaroniaSoapyDevice::getSampleRateRange(const int direction, 
     (void)direction;
     (void)channel;
     SoapySDR::RangeList ranges;
-    // Capped at the IQ-mode constraint (span * 1.5 <= 92.16 MHz clock):
-    // the old 92 MHz upper bound advertised rates the crate itself
-    // rejects at construction/retune time.
-    ranges.push_back(SoapySDR::Range(10e3, 61.44e6));
+    // The ends of the ladder this device actually offers, so the range
+    // and listSampleRates() cannot disagree. The 10 kHz floor this
+    // replaces was below the slowest rung the hardware has (120 kHz on
+    // an ECO), so the range admitted rates no entry in the list matched.
+    const std::vector<double> rates = listSampleRates(SOAPY_SDR_RX, 0);
+    if (!rates.empty()) {
+        ranges.push_back(SoapySDR::Range(rates.back(), rates.front()));
+    } else {
+        ranges.push_back(SoapySDR::Range(10e3, 61.44e6));
+    }
     return ranges;
 }
 
 std::vector<double> AaroniaSoapyDevice::listSampleRates(const int direction, const size_t channel) const {
     (void)direction;
     (void)channel;
-    // The device's actual rates: a 61.44 MHz clock decimated by powers of
-    // two, which is what the RTSA GUI shows as Full through 1 / 512. Apps
-    // build their rate dropdowns from this list, so it has to be the real
-    // ladder. It previously advertised round numbers (1, 2, 5, 10, 20 MHz)
-    // that the hardware cannot produce: requesting one silently ran the
-    // device at a neighbouring rate while the application displayed the
-    // rate it asked for. Verified against a V6 ECO's own decimation enum.
+    // Applications build their rate dropdowns from this list, so it has
+    // to be rates the hardware can actually produce. It once advertised
+    // round numbers (1, 2, 5, 10, 20 MHz) the device cannot produce:
+    // requesting one silently ran it at a neighbouring rate while the
+    // application displayed the rate it asked for.
+    //
+    // Preferred source is the device: its native undecimated rate,
+    // snapped to an exact rung because the reported figure is a running
+    // measurement, halved once per rung its decimation enum offers. That
+    // is right for a model whose ladder is not the ECO's — a full V6 on
+    // a faster receiver clock tops out at 163.84 MHz, not 61.44.
+    if (!_sampleRates.empty()) {
+        return _sampleRates;
+    }
+    // Fallback: the V6 ECO ladder, verified against its decimation enum.
     return {
         61.44e6,    // Full
         30.72e6,    // 1 / 2
@@ -588,7 +659,14 @@ SoapySDR::Range AaroniaSoapyDevice::getGainRange(const int direction, const size
     (void)direction;
     (void)channel;
     (void)name;
-    return SoapySDR::Range(-100.0, 10.0); // Reference level, dBm
+    // Reference level in dBm, as reflevel0 declares it. A V6 ECO says
+    // -55 to +23; the constant said -100 to +10, so an application's
+    // gain slider spanned values the device silently clamped at one end
+    // and stopped 13 dB short of usable headroom at the other.
+    if (_hasRefRange) {
+        return SoapySDR::Range(_refMinDbm, _refMaxDbm, _refStepDb);
+    }
+    return SoapySDR::Range(-100.0, 10.0);
 }
 
 std::vector<std::string> AaroniaSoapyDevice::listSensors(void) const {

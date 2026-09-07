@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,6 +58,35 @@ typedef struct FfiSourceInfo {
     double reference_level;
     const char* device_serial;
 } FfiSourceInfo;
+
+// --- What the device reports about itself --- //
+//
+// Optionality is explicit: 0.0 is a legitimate reference level and a
+// legitimate step, so no numeric sentinel could distinguish "the device
+// declares 0" from "the device did not say". Strings are NULL when
+// absent, the ranges carry a has_ flag, and sample_rate_count == 0
+// means the ladder could not be derived. Fall back per field, not on
+// the whole struct.
+typedef struct FfiDeviceCapabilities {
+    const char* model;    // e.g. "SPECTRAN V6 ECO"; NULL when unknown
+    const char* serial;   // NULL when unknown
+    const char* version;  // firmware/FPGA revisions; NULL when unknown
+
+    bool   has_center_frequency;
+    double center_frequency_min_hz;
+    double center_frequency_max_hz;
+    double center_frequency_step_hz;  // 0.0 = device declares no step
+
+    bool   has_reference_level;
+    double reference_level_min_dbm;
+    double reference_level_max_dbm;
+    double reference_level_step_db;   // 0.0 = device declares no step
+
+    // Settable IQ sample rates in Hz, highest first. Owned by this
+    // struct; NULL and 0 when the device could not be asked.
+    size_t        sample_rate_count;
+    const double* sample_rates;
+} FfiDeviceCapabilities;
 
 // Opaque pointers
 typedef struct AaroniaSourceBuilder AaroniaSourceBuilder;
@@ -124,6 +154,15 @@ AaroniaFfiError aaronia_source_set_span_frequency(AaroniaSource* source, double 
 AaroniaFfiError aaronia_source_set_reference_level(AaroniaSource* source, double ref_level_dbm);
 FfiSourceInfo* aaronia_source_get_source_info(AaroniaSource* source);
 void aaronia_source_info_free(FfiSourceInfo* info);
+
+// Read the device's declared capabilities. BLOCKING: two control-plane
+// GETs, so call it once and cache. Returns NULL only for a null source
+// or when called from a current-thread tokio runtime; a device that
+// cannot be asked yields a struct with every field absent. Answers for
+// the HTTP backend — file and native-SDK sources report nothing, having
+// no equivalent surface to ask.
+FfiDeviceCapabilities* aaronia_source_get_capabilities(AaroniaSource* source);
+void aaronia_source_capabilities_free(FfiDeviceCapabilities* caps);
 
 // --- Sink FFI --- //
 //

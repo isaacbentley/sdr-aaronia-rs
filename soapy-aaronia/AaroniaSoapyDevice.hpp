@@ -127,6 +127,23 @@ private:
     int _txStreamTag;
     bool _isStreaming;
     std::vector<FfiComplex> _tempFloatBuffer;
+
+    // What the device said about itself, read once at construction.
+    //
+    // Cached rather than fetched per call because reading it is two
+    // control-plane GETs, and SoapySDR asks for ranges repeatedly while
+    // an application builds its UI. Empty strings and empty vectors
+    // mean "the device did not say", and every getter falls back to its
+    // own constant for that field alone — a device that answers about
+    // frequency but not gain still gets its frequency range published.
+    std::string _model;
+    std::string _serial;
+    std::string _version;
+    bool _hasFreqRange;
+    double _freqMinHz, _freqMaxHz, _freqStepHz;
+    bool _hasRefRange;
+    double _refMinDbm, _refMaxDbm, _refStepDb;
+    std::vector<double> _sampleRates;
 };
 
 #endif // AARONIA_SOAPY_DEVICE_HPP

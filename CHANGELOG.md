@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **The SoapySDR probe now reports what the device says about itself.**
+  `SoapySDRUtil --probe` published constants compiled in for one model:
+  `hardware=Spectran V6` whatever was attached, a 10 Hz–6 GHz frequency
+  range, and a −100…+10 dB gain range. A SPECTRAN V6 ECO declares
+  5.5 MHz–8 GHz and −55…+23 dBm — too low at one end for any tune to
+  succeed, two whole GHz short at the other, and a gain slider spanning
+  values the device clamps. The plugin now reads `/remoteconfig` and
+  `/healthstatus` once at construction and publishes the model, serial,
+  firmware version, both ranges with their declared steps, and the
+  sample-rate ladder.
+
+  The ladder is the part that needed care: `status/iqsamples` is the
+  device's native undecimated rate but it is a *measurement*
+  (61 411 246 Hz for a nominal 61 440 000), so it is snapped to the exact
+  `receiver_clock / 1.5` rung it names — new `utils::snap_to_ladder_top`
+  — before being halved once per rung `decimation0` offers. A rate
+  advertised to an application has to be one the device can be set to.
+  `getSampleRateRange` is now taken from the ends of that same ladder, so
+  it can no longer disagree with `listSampleRates`; its old 10 kHz floor
+  sat below the slowest rung the hardware has.
+
+  New API: `http_endpoints::DeviceCapabilities` and `ValueRange`,
+  `HttpEndpointsClient::get_device_capabilities()`,
+  `AaroniaSource::device_capabilities()`, and the C entry points
+  `aaronia_source_get_capabilities` / `aaronia_source_capabilities_free`.
+  Every field is optional and independently so: a device answering about
+  frequency but not gain still gets its frequency range published, and
+  the file and native-SDK backends — which have no equivalent surface to
+  ask — fall back throughout. Nothing here is a guess; a field that
+  cannot be read stays absent.
 - **A stream gap now says whether the device caused it.** `HttpSource`
   reads `/healthstatus` on each gap report and checks the device block's
   own loss counters — `status/errors`, `status/usboverflows`,

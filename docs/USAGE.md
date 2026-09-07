@@ -204,6 +204,37 @@ for block in client.get_device_health().await? {
 # }
 ```
 
+### What the device says it can do
+
+The same control-plane surface declares the device's own limits, and
+`get_device_capabilities()` reduces the two trees to them: model, serial
+and firmware version, the bounds on centre frequency and reference
+level, and the decimation ladder's depth.
+
+```rust,no_run
+# async fn caps() -> sdr_aaronia_rs::Result<()> {
+use sdr_aaronia_rs::http_endpoints::{AuthMethod, HttpEndpointsClient};
+
+let client = HttpEndpointsClient::new("http://localhost:54664".into(), AuthMethod::None)?;
+let caps = client.get_device_capabilities().await;
+println!("{:?} serial {:?}", caps.model, caps.serial);
+if let Some(range) = caps.center_frequency {
+    println!("tunes {:.3}-{:.3} MHz", range.min / 1e6, range.max / 1e6);
+}
+// Highest first, and every rung one the device can actually be set to:
+// its reported native rate is a measurement, so it is snapped to an
+// exact ladder top before being halved down.
+println!("sample rates: {:?}", caps.sample_rates());
+# Ok(())
+# }
+```
+
+Every field is optional and independently so, because the answer feeds
+things that must not be guessed. The SoapySDR plugin publishes exactly
+these at probe time — a V6 ECO declares 5.5 MHz–8 GHz and −55…+23 dBm,
+where the plugin previously advertised 10 Hz–6 GHz and −100…+10 dB for
+every model — and falls back per field for a device that cannot answer.
+
 **Clearing the device does not mean you are alone on the server.** One
 of the causes it leaves standing is another client: the HTTP Server block
 serves each connection a full copy of the stream and refuses none, so a

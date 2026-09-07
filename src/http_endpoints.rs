@@ -523,6 +523,171 @@ impl DeviceHealthSummary {
     }
 }
 
+/// A numeric setting's declared bounds, as the device states them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValueRange {
+    pub min: f64,
+    pub max: f64,
+    /// Distance between valid values, when the device declares one.
+    pub step: Option<f64>,
+}
+
+/// What the device says about itself: its identity and the bounds it
+/// declares on the settings a client can drive.
+///
+/// Read from the two trees the RTSA HTTP surface already serves —
+/// `/remoteconfig` for the bounds, `/healthstatus` for identity and the
+/// native IQ rate — so a caller that must *advertise* the device's
+/// limits (the SoapySDR plugin publishes frequency, gain and sample-rate
+/// ranges at probe time) states what this device reports rather than a
+/// constant compiled in for one model.
+///
+/// It matters because the constants were wrong. A V6 ECO declares
+/// 5.5 MHz–8 GHz of centre frequency where the plugin advertised
+/// 10 Hz–6 GHz, and a −55…+23 dBm reference level where it advertised
+/// −100…+10 dB.
+///
+/// Every field is optional and independently so: a tree that does not
+/// carry an item leaves its field `None`, and a caller falls back for
+/// that field alone rather than discarding a whole reading.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeviceCapabilities {
+    /// Human-readable model, e.g. `"SPECTRAN V6 ECO"` — `/healthstatus`
+    /// `info/devname`, else `/remoteconfig` `info/title`.
+    pub model: Option<String>,
+    /// `/healthstatus` `info/serialno`.
+    pub serial: Option<String>,
+    /// `/healthstatus` `info/version` — firmware/FPGA revisions.
+    pub version: Option<String>,
+    /// Bounds on `centerfreq0`, in Hz.
+    pub center_frequency: Option<ValueRange>,
+    /// Bounds on `reflevel0`, in dBm.
+    pub reference_level: Option<ValueRange>,
+    /// How many rungs `decimation0` offers — `"Full,1 / 2,…"` counted,
+    /// so a device with a shorter ladder is not advertised ten.
+    pub decimation_steps: Option<usize>,
+    /// `/healthstatus` `status/iqsamples`: the **native**, undecimated
+    /// IQ rate, which is not the rate the stream is running at. A
+    /// measurement, so see [`Self::sample_rates`] before using it as a
+    /// ladder top.
+    pub native_iq_rate_hz: Option<f64>,
+}
+
+impl DeviceCapabilities {
+    /// Reduce a `/remoteconfig` tree and a `/healthstatus` tree to the
+    /// capabilities above.
+    ///
+    /// Either may be a tree this crate did not expect; nothing is
+    /// required to be present, and what is missing stays `None`.
+    pub fn from_trees(config: Option<&ConfigItem>, health: Option<&HealthStatus>) -> Self {
+        let mut caps = Self::default();
+
+        if let Some(config) = config {
+            caps.center_frequency = range_of(config, "centerfreq0");
+            caps.reference_level = range_of(config, "reflevel0");
+            caps.decimation_steps = enum_values_of(config, "decimation0");
+            caps.model = find_group(config, "info").and_then(|i| string_named(i, "title"));
+        }
+
+        if let Some(health) = health {
+            let info = find_group(health, "info");
+            // `devname` over `/remoteconfig`'s `title`: same string on a
+            // measured V6 ECO, but it is the device's own name for
+            // itself rather than the block's label.
+            if let Some(name) = info.and_then(|i| string_named(i, "devname")) {
+                caps.model = Some(name);
+            }
+            caps.serial = info.and_then(|i| string_named(i, "serialno"));
+            caps.version = info.and_then(|i| string_named(i, "version"));
+            caps.native_iq_rate_hz =
+                find_group(health, "status").and_then(|s| number_named(s, "iqsamples"));
+        }
+
+        caps
+    }
+
+    /// The sample rates this device can actually be set to, highest
+    /// first, or `None` when the reading does not support an answer.
+    ///
+    /// Both halves have to come from the device for this to be worth
+    /// more than the compiled-in ladder: the top rung from
+    /// [`Self::native_iq_rate_hz`] — snapped to an exact rung, because
+    /// the reported figure is a measurement — and the depth from
+    /// [`Self::decimation_steps`], so a device offering fewer rungs is
+    /// not advertised more. Missing or unrecognised either way gives
+    /// `None`, which is the caller's signal to fall back rather than
+    /// publish a ladder the hardware will not honour.
+    pub fn sample_rates(&self) -> Option<Vec<f64>> {
+        let top = crate::utils::snap_to_ladder_top(self.native_iq_rate_hz?)?;
+        let steps = self.decimation_steps?;
+        if steps == 0 {
+            return None;
+        }
+        let ladder = crate::utils::iq_ladder_from_top(top);
+        Some(ladder.iter().take(steps).copied().collect())
+    }
+}
+
+/// The first group named `want` anywhere in `item`, depth-first.
+fn find_group<'a>(item: &'a ConfigItem, want: &str) -> Option<&'a [ConfigItem]> {
+    let ConfigItem::Group { name, items, .. } = item else {
+        return None;
+    };
+    if name == want {
+        return Some(items);
+    }
+    items.iter().find_map(|child| find_group(child, want))
+}
+
+/// The declared bounds of the first numeric item named `want` anywhere
+/// in the tree.
+fn range_of(item: &ConfigItem, want: &str) -> Option<ValueRange> {
+    fn visit(item: &ConfigItem, want: &str) -> Option<ValueRange> {
+        match item {
+            ConfigItem::Group { items, .. } => items.iter().find_map(|c| visit(c, want)),
+            ConfigItem::Float {
+                name,
+                min,
+                max,
+                step,
+                ..
+            }
+            | ConfigItem::Number {
+                name,
+                min,
+                max,
+                step,
+                ..
+            } if name == want => {
+                // A bound is only useful as a pair: an item declaring
+                // one side says nothing a caller can advertise.
+                Some(ValueRange {
+                    min: (*min)?,
+                    max: (*max)?,
+                    step: *step,
+                })
+            }
+            _ => None,
+        }
+    }
+    visit(item, want)
+}
+
+/// How many options the first enum named `want` offers.
+fn enum_values_of(item: &ConfigItem, want: &str) -> Option<usize> {
+    fn visit(item: &ConfigItem, want: &str) -> Option<usize> {
+        match item {
+            ConfigItem::Group { items, .. } => items.iter().find_map(|c| visit(c, want)),
+            ConfigItem::Enum { name, values, .. } if name == want => {
+                let count = values.split(',').filter(|v| !v.trim().is_empty()).count();
+                (count > 0).then_some(count)
+            }
+            _ => None,
+        }
+    }
+    visit(item, want)
+}
+
 /// First numeric item named `want` among `items`, whatever numeric
 /// flavour the server typed it as. `/healthstatus` types its counters
 /// `float` today, but the same names are `number`/`integer` elsewhere in
@@ -1495,6 +1660,33 @@ impl HttpEndpointsClient {
         Ok(DeviceHealthSummary::from_health_status(&health))
     }
 
+    /// Reads what the device says about itself — identity, and the
+    /// bounds it declares on centre frequency, reference level and the
+    /// decimation ladder.
+    ///
+    /// Two GETs, and **neither failing is an error**: the halves are
+    /// independent, so a server that answers `/remoteconfig` but not
+    /// `/healthstatus` still yields the frequency and gain bounds. The
+    /// result is all-`None` only when both reads fail, which a caller
+    /// reads as "this device could not be asked" and falls back from.
+    pub async fn get_device_capabilities(&self) -> DeviceCapabilities {
+        let config = match self.get_config().await {
+            Ok(config) => Some(config),
+            Err(e) => {
+                debug!("device capabilities: /remoteconfig unavailable: {e}");
+                None
+            }
+        };
+        let health = match self.get_health_status().await {
+            Ok(health) => Some(health),
+            Err(e) => {
+                debug!("device capabilities: /healthstatus unavailable: {e}");
+                None
+            }
+        };
+        DeviceCapabilities::from_trees(config.as_ref().map(|c| &c.config), health.as_ref())
+    }
+
     /// Fetches the complete configuration tree from the `/remoteconfig` endpoint.
     ///
     /// Reads are license-free: this is the documented behaviour and it
@@ -2066,6 +2258,166 @@ mod tests {
 
     fn parse_health(value: serde_json::Value) -> HealthStatus {
         serde_json::from_value(value).expect("healthstatus tree parses")
+    }
+
+    /// The bounds a live V6 ECO declares, as `/remoteconfig` states
+    /// them — the values that showed the plugin's constants were wrong.
+    fn live_shaped_config() -> serde_json::Value {
+        serde_json::json!({
+            "type": "group", "name": "remoteconfig", "label": "RemoteConfig",
+            "flags": "", "items": [{
+                "type": "group", "name": "Block_Spectran_V6Eco_0",
+                "label": "SPECTRAN V6 ECO", "flags": "grp_tree_root", "items": [
+                    { "type": "group", "name": "info", "label": "Info", "flags": "", "items": [
+                        { "type": "string", "name": "title", "label": "Title", "flags": "",
+                          "value": "SPECTRAN V6 ECO", "default": "SPECTRAN V6 ECO",
+                          "pattern": null }
+                    ]},
+                    { "type": "group", "name": "config", "label": "Config", "flags": "", "items": [
+                        { "type": "group", "name": "main", "label": "Main", "flags": "", "items": [
+                            { "type": "float", "name": "centerfreq0", "label": "Center Channel 1",
+                              "flags": "cust_13", "min": 5500000, "max": 8000000000.0,
+                              "step": 1000, "value": 854000000.0, "default": 2440000000.0,
+                              "unit": "Frequency" },
+                            { "type": "enum", "name": "decimation0", "label": "Span",
+                              "flags": "show_more", "value": 2, "default": 0,
+                              "values": "Full,1 / 2,1 / 4,1 / 8,1 / 16,1 / 32,1 / 64,1 / 128,1 / 256,1 / 512" },
+                            { "type": "float", "name": "reflevel0", "label": "Reference Level",
+                              "flags": "flo_slider", "min": -55, "max": 23, "step": 0.5,
+                              "value": -25.0, "default": 0.0, "unit": "dBm" }
+                        ]}
+                    ]}
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn capabilities_read_the_declared_bounds() {
+        let config: ConfigItem =
+            serde_json::from_value(live_shaped_config()).expect("config tree parses");
+        let health: HealthStatus =
+            serde_json::from_value(live_shaped_health("Running", 0.0, 0.0, 0.0))
+                .expect("health tree parses");
+
+        let caps = DeviceCapabilities::from_trees(Some(&config), Some(&health));
+
+        assert_eq!(caps.model.as_deref(), Some("SPECTRAN V6 ECO"));
+        assert_eq!(
+            caps.center_frequency,
+            Some(ValueRange {
+                min: 5_500_000.0,
+                max: 8_000_000_000.0,
+                step: Some(1000.0)
+            }),
+            "the plugin's constant said 10 Hz - 6 GHz",
+        );
+        assert_eq!(
+            caps.reference_level,
+            Some(ValueRange {
+                min: -55.0,
+                max: 23.0,
+                step: Some(0.5)
+            }),
+            "the plugin's constant said -100 - +10 dB",
+        );
+        assert_eq!(caps.decimation_steps, Some(10));
+        assert_eq!(caps.native_iq_rate_hz, Some(61_411_246.421));
+    }
+
+    /// The ladder has to be built from an *exact* rung. The device's
+    /// reported native rate is a running measurement — 61_411_246 for a
+    /// nominal 61_440_000 — and a rate advertised to an application must
+    /// be one the device can be set to, not one 0.05 % off it.
+    #[test]
+    fn capabilities_snap_the_measured_rate_to_an_exact_ladder() {
+        let config: ConfigItem = serde_json::from_value(live_shaped_config()).unwrap();
+        let health: HealthStatus =
+            serde_json::from_value(live_shaped_health("Running", 0.0, 0.0, 0.0)).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), Some(&health));
+
+        let rates = caps.sample_rates().expect("a ladder");
+        assert_eq!(rates.len(), 10, "one rate per decimation rung");
+        assert_eq!(rates[0], 61_440_000.0, "exact, not the measured 61_411_246");
+        assert_eq!(rates[9], 120_000.0);
+        assert!(rates.windows(2).all(|w| w[0] == w[1] * 2.0));
+    }
+
+    /// A shorter decimation enum must shorten the ladder: advertising
+    /// rungs the device does not offer is how an application ends up
+    /// requesting a rate that silently runs at a neighbouring one.
+    #[test]
+    fn capabilities_take_the_ladder_depth_from_the_device() {
+        let mut value = live_shaped_config();
+        let main = value["items"][0]["items"][1]["items"][0]["items"]
+            .as_array_mut()
+            .unwrap();
+        main[1]["values"] = serde_json::json!("Full,1 / 2,1 / 4");
+
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let health: HealthStatus =
+            serde_json::from_value(live_shaped_health("Running", 0.0, 0.0, 0.0)).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), Some(&health));
+
+        assert_eq!(caps.decimation_steps, Some(3));
+        assert_eq!(
+            caps.sample_rates().unwrap(),
+            vec![61_440_000.0, 30_720_000.0, 15_360_000.0]
+        );
+    }
+
+    /// Nothing to read is not an error, and must not become a guess: a
+    /// caller falls back per field, so every field has to be absent
+    /// rather than defaulted to a plausible number.
+    #[test]
+    fn capabilities_are_absent_when_nothing_can_be_read() {
+        let caps = DeviceCapabilities::from_trees(None, None);
+        assert_eq!(caps, DeviceCapabilities::default());
+        assert!(caps.model.is_none());
+        assert!(caps.center_frequency.is_none());
+        assert!(caps.reference_level.is_none());
+        assert!(
+            caps.sample_rates().is_none(),
+            "no ladder without both a rate and a rung count"
+        );
+    }
+
+    /// Each half stands alone: a server answering `/remoteconfig` but
+    /// not `/healthstatus` still yields the bounds a plugin advertises.
+    #[test]
+    fn capabilities_survive_half_a_reading() {
+        let config: ConfigItem = serde_json::from_value(live_shaped_config()).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+
+        assert!(caps.center_frequency.is_some());
+        assert!(caps.reference_level.is_some());
+        assert_eq!(caps.decimation_steps, Some(10));
+        // Identity and the native rate live in the other tree.
+        assert_eq!(caps.model.as_deref(), Some("SPECTRAN V6 ECO"));
+        assert!(caps.serial.is_none());
+        assert!(caps.native_iq_rate_hz.is_none());
+        assert!(
+            caps.sample_rates().is_none(),
+            "no native rate means no honest ladder top"
+        );
+    }
+
+    /// A bound is only advertisable as a pair.
+    #[test]
+    fn capabilities_ignore_a_one_sided_bound() {
+        let mut value = live_shaped_config();
+        let main = value["items"][0]["items"][1]["items"][0]["items"]
+            .as_array_mut()
+            .unwrap();
+        main[0]["max"] = serde_json::Value::Null;
+
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+        assert!(caps.center_frequency.is_none());
+        assert!(
+            caps.reference_level.is_some(),
+            "one unusable item must not discard the others"
+        );
     }
 
     #[test]
