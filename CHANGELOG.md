@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **The SoapySDR plugin advertised a TX channel on every device,
+  including receivers that cannot transmit at all.** `SoapySDRUtil
+  --probe` on a V6 ECO over HTTP reported `1 Tx`, a full TX channel
+  section and `Full-duplex: YES`; an application that believed it failed
+  on the first write. `getNumChannels` did guard on holding a sink, but
+  `aaronia_sink_build` allocates unconditionally — it succeeds on a build
+  carrying no TX code at all, and only `aaronia_sink_initialize` fails —
+  so the guard was never false. A sink is now built only when the new
+  `aaronia_sink_supported()` reports this binary carries the native-SDK
+  TX path *and* the source is that backend, which means a `serial=` open
+  with no `url=`/`file=` overriding it. The probe now reads `0 Tx` and
+  `Full-duplex: NO`.
+
+  Still not a device capability check: a native-SDK build opened by
+  serial against a V6 ECO would advertise TX, since the ECO has no
+  transmitter and nothing here asks the SDK.
 - **Restored a clean CI run.** Three clippy lints had been failing
   `cargo clippy --workspace --all-features --all-targets` on Linux since
   v0.7.7 — a collapsible `if let` in `UnifiedSink::initialize`, a needless

@@ -148,6 +148,14 @@ typedef struct AaroniaSink AaroniaSink; // Opaque UnifiedSink
 #define AARONIA_TX_SEGMENT_END   ((uint64_t)0x00000008)
 #define AARONIA_TX_PUSH          ((uint64_t)0x00008000)
 
+// True when this build carries the native-SDK transmit path. Ask before
+// advertising a TX capability: aaronia_sink_build succeeds everywhere,
+// so a non-null sink proves nothing. Compile-time only — it cannot say
+// whether the attached device has a transmitter (a V6 ECO does not), and
+// TX also requires the native-SDK source backend, so a device opened
+// over HTTP or from a file has no TX path regardless.
+bool aaronia_sink_supported(void);
+
 AaroniaSinkBuilder* aaronia_sink_builder_new(void);
 void aaronia_sink_builder_free(AaroniaSinkBuilder* builder);
 void aaronia_sink_builder_center_frequency(AaroniaSinkBuilder* builder, double hz);

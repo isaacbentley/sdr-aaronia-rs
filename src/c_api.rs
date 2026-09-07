@@ -1248,6 +1248,30 @@ pub unsafe extern "C" fn aaronia_sink_builder_new() -> *mut AaroniaSinkBuilder {
     Box::into_raw(Box::new(AaroniaSinkBuilder::new()))
 }
 
+/// Whether this build carries a transmit path at all.
+///
+/// `aaronia_sink_build` succeeds everywhere — it allocates a sink
+/// object, and only `aaronia_sink_initialize` fails where TX is
+/// unavailable — so a non-null sink is **not** evidence that anything
+/// can transmit. A caller that has to advertise the capability before
+/// opening anything (the SoapySDR plugin publishes its TX channel count
+/// at device construction) must ask this instead, or it advertises a TX
+/// channel whose every write fails.
+///
+/// Returns compile-time availability only: `true` means the binary
+/// carries the native-SDK TX code, not that the attached device has a
+/// transmitter. A SPECTRAN V6 ECO does not, and this cannot tell.
+/// Transmission additionally requires the native-SDK *source* backend,
+/// so a device opened over HTTP or from a file has no TX path whatever
+/// this returns.
+///
+/// Takes no arguments and touches no state, so it is a safe `fn`: sound
+/// to call from any thread at any time.
+#[unsafe(no_mangle)]
+pub extern "C" fn aaronia_sink_supported() -> bool {
+    crate::unified_sink::UnifiedSink::tx_supported()
+}
+
 /// Free a sink builder. Null is a no-op.
 ///
 /// # Safety

@@ -67,6 +67,26 @@ impl UnifiedSink {
         Self::with_config(UnifiedSinkConfig::default())
     }
 
+    /// Whether this build has a transmit path at all.
+    ///
+    /// `UnifiedSink` constructs on every platform so that FFI consumers
+    /// hold one type everywhere, and only [`Self::initialize`] fails
+    /// where TX is unavailable. That is too late for a caller that has
+    /// to *advertise* a capability before anything is opened — the
+    /// SoapySDR plugin publishes its channel count at device
+    /// construction — so the same compile-time condition is readable
+    /// here, before a sink exists.
+    ///
+    /// Compile-time only: `true` means this binary carries the TX code,
+    /// not that the attached device has a transmitter. A V6 ECO does
+    /// not, and nothing here can tell.
+    pub const fn tx_supported() -> bool {
+        cfg!(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))
+    }
+
     /// The sink's current configuration.
     pub fn config(&self) -> &UnifiedSinkConfig {
         &self.config

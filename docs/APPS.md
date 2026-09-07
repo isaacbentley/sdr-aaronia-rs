@@ -116,5 +116,7 @@ directly and skip the SoapySDR layer.
 - Retuning mid-stream is safe and requires no Aaronia licence.
 - Gaps detected in the stream are counted by `readSensor("cumulative_drops")`.
   An overrun sets `SOAPY_SDR_END_ABRUPT` on the affected read.
-- TX is hardware-unverified and exists only when the plugin is built
-  against the native SDK on Windows or Linux.
+- TX is hardware-unverified, and a TX channel is reported only when the
+  plugin was built against the native SDK on Windows or Linux *and* the
+  device was opened by `serial=`. Over `url=` or `file=` the probe shows
+  `0 Tx`.

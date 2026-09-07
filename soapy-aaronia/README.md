@@ -136,11 +136,19 @@ actually running, which is the number to trust.
   always sends center frequency and span together, because RTSA servers
   ignore capture requests carrying only one of the two. This was
   verified against RTSA-Suite PRO with a SPECTRAN V6 ECO.
-- **TX:** `CF32`, single channel, available only when the module is
-  built against the native SDK on Windows or Linux. Elsewhere
-  `setupStream(TX)` fails with a descriptive error. Bursts are pushed
-  for immediate transmission; timed TX (`SOAPY_SDR_HAS_TIME`) is not
-  supported. The TX path is hardware-unverified.
+- **TX:** `CF32`, single channel, and the device reports a TX channel
+  only when two things hold: the module was built against the native SDK
+  on Windows or Linux, and the device was opened by `serial=` — the
+  backend that reaches the SDK. A device opened by `url=` or `file=`
+  streams over a transport with no transmit path, so it reports `0 Tx`
+  and `Full-duplex: NO`, and `setupStream(TX)` is never reached. Bursts
+  are pushed for immediate transmission; timed TX
+  (`SOAPY_SDR_HAS_TIME`) is not supported. The TX path is
+  hardware-unverified.
+
+  The check is on the build and the backend, not on the hardware:
+  a SPECTRAN V6 ECO has no transmitter, and opening one by serial from a
+  native-SDK build would still advertise a TX channel.
 
 ## Time, gain, sensors
 

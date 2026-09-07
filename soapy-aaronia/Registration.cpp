@@ -166,14 +166,42 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         throw std::runtime_error(err);
     }
 
-    AaroniaSinkBuilder* sink_builder = aaronia_sink_builder_new();
-    SinkBuilderGuard sinkBuilderGuard(sink_builder);
+    // A sink is built only when this device could actually transmit,
+    // because the device advertises its TX channel count from whether it
+    // holds one. `aaronia_sink_build` allocates unconditionally — it
+    // succeeds on a build with no TX code at all, and only
+    // `aaronia_sink_initialize` fails — so building one always and
+    // testing the pointer advertised a TX channel on every device,
+    // including HTTP-attached receivers with no transmitter anywhere in
+    // the path. Two conditions have to hold:
+    //
+    //   - this build carries the native-SDK TX code, and
+    //   - the *source* is the native-SDK backend. `serial` selects it,
+    //     but only when nothing else already chose a transport: the
+    //     source construction above lets `url` and `file` win over a
+    //     serial that is also present, so testing `serial` alone would
+    //     put TX back on an HTTP device opened as `url=...,serial=...`.
+    //
+    // Neither can be relaxed into "probably fine": what they buy is that
+    // an application sees no TX channel rather than one that throws on
+    // the first write.
+    //
+    // Still not a device capability check. A V6 ECO has no transmitter
+    // and would be advertised as having one on a native-SDK build opened
+    // by serial; settling that needs an SDK query this crate does not yet
+    // make.
+    const bool txPossible = aaronia_sink_supported() && args.count("serial") != 0
+                            && args.count("url") == 0 && args.count("file") == 0;
     SinkGuard sink(nullptr);
-    if (sink_builder) {
-        // TX shares the tuning args with RX unless retuned later.
-        if (hasFreq) aaronia_sink_builder_center_frequency(sink_builder, freq);
-        if (hasRate) aaronia_sink_builder_sample_rate(sink_builder, rate);
-        sink.p = aaronia_sink_build(sink_builder);
+    if (txPossible) {
+        AaroniaSinkBuilder* sink_builder = aaronia_sink_builder_new();
+        SinkBuilderGuard sinkBuilderGuard(sink_builder);
+        if (sink_builder) {
+            // TX shares the tuning args with RX unless retuned later.
+            if (hasFreq) aaronia_sink_builder_center_frequency(sink_builder, freq);
+            if (hasRate) aaronia_sink_builder_sample_rate(sink_builder, rate);
+            sink.p = aaronia_sink_build(sink_builder);
+        }
     }
 
     // Device takes ownership of both on successful construction.
