@@ -49,10 +49,10 @@ The Aaronia RTSA Vendor SDK provides low-level, high-performance access to Aaron
 *   **Real-time Data Access**: Packet-based streaming of IQ samples and spectrum data with configurable decimation
 *   **Device Modes**: Verified support for multiple operational modes:
     *   **SpectranV6**: `spectranv6/raw`, `spectranv6/iqreceiver`, `spectranv6/iqtransceiver`, `spectranv6/iqtransmitter`, `spectranv6/sweepsa`
-    *   **SpectranV6 ECO**: `spectranv6eco/rtsa` (its raw pipeline; there is no `spectranv6eco/raw`), `spectranv6eco/iqreceiver`, `spectranv6eco/iqtransceiver`, `spectranv6eco/iqtransmitter`, `spectranv6eco/sweepsa`
+    *   **SpectranV6 ECO**: `spectranv6eco/rtsa` (its raw pipeline, and what the SDK's own ECO sample opens; `spectranv6eco/raw` is listed in the 3.0.3 samples Readme but unverified — see Verified Architecture above), `spectranv6eco/iqreceiver`, `spectranv6eco/iqtransceiver`, `spectranv6eco/iqtransmitter`, `spectranv6eco/sweepsa`
 *   **Configuration Tree**: Hierarchical configuration system with verified parameters:
     *   **Clock Rates** (V6): 46MHz (46.08), 61MHz (61.44), 76MHz (76.80), 92MHz (92.16), 122MHz (122.88), 184MHz (184.32), 245MHz (245.76), 492MHz (491.52) — see the full label table under [Rust Binding Notes](#rust-binding-notes)
-    *   **Clock Rates** (V6 ECO): fixed at 92.16 MHz. Its top IQ rate is 61.44 MHz, which is that clock over 1.5 — the two are easy to confuse and this document once recorded the rate as the clock
+    *   **Clock Rates** (V6 ECO): fixed at 92.16 MHz. Its top IQ rate is 61.44 MHz, which is that clock over 1.5 — easy to confuse, and confusing them records the rate as the clock
     *   **Decimation**: Full, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, 1/128, 1/256, 1/512
     *   **IQ Mode Sample Rate**: equal to `spanfreq` (constraint: `spanfreq ≤ receiverclock / 1.5`). Measured on a V6 ECO, untested on a full V6, and not obviously consistent with Aaronia's own 245 MHz / 250 Msample figures for the V6 — see [HTTPSPEC](HTTPSPEC.md#unresolved-the-full-v6s-top-rate)
 *   **Health Monitoring**: Real-time device status including temperatures, sample rates, power levels, USB statistics, GPS data

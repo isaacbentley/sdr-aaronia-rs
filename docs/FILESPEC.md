@@ -195,12 +195,9 @@ Indicates the start of a new stream.
 > `capture_start_offset` when the chunk is exactly 48 bytes and the
 > value is plausible (finite, `0 ≤ v < ~10 years`), and the metadata
 > layer anchors `start_time_ns` with it so the reported time span
-> matches the recorded data rather than the stream clock. An earlier revision dispatched
-> 40-byte chunks into a fabricated alternate "proximity" layout
-> (u32 id / stream type / f32 rate / f32 frequency / device name);
-> no spec revision, capture, or writer produces that layout, and it
-> misparsed exactly the minimal spec-conformant chunks — it has been
-> removed.
+> matches the recorded data rather than the stream clock. There is no
+> alternate 40-byte "proximity" layout: no spec revision, capture or
+> writer produces one.
 
 ---
 
@@ -463,9 +460,8 @@ Several chunks use enums or flags to specify data types or features. The most im
 > official file-format document (rev. 4). Note the sample-type
 > ordering: each width's *unsigned* variant is immediately followed by
 > its signed sibling (`U8, U16, S16, U32, S32, F32`), rather than all
-> unsigned then all signed — an earlier revision of the
-> Rust reader had `S16`/`U32` swapped and omitted `DSST_U32N` (9)
-> entirely, so a file using value 9 failed to open. The reader now
+> unsigned then all signed — an ordering easy to transpose, and a
+> transposition silently misreads every affected chunk. The reader
 > maps any value outside the specified range of these three `SAMP`
 > enums to an `Unknown` variant and skips chunks it cannot decode,
 > instead of rejecting the whole file.
@@ -708,13 +704,10 @@ E0 96 2A ED 3A 1C 15 43 mCreationTime
 00 00 00 00 00 00 00 00 mStreamOffset (terminating, no prior stream)
 ```
 
-> **Divergence resolved:** an earlier revision of this crate dispatched
-> 40-byte STRM chunks (`mChunkSize = 0x28`, as in this dump) into a
-> fabricated "proximity" layout that would have misparsed exactly this
-> official example. Verification against the vendor PDF and the LFS
-> test captures confirmed the standard layout is the only one — see
-> the layout note in the STRM chunk definition above. The reader now
-> parses every STRM with the standard layout.
+> **Note:** this 40-byte STRM (`mChunkSize = 0x28`) takes the standard
+> layout, like every other size — verified against the vendor PDF and
+> the LFS test captures. See the layout note in the STRM chunk
+> definition above.
 
 #### Sample Packet (SAMP)
 ```
