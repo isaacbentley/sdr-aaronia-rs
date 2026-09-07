@@ -54,7 +54,7 @@ HTTP streaming uses a JSON metadata line followed by binary sample data. **Verif
 {JSON_METADATA}[0x0A][0x1E][BINARY_SAMPLE_DATA]
 ```
 
-Earlier revisions of this document (and the upstream description "separated by RS or LF") implied a single separator byte; parsing with a single separator shifts every binary sample by one byte. The crate's parser accepts both the two-byte form and a lone LF/RS.
+The upstream description, "separated by RS or LF", reads as a single byte; parsing it that way shifts every binary sample by one. The crate's parser accepts both the two-byte form and a lone LF/RS.
 
 ## Data Formats
 
@@ -175,8 +175,7 @@ JSON-plus-binary will fail somewhere well past the point that would
 have identified the cause. Verified against a live server: `format=`
 with a nonsense value returned `DSFH`.
 
-This crate builds the string from an enum, so it cannot typo, and the
-SoapySDR plugin now warns on an unrecognised `format=` device argument
+The SoapySDR plugin warns on an unrecognised `format=` device argument
 rather than silently falling back to the default.
 
 ### When the server drops data
@@ -204,10 +203,10 @@ bytes off the socket over 6 s after a 500 ms settle:
 | 2       | 61.8 MB/s  | 123.5 MB/s | contiguous, both clients           |
 | 5       | 52–62 MB/s | 293.9 MB/s | saturated; 2 of 5 clients lost data |
 
-The five-client rows are the ones to read. The aggregate pins at
-293.9 MB/s — the same ~292 MB/s ceiling this 2.5GbE path saturates at
-with a single fast stream — so the constraint is the path, not a
-per-client limit. And the loss is **not shared out fairly**: three of the
+The aggregate pins at 293.9 MB/s — the same ~292 MB/s ceiling this
+2.5GbE path saturates at with a single fast stream — so the constraint
+is the path, not a per-client limit. And the loss is **not shared out
+fairly**: three of the
 five clients ran contiguous at the full 61.7 MB/s while the other two ran
 short with hundreds of timestamp gaps each. Repeating the run moved the
 loss to a different pair.
@@ -896,20 +895,16 @@ each" for the V6's two inputs, and both round to the 245.76 MHz that
 the `245MHz` clock label denotes — the clock itself, not two thirds of
 it.
 
-There is a reading that reconciles them. The clock list runs past
-`245MHz` to `492MHz` (491.52 MHz), and 245.76 MHz of span satisfies the
-1.5 rule against that clock with room to spare. On that reading 245 MHz
-of real-time bandwidth is real but needs the fastest clock, and the
+The likeliest reconciliation is the clock list itself: it runs past
+`245MHz` to `492MHz` (491.52 MHz), against which 245.76 MHz of span
+satisfies the 1.5 rule with room to spare. On that reading 245 MHz of
+real-time bandwidth is real but needs the fastest clock, and the
 `245MHz` label tops out at 163.84 MHz exactly as the crate computes.
-
-What does not fit either reading is the Remote Config panel Aaronia
-published in 2021 and again in 2022: a full V6 with the clock set to
-`92MHz` reporting roughly 92.16 MHz of IQ samples per second. That
-counter is not the delivered rate — measured on an ECO, `iqsamples`
-held at 61.44 MHz while the device was actually delivering 15.36 and
-then 7.68 MHz, so it reports the native undecimated rate. Taken at face
-value it says a full V6 at a 92 MHz clock has a native rate of
-92.16 MHz, which the 1.5 rule forbids.
+Aaronia's 2021 and 2022 Remote Config screenshots — a full V6 at a
+`92MHz` clock reporting ~92.16 MHz of IQ samples per second — fit
+neither reading: at face value they put the native rate *at* the clock,
+which the 1.5 rule forbids. That counter is `iqsamples`, the native
+undecimated rate rather than the delivered one (see `/healthstatus`).
 
 No full V6 has been available to measure, so this stays open. The
 practical guidance is unchanged: the ECO path is verified rung by rung,
@@ -947,24 +942,20 @@ connection is free. Stream Merger and Stream Splitter, the blocks that
 would otherwise let several streams share one connection, are not in
 the free licence either.
 
-An earlier revision of this document read that limit as covering
-*connections* and warned that running this crate alongside a second
-client — a SoapySDR application, say — would meet it. **That is not what
-a live system does.** On the same RTSA-Suite PRO holding one HTTP Server
-block licence, five simultaneous `/stream` clients were all served, with
-no error, no refusal and no licence complaint. The limit is on block
-instances in the mission graph, not on connections to one block. What
-several clients cost is bandwidth, not licence — see below. It has
-nothing to do with the Remote Config licence discussed further down.
+**That limit is on block instances, not connections.** Measured: five
+simultaneous `/stream` clients were all served on a system holding one
+HTTP Server block licence, with no error, no refusal and no licence
+complaint. What several clients cost is bandwidth, not licence — see
+below — and it is unrelated to the Remote Config licence discussed
+further down.
 
 **Remote Configuration** (`/remoteconfig`):
 - Device parameter configuration.
-- Aaronia sells a "Remote Config" license, and this document previously
-  stated that `/remoteconfig` writes fail without it. **That is not what
-  a live system does.** On RTSA-Suite PRO driving a SPECTRAN V6 ECO whose
-  license list contains no Remote Config entry, `PUT /remoteconfig`
-  retuned the device repeatedly, in both the config-tree and simplified
-  forms, returning HTTP 200 with the change applied.
+- Aaronia sells a "Remote Config" license, but **writes do not appear to
+  need it.** On RTSA-Suite PRO driving a SPECTRAN V6 ECO whose license
+  list contains no Remote Config entry, `PUT /remoteconfig` retuned the
+  device repeatedly, in both the config-tree and simplified forms,
+  returning HTTP 200 with the change applied.
 - What that license actually gates is therefore unconfirmed. It may
   cover a different feature, or a different edition or version, or
   parameters other than the ones tested. Treat any claim that
