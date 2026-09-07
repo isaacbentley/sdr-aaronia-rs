@@ -148,6 +148,13 @@ pub struct StreamStats {
     /// and reset to `None` whenever the check re-arms — on a
     /// configuration restart, or on a device retune past the verdict.
     pub link_budget: Option<crate::link_budget::LinkBudgetVerdict>,
+    /// The device blocks' own loss counters, read at the most recent
+    /// stream-gap report — the cross-check that says whether a gap
+    /// started at the device or downstream of it. `None` until a gap has
+    /// been reported and the read has come back; an empty vector means
+    /// the mission publishes no block health, so the device can be
+    /// neither cleared nor blamed.
+    pub device_health: Option<Vec<crate::http_endpoints::DeviceHealthSummary>>,
 }
 
 impl Default for StreamStats {
@@ -165,6 +172,7 @@ impl Default for StreamStats {
             packet_rate: 0.0,
             restart_pending: false,
             link_budget: None,
+            device_health: None,
         }
     }
 }
@@ -982,6 +990,98 @@ impl HttpSource {
     }
 
     /// Clean up the stream when it fails or ends
+    /// Ask the device whether a stream gap was its own doing, and say so.
+    ///
+    /// Runs on every gap *report*, so it inherits that report's geometric
+    /// schedule (1, 4, 16, … drops) rather than firing per gap. The
+    /// counters it reads are per-second rates, so each reading describes
+    /// the moment its gap was reported — which is the point of reading
+    /// them live instead of once at connect.
+    ///
+    /// Detached rather than awaited. This is reached from `work()`'s call
+    /// chain, and the control-plane timeout is 30 s: awaiting a health
+    /// read here would stall the block for far longer than the gap it is
+    /// explaining, and a stalled `work()` backs the chunk channel up into
+    /// the very loss being diagnosed. The answer therefore lands as its
+    /// own log line just behind the gap warning, and on
+    /// [`StreamStats::device_health`] for a programmatic consumer.
+    ///
+    /// What it can and cannot settle: clearing the device narrows a gap
+    /// down to the server's outbound buffer or the wire, and **another
+    /// client on the same server block is one of the causes it cannot
+    /// distinguish**. Nothing the RTSA HTTP surface exposes counts
+    /// connections — not `/info`, not `/healthstatus`, not
+    /// `/remoteconfig` — and the server accepts further clients silently,
+    /// serving each a full copy of the stream. Measured on a 2.5GbE path,
+    /// five concurrent clients saturated it at 294 MB/s and the loss
+    /// landed on an arbitrary subset of them, so a clean stream is not
+    /// evidence of being alone either.
+    fn spawn_gap_health_probe(&self) {
+        // No handle means no runtime to spawn on (a unit-constructed
+        // block, never started); nothing to do and nothing to report.
+        let Some(handle) = self.tokio_handle.clone() else {
+            return;
+        };
+        let client = self.endpoints_client.clone();
+        let shared = self.shared_stats.clone();
+
+        handle.spawn(async move {
+            let blocks = match client.get_device_health().await {
+                Ok(blocks) => blocks,
+                Err(e) => {
+                    // The stream is the diagnosis; the cross-check is a
+                    // bonus. Losing it is not worth a second warning
+                    // stacked on the gap the operator is already reading.
+                    debug!("Stream-gap cross-check could not read /healthstatus: {e}");
+                    return;
+                }
+            };
+
+            let describe = |wanted: Option<bool>| {
+                blocks
+                    .iter()
+                    .filter(|b| b.losing_nothing() == wanted)
+                    .map(|b| b.describe())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let losing = describe(Some(false));
+            let cleared = describe(Some(true));
+
+            if !losing.is_empty() {
+                warn!(
+                    "Stream-gap cross-check: the device is losing samples of \
+                     its own ({losing}), so the gap starts there and not on \
+                     the link. Network headroom cannot recover it — look at \
+                     the USB path and the mission's own processing first."
+                );
+            } else if !cleared.is_empty() {
+                warn!(
+                    "Stream-gap cross-check: the device reports no loss of its \
+                     own ({cleared}), so the samples went missing downstream \
+                     of it — in the RTSA HTTP server's outbound buffer, which \
+                     drops past 8 MB, or on the wire. A second client \
+                     streaming from the same server block is one cause, and \
+                     the server will not report it: each connection is served \
+                     a full copy, so another client doubles the server's \
+                     egress while no endpoint counts connections. Check the \
+                     RTSA host for other clients on this port."
+                );
+            } else {
+                debug!(
+                    "Stream-gap cross-check: no block reported loss counters, \
+                     so the device can be neither cleared nor blamed"
+                );
+            }
+
+            if let Some(shared) = shared
+                && let Ok(mut stats) = shared.write()
+            {
+                stats.device_health = Some(blocks);
+            }
+        });
+    }
+
     async fn cleanup_stream(&mut self) {
         // Stop streaming via control endpoint to prevent device from continuing to stream
         if self.stream_active {
@@ -1107,14 +1207,18 @@ impl HttpSource {
                         "Stream gap: the server has skipped {drops} times \
                          ({:.2} s of signal in total, {:.3} s this time). The \
                          samples were never sent, so this is loss upstream of \
-                         this process — the device is producing more than the \
-                         link can carry. Digital decoding cannot survive it: \
-                         every gap is an unsignalled discontinuity to the \
+                         this process — more is being produced than the path \
+                         can carry. Digital decoding cannot survive it: every \
+                         gap is an unsignalled discontinuity to the \
                          demodulator. Narrow the span or use a faster link.\
                          {predicted}",
                         self.stream_gap_seconds, gap_seconds,
                     );
                     self.next_gap_report = drops.saturating_mul(4);
+                    // Ask the device whether the loss is its own. The
+                    // answer arrives as its own line, just behind this
+                    // one — see `spawn_gap_health_probe`.
+                    self.spawn_gap_health_probe();
                 }
             }
         }
@@ -1207,9 +1311,19 @@ impl HttpSource {
         if let Some(ref shared) = self.shared_stats
             && let Ok(mut stats) = shared.write()
         {
+            // This replaces the whole snapshot, so every field the block
+            // does not itself hold has to be carried across by hand.
+            // `restart_pending` is the consumer's request to us;
+            // `device_health` is written asynchronously by the gap
+            // cross-check, which has no `&mut self` to store it on — and
+            // this refresh runs on every processed chunk, so a reading
+            // not carried here would be gone within milliseconds of
+            // being taken.
             let pending = stats.restart_pending;
+            let device_health = stats.device_health.take();
             *stats = self.get_stream_stats();
             stats.restart_pending = pending;
+            stats.device_health = device_health;
         }
 
         Ok((total_samples_added, iq_samples_added))
@@ -1268,6 +1382,10 @@ impl HttpSource {
                 LinkCheck::Done(verdict) => verdict.clone(),
                 _ => None,
             },
+            // Not derivable from block state: the gap cross-check reads
+            // it asynchronously and writes it straight to the shared
+            // handle, which carries it across this snapshot.
+            device_health: None,
         }
     }
 }
@@ -2746,6 +2864,139 @@ mod tests {
             "a check that was never armed has nothing to restart",
         );
         assert_eq!(unarmed.link_device_rate, Some(30_720_000.0));
+    }
+
+    /// The per-chunk stats refresh replaces the whole shared snapshot, so
+    /// anything written to it from outside the block has to be carried
+    /// across explicitly. The gap cross-check runs detached and has no
+    /// `&mut self` to store its reading on, so it writes straight to the
+    /// shared handle — and this refresh runs on every processed chunk.
+    /// Without the carry-across, a reading would be erased within
+    /// milliseconds of being taken and no consumer would ever see one.
+    #[test]
+    fn shared_stats_refresh_keeps_the_gap_cross_check_reading() {
+        use crate::http_endpoints::DeviceHealthSummary;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let shared = std::sync::Arc::new(std::sync::RwLock::new(StreamStats::default()));
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .format(StreamFormat::Int16)
+            .with_shared_stats(shared.clone())
+            .build()
+            .expect("Should create HttpSource");
+
+        let reading = DeviceHealthSummary {
+            block: "Block_Spectran_V6Eco_0".to_string(),
+            device_state: Some("Running".to_string()),
+            errors_per_second: Some(0.0),
+            usb_overflows_per_second: Some(0.0),
+            dsp_overflows_per_second: Some(0.0),
+        };
+        shared.write().unwrap().device_health = Some(vec![reading.clone()]);
+
+        // One clean packet: no gap, so no probe of its own is spawned —
+        // this is the refresh alone, which is what must not erase it.
+        let iq = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 4));
+        block
+            .process_advanced_stream_data(&iq)
+            .expect("the IQ packet parses");
+
+        assert_eq!(
+            shared.read().unwrap().device_health,
+            Some(vec![reading]),
+            "the refresh must carry the cross-check reading across",
+        );
+    }
+
+    /// End to end: a stream gap must produce a `/healthstatus` read whose
+    /// verdict reaches the shared stats.
+    ///
+    /// The probe is detached — it cannot report through the return value
+    /// of the sync path that starts it — so the arrival of a reading is
+    /// the only proof the wiring holds: the spawn found a runtime, the
+    /// control-plane request was made and parsed, and the refresh that
+    /// runs on every chunk did not erase the answer.
+    #[tokio::test]
+    async fn a_stream_gap_reads_the_device_health() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/healthstatus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "type": "group", "name": "healthstatus", "label": "HealthStatus",
+                "flags": "", "items": [{
+                    "type": "group", "name": "Block_Spectran_V6Eco_0",
+                    "label": "SPECTRAN V6 ECO", "flags": "grp_tree_root", "items": [{
+                        "type": "group", "name": "status", "label": "Status",
+                        "flags": "", "items": [
+                            { "type": "string", "name": "devstate", "label": "Device State",
+                              "flags": "", "value": "Running", "default": "Running",
+                              "pattern": null },
+                            { "type": "float", "name": "errors", "label": "Errors/s",
+                              "flags": "", "min": 0, "max": 1e9, "step": 1,
+                              "value": 0.0, "default": 0, "unit": "Frequency" },
+                            { "type": "float", "name": "usboverflows",
+                              "label": "USB Overflows/s", "flags": "", "min": 0,
+                              "max": 1e9, "step": 1, "value": 0.0, "default": 0,
+                              "unit": "Frequency" },
+                            { "type": "float", "name": "dsboverflows",
+                              "label": "DSP Overflows/s", "flags": "", "min": 0,
+                              "max": 1e9, "step": 1, "value": 0.0, "default": 0,
+                              "unit": "Frequency" }
+                        ]
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let shared = std::sync::Arc::new(std::sync::RwLock::new(StreamStats::default()));
+        let mut block = HttpSourceBuilder::new(&server.uri())
+            .format(StreamFormat::Int16)
+            .with_shared_stats(shared.clone())
+            .build()
+            .expect("Should create HttpSource");
+
+        // Two packets a full second apart, against a 1 ms tolerance: the
+        // second is a gap, and the first gap report fires the probe.
+        for (start, end) in [(100.0, 100.001), (101.0, 101.001)] {
+            let packet = Bytes::from(int16_iq_packet(15_360_000.0, start, end, 4));
+            block
+                .process_advanced_stream_data(&packet)
+                .expect("the IQ packet parses");
+        }
+        assert_eq!(
+            shared.read().unwrap().dropped_packets,
+            1,
+            "the second packet is a gap",
+        );
+
+        // The read is detached, so wait for it rather than assuming it
+        // has landed. Generous: this is a localhost mock, and a timeout
+        // here means the wiring is broken, not that the box is slow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let health = loop {
+            if let Some(health) = shared.read().unwrap().device_health.clone() {
+                break health;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the gap cross-check never published a reading",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].block, "Block_Spectran_V6Eco_0");
+        assert_eq!(
+            health[0].losing_nothing(),
+            Some(true),
+            "the mocked device is clean, so the gap is downstream of it",
+        );
     }
 
     /// One serialized RTSA int16 IQ packet as the wire carries it: JSON

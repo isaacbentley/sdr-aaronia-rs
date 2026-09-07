@@ -189,6 +189,62 @@ the network cannot carry all end here, so reducing the wire format
 (`format=int16`) or the rate (`rate_reduction=n`) is the fix rather
 than a larger client-side buffer.
 
+### Several clients on one server block
+
+The HTTP Server block accepts any number of concurrent `/stream`
+clients, silently, and serves **each one a full copy** of the stream. It
+does not split the data and it does not refuse the second connection, so
+*n* clients cost the server *n* times the egress. Measured against a
+V6 ECO at 15.36 MS/s (`format=int16`, 61.4 MB/s a client), counting
+bytes off the socket over 6 s after a 500 ms settle:
+
+| clients | per client | aggregate  | result                             |
+|---------|------------|------------|------------------------------------|
+| 1       | 61.8 MB/s  | 61.8 MB/s  | contiguous                         |
+| 2       | 61.8 MB/s  | 123.5 MB/s | contiguous, both clients           |
+| 5       | 52–62 MB/s | 293.9 MB/s | saturated; 2 of 5 clients lost data |
+
+The five-client rows are the ones to read. The aggregate pins at
+293.9 MB/s — the same ~292 MB/s ceiling this 2.5GbE path saturates at
+with a single fast stream — so the constraint is the path, not a
+per-client limit. And the loss is **not shared out fairly**: three of the
+five clients ran contiguous at the full 61.7 MB/s while the other two ran
+short with hundreds of timestamp gaps each. Repeating the run moved the
+loss to a different pair.
+
+Two consequences for a client:
+
+- **A clean stream is not evidence of being alone.** You may be one of
+  the connections the server is keeping up with while it starves another.
+- **A gap is not evidence of company either.** A slow link, a slow
+  consumer and a second client all arrive as the same 8 MB outbound
+  buffer overflowing.
+
+#### Nothing reports the number of clients
+
+There is no endpoint, field or header that counts connections. Checked
+against a live RTSA-Suite PRO:
+
+| Surface | What it carries |
+| :--- | :--- |
+| `/info` | `name`, `title`, `uuid`, `port`, `mission`, `features` — no counts |
+| `/healthstatus` | the device block only; the HTTP Server block publishes no health at all |
+| `/remoteconfig` | the device block only, same as above |
+| `/stream` response headers | `Access-Control-Allow-Origin`, `Transfer-Encoding`, `Date`, `DateMS` |
+
+So a client cannot ask. What it can do is rule the *device* out: at the
+moment of a gap, `/healthstatus` reports the device block's own loss
+counters — `status/errors`, `status/usboverflows`, `status/dsboverflows`,
+all per-second rates — and if they are zero the samples went missing
+downstream of the device, in the server's outbound buffer or on the wire.
+That narrows a gap to a set of causes that includes another client
+without singling one out. `HttpEndpointsClient::get_device_health()`
+performs the read; `HttpSource` runs it automatically on each stream-gap
+report and publishes the result on `StreamStats::device_health`.
+
+For a definitive answer, look at the RTSA host itself — the HTTP Server
+block's own panel, or the host's socket table for peers on port 54664.
+
 ### Liveness
 
 There is no status endpoint. Aaronia's own remote control notes probe
@@ -595,7 +651,10 @@ when it is wrong.
 Note: this crate's `get_health_status()` parses the response as a generic
 configuration tree (`HealthStatus` is an alias for `ConfigItem`) rather
 than the typed shape below, which describes the upstream block-health
-fields.
+fields. `get_device_health()` reduces that tree to the per-block loss
+counters — `status/errors`, `status/usboverflows`, `status/dsboverflows`,
+plus `status/devstate` — which is the read that says whether a stream gap
+started at the device; see "Several clients on one server block" above.
 
 **Subgroups** per health-aware block, per Aaronia's specification:
 `info`, `status`, `health`, `settings`, and `components` — the last a
@@ -862,10 +921,15 @@ connection is free. Stream Merger and Stream Splitter, the blocks that
 would otherwise let several streams share one connection, are not in
 the free licence either.
 
-This is the licence limit most likely to be met in practice: running
-this crate and a second client — a SoapySDR application, say — against
-one server at the same time is a second connection. It has nothing to
-do with the Remote Config licence discussed below.
+An earlier revision of this document read that limit as covering
+*connections* and warned that running this crate alongside a second
+client — a SoapySDR application, say — would meet it. **That is not what
+a live system does.** On the same RTSA-Suite PRO holding one HTTP Server
+block licence, five simultaneous `/stream` clients were all served, with
+no error, no refusal and no licence complaint. The limit is on block
+instances in the mission graph, not on connections to one block. What
+several clients cost is bandwidth, not licence — see below. It has
+nothing to do with the Remote Config licence discussed further down.
 
 **Remote Configuration** (`/remoteconfig`):
 - Device parameter configuration.
@@ -1029,6 +1093,7 @@ fn parse_iq_int16(data: &[u8], metadata_scale: f32) -> Vec<Complex32> {
 |---------|------|---------|
 | 1.0 | 2025-01-11 | Initial HTTP specification from original documentation |
 | 2.0 | 2025-01-11 | Enhanced with comprehensive streaming protocol specification and implementation guidelines |
+| 2.5 | 2026-09-06 | Measured what several clients on one HTTP Server block actually do: the block serves each connection a full copy and refuses none, so *n* clients cost *n* times the egress — five concurrent clients saturated a 2.5GbE path at 293.9 MB/s and the loss landed on an arbitrary two of them, moving on a repeat run. Corrected the free-licence claim: five clients were served on a one-block licence, so the limit is on block instances, not connections. Confirmed no surface counts connections (`/info`, `/healthstatus`, `/remoteconfig`, `/stream` headers), and documented the device-block loss counters as the cross-check that at least rules the device out |
 | 2.4 | 2026-08-12 | Added Aaronia support's full `/control` settings list (`deviceconnect`, `camera`, per-type fields, `receiverUUID`/`receiverName` scoping), which supersedes the specification's claim that commands cannot be addressed to a block; documented that an unrecognised `format=` silently serves the RTSA file format and that `raw16` aliases `int16`, both verified live |
 | 2.3 | 2026-08-12 | Folded in Aaronia's endpoint specification (rev 11) and the block forum threads: `/control` broadcasts to every block and is PUT-only, the server drops data past an 8 MB outbound buffer, `/healthstatus` subgroups and the fields a V6 ECO reports, and the one-server/one-client free-licence limit. Measured that `status/iqsamples` is the native rate, not the delivered one. Corrected the marker-stream entry: it declares `payload: "spectra"`, so its nested samples are the spectra form and not a counter-example to flat categories |
 | 2.2 | 2026-08-12 | Verified Aaronia's V6 remote control notes (rev 4) against hardware: enum writes by index, multi-group and non-`main` `simpleconfig` PUTs, the silent no-op on an unknown block name, the ignored receiver name in the config-tree form; documented mission loading and the `type` requirement on `/control`, the absence of a status endpoint, and the unresolved conflict over what "Full" means on a full V6; resolved a contradiction over what the Remote Config licence gates |

@@ -51,6 +51,39 @@ async fn live_control_plane() {
         std::mem::discriminant(&health)
     );
 
+    // The gap cross-check's own read: the device-block loss counters,
+    // extracted from that same tree. A mission with a device wired in
+    // must yield at least one block — if a firmware or RTSA revision
+    // renames the counters, this is where it surfaces, rather than as a
+    // cross-check that silently stops clearing the device.
+    let blocks = c.get_device_health().await.expect("device health");
+    println!("device health: {blocks:?}");
+    assert!(
+        !blocks.is_empty(),
+        "a mission streaming from a device publishes at least one status block"
+    );
+    for b in &blocks {
+        println!(
+            "  {} -> losing_nothing={:?}",
+            b.describe(),
+            b.losing_nothing()
+        );
+        assert!(
+            b.losing_nothing().is_some(),
+            "block {} reported none of the three loss counters; the \
+             cross-check would be unable to clear or blame the device",
+            b.block
+        );
+    }
+
+    // The negative half of the same finding: nothing in the HTTP surface
+    // counts stream clients, so no block here is the HTTP server's.
+    assert!(
+        !blocks.iter().any(|b| b.block.contains("HTTPServer")),
+        "the HTTP Server block is not expected to publish health; if it \
+         now does, check whether it also exposes a connection count"
+    );
+
     // Read-only license check must not touch device state.
     let status = c.detect_remote_config_license().await;
     println!("remote-config (read-only) status: {:?}", status);

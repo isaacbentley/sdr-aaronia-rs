@@ -405,6 +405,148 @@ pub struct MissionControl {
 /// Note: The healthstatus endpoint returns a ConfigItem directly, not wrapped in a request structure
 pub type HealthStatus = ConfigItem;
 
+/// What the blocks in a `/healthstatus` tree report about losses of
+/// their *own*, reduced to the counters that answer one question: when
+/// this stream has a gap, did the device lose the samples?
+///
+/// The counters are rates — Aaronia labels them `Errors/s`, `USB
+/// Overflows/s`, `DSP Overflows/s` — so a reading taken while a gap is
+/// being reported describes that moment rather than the run so far,
+/// which is what makes the cross-check worth doing live instead of once
+/// at connect.
+///
+/// **This cannot say how many clients are streaming.** Only blocks that
+/// publish a `status` subgroup appear here, and on a measured V6 ECO
+/// mission that is the device block alone — the HTTP Server block
+/// publishes no health, exposes no connection count, and accepts
+/// further clients silently. Clearing the device is therefore the most
+/// a client can do on its own: it narrows a gap down to the server's
+/// egress or the wire, where a second client is one of the causes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceHealthSummary {
+    /// The block's name in the tree, e.g. `Block_Spectran_V6Eco_0`.
+    pub block: String,
+    /// `status/devstate` — the device's own word for what it is doing,
+    /// `"Running"` during a healthy capture. Reported but deliberately
+    /// not part of [`Self::losing_nothing`]: it is a free-form string
+    /// whose vocabulary this crate has not enumerated, and the loss
+    /// counters answer the question directly.
+    pub device_state: Option<String>,
+    /// `status/errors` — device errors per second.
+    pub errors_per_second: Option<f64>,
+    /// `status/usboverflows` — USB transport overflows per second.
+    pub usb_overflows_per_second: Option<f64>,
+    /// `status/dsboverflows` — DSP overflows per second. The wire name
+    /// really is `dsb` against a `DSP Overflows/s` label; both spellings
+    /// are Aaronia's, and the wire one is what is matched.
+    pub dsp_overflows_per_second: Option<f64>,
+}
+
+impl DeviceHealthSummary {
+    /// One summary per block in the tree that publishes a `status`
+    /// subgroup, in tree order.
+    ///
+    /// Blocks without one are skipped rather than reported empty: a
+    /// block that publishes no health has nothing to say, and an entry
+    /// full of `None` would read as a device that answered.
+    pub fn from_health_status(health: &HealthStatus) -> Vec<Self> {
+        fn collect(item: &ConfigItem, out: &mut Vec<DeviceHealthSummary>) {
+            let ConfigItem::Group { name, items, .. } = item else {
+                return;
+            };
+            let status = items.iter().find_map(|child| match child {
+                ConfigItem::Group { name, items, .. } if name == "status" => Some(items),
+                _ => None,
+            });
+            if let Some(status) = status {
+                out.push(DeviceHealthSummary {
+                    block: name.clone(),
+                    device_state: string_named(status, "devstate"),
+                    errors_per_second: number_named(status, "errors"),
+                    usb_overflows_per_second: number_named(status, "usboverflows"),
+                    dsp_overflows_per_second: number_named(status, "dsboverflows"),
+                });
+            }
+            // Recurse regardless: `components` nests satellite blocks,
+            // each with a `status` group of its own.
+            for child in items {
+                collect(child, out);
+            }
+        }
+
+        let mut out = Vec::new();
+        collect(health, &mut out);
+        out
+    }
+
+    /// Whether this block reports losing nothing itself.
+    ///
+    /// `None` when the tree carried none of the three counters. With
+    /// nothing to judge on, that is the honest answer — a `true` here
+    /// would read as the device having been cleared, and a caller
+    /// deciding where a gap came from would take it as evidence.
+    pub fn losing_nothing(&self) -> Option<bool> {
+        let counters = [
+            self.errors_per_second,
+            self.usb_overflows_per_second,
+            self.dsp_overflows_per_second,
+        ];
+        if counters.iter().all(Option::is_none) {
+            return None;
+        }
+        Some(counters.into_iter().flatten().all(|rate| rate == 0.0))
+    }
+
+    /// The block and its counters on one line, for a log message.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(state) = &self.device_state {
+            parts.push(format!("state {state}"));
+        }
+        for (value, label) in [
+            (self.errors_per_second, "errors/s"),
+            (self.usb_overflows_per_second, "USB overflows/s"),
+            (self.dsp_overflows_per_second, "DSP overflows/s"),
+        ] {
+            if let Some(rate) = value {
+                // Not `{rate:.0}`: these are rates, not counts, and a
+                // decayed 0.4 errors/s would round to "0 errors/s" in
+                // the very line explaining that the device is losing
+                // samples. Display prints 0 as "0" and keeps the rest.
+                parts.push(format!("{rate} {label}"));
+            }
+        }
+        if parts.is_empty() {
+            parts.push("no counters reported".to_string());
+        }
+        format!("{}: {}", self.block, parts.join(", "))
+    }
+}
+
+/// First numeric item named `want` among `items`, whatever numeric
+/// flavour the server typed it as. `/healthstatus` types its counters
+/// `float` today, but the same names are `number`/`integer` elsewhere in
+/// the tree and nothing promises that will not change.
+fn number_named(items: &[ConfigItem], want: &str) -> Option<f64> {
+    items.iter().find_map(|item| match item {
+        ConfigItem::Float { name, value, .. } | ConfigItem::Number { name, value, .. }
+            if name == want =>
+        {
+            Some(*value)
+        }
+        ConfigItem::Integer { name, value, .. } if name == want => Some(*value as f64),
+        _ => None,
+    })
+}
+
+/// First string item named `want` among `items`.
+fn string_named(items: &[ConfigItem], want: &str) -> Option<String> {
+    items.iter().find_map(|item| match item {
+        ConfigItem::String { name, value, .. } if name == want => Some(value.clone()),
+        _ => None,
+    })
+}
+
 /// Represents the health status of an individual processing block within the device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockHealth {
@@ -1342,6 +1484,17 @@ impl HttpEndpointsClient {
         Ok(health)
     }
 
+    /// Fetches `/healthstatus` and reduces it to the per-block loss
+    /// counters — the cross-check that says whether a stream gap was the
+    /// device's own doing.
+    ///
+    /// An empty vector is not an error: it means no block in the mission
+    /// publishes health, so the device can be neither cleared nor blamed.
+    pub async fn get_device_health(&self) -> Result<Vec<DeviceHealthSummary>> {
+        let health = self.get_health_status().await?;
+        Ok(DeviceHealthSummary::from_health_status(&health))
+    }
+
     /// Fetches the complete configuration tree from the `/remoteconfig` endpoint.
     ///
     /// Reads are license-free: this is the documented behaviour and it
@@ -1863,6 +2016,173 @@ fn read_config_leaf_value(items: &[serde_json::Value], field: &str) -> Option<f6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `/healthstatus` tree shaped like the one a live V6 ECO serves:
+    /// one block, `info` / `health` / `status` subgroups, counters typed
+    /// `float`. Field sets are copied from a captured response, so a
+    /// change in what the server sends shows up here as a parse failure
+    /// rather than as silently absent counters.
+    fn live_shaped_health(devstate: &str, errors: f64, usb: f64, dsp: f64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "group", "name": "healthstatus", "label": "HealthStatus",
+            "flags": "", "items": [{
+                "type": "group", "name": "Block_Spectran_V6Eco_0",
+                "label": "SPECTRAN V6 ECO", "flags": "grp_tree_root", "items": [
+                    { "type": "bool", "name": "modHealthStatGrp", "flags": "hidden",
+                      "value": true, "default": true,
+                      "text_off": "Disabled", "text_on": "Enabled" },
+                    { "type": "group", "name": "info", "label": "Info", "flags": "", "items": [
+                        { "type": "string", "name": "name", "label": "Name", "flags": "",
+                          "value": "Block_Spectran_V6Eco_0",
+                          "default": "Block_Spectran_V6Eco_0", "pattern": null }
+                    ]},
+                    { "type": "group", "name": "health", "label": "Health", "flags": "", "items": [
+                        { "type": "float", "name": "fpgatemp", "label": "FPGA Temperature",
+                          "flags": "", "min": 0, "max": 100, "step": 0.1,
+                          "value": 53.16, "default": 53.53, "unit": "Temperature" }
+                    ]},
+                    { "type": "group", "name": "status", "label": "Status", "flags": "", "items": [
+                        { "type": "string", "name": "devstate", "label": "Device State",
+                          "flags": "", "value": devstate, "default": "Running",
+                          "pattern": null },
+                        { "type": "float", "name": "iqsamples", "label": "IQ Samples/s",
+                          "flags": "", "min": 0, "max": 1e9, "step": 1,
+                          "value": 61411246.421, "default": 61408875.828,
+                          "unit": "Frequency" },
+                        { "type": "float", "name": "errors", "label": "Errors/s",
+                          "flags": "", "min": 0, "max": 1e9, "step": 1,
+                          "value": errors, "default": 0, "unit": "Frequency" },
+                        { "type": "float", "name": "usboverflows", "label": "USB Overflows/s",
+                          "flags": "", "min": 0, "max": 1e9, "step": 1,
+                          "value": usb, "default": 0, "unit": "Frequency" },
+                        { "type": "float", "name": "dsboverflows", "label": "DSP Overflows/s",
+                          "flags": "", "min": 0, "max": 1e9, "step": 1,
+                          "value": dsp, "default": 0, "unit": "Frequency" }
+                    ]}
+                ]
+            }]
+        })
+    }
+
+    fn parse_health(value: serde_json::Value) -> HealthStatus {
+        serde_json::from_value(value).expect("healthstatus tree parses")
+    }
+
+    #[test]
+    fn device_health_reads_the_status_counters() {
+        let health = parse_health(live_shaped_health("Running", 0.0, 0.0, 0.0));
+        let blocks = DeviceHealthSummary::from_health_status(&health);
+
+        assert_eq!(blocks.len(), 1, "one block publishes a status group");
+        let dev = &blocks[0];
+        assert_eq!(dev.block, "Block_Spectran_V6Eco_0");
+        assert_eq!(dev.device_state.as_deref(), Some("Running"));
+        assert_eq!(dev.errors_per_second, Some(0.0));
+        assert_eq!(dev.usb_overflows_per_second, Some(0.0));
+        // The wire name is `dsboverflows`, against a `DSP Overflows/s`
+        // label; matching the label instead would leave this `None`.
+        assert_eq!(dev.dsp_overflows_per_second, Some(0.0));
+        assert_eq!(
+            dev.losing_nothing(),
+            Some(true),
+            "every counter zero clears the device"
+        );
+    }
+
+    #[test]
+    fn device_health_names_a_device_that_is_losing() {
+        let health = parse_health(live_shaped_health("Running", 0.0, 12.0, 0.0));
+        let blocks = DeviceHealthSummary::from_health_status(&health);
+
+        assert_eq!(
+            blocks[0].losing_nothing(),
+            Some(false),
+            "one nonzero counter is enough: the loss starts at the device"
+        );
+        assert!(
+            blocks[0].describe().contains("12 USB overflows/s"),
+            "the description carries the counter that fired: {}",
+            blocks[0].describe()
+        );
+    }
+
+    /// Absent counters must not read as a cleared device. A `status`
+    /// group carrying only `devstate` says nothing about loss, and
+    /// `Some(true)` there would be taken as evidence the device is fine.
+    #[test]
+    fn device_health_cannot_judge_without_counters() {
+        let health = parse_health(serde_json::json!({
+            "type": "group", "name": "healthstatus", "label": "HealthStatus",
+            "flags": "", "items": [{
+                "type": "group", "name": "Block_Something_0", "label": "Something",
+                "flags": "", "items": [{
+                    "type": "group", "name": "status", "label": "Status",
+                    "flags": "", "items": [
+                        { "type": "string", "name": "devstate", "label": "Device State",
+                          "flags": "", "value": "Running", "default": "Running",
+                          "pattern": null }
+                    ]
+                }]
+            }]
+        }));
+        let blocks = DeviceHealthSummary::from_health_status(&health);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].losing_nothing(), None);
+    }
+
+    /// The finding this whole cross-check is built around: the HTTP
+    /// Server block publishes no health at all, so it contributes no
+    /// entry — and no client count. Measured against RTSA-Suite PRO,
+    /// whose `/healthstatus` carries the device block alone.
+    #[test]
+    fn device_health_skips_blocks_that_publish_no_status() {
+        let health = parse_health(serde_json::json!({
+            "type": "group", "name": "healthstatus", "label": "HealthStatus",
+            "flags": "", "items": [{
+                "type": "group", "name": "Block_HTTPServer_0", "label": "HTTP Server",
+                "flags": "grp_tree_root", "items": [{
+                    "type": "group", "name": "info", "label": "Info", "flags": "", "items": [
+                        { "type": "string", "name": "name", "label": "Name", "flags": "",
+                          "value": "Block_HTTPServer_0", "default": "Block_HTTPServer_0",
+                          "pattern": null }
+                    ]
+                }]
+            }]
+        }));
+
+        assert!(
+            DeviceHealthSummary::from_health_status(&health).is_empty(),
+            "a block with no status group has nothing to report"
+        );
+    }
+
+    /// Satellite devices arrive nested under `components`, so the walk
+    /// must recurse past a block that already matched.
+    #[test]
+    fn device_health_finds_nested_component_blocks() {
+        let mut tree = live_shaped_health("Running", 0.0, 0.0, 0.0);
+        let outer = tree["items"][0]["items"].as_array_mut().unwrap();
+        outer.push(serde_json::json!({
+            "type": "group", "name": "components", "label": "Components",
+            "flags": "", "items": [{
+                "type": "group", "name": "Block_Remote_0", "label": "Remote",
+                "flags": "", "items": [{
+                    "type": "group", "name": "status", "label": "Status",
+                    "flags": "", "items": [
+                        { "type": "float", "name": "errors", "label": "Errors/s",
+                          "flags": "", "min": 0, "max": 1e9, "step": 1,
+                          "value": 3.0, "default": 0, "unit": "Frequency" }
+                    ]
+                }]
+            }]
+        }));
+
+        let blocks = DeviceHealthSummary::from_health_status(&parse_health(tree));
+        let names: Vec<&str> = blocks.iter().map(|b| b.block.as_str()).collect();
+        assert_eq!(names, ["Block_Spectran_V6Eco_0", "Block_Remote_0"]);
+        assert_eq!(blocks[1].losing_nothing(), Some(false));
+    }
 
     /// Truncate `text` to at most `max_chars` **characters** for a
     /// diagnostic preview.

@@ -176,6 +176,44 @@ naming a narrower span from the device's own ladder that fits. The
 verdict is also published as `StreamStats::link_budget` on the shared
 stats handle, and is re-measured after a configuration restart.
 
+### When a gap happens anyway: was it the device?
+
+A gap that arrives despite a link with headroom has more than one cause,
+and the crate asks the device about the one it can settle. On each
+stream-gap report `HttpSource` reads `/healthstatus` and checks the
+device block's own loss counters — errors, USB overflows and DSP
+overflows, all per-second rates, so the reading describes the moment of
+the gap. If they are nonzero the loss starts at the device and no amount
+of network headroom will recover it. If they are zero the samples went
+missing downstream, in the RTSA HTTP server's outbound buffer (it drops
+past 8 MB) or on the wire. The reading is logged beside the gap warning
+and published as `StreamStats::device_health`; the same read is available
+directly:
+
+```rust,no_run
+# async fn health() -> sdr_aaronia_rs::Result<()> {
+use sdr_aaronia_rs::http_endpoints::{AuthMethod, HttpEndpointsClient};
+
+let client = HttpEndpointsClient::new("http://localhost:54664".into(), AuthMethod::None)?;
+for block in client.get_device_health().await? {
+    // `None` means the block reported none of the counters — the honest
+    // answer is "cannot say", not a device that has been cleared.
+    println!("{} -> losing nothing: {:?}", block.describe(), block.losing_nothing());
+}
+# Ok(())
+# }
+```
+
+**Clearing the device does not mean you are alone on the server.** One
+of the causes it leaves standing is another client: the HTTP Server block
+serves each connection a full copy of the stream and refuses none, so a
+second client doubles the server's egress. Nothing in the HTTP surface
+counts connections, and the loss under saturation lands on an arbitrary
+subset of the clients — measured, three of five ran contiguous while two
+lost data — so a clean stream is not evidence of being alone either. For
+a definitive count, look at the RTSA host. See `docs/HTTPSPEC.md`,
+"Several clients on one server block".
+
 ## Reusable configuration profiles
 
 Build your own configuration for specific bands:

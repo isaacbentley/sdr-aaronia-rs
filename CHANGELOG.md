@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **A stream gap now says whether the device caused it.** `HttpSource`
+  reads `/healthstatus` on each gap report and checks the device block's
+  own loss counters — `status/errors`, `status/usboverflows`,
+  `status/dsboverflows`, all per-second rates, so the reading describes
+  the moment of the gap rather than the run so far. Nonzero and the loss
+  starts at the device, where no amount of network headroom will recover
+  it; zero and the samples went missing downstream, in the server's 8 MB
+  outbound buffer or on the wire. The read is detached rather than
+  awaited: the control-plane timeout is 30 s, and stalling `work()` that
+  long would back the chunk channel up into the very loss being
+  diagnosed. `HttpEndpointsClient::get_device_health()` exposes the same
+  reduction of the health tree, and each reading is published as
+  `StreamStats::device_health`.
+
+  What it cannot settle is whether another client is on the same server
+  block. Nothing in the HTTP surface counts connections, so clearing the
+  device narrows a gap to a set of causes that includes contention
+  without singling it out — which is why the warning names it rather
+  than asserting it.
+
 ### Fixed
 - **The SoapySDR plugin advertised a TX channel on every device,
   including receivers that cannot transmit at all.** `SoapySDRUtil
@@ -30,6 +51,23 @@ All notable changes to this project will be documented in this file.
   success; only CI's `--all-features` run sees them.
 
 ### Documentation
+- **What several clients on one HTTP Server block cost, measured.** The
+  block accepts any number of concurrent `/stream` clients and serves
+  each one a full copy, so *n* clients cost the server *n* times the
+  egress. Two clients at 15.36 MS/s ran contiguous at 61.8 MB/s each;
+  five saturated the 2.5GbE path at 293.9 MB/s — the same ceiling a
+  single fast stream hits — and the loss fell on an arbitrary two of the
+  five, moving to a different pair on a repeat run. Two consequences a
+  client cannot escape: a clean stream is not evidence of being alone,
+  and a gap is not evidence of company. `/info`, `/healthstatus`,
+  `/remoteconfig` and the `/stream` response headers were all checked and
+  none counts connections.
+- **Corrected the free-licence claim in `docs/HTTPSPEC.md`.** It read
+  that running this crate alongside a second client would meet the
+  one-connection limit. Five simultaneous clients were served on a system
+  holding one HTTP Server block licence, with no error and no refusal:
+  the limit is on block instances in the mission graph, not on
+  connections to one block.
 - **The link a device actually needs, measured.** `link_budget`'s module
   docs gain a 2.5GbE table beside the gigabit one, and the README a
   requirements section. A 44 MHz real-time-bandwidth device — an ECO 100 —
