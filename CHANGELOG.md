@@ -44,9 +44,12 @@ All notable changes to this project will be documented in this file.
   `GET /stream?format=rtsa&rate_reduction=8&input=main&compression=5&rate_adaption=0`.
   `format=rtsa` streams the file container and is the only format that
   accepts `compression=N`, which applies the file format's own lossy
-  codec. Measured on a V6 ECO at 15.36 MS/s against `format=int16`:
-  level 1 is 1.36x, level 5 is 2.19x, level 9 is 6.55x. Level 0 costs 20%
-  *more* than raw int16, being the container overhead with no codec.
+  codec. The container carries `float32` (`mSampleType` 11, `DSST_F32N`),
+  so level 0 is plain float32 with under 1% of chunk overhead — 123.0
+  MB/s against 122.9 theoretical at 15.36 MS/s. Against that baseline the
+  codec buys 2.74x at level 1, 4.43x at level 5 and 13.10x at level 9;
+  even level 1 undercuts plain `int16` while carrying float precision.
+  Ratios hold at 3.84 MS/s too.
 
   HTTPSPEC had documented `format=rtsa` only as the thing a typo falls
   back to — "a completely different wire format rather than an error" —

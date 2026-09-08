@@ -1071,21 +1071,34 @@ HTTP Client documentation says so plainly: *"Data is compressed in the
 same way as file compression. With a higher degree of compression, data
 loss also increases."* It is lossy, and the level is the trade.
 
-Measured against a V6 ECO at 15.36 MS/s, byte rate off the socket:
+**The container carries `float32`.** Its `SAMP` chunks report
+`mSampleType` 11, `DSST_F32N` — 8 bytes a sample, twice `int16`. So the
+honest comparison for the codec is against `format=float32`, and the
+comparison for *choosing a wire format* is against `int16`. Measured on a
+V6 ECO at 15.36 MS/s over a link with headroom (2.5GbE, ~292 MB/s), byte
+rate off the socket:
 
-| stream | delivered | vs `int16` |
-| :--- | ---: | ---: |
-| `format=int16` | 61.8 MB/s | 1.00x |
-| `format=rtsa&compression=0` | 73.9 MB/s | 0.84x |
-| `format=rtsa&compression=1` | 45.6 MB/s | 1.36x |
-| `format=rtsa&compression=3` | 37.7 MB/s | 1.64x |
-| `format=rtsa&compression=5` | 28.3 MB/s | 2.19x |
-| `format=rtsa&compression=7` | 18.4 MB/s | 3.36x |
-| `format=rtsa&compression=9` | 9.4 MB/s | 6.55x |
+| stream | delivered | vs `float32` | vs `int16` |
+| :--- | ---: | ---: | ---: |
+| `format=int16` | 61.8 MB/s | — | 1.00x |
+| `format=float32` | 123.2 MB/s | 1.00x | 1.99x |
+| `format=rtsa&compression=0` | 123.0 MB/s | 1.00x | 1.99x |
+| `format=rtsa&compression=1` | 44.9 MB/s | 2.74x | 0.73x |
+| `format=rtsa&compression=5` | 27.8 MB/s | 4.43x | 0.45x |
+| `format=rtsa&compression=9` | 9.4 MB/s | 13.10x | 0.15x |
 
-Uncompressed, the container costs 20% *more* than raw `int16` — chunk
-headers and per-packet metadata. Everything above level 0 pays that back
-many times over.
+At level 0 the container is `float32` with no measurable overhead — 123.0
+against 122.9 theoretical, so the chunk headers cost well under 1%. The
+codec then buys 2.7x at level 1 and 13x at level 9, and even level 1
+undercuts plain `int16` while carrying float precision. The same ratios
+hold at 3.84 MS/s (2.72x, 4.39x, 12.81x), so they are a property of the
+codec rather than of one rate.
+
+Measure this on a link with room. An earlier pass over WiFi 6E put
+`compression=0` at 73.9 MB/s and concluded the container cost 20% *more*
+than `int16` — but 123 MB/s of `float32` cannot cross a 97 MB/s link, so
+that figure was a saturated, dropping stream rather than a container
+overhead.
 
 **This crate cannot decode it for IQ.** Tested: a real compressed
 payload pulled off the stream, handed to `Decompressor::decompress`,
