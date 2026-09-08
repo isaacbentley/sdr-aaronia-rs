@@ -459,16 +459,16 @@ async fn live_stream_rate_reduction_and_scale() {
     assert!(s.packets > 0 && s.samples > 0);
     assert_eq!(s.errors, 0);
 
-    // `rate_reduction` is a no-op for IQ on RTSA-Suite PRO, measured.
-    // A factor of 64 leaves `sampleFrequency` and the byte rate exactly
-    // where they were, at 2, 10 and 64. The parameter is accepted and
-    // ignored, so it is not a bandwidth lever however the endpoint
-    // specification describes it.
+    // `rate_reduction` is *time compression* — the operation the
+    // `waterfall` payload is described by — so it thins frames over
+    // time. A continuous IQ stream has no frames, and measurement
+    // agrees: at 2, 10 and 64 the reported rate and the byte rate are
+    // unchanged. Not a bandwidth lever for IQ.
     //
     // Asserted rather than merely noted: this test used to check only
-    // that packets arrived, which it does whether or not the reduction
-    // works, so the docs claimed a lever nothing verified. If a future
-    // RTSA version starts honouring it, this fails and says so.
+    // that packets arrived, which it does either way, so the docs
+    // called it a bandwidth fix with nothing verifying that. Pinning
+    // the IQ behaviour keeps the claim from drifting back.
     let unreduced = pump_stream_with_params(
         HttpEndpointsClient::stream_params()
             .format(StreamFormat::Int16)
@@ -484,8 +484,9 @@ async fn live_stream_rate_reduction_and_scale() {
     );
     assert!(
         (ratio - 1.0).abs() < 0.05,
-        "rate_reduction=64 changed the reported rate ({:.0} -> {:.0} Hz). The \
-         server now honours it; update HTTPSPEC, which records it as ignored.",
+        "rate_reduction=64 changed the reported rate ({:.0} -> {:.0} Hz). It \
+         now affects IQ; update HTTPSPEC, which records it as time \
+         compression with no effect on a continuous stream.",
         unreduced.rate,
         s.rate,
     );
