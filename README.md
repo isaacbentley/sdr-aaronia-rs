@@ -40,6 +40,24 @@ selects a backend and presents the same interface either way.
   wasted: `link_budget` measures the path end to end and names the
   widest span on the device's decimation ladder that fits it.
 
+Three backends feed one engine that a range of consumers read from:
+
+```
+               ┌── Native SDK (C FFI)
+Backends:      ├── HTTP Streaming (REST + binary chunked)
+               └── Offline .rtsa Files (binary parser)
+                       │
+                       ▼
+Engine:        [ AaroniaSource / Unified Source ]
+                       │
+                       ▼
+Consumers:     ├── Native Rust API
+               ├── FutureSDR Block (HttpSource / HttpSink)
+               ├── Seify Driver (seify_impl.rs)
+               ├── C ABI (c_api.rs) ──► SoapySDR (C++) ──► GQRX / SDR++ / GNU Radio
+               └── Python Bindings (PyO3: python-aaronia) ──► NumPy / Arrow
+```
+
 ## Link requirements
 
 The server streams IQ at a fixed number of bytes per sample, so the span

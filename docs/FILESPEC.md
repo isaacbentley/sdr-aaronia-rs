@@ -4,9 +4,7 @@
 
 The Aaronia Real-Time Spectrum Analyzer (RTSA) file format is a chunk-based binary format designed for storing high-performance RF sample data, spectrum analysis results, and associated metadata. This specification covers both standard RTSA files and reverse-order variants, as well as HTTP streaming protocol variants.
 
-This document outlines the complete structure of the Aaronia RTSA file format, based on the official PDF documentation, empirical analysis, and implementation experience.
-
-> **Status & attribution.** This document is a *community-compiled* reference, **not** an official Aaronia specification. It is assembled from public posts on the Aaronia V6 forum, Aaronia's product documentation, and empirical analysis of capture files. Where these disagree, the vendor's own materials are authoritative. See [Sources and Attribution](#sources-and-attribution) for the upstream, vendor-published references.
+> **Status & attribution.** This document is a *community-compiled* reference, **not** an official Aaronia specification. It is assembled from public posts on the Aaronia V6 forum, Aaronia's product documentation, empirical analysis of capture files, and this crate's own implementation experience. Where these disagree, the vendor's own materials are authoritative. See [Sources and Attribution](#sources-and-attribution) for the upstream, vendor-published references.
 
 ## Table of Contents
 
@@ -506,9 +504,6 @@ Specifies the physical unit for the sample data.
 | 19 | `DSSU_VOLT` | Volts. |
 | 20 | `DSSU_LOG_PERCENTAGE` | Logarithmic percentage (0 to 1). |
 
-The Rust reader maps all 21 values in table order; values outside 0–20
-degrade to an `Unknown` variant rather than rejecting the file.
-
 #### `SAMP` Chunk: `mPayloadType`
 Specifies the high-level structure of the sample data.
 
@@ -776,12 +771,6 @@ xx xx xx xx      (alignment padding before mEndTime)
 - **Metadata**: Minimal metadata in STRM/STRT chunks
 - **Calculation**: `total_samples = stream_offset / 8` (bytes per Complex32)
 
----
-
-## Related Specifications
-
-For HTTP streaming protocol and real-time data access, see [HTTPSPEC.md](HTTPSPEC.md).
-
 ## Implementation Guidelines
 
 ### Parser Architecture
@@ -880,6 +869,12 @@ See [Compression of Spectrum Data](#compression-of-spectrum-data-dspt_spectra) a
 | 2.1 | 2025-01-11 | Separated HTTP streaming to HTTPSPEC.md |
 | 2.2 | 2026-08-06 | Corrected against the Rust implementation: `RTSAFileTool` delegation for compressed IQ, enum numeric values, MDTT element layout, STRM/STRT size caveats, parser limits, and time-normalization scope |
 | 2.3 | 2026-08-08 | Verified against the official file-format PDF (rev 4) and the LFS test captures: STRT alignment padding and size-versioned tail, SPRV/ANTA fixed-field sizes, single standard STRM layout (proximity layout removed), official `DSST`/`DSSU`/`DSPT` numbering with `Unknown` fallback, `mEndTime` documented as stream-relative duration; resolved the v2.2 STRM/STRT caveats |
+
+---
+
+## Related Specifications
+
+For HTTP streaming protocol and real-time data access, see [HTTPSPEC.md](HTTPSPEC.md).
 
 ---
 

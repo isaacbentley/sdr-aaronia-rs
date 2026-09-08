@@ -2,9 +2,7 @@
 
 ## Overview
 
-The Aaronia Real-Time Spectrum Analyzer (RTSA) Vendor Software Development Kit (SDK) provides the foundational libraries and APIs for direct interaction with Aaronia RTSA hardware and software components. This document outlines the expected functionalities, typical architecture, and integration considerations for developers utilizing the official Aaronia SDK, particularly when building higher-level wrappers or applications.
-
-This specification focuses on how external applications can interface with the vendor-provided SDK, covering device control, and data acquisition functionalities. It serves as a guide for understanding the vendor SDK's capabilities and how to effectively integrate it into custom solutions.
+The Aaronia Real-Time Spectrum Analyzer (RTSA) Vendor Software Development Kit (SDK) provides libraries and APIs for direct interaction with Aaronia RTSA hardware and software components. This specification covers how external applications — higher-level wrappers or custom solutions — interface with the vendor SDK for device control and data acquisition.
 
 > **Status & attribution.** This document is a *community-compiled* reference, **not** an official Aaronia specification. It is assembled from Aaronia's official open-source sample code, public posts on the Aaronia V6 forum, vendor SDK headers, and empirical analysis. Where these disagree, the vendor's own materials are authoritative. See [Sources and Attribution](#sources-and-attribution) for the upstream, vendor-published references.
 
@@ -31,6 +29,7 @@ This specification focuses on how external applications can interface with the v
 - [Integration Guidelines](#integration-guidelines)
 - [Licensing Considerations](#licensing-considerations)
 - [Related Specifications](#related-specifications)
+- [Facts taken from Aaronia's published samples](#facts-taken-from-aaronias-published-samples)
 - [Sources and Attribution](#sources-and-attribution)
 
 ## Features and Purpose
@@ -56,8 +55,6 @@ The Aaronia RTSA Vendor SDK provides low-level, high-performance access to Aaron
     *   **Decimation**: Full, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, 1/128, 1/256, 1/512
     *   **IQ Mode Sample Rate**: equal to `spanfreq` (constraint: `spanfreq ≤ receiverclock / 1.5`). Measured on a V6 ECO, untested on a full V6, and not obviously consistent with Aaronia's own 245 MHz / 250 Msample figures for the V6 — see [HTTPSPEC](HTTPSPEC.md#unresolved-the-full-v6s-top-rate)
 *   **Health Monitoring**: Real-time device status including temperatures, sample rates, power levels, USB statistics, GPS data
-
-The SDK is designed for building custom spectrum analysis applications, SDR integration, and specialized RF measurement tools.
 
 ## Verified Architecture
 
@@ -118,14 +115,29 @@ DSPStreamCompressor::WaveBitUnpackAVX2(long)  AllocateBitBuffer(unsigned int)
 ```
 
 Constructor and destructor are exported too, so this is reachable in
-principle. Three things stand in the way in practice. There is no header,
-so `sizeof(DSPStreamCompressor)` is unknown and the object cannot be
-allocated with confidence. The entry points take no input pointer —
-`WaveBitUnpackIQ()` takes nothing at all — so compressed bytes must be
-staged through internal state by a call sequence only a header would
-document. And the licence (`sdk/aaronia-software-license.txt`, §1.2)
-forbids reverse engineering or reconstructing the underlying algorithms,
-which is what discovering that sequence by experiment amounts to.
+principle. What stands in the way is mostly engineering, not the licence.
+The top-level entries take a buffer — `DecompressIQ(float*, long, float)`
+and `Decompress(float*, …)` — so the demangled export table already
+yields a callable signature; only the internal helpers like
+`WaveBitUnpackIQ()` take nothing and run off object state. Reaching any of
+them means constructing a `DSPStreamCompressor`, and with no header
+`sizeof(DSPStreamCompressor)` is unknown, so the object can only be
+over-allocated on a guess. The parameter meanings and call order are
+undocumented too. Above all, these are ordinary C++ symbols, not the
+34-function `AARTSAAPI_*` C API: no ABI stability is promised, so a binding
+to them can break silently on any SDK build or platform.
+
+The licence permits the use and bars the study. §1.2
+(`sdk/aaronia-software-license.txt`) grants a licence to use the object
+code for supporting a Licensee Product, and separately forbids
+decompiling, disassembling, or otherwise reverse engineering it to
+reconstruct or discover its source or algorithms. Calling an exported
+function to obtain its output is the former, and reveals nothing of the
+codec's internals. The one arguable edge is pinning down the object layout
+and parameter semantics by experiment: a broad reading of "discover …
+underlying ideas" might reach it, a narrow reading treats it as interface
+use. It is genuinely arguable, governed by German and EU law (§6.6), and
+in any case moot beside the ABI-stability problem.
 
 The supported route is **`RTSAFileTool`**, which ships in the install
 root on Linux as well as Windows. This crate already shells out to it for
@@ -362,23 +374,20 @@ on eco devices, which expose no such key and run at a fixed clock). The check en
 The ConfigItem labels the SDK exposes are *rounded* — `"92MHz"` is
 actually 92.16 MHz, etc. Use `receiver_clock_for_label` to convert.
 
-| Label    | Actual rate    | Source              |
-|----------|----------------|---------------------|
-| `46MHz`  | 46.08 MHz      | README + ConfigTree |
-| `61MHz`  | 61.44 MHz      | README + ConfigTree |
-| `76MHz`  | 76.80 MHz      | README              |
-| `77MHz`  | 76.80 MHz      | ConfigTree (alias)  |
-| `92MHz`  | 92.16 MHz      | README + ConfigTree |
-| `122MHz` | 122.88 MHz     | README + ConfigTree |
-| `184MHz` | 184.32 MHz     | ConfigTree          |
-| `245MHz` | 245.76 MHz     | README + ConfigTree |
-| `492MHz` | 491.52 MHz     | ConfigTree          |
+| Label    | Actual rate    | Source             |
+|----------|----------------|--------------------|
+| `46MHz`  | 46.08 MHz      | ConfigTree         |
+| `61MHz`  | 61.44 MHz      | ConfigTree         |
+| `77MHz`  | 76.80 MHz      | ConfigTree (alias) |
+| `92MHz`  | 92.16 MHz      | ConfigTree         |
+| `122MHz` | 122.88 MHz     | ConfigTree         |
+| `184MHz` | 184.32 MHz     | ConfigTree         |
+| `245MHz` | 245.76 MHz     | ConfigTree         |
+| `492MHz` | 491.52 MHz     | ConfigTree         |
 
-The eco family runs at a fixed clock and does not expose the
-`device/receiverclock` config key — `configure_iq_receiver` skips the
-write on that family (see `DeviceOpenMode::EcoIqReceiver`) and uses
-`DEFAULT_RECEIVER_CLOCK_HZ`, 92.16 MHz. Its top IQ rate is 61.44 MHz,
-which is that clock over 1.5; do not confuse the two.
+On the eco family `configure_iq_receiver` skips the
+`device/receiverclock` write (`DeviceOpenMode::EcoIqReceiver`); the clock
+is fixed.
 
 ### `read_samples` polling cadence
 
@@ -887,7 +896,7 @@ void print_config_tree(AARTSAAPI_Device& device, const std::wstring& prefix, AAR
 
 ## Error Handling
 
-The Vendor SDK uses `AARTSAAPI_Result` return codes for all API functions. Integrators must check these return codes after every API call to ensure proper operation.
+The SDK returns `AARTSAAPI_Result` from every function; check it after each call.
 
 *   **Checking for Success**: Compare the return value against `AARTSAAPI_OK`.
 *   **Handling Retries**: If `AARTSAAPI_RETRY` is returned (e.g., by `AARTSAAPI_RescanDevices`), the operation should be retried after a short delay.
@@ -896,7 +905,6 @@ The Vendor SDK uses `AARTSAAPI_Result` return codes for all API functions. Integ
 
 ## Performance Considerations
 
-*   **Native Code**: The SDK's C/C++ implementation ensures high performance for device communication and data processing.
 *   **Data Buffer Management**: The `AARTSAAPI_Packet` structure provides a direct pointer (`fp32`) to the sample data. Integrators should process this data efficiently, avoiding unnecessary copies.
 *   **Packet Consumption**: It is critical to call `AARTSAAPI_ConsumePackets` after processing data to prevent internal buffers from overflowing, which can lead to data drops or API blocking.
 *   **Asynchronous Operations**: While the API itself is largely synchronous, integrators can achieve parallelism by running SDK interactions in separate threads, especially for continuous data acquisition.
@@ -939,7 +947,6 @@ The Vendor SDK uses `AARTSAAPI_Result` return codes for all API functions. Integ
 *   **Critical Requirements**:
     - **Error Handling**: All functions return `AARTSAAPI_Result` - check against `AARTSAAPI_OK`
     - **Wide Strings**: Use `L"string"` literals for all parameters
-    - **Structure Sizes**: Set `cbsize` field for all structures
     - **Robust Rescan**: Handle `AARTSAAPI_RETRY` return from `RescanDevices`
     - **Data Processing**: Sample rate in `packet.stepFrequency`, IQ data in `packet.fp32`
 *   **Packet Processing**: Use polling pattern with sleep for unavailable packets:
@@ -961,31 +968,10 @@ The use of the Aaronia RTSA SDK is governed by the **Aaronia Software License Ag
 *   **Limitation of Liability**: Aaronia's liability is strictly limited (e.g., to the license fee or 100€).
 *   **High Risk Activities**: The SDK is not intended for use in critical applications where failure could lead to death, personal injury, or severe damage.
 
-Integrators must carefully review the full license agreement to ensure compliance.
-
 ## Related Specifications
 
 *   **[FILESPEC.md](FILESPEC.md)**: Details the Aaronia RTSA binary file format.
 *   **[HTTPSPEC.md](HTTPSPEC.md)**: Describes the Aaronia RTSA HTTP streaming protocol.
-
----
-
-## Sources and Attribution
-
-This specification is a compiled, community-maintained document. It is **not**
-published or endorsed by Aaronia AG, and it may lag or diverge from the
-vendor's own materials. For authoritative, vendor-published references,
-consult:
-
-- **Aaronia official API sample code** — [Aaronia-Open-source/RTSA-API-Samples](https://github.com/Aaronia-Open-source/RTSA-API-Samples)
-- **Notes on using the Spectran V6 DLL** (Aaronia V6 forum) — [v6-forum.aaronia.de/forum/topic/notes-on-using-the-spectran-v6-dll](https://v6-forum.aaronia.de/forum/topic/notes-on-using-the-spectran-v6-dll/)
-- Aaronia RTSA SDK headers (`aaroniartsaapi.h`) and the bundled sample programs (`IQReceiverEco`, `RawIQ`, `SweepSpectrumEco`).
-
-The content here is derived from the above plus empirical analysis. Note that
-the Aaronia Software License Agreement governs use of the SDK itself (see
-[Licensing Considerations](#licensing-considerations)); this community document
-describes only the public interface. "Aaronia", "RTSA", and "Spectran" are the
-property of Aaronia AG.
 
 ## Facts taken from Aaronia's published samples
 
@@ -1048,3 +1034,22 @@ data, to improve startup synchronisation.
 and `main/demodspanfreq`, `main/centerfreqtx` and `main/centerfreqrx`
 for independent transceiver tuning, `calibration/preamp`, and the
 read-only `boostusbbytessecond` throughput reading.
+
+---
+
+## Sources and Attribution
+
+This specification is a compiled, community-maintained document. It is **not**
+published or endorsed by Aaronia AG, and it may lag or diverge from the
+vendor's own materials. For authoritative, vendor-published references,
+consult:
+
+- **Aaronia official API sample code** — [Aaronia-Open-source/RTSA-API-Samples](https://github.com/Aaronia-Open-source/RTSA-API-Samples)
+- **Notes on using the Spectran V6 DLL** (Aaronia V6 forum) — [v6-forum.aaronia.de/forum/topic/notes-on-using-the-spectran-v6-dll](https://v6-forum.aaronia.de/forum/topic/notes-on-using-the-spectran-v6-dll/)
+- Aaronia RTSA SDK headers (`aaroniartsaapi.h`) and the bundled sample programs (`IQReceiverEco`, `RawIQ`, `SweepSpectrumEco`).
+
+The content here is derived from the above plus empirical analysis. Note that
+the Aaronia Software License Agreement governs use of the SDK itself (see
+[Licensing Considerations](#licensing-considerations)); this community document
+describes only the public interface. "Aaronia", "RTSA", and "Spectran" are the
+property of Aaronia AG.

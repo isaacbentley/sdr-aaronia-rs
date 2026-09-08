@@ -2,17 +2,21 @@
 
 ## Overview
 
-The Aaronia Real-Time Spectrum Analyzer (RTSA) HTTP streaming protocol provides real-time access to measurement data through REST API endpoints. This specification covers the complete HTTP streaming protocol, data formats, and implementation guidelines for high-performance RF data streaming.
+The Aaronia Real-Time Spectrum Analyzer (RTSA) HTTP streaming protocol provides real-time access to measurement data through REST API endpoints.
 
 > **Status & attribution.** This document is a *community-compiled* reference, **not** an official Aaronia specification. It is assembled from public posts on the Aaronia V6 forum, Aaronia's product documentation, and empirical analysis. Where these disagree, the vendor's own materials are authoritative. See [Sources and Attribution](#sources-and-attribution) for the upstream, vendor-published references.
 
 ## Table of Contents
 
+- [Features and Purpose](#features-and-purpose)
+- [Block Graph](#block-graph)
 - [Stream Format Types](#stream-format-types)
 - [Packet Structure](#packet-structure)
 - [Data Formats](#data-formats)
+- [General Fields (Common to All Stream Formats)](#general-fields-common-to-all-stream-formats)
 - [HTTP Endpoints](#http-endpoints)
 - [Payload Types](#payload-types)
+- [What the native SDK samples tell us about this API](#what-the-native-sdk-samples-tell-us-about-this-api)
 - [Authorization & Licensing](#authorization--licensing)
 - [Performance Optimization](#performance-optimization)
 - [Implementation Guidelines](#implementation-guidelines)
@@ -143,9 +147,9 @@ The stream server supports multiple data formats for high-performance streaming:
 - `rate_reduction=n`: **Time compression**, by a factor of *n*. It acts
   on frame-based payloads — the `waterfall` payload is described in these
   same terms — not on a continuous IQ stream, which has no frames to
-  compress in time. Measured on IQ at 2, 10 and 64: accepted, answers
-  200, and changes nothing. Not a bandwidth lever for IQ; see
-  "Compression does not help" below.
+  compress in time. Measured on IQ at 2, 8, 10 and 64, with and without
+  `format=rtsa`: accepted, answers 200, and changes neither the reported
+  rate nor the byte rate. Not a bandwidth lever for IQ.
 - `rate_adaption=0`: Disable automatic rate adaptation
 - `scale`: Server-side scale factor for integer formats. **Distinct from
   the per-packet `scale` JSON metadata field** — the URL parameter scales
@@ -188,15 +192,14 @@ rather than silently falling back to the default.
 
 ### When the server drops data
 
-The HTTP server block starts dropping data once its outbound TCP
-buffer passes **8 MB**. Nothing announces it; the loss shows up as a
-gap between the timestamps of two adjacent packets, which is what
-`DropDetector` watches for. A slow consumer, a slow link, or a rate
-the network cannot carry all end here, so reducing the wire format
+Past that 8 MB outbound buffer (see **Backpressure** above), nothing
+announces the loss; it shows up only as a gap between the timestamps of
+two adjacent packets. A slow consumer, a slow link, or a rate the
+network cannot carry all end here, so reducing the wire format
 (`format=int16`) is the fix rather than a larger client-side buffer.
 Narrowing the span works too, since it moves the device down its
-decimation ladder. `rate_reduction=n` does not help here: it is time
-compression for frame-based payloads and has no effect on IQ.
+decimation ladder. `rate_reduction=n` does not help here either — it is
+time compression for frame-based payloads (see the parameter note above).
 
 ### Several clients on one server block
 
@@ -1019,11 +1022,7 @@ match client.probe_remote_config_write_license().await {
 }
 ```
 
-**Technical Details**:
-- Detection uses `verify_config_changes()` with safe parameter testing
-- Tests actual write capability, not just HTTP response codes
-- Automatically restores original values after testing
-- Provides definitive licensing status for production use
+**Technical details**: internally this is `verify_config_changes()` — it write-tests an actual parameter (not just the HTTP status) and restores the original value afterward.
 
 See: https://aaronia.com/en/software-licence-remote-config
 Documentation: https://rtsa-manual.aaronia.com/en/Content/C_Operation/DDCommandCenter/RemoteConfig.htm
@@ -1094,11 +1093,10 @@ undercuts plain `int16` while carrying float precision. The same ratios
 hold at 3.84 MS/s (2.72x, 4.39x, 12.81x), so they are a property of the
 codec rather than of one rate.
 
-Measure this on a link with room. An earlier pass over WiFi 6E put
-`compression=0` at 73.9 MB/s and concluded the container cost 20% *more*
-than `int16` — but 123 MB/s of `float32` cannot cross a 97 MB/s link, so
-that figure was a saturated, dropping stream rather than a container
-overhead.
+Measure this on a link with headroom. An earlier WiFi 6E pass put
+`compression=0` at 73.9 MB/s — seemingly 20% *more* than `int16` — but
+123 MB/s of `float32` cannot cross that 97 MB/s link, so that was a
+saturated, dropping stream, not container overhead.
 
 **This crate cannot decode it for IQ.** Tested: a real compressed
 payload pulled off the stream, handed to `Decompressor::decompress`,
@@ -1109,7 +1107,7 @@ the requested level — and that is the same proprietary codec that stops
 this crate reading compressed IQ *files*. Note also that `format=rtsa`
 with no `compression=` parameter still arrives at `mCompression=1`, so
 the container is compressed by default; only `compression=0` is
-decodable, and that costs 20% more than plain `int16`.
+decodable, and that is twice the size of plain `int16`.
 
 Spectra should be a different story, since `DSPT_SPECTRA` compression is
 documented and `decompression.rs` decodes it — untested here, as this
@@ -1118,15 +1116,11 @@ mission exposes only an IQ input.
 How much signal each level costs is also unmeasured. "Data loss
 increases" is Aaronia's phrasing, not a specification.
 
-`rate_reduction=N` rides in the same request but is time compression for
-frame-based payloads. Measured on IQ at 2, 8, 10 and 64, with and without
-`format=rtsa`, it changes neither the reported rate nor the byte rate.
-
 ### Generic HTTP compression, and why raw IQ resists it
 
-The server does gzip its **control plane** — `/remoteconfig` comes back
-3,503 bytes against 17,432 — but not `/stream`. That matters less than it
-sounds, because raw IQ barely compresses with a general-purpose codec.
+The server gzips its **control plane** but not `/stream` (see above) —
+that matters less than it sounds, because raw IQ barely compresses with a
+general-purpose codec.
 Measured on a live V6 ECO, 24 MB per row, zlib level 1:
 
 | stream | ratio | distinct values | entropy |
@@ -1221,11 +1215,12 @@ fn parse_iq_int16(data: &[u8], metadata_scale: f32) -> Vec<Complex32> {
 |---------|------|---------|
 | 1.0 | 2025-01-11 | Initial HTTP specification from original documentation |
 | 2.0 | 2025-01-11 | Enhanced with comprehensive streaming protocol specification and implementation guidelines |
-| 2.5 | 2026-09-06 | Measured what several clients on one HTTP Server block actually do: the block serves each connection a full copy and refuses none, so *n* clients cost *n* times the egress — five concurrent clients saturated a 2.5GbE path at 293.9 MB/s and the loss landed on an arbitrary two of them, moving on a repeat run. Corrected the free-licence claim: five clients were served on a one-block licence, so the limit is on block instances, not connections. Confirmed no surface counts connections (`/info`, `/healthstatus`, `/remoteconfig`, `/stream` headers), and documented the device-block loss counters as the cross-check that at least rules the device out |
-| 2.4 | 2026-08-12 | Added Aaronia support's full `/control` settings list (`deviceconnect`, `camera`, per-type fields, `receiverUUID`/`receiverName` scoping), which supersedes the specification's claim that commands cannot be addressed to a block; documented that an unrecognised `format=` silently serves the RTSA file format and that `raw16` aliases `int16`, both verified live |
-| 2.3 | 2026-08-12 | Folded in Aaronia's endpoint specification (rev 11) and the block forum threads: `/control` broadcasts to every block and is PUT-only, the server drops data past an 8 MB outbound buffer, `/healthstatus` subgroups and the fields a V6 ECO reports, and the one-server/one-client free-licence limit. Measured that `status/iqsamples` is the native rate, not the delivered one. Corrected the marker-stream entry: it declares `payload: "spectra"`, so its nested samples are the spectra form and not a counter-example to flat categories |
-| 2.2 | 2026-08-12 | Verified Aaronia's V6 remote control notes (rev 4) against hardware: enum writes by index, multi-group and non-`main` `simpleconfig` PUTs, the silent no-op on an unknown block name, the ignored receiver name in the config-tree form; documented mission loading and the `type` requirement on `/control`, the absence of a status endpoint, and the unresolved conflict over what "Full" means on a full V6; resolved a contradiction over what the Remote Config licence gates |
 | 2.1 | 2026-08-06 | Live-hardware corrections folded in (two-byte separator, spectra frame counting, `scale` inversion); documented `/samples`, the `/sample` TX push, and the `simpleconfig` PUT form; corrected `limit` semantics, field types, and flat histogram/categories sample arrays; removed decorative icons |
+| 2.2 | 2026-08-12 | Verified Aaronia's V6 remote control notes (rev 4) against hardware: enum writes by index, multi-group and non-`main` `simpleconfig` PUTs, the silent no-op on an unknown block name, the ignored receiver name in the config-tree form; documented mission loading and the `type` requirement on `/control`, the absence of a status endpoint, and the unresolved conflict over what "Full" means on a full V6; resolved a contradiction over what the Remote Config licence gates |
+| 2.3 | 2026-08-12 | Folded in Aaronia's endpoint specification (rev 11) and the block forum threads: `/control` broadcasts to every block and is PUT-only, the server drops data past an 8 MB outbound buffer, `/healthstatus` subgroups and the fields a V6 ECO reports, and the one-server/one-client free-licence limit. Measured that `status/iqsamples` is the native rate, not the delivered one. Corrected the marker-stream entry: it declares `payload: "spectra"`, so its nested samples are the spectra form and not a counter-example to flat categories |
+| 2.4 | 2026-08-12 | Added Aaronia support's full `/control` settings list (`deviceconnect`, `camera`, per-type fields, `receiverUUID`/`receiverName` scoping), which supersedes the specification's claim that commands cannot be addressed to a block; documented that an unrecognised `format=` silently serves the RTSA file format and that `raw16` aliases `int16`, both verified live |
+| 2.5 | 2026-09-06 | Measured what several clients on one HTTP Server block actually do: the block serves each connection a full copy and refuses none, so *n* clients cost *n* times the egress — five concurrent clients saturated a 2.5GbE path at 293.9 MB/s and the loss landed on an arbitrary two of them, moving on a repeat run. Corrected the free-licence claim: five clients were served on a one-block licence, so the limit is on block instances, not connections. Confirmed no surface counts connections (`/info`, `/healthstatus`, `/remoteconfig`, `/stream` headers), and documented the device-block loss counters as the cross-check that at least rules the device out |
+| 2.6 | 2026-09-07 | `format=rtsa` compresses `/stream`, wrapping the file container and its codec (`compression=0`–`9`, default `mCompression=1`): 2.7× at level 1, 13× at level 9 vs `float32` on a V6 ECO. Only `compression=0` decodes here — the rest is the proprietary `DSPT_IQ` that also stops compressed files. `rate_reduction` is time compression, inert on IQ. Added `Accept-Encoding`: the control plane gzips, `/stream` does not. |
 ---
 
 ## Sources and Attribution
