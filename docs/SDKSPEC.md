@@ -88,6 +88,38 @@ RTSA-Suite PRO 3.0.3.16655 for Linux (2026-09-07):
 container and runs the crate's load test against it — no hardware, no
 x86-64 host.
 
+**The compression codec is in the library, but not in its C API.** None
+of the 34 `AARTSAAPI_*` functions decompress anything. The `.so` does
+export the whole application's C++ internals, and among them is the codec
+behind `format=rtsa&compression=N` (see
+[HTTPSPEC](HTTPSPEC.md#compression-format-rtsa)):
+
+```
+DSPStreamCompressor::DSPStreamCompressor()
+DSPStreamCompressor::DecompressIQ(float*, long, float)
+DSPStreamCompressor::Decompress(float*, unsigned int, unsigned int, unsigned long, float)
+DSPStreamCompressor::WaveBitUnpackIQ()        WaveDequantize(float)
+DSPStreamCompressor::WaveBitUnpackAVX2(long)  AllocateBitBuffer(unsigned int)
+```
+
+Constructor and destructor are exported too, so this is reachable in
+principle. Three things stand in the way in practice. There is no header,
+so `sizeof(DSPStreamCompressor)` is unknown and the object cannot be
+allocated with confidence. The entry points take no input pointer —
+`WaveBitUnpackIQ()` takes nothing at all — so compressed bytes must be
+staged through internal state by a call sequence only a header would
+document. And the licence (`sdk/aaronia-software-license.txt`, §1.2)
+forbids reverse engineering or reconstructing the underlying algorithms,
+which is what discovering that sequence by experiment amounts to.
+
+The supported route is **`RTSAFileTool`**, which ships in the install
+root on Linux as well as Windows. This crate already shells out to it for
+compressed IQ *files* (`detection::get_rtsa_file_tool_path`). It is
+file-oriented, so applying it to a live stream would mean spooling chunks
+through temporary files — possible, and not obviously worth it: the
+stream compression is lossy, and it is only decodable on a machine with
+RTSA-Suite installed, where the native-SDK backend is available anyway.
+
 ```mermaid
 graph TD
     A["Application / Wrapper (e.g., sdr-aaronia-rs)"] --> B(Aaronia RTSA Vendor SDK)

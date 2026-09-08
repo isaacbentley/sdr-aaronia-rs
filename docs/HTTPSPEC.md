@@ -1057,6 +1057,13 @@ GET /stream?format=rtsa&rate_reduction=8&input=main&compression=5&rate_adaption=
 Accept-Encoding: deflate
 ```
 
+That `Accept-Encoding` is worth copying even though it does nothing for
+`/stream`: the **control plane** compresses. `/remoteconfig` is 17,432
+bytes plain, 3,520 gzipped and 3,299 deflated; `/healthstatus` 6,100
+against 1,436. This crate now asks (`reqwest`'s `deflate`/`gzip`
+features), which matters because capabilities are read from both at
+every device open.
+
 `format=rtsa` streams the file container — `DSFH`, then `STRM`, `ANTA`
 and `SAMP` chunks, the same layout [FILESPEC](FILESPEC.md) describes —
 and `compression=N` applies the file format's own codec to it. Aaronia's
@@ -1080,13 +1087,23 @@ Uncompressed, the container costs 20% *more* than raw `int16` — chunk
 headers and per-packet metadata. Everything above level 0 pays that back
 many times over.
 
-Two things this does not settle. Whether the crate can decode a
-compressed IQ payload is open: it parses the container already
-(`file_source.rs`) and decodes the documented spectra codec
-(`decompression.rs`), but `DSPT_IQ` compression is proprietary and
-undocumented, and the reader rejects it rather than emit wrong samples.
-And how much of the signal survives each level is unmeasured — "data
-loss increases" is Aaronia's phrasing, not a specification.
+**This crate cannot decode it for IQ.** Tested: a real compressed
+payload pulled off the stream, handed to `Decompressor::decompress`,
+comes back *"DSPT_IQ decompression requires the Aaronia SDK/DLL. Native
+decompression is proprietary and currently unsupported."* The SAMP
+headers say why — `mPayloadType` 2 (`DSPT_IQ`), `mCompression` matching
+the requested level — and that is the same proprietary codec that stops
+this crate reading compressed IQ *files*. Note also that `format=rtsa`
+with no `compression=` parameter still arrives at `mCompression=1`, so
+the container is compressed by default; only `compression=0` is
+decodable, and that costs 20% more than plain `int16`.
+
+Spectra should be a different story, since `DSPT_SPECTRA` compression is
+documented and `decompression.rs` decodes it — untested here, as this
+mission exposes only an IQ input.
+
+How much signal each level costs is also unmeasured. "Data loss
+increases" is Aaronia's phrasing, not a specification.
 
 `rate_reduction=N` rides in the same request but is time compression for
 frame-based payloads. Measured on IQ at 2, 8, 10 and 64, with and without

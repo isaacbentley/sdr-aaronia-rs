@@ -55,10 +55,22 @@ All notable changes to this project will be documented in this file.
   available on `/stream` and still would not help (zlib manages 1.07x on
   `float32`); Aaronia's codec wins by being lossy and signal-aware.
 
-  Two open questions are recorded rather than answered: whether this
-  crate can decode a compressed *IQ* payload, since `DSPT_IQ` compression
-  is proprietary and `decompression.rs` rejects it, and how much signal
-  each level costs.
+  This crate cannot use it for IQ, tested rather than assumed: a real
+  compressed payload handed to `Decompressor::decompress` comes back
+  rejected as proprietary `DSPT_IQ`, the same wall that stops compressed
+  IQ *files*. `format=rtsa` also defaults to `mCompression=1`, so only
+  `compression=0` is decodable and that is 20% larger than plain `int16`.
+  Spectra should decode, `DSPT_SPECTRA` being documented, but this
+  mission has no spectra input to try.
+
+### Performance
+- **The control plane is now requested compressed.** `reqwest` gains the
+  `deflate` and `gzip` features, so the client sends
+  `Accept-Encoding: gzip,deflate` where it previously sent none. Measured
+  against the device: `/remoteconfig` 17,432 bytes to 3,299 deflated,
+  `/healthstatus` 6,100 to 1,436. Both are read at every device open, and
+  `/healthstatus` again on each stream-gap report. No effect on `/stream`,
+  which the server does not compress at any level.
 - The reader channel's size comment claimed ~157 KiB chunks and ~10 MB of
   queue. Measured against a live server it is 64 KiB for 71% of chunks,
   so the queue is ~4 MB, about 45 ms at the 88 MB/s a WiFi 6E path

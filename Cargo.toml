@@ -18,7 +18,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-reqwest = { version = "0.13", features = ["blocking", "json", "stream"], optional = true }
+# `deflate`/`gzip`: the RTSA control plane compresses when asked and we
+# were not asking — /remoteconfig is 17,432 bytes plain against 3,299
+# deflated, /healthstatus 6,100 against 1,436, and both are fetched on
+# every device open. RTSA-Suite's own HTTP Client sends
+# `Accept-Encoding: deflate`. Costs nothing on /stream, which the server
+# does not compress at any level.
+reqwest = { version = "0.13", features = ["blocking", "json", "stream", "deflate", "gzip"], optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 thiserror = "2.0"
