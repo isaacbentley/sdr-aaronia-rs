@@ -2,6 +2,7 @@
 #include <SoapySDR/Logger.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 
 // Fetch-and-free the thread-local Rust error string.
@@ -21,9 +22,17 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
       _hasRefRange(false), _refMinDbm(0.0), _refMaxDbm(0.0), _refStepDb(0.0),
       _sourceType(Http)
 {
-    (void)args;
     if (!_source) {
         throw std::runtime_error("AaroniaSoapyDevice initialized with null source pointer");
+    }
+
+    // The URL the source streams from, for the standalone sensor client
+    // built lazily on first sensor read (HTTP backend only). Defaults to
+    // the RTSA server's own default when the caller named none.
+    if (args.count("url") != 0) {
+        _httpUrl = args.at("url");
+    } else if (args.count("file") == 0) {
+        _httpUrl = "http://localhost:54664";
     }
 
     FfiSourceInfo* info = aaronia_source_get_source_info(_source);
@@ -82,20 +91,33 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
 }
 
 AaroniaSoapyDevice::~AaroniaSoapyDevice() {
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (_source) {
-        if (_isStreaming) {
-            aaronia_source_stop_streaming(_source);
+    // Two separate lock scopes, `_mutex` released before `_sensorMutex` is
+    // taken: no live code path takes them in the other order, and keeping
+    // them un-nested here means none can deadlock the destructor if one
+    // ever does.
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_source) {
+            if (_isStreaming) {
+                aaronia_source_stop_streaming(_source);
+            }
+            aaronia_source_free(_source);
+            _source = nullptr;
         }
-        aaronia_source_free(_source);
-        _source = nullptr;
+        if (_sink) {
+            // Stop unconditionally: the sink's stream lifecycle (started
+            // at setupStream) is independent of the RX _isStreaming flag.
+            aaronia_sink_stop_streaming(_sink);
+            aaronia_sink_free(_sink);
+            _sink = nullptr;
+        }
     }
-    if (_sink) {
-        // Stop unconditionally: the sink's stream lifecycle (started at
-        // setupStream) is independent of the RX _isStreaming flag.
-        aaronia_sink_stop_streaming(_sink);
-        aaronia_sink_free(_sink);
-        _sink = nullptr;
+    {
+        std::lock_guard<std::mutex> slock(_sensorMutex);
+        if (_sensorClient) {
+            aaronia_endpoints_client_free(_sensorClient);
+            _sensorClient = nullptr;
+        }
     }
 }
 
@@ -746,9 +768,127 @@ SoapySDR::Range AaroniaSoapyDevice::getGainRange(const int direction, const size
     return SoapySDR::Range(-100.0, 10.0);
 }
 
+// ---------------------------------------------------------------------
+// Bandwidth API
+//
+// The device's alias-free bandwidth is narrower than its sample rate;
+// SoapySDR keeps the two as separate knobs. `setBandwidth` maps the
+// requested bandwidth to the sample rate that delivers it and drives the
+// already-verified `setSampleRate`, so no new device-write path appears.
+// ---------------------------------------------------------------------
+
+void AaroniaSoapyDevice::setBandwidth(const int direction, const size_t channel, const double bw) {
+    if (bw <= 0.0) return;
+    setSampleRate(direction, channel, aaronia_iq_sample_rate_for_bandwidth(bw));
+}
+
+double AaroniaSoapyDevice::getBandwidth(const int direction, const size_t channel) const {
+    return aaronia_usable_bandwidth_hz(getSampleRate(direction, channel));
+}
+
+std::vector<double> AaroniaSoapyDevice::listBandwidths(const int direction, const size_t channel) const {
+    std::vector<double> bandwidths;
+    for (const double rate : listSampleRates(direction, channel)) {
+        bandwidths.push_back(aaronia_usable_bandwidth_hz(rate));
+    }
+    return bandwidths;
+}
+
+SoapySDR::RangeList AaroniaSoapyDevice::getBandwidthRange(const int direction, const size_t channel) const {
+    SoapySDR::RangeList ranges;
+    for (const double bw : listBandwidths(direction, channel)) {
+        ranges.push_back(SoapySDR::Range(bw, bw));
+    }
+    return ranges;
+}
+
+// ---------------------------------------------------------------------
+// Sensor API
+// ---------------------------------------------------------------------
+
+namespace {
+
+// The device's live sensors, each a field of FfiDeviceSensors. NaN means
+// the device did not report it, and such a sensor is not listed.
+struct SensorDef {
+    const char *key;
+    const char *name;
+    const char *units;
+    const char *description;
+    double FfiDeviceSensors::*field;
+};
+
+const SensorDef kSensorDefs[] = {
+    {"fpga_temp", "FPGA Temperature", "C", "FPGA die temperature", &FfiDeviceSensors::fpga_temp_c},
+    {"frontend_temp", "Frontend Temperature", "C", "RF frontend temperature", &FfiDeviceSensors::frontend_temp_c},
+    {"board_power", "Board Power", "W", "Board power draw", &FfiDeviceSensors::board_power_w},
+    {"adc_range", "ADC Range", "dB", "ADC headroom below full scale; near zero is close to clipping", &FfiDeviceSensors::adc_range_db},
+    {"usb_buffer", "USB Buffer Fill", "", "USB transfer buffer fill, fraction 0-1", &FfiDeviceSensors::usb_buffer_fill},
+    {"dsp_buffer", "DSP Buffer Fill", "", "DSP buffer fill, fraction 0-1", &FfiDeviceSensors::dsp_buffer_fill},
+    {"errors", "Errors/s", "", "Device errors per second", &FfiDeviceSensors::errors_per_second},
+    {"usb_overflows", "USB Overflows/s", "", "USB overflows per second", &FfiDeviceSensors::usb_overflows_per_second},
+    {"dsp_overflows", "DSP Overflows/s", "", "DSP overflows per second", &FfiDeviceSensors::dsp_overflows_per_second},
+    {"gps_satellites", "GPS Satellites", "", "GPS satellites in view", &FfiDeviceSensors::gps_satellites},
+    {"gps_latitude", "GPS Latitude", "deg", "GPS latitude; 0 with no fix", &FfiDeviceSensors::gps_latitude},
+    {"gps_longitude", "GPS Longitude", "deg", "GPS longitude; 0 with no fix", &FfiDeviceSensors::gps_longitude},
+};
+
+const SensorDef *findSensorDef(const std::string &key) {
+    for (const auto &def : kSensorDefs) {
+        if (key == def.key) return &def;
+    }
+    return nullptr;
+}
+
+std::string formatSensorValue(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%g", v);
+    return std::string(buf);
+}
+
+} // namespace
+
+bool AaroniaSoapyDevice::refreshSensorsLocked(void) const {
+    // The rich sensors come from /healthstatus, which only the HTTP
+    // backend serves — the raw native SDK's own health tree reads all
+    // zeros. No client means no reading, and the caller then offers just
+    // cumulative_drops. The client is built once, lazily, so a capture
+    // that never reads sensors pays nothing.
+    if (_sourceType != Http || _httpUrl.empty()) {
+        return false;
+    }
+    if (!_sensorClient) {
+        _sensorClient = aaronia_endpoints_client_new(_httpUrl.c_str());
+        if (!_sensorClient) {
+            return false;
+        }
+    }
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    if (_sensorsCacheValid && now - _sensorsCacheTime < milliseconds(250)) {
+        return true;
+    }
+    if (aaronia_endpoints_client_read_sensors(_sensorClient, &_sensorsCache)) {
+        _sensorsCacheTime = now;
+        _sensorsCacheValid = true;
+        return true;
+    }
+    return false;
+}
+
 std::vector<std::string> AaroniaSoapyDevice::listSensors(void) const {
     std::vector<std::string> sensors;
+    // Always present: the client-side drop detector, which every backend
+    // feeds and which needs no health fetch.
     sensors.push_back("cumulative_drops");
+    std::lock_guard<std::mutex> lock(_sensorMutex);
+    if (refreshSensorsLocked()) {
+        for (const auto &def : kSensorDefs) {
+            if (!std::isnan(_sensorsCache.*def.field)) {
+                sensors.push_back(def.key);
+            }
+        }
+    }
     return sensors;
 }
 
@@ -758,16 +898,33 @@ SoapySDR::ArgInfo AaroniaSoapyDevice::getSensorInfo(const std::string &name) con
         info.key = "cumulative_drops";
         info.name = "Cumulative Drops";
         info.type = SoapySDR::ArgInfo::INT;
-        info.description = "Total number of packet drops detected in the streaming connection";
+        info.units = "";
+        info.description = "Timestamp gaps the client's drop detector has seen in the stream";
+        return info;
+    }
+    if (const SensorDef *def = findSensorDef(name)) {
+        info.key = def->key;
+        info.name = def->name;
+        info.type = SoapySDR::ArgInfo::FLOAT;
+        info.units = def->units;
+        info.description = def->description;
     }
     return info;
 }
 
 std::string AaroniaSoapyDevice::readSensor(const std::string &name) const {
     if (name == "cumulative_drops") {
+        // A local counter read, not an HTTP fetch: brief enough to take
+        // the streaming lock for.
         std::lock_guard<std::mutex> lock(_mutex);
-        uint64_t drops = aaronia_source_get_cumulative_drops(_source);
-        return std::to_string(drops);
+        return std::to_string(aaronia_source_get_cumulative_drops(_source));
+    }
+    if (const SensorDef *def = findSensorDef(name)) {
+        // The health fetch stays off `_mutex` — see the member comment.
+        std::lock_guard<std::mutex> lock(_sensorMutex);
+        if (refreshSensorsLocked() && !std::isnan(_sensorsCache.*def->field)) {
+            return formatSensorValue(_sensorsCache.*def->field);
+        }
     }
     return "";
 }

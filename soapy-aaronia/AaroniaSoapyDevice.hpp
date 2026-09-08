@@ -6,6 +6,7 @@
 #include <SoapySDR/Formats.hpp>
 #include "../include/aaronia.h"
 
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -91,6 +92,14 @@ public:
     SoapySDR::RangeList getSampleRateRange(const int direction, const size_t channel) const override;
     std::vector<double> listSampleRates(const int direction, const size_t channel) const override;
 
+    // Bandwidth API. The RTSA's alias-free bandwidth is narrower than its
+    // sample rate; these expose that as SoapySDR's separate bandwidth
+    // knob, mapping through the already-verified sample-rate control.
+    void setBandwidth(const int direction, const size_t channel, const double bw) override;
+    double getBandwidth(const int direction, const size_t channel) const override;
+    std::vector<double> listBandwidths(const int direction, const size_t channel) const override;
+    SoapySDR::RangeList getBandwidthRange(const int direction, const size_t channel) const override;
+
     // Stream geometry
     size_t getStreamMTU(SoapySDR::Stream *stream) const override;
 
@@ -154,6 +163,26 @@ private:
     // that only one backend has: timestamps come from the HTTP
     // packet headers and nowhere else.
     CAaroniaSourceType _sourceType;
+
+    // Live sensors (HTTP backend only), read through a dedicated
+    // endpoints client and guarded by their own `_sensorMutex` — never
+    // `_mutex`. `_mutex` is what readStream holds, and the sensor fetch is
+    // a blocking /healthstatus GET; sharing the lock would stall sample
+    // delivery and risk drops. The client is created lazily on first use,
+    // from `_httpUrl`. Over the native SDK there is no client — its raw
+    // health tree reads all zeros — so only `cumulative_drops` (a fast
+    // local read off `_source`, under `_mutex`) is offered there. Briefly
+    // cached (250 ms) so a probe's burst of readSensor calls is one GET.
+    // `mutable`: these const methods memoize.
+    std::string _httpUrl;
+    mutable std::mutex _sensorMutex;
+    mutable HttpEndpointsClient *_sensorClient = nullptr;
+    mutable FfiDeviceSensors _sensorsCache;
+    mutable std::chrono::steady_clock::time_point _sensorsCacheTime;
+    mutable bool _sensorsCacheValid = false;
+    // Fetch the sensors if the cache is stale, and return whether a
+    // reading is available. Caller must hold `_sensorMutex`.
+    bool refreshSensorsLocked(void) const;
 };
 
 #endif // AARONIA_SOAPY_DEVICE_HPP

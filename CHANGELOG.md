@@ -4,80 +4,59 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Performance
-- **The int16 and float16 IQ decoders are ~23% faster end to end.** Both
-  built their output with `Vec::with_capacity` then `push` per sample,
-  which carries a capacity check the compiler cannot elide and which was
-  blocking vectorisation. Collecting from the slice iterator instead —
-  `TrustedLen`, so the vector is sized once — measured 495 to 2433 MS/s
-  on the decode loop alone, and 123.5 to 152 MS/s over the whole HTTP
-  path including framing and transport. float32 was already a single
-  `copy_nonoverlapping` and is unchanged.
-
-  Worth stating what this does not buy: at 605 MB/s the crate is about
-  2.5x the fastest a V6 can produce and 6x a WiFi 6E link, so it was not
-  the bottleneck before and is not now. What it buys is CPU left over
-  for whatever consumes the samples.
-
 ### Added
-- **`scripts/fake-rtsa-server.py`** serves `/stream` in the real wire
-  format at loopback speed, so a decode path can be measured without a
-  device or a network. It is how the figures above were taken: over any
-  real link the transport dominates and a CPU change is invisible. Its
-  docstring carries the caveat that goes with it — over loopback hyper's
-  adaptive read buffer never leaves its 8 KiB floor, so kernel time there
-  is a property of the harness, not of the crate.
+- **SoapySDR: device sensors.** The plugin exposed one sensor
+  (`cumulative_drops`); it now surfaces the device's live telemetry from
+  `/healthstatus` — FPGA and frontend temperature, ADC headroom (dB below
+  full scale, so a client can raise the reference level before it clips),
+  USB and DSP buffer fill, error and overflow rates, GPS satellites and
+  position. `listSensors` / `readSensor` / `getSensorInfo`, read through a
+  dedicated connection and briefly cached, so polling them during a
+  capture neither stalls the sample stream nor costs a fetch per key.
+  HTTP backend only: the native SDK's own `AARTSAAPI_ConfigHealth` tree
+  reads all zeros in raw-SDK mode — the live telemetry is computed and
+  populated by RTSA-Suite, the managing application, not by the raw SDK,
+  confirmed by dumping the tree live from a V6 ECO — so over `sdk=true`
+  the plugin reports only `cumulative_drops`, which is real and
+  client-side. Verified live over HTTP on a V6 ECO.
+- **SoapySDR: bandwidth API.** `setBandwidth` / `getBandwidth` /
+  `listBandwidths` / `getBandwidthRange`. The device's alias-free
+  bandwidth is 0.8x its sample rate; these expose that as SoapySDR's
+  separate knob, mapping a requested bandwidth to a sample rate and
+  driving the already-verified `setSampleRate` — no new device-write path.
+  Verified on a V6 ECO: 15.36 MS/s reports 12.288 MHz, `setBandwidth`
+  snaps to a rung.
+- **SoapySDR: the native SDK is discoverable.** `find` advertises a
+  second `sdk=true` device beside the HTTP one whenever the SDK is
+  installed, and `sdk=true` / `serial=` force the native backend instead
+  of silently falling back to localhost HTTP. Verified streaming 15.357
+  MS/s over the SDK through the plugin from Python.
+- **C ABI.** `aaronia_source_read_sensors` (fills a value struct, `NaN`
+  for absent — no ownership, nothing to free);
+  `aaronia_source_builder_force_source_type` and `aaronia_sdk_installed`,
+  the C equivalent of `force_native_sdk`, which C had no way to request;
+  and the stateless bandwidth helpers `aaronia_usable_bandwidth_hz` /
+  `aaronia_iq_sample_rate_for_bandwidth`. `DeviceSensors` is the Rust type
+  behind the first.
 
-### Documentation
-- **`rate_reduction` is time compression, not a sample-rate divider.**
-  Five places described it as reducing the rate or optimising bandwidth.
-  It thins frames over time — the operation the `waterfall` payload is
-  described by — so a continuous IQ stream, having no frames, is
-  unaffected: measured at factors of 2, 10 and 64, `sampleFrequency`
-  holds at 15,359,988 Hz and the byte rate does not move. That is the
-  parameter behaving as specified on a payload it was not meant for.
-  `live_stream_rate_reduction_and_scale` had asserted only that packets
-  arrived, which is true either way, so nothing caught the wrong
-  description; it now pins the IQ behaviour.
-- **The stream can be compressed, up to 6.55x, via `format=rtsa`.**
-  Captured from RTSA-Suite's own HTTP Client block:
-  `GET /stream?format=rtsa&rate_reduction=8&input=main&compression=5&rate_adaption=0`.
-  `format=rtsa` streams the file container and is the only format that
-  accepts `compression=N`, which applies the file format's own lossy
-  codec. The container carries `float32` (`mSampleType` 11, `DSST_F32N`),
-  so level 0 is plain float32 with under 1% of chunk overhead — 123.0
-  MB/s against 122.9 theoretical at 15.36 MS/s. Against that baseline the
-  codec buys 2.74x at level 1, 4.43x at level 5 and 13.10x at level 9;
-  even level 1 undercuts plain `int16` while carrying float precision.
-  Ratios hold at 3.84 MS/s too.
-
-  HTTPSPEC had documented `format=rtsa` only as the thing a typo falls
-  back to — "a completely different wire format rather than an error" —
-  and this release had gone on to claim compression was neither offered
-  nor useful. Both are corrected. Generic HTTP compression is still not
-  available on `/stream` and still would not help (zlib manages 1.07x on
-  `float32`); Aaronia's codec wins by being lossy and signal-aware.
-
-  This crate cannot use it for IQ, tested rather than assumed: a real
-  compressed payload handed to `Decompressor::decompress` comes back
-  rejected as proprietary `DSPT_IQ`, the same wall that stops compressed
-  IQ *files*. `format=rtsa` also defaults to `mCompression=1`, so only
-  `compression=0` is decodable and that is 20% larger than plain `int16`.
-  Spectra should decode, `DSPT_SPECTRA` being documented, but this
-  mission has no spectra input to try.
-
-### Performance
-- **The control plane is now requested compressed.** `reqwest` gains the
-  `deflate` and `gzip` features, so the client sends
-  `Accept-Encoding: gzip,deflate` where it previously sent none. Measured
-  against the device: `/remoteconfig` 17,432 bytes to 3,299 deflated,
-  `/healthstatus` 6,100 to 1,436. Both are read at every device open, and
-  `/healthstatus` again on each stream-gap report. No effect on `/stream`,
-  which the server does not compress at any level.
-- The reader channel's size comment claimed ~157 KiB chunks and ~10 MB of
-  queue. Measured against a live server it is 64 KiB for 71% of chunks,
-  so the queue is ~4 MB, about 45 ms at the 88 MB/s a WiFi 6E path
-  delivers.
+### Fixed
+- **File playback reported the decompression time as the capture time.**
+  A DSPT_IQ-compressed `.rtsa` is decompressed through RTSAFileTool, which
+  writes a fresh header stamped with the moment of conversion, so the
+  re-opened file reported *now* — a 2020 capture read as 2026. The
+  original header's `creation_time`, parsed before compression was
+  detected, is now carried across the decompression, and the derived
+  start/end fall-backs follow it. Surfaced the first time the fixture test
+  ran on a machine with RTSA-Suite installed.
+- **The SoapySDR plugin could not load the SDK inside a host that carries
+  its own Qt6.** The loader was given `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`,
+  which searches the host application's directory first; a GNU Radio
+  (radioconda) install holds a different Qt6 build there under the same
+  names, and the load failed. It now searches only the DLL's own
+  directory, the SDK install root, and System32.
+- **The Seify native-SDK test panicked on teardown.** `AaroniaSeifyDevice`
+  owns a tokio runtime, and dropping one inside an async context is a
+  tokio panic; the test is synchronous now.
 
 ## [v0.8.2] - 2026-09-08
 
@@ -168,6 +147,84 @@ rate and soak tests warm up past it. The SoapySDR plugin, built with
 MSVC against radioconda's SoapySDR, streams 15.357 MS/s over the SDK
 into Python; see [docs/VERIFICATION.md](docs/VERIFICATION.md) for the
 two limits found on the way.
+
+
+_Also in 0.8.2 (recorded here on the 0.9.0 pass; these landed across the 0.8.x docs/perf commits and were never restamped):_
+
+### Performance
+- **The int16 and float16 IQ decoders are ~23% faster end to end.** Both
+  built their output with `Vec::with_capacity` then `push` per sample,
+  which carries a capacity check the compiler cannot elide and which was
+  blocking vectorisation. Collecting from the slice iterator instead —
+  `TrustedLen`, so the vector is sized once — measured 495 to 2433 MS/s
+  on the decode loop alone, and 123.5 to 152 MS/s over the whole HTTP
+  path including framing and transport. float32 was already a single
+  `copy_nonoverlapping` and is unchanged.
+
+  Worth stating what this does not buy: at 605 MB/s the crate is about
+  2.5x the fastest a V6 can produce and 6x a WiFi 6E link, so it was not
+  the bottleneck before and is not now. What it buys is CPU left over
+  for whatever consumes the samples.
+
+### Added
+- **`scripts/fake-rtsa-server.py`** serves `/stream` in the real wire
+  format at loopback speed, so a decode path can be measured without a
+  device or a network. It is how the figures above were taken: over any
+  real link the transport dominates and a CPU change is invisible. Its
+  docstring carries the caveat that goes with it — over loopback hyper's
+  adaptive read buffer never leaves its 8 KiB floor, so kernel time there
+  is a property of the harness, not of the crate.
+
+### Documentation
+- **`rate_reduction` is time compression, not a sample-rate divider.**
+  Five places described it as reducing the rate or optimising bandwidth.
+  It thins frames over time — the operation the `waterfall` payload is
+  described by — so a continuous IQ stream, having no frames, is
+  unaffected: measured at factors of 2, 10 and 64, `sampleFrequency`
+  holds at 15,359,988 Hz and the byte rate does not move. That is the
+  parameter behaving as specified on a payload it was not meant for.
+  `live_stream_rate_reduction_and_scale` had asserted only that packets
+  arrived, which is true either way, so nothing caught the wrong
+  description; it now pins the IQ behaviour.
+- **The stream can be compressed, up to 6.55x, via `format=rtsa`.**
+  Captured from RTSA-Suite's own HTTP Client block:
+  `GET /stream?format=rtsa&rate_reduction=8&input=main&compression=5&rate_adaption=0`.
+  `format=rtsa` streams the file container and is the only format that
+  accepts `compression=N`, which applies the file format's own lossy
+  codec. The container carries `float32` (`mSampleType` 11, `DSST_F32N`),
+  so level 0 is plain float32 with under 1% of chunk overhead — 123.0
+  MB/s against 122.9 theoretical at 15.36 MS/s. Against that baseline the
+  codec buys 2.74x at level 1, 4.43x at level 5 and 13.10x at level 9;
+  even level 1 undercuts plain `int16` while carrying float precision.
+  Ratios hold at 3.84 MS/s too.
+
+  HTTPSPEC had documented `format=rtsa` only as the thing a typo falls
+  back to — "a completely different wire format rather than an error" —
+  and this release had gone on to claim compression was neither offered
+  nor useful. Both are corrected. Generic HTTP compression is still not
+  available on `/stream` and still would not help (zlib manages 1.07x on
+  `float32`); Aaronia's codec wins by being lossy and signal-aware.
+
+  This crate cannot use it for IQ, tested rather than assumed: a real
+  compressed payload handed to `Decompressor::decompress` comes back
+  rejected as proprietary `DSPT_IQ`, the same wall that stops compressed
+  IQ *files*. `format=rtsa` also defaults to `mCompression=1`, so only
+  `compression=0` is decodable and that is 20% larger than plain `int16`.
+  Spectra should decode, `DSPT_SPECTRA` being documented, but this
+  mission has no spectra input to try.
+
+### Performance
+- **The control plane is now requested compressed.** `reqwest` gains the
+  `deflate` and `gzip` features, so the client sends
+  `Accept-Encoding: gzip,deflate` where it previously sent none. Measured
+  against the device: `/remoteconfig` 17,432 bytes to 3,299 deflated,
+  `/healthstatus` 6,100 to 1,436. Both are read at every device open, and
+  `/healthstatus` again on each stream-gap report. No effect on `/stream`,
+  which the server does not compress at any level.
+- The reader channel's size comment claimed ~157 KiB chunks and ~10 MB of
+  queue. Measured against a live server it is 64 KiB for 71% of chunks,
+  so the queue is ~4 MB, about 45 ms at the 88 MB/s a WiFi 6E path
+  delivers.
 
 ## [v0.8.1] - 2026-09-07
 

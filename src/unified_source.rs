@@ -1928,6 +1928,44 @@ impl AaroniaSource {
         }
     }
 
+    /// The device's live sensors — temperatures, ADC headroom, buffer
+    /// fill, loss counters, GPS. See [`crate::http_endpoints::DeviceSensors`].
+    ///
+    /// An **HTTP-backend** feature, from the `/healthstatus` tree (built
+    /// from the configured URL without requiring a stream, like
+    /// [`Self::device_capabilities`]). The native SDK and file backends
+    /// report nothing: the SDK's own `AARTSAAPI_ConfigHealth` tree reads
+    /// all zeros in raw-SDK mode — the live telemetry is computed and
+    /// populated by RTSA-Suite (the HTTP server), not by the raw SDK —
+    /// so exposing it there would report a device permanently at 0 °C.
+    pub async fn device_sensors(&self) -> crate::http_endpoints::DeviceSensors {
+        use crate::http_endpoints::{AuthMethod, DeviceSensors, HttpEndpointsClient};
+
+        // The native SDK has no usable sensor surface (see the doc above);
+        // never fall through to an HTTP fetch for a native source.
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.source_type == SourceType::NativeSdk {
+            return DeviceSensors::default();
+        }
+
+        if let Some(client) = &self.http_client {
+            return client.get_device_sensors().await.unwrap_or_default();
+        }
+        let Some(base_url) = &self.config.http_base_url else {
+            return DeviceSensors::default();
+        };
+        match HttpEndpointsClient::new(base_url.clone(), AuthMethod::None) {
+            Ok(client) => client.get_device_sensors().await.unwrap_or_default(),
+            Err(e) => {
+                warn!("device sensors: could not build a client for {base_url}: {e}");
+                DeviceSensors::default()
+            }
+        }
+    }
+
     /// Get the current configuration
     pub fn get_config(&self) -> &AaroniaConfig {
         &self.config

@@ -23,6 +23,11 @@ crate built with both features — `features = ["seify", "native-sdk"]` —
 on Windows or Linux with RTSA-Suite PRO installed. Without the feature
 the request is a clean error, never a fallback to HTTP.
 
+`AaroniaSeifyDevice` owns a tokio runtime. Drop it from synchronous
+code: dropping it inside an `async` context (a `#[tokio::test]`, a task)
+is a tokio panic, "Cannot drop a runtime in a context where blocking is
+not allowed".
+
 ```rust
 use sdr_aaronia_rs::seify_impl::AaroniaSeifyDevice;
 use seify::{Args, RxDevice, RxStreamer, DeviceInfo};
@@ -95,12 +100,28 @@ SoapySDRUtil --info
 
 ### Usage
 
-The driver expects the `url` argument to connect to the Spectran V6 RTSA HTTP server.
+`url=` connects to an RTSA-Suite HTTP server block, `file=` plays back a
+recording, and `sdk=true` (or `serial=<device serial>`) opens the device
+through the Aaronia native SDK — a build with `-DAARONIA_NATIVE_SDK=ON`
+on a machine with RTSA-Suite PRO installed. A bare `driver=aaronia` keeps
+its old meaning, the HTTP server on localhost; when the SDK is installed,
+`SoapySDRUtil --find` lists a second, `sdk=true` entry beside it.
 
 ```bash
 # Example testing with SoapySDRUtil
 SoapySDRUtil --probe="driver=aaronia,url=http://localhost:54664"
+SoapySDRUtil --probe="driver=aaronia,sdk=true"
 ```
+
+Two things learned running the plugin on Windows inside a GNU Radio
+(radioconda) install: that build's Python binding rejects the `dict`
+form for every driver — `SoapySDR.Device("driver=aaronia,sdk=true")`
+works where `SoapySDR.Device(dict(driver="aaronia", sdk="true"))` raises
+"no match" — and a host process that has already loaded its own Qt6
+(GNU Radio Companion itself) cannot also load the Aaronia SDK, which
+brings a different Qt6; use `url=` from inside GRC. Loading the SDK from
+a host whose *directory* merely contains Qt6 copies, such as
+`SoapySDRUtil` in radioconda's `Library\bin`, works since 0.8.3.
 
 In Python (using `SoapySDR` python bindings):
 ```python
@@ -161,3 +182,48 @@ In SoapySDR, you can access these metrics via the `readSensor()` API:
 drops = sdr.readSensor("cumulative_drops")
 print(f"Gaps seen: {drops}")
 ```
+
+### Sensors
+
+Over the **HTTP backend** the plugin also surfaces the device's live
+telemetry from `/healthstatus` as SoapySDR sensors. `listSensors()`
+returns only those the device is currently reporting:
+
+```python
+for name in sdr.listSensors():
+    info = sdr.getSensorInfo(name)
+    print(f"{name} = {sdr.readSensor(name)} {info.units}")
+# fpga_temp = 54.3 C
+# frontend_temp = 65.1 C
+# adc_range = 29.4 dB        # headroom below full scale; near 0 is close to clipping
+# usb_buffer = 0.0625        # transfer-buffer fill, fraction 0-1
+# dsp_buffer = 0
+# gps_satellites = 0
+# ...plus cumulative_drops
+```
+
+`adc_range` is the one to watch when setting the reference level, and a
+climbing `usb_buffer` is the first sign the host is not draining the
+stream fast enough. The reads are briefly cached, so a probe's burst of
+`readSensor` calls costs one HTTP fetch, and they go through a separate
+connection from the sample stream — polling sensors during a capture does
+not stall sample delivery. Over the **native SDK** backend only
+`cumulative_drops` is reported: the raw SDK's own `AARTSAAPI_ConfigHealth`
+tree reads all zeros (the live telemetry is populated by RTSA-Suite, the
+managing application, not by the raw SDK), so exposing it there would
+report a device permanently at 0 °C.
+
+### Bandwidth
+
+SoapySDR keeps sample rate and analog/usable bandwidth as separate knobs.
+The RTSA's alias-free bandwidth is ~0.8x its sample rate, exposed here:
+
+```python
+sdr.setBandwidth(SoapySDR.SOAPY_SDR_RX, 0, 10e6)   # asks for ~10 MHz usable
+print(sdr.getBandwidth(SoapySDR.SOAPY_SDR_RX, 0))  # the bandwidth actually delivered
+print(sdr.listBandwidths(SoapySDR.SOAPY_SDR_RX, 0))
+```
+
+`setBandwidth` maps the request to the nearest sample-rate rung and
+drives `setSampleRate`; the two stay consistent, so setting either
+updates the other.

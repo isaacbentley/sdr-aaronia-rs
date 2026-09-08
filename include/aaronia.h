@@ -96,6 +96,24 @@ typedef struct FfiDeviceCapabilities {
     const char*         rx_antenna;     // e.g. "RX1"; NULL if the mode names none
 } FfiDeviceCapabilities;
 
+/* Live sensor readings. A plain value struct the caller allocates; every
+ * field is a reading or NaN for "not reported". No ownership, nothing to
+ * free. Fill it with aaronia_source_read_sensors. */
+typedef struct FfiDeviceSensors {
+    double fpga_temp_c;
+    double frontend_temp_c;
+    double board_power_w;
+    double adc_range_db;              // ADC headroom below full scale, dB
+    double usb_buffer_fill;          // fraction 0.0-1.0
+    double dsp_buffer_fill;          // fraction 0.0-1.0
+    double errors_per_second;
+    double usb_overflows_per_second;
+    double dsp_overflows_per_second;
+    double gps_satellites;
+    double gps_latitude;             // degrees; 0 with no fix
+    double gps_longitude;            // degrees; 0 with no fix
+} FfiDeviceSensors;
+
 // Opaque pointers
 typedef struct AaroniaSourceBuilder AaroniaSourceBuilder;
 typedef struct AaroniaSource AaroniaSource;
@@ -116,6 +134,24 @@ void aaronia_source_builder_reference_level(AaroniaSourceBuilder* builder, doubl
 void aaronia_source_builder_http_source(AaroniaSourceBuilder* builder, const char* base_url);
 void aaronia_source_builder_file_source(AaroniaSourceBuilder* builder, const char* file_path);
 void aaronia_source_builder_device_serial(AaroniaSourceBuilder* builder, const char* serial);
+
+/* Pin the source to one backend instead of auto-detecting. Forcing
+ * NativeSdk makes a missing SDK a build error rather than a silent
+ * fallback to localhost HTTP. */
+void aaronia_source_builder_force_source_type(AaroniaSourceBuilder *builder,
+                                              CAaroniaSourceType source_type);
+
+/* Whether the native SDK library is present, by the search the builder
+ * uses; does not load it. */
+bool aaronia_sdk_installed(void);
+
+/* Alias-free bandwidth (Hz) delivered at an IQ sample rate; smaller than
+ * the rate. Stateless. */
+double aaronia_usable_bandwidth_hz(double sample_rate_hz);
+
+/* The IQ sample rate (Hz) whose alias-free bandwidth covers bandwidth_hz;
+ * the inverse of aaronia_usable_bandwidth_hz. Stateless. */
+double aaronia_iq_sample_rate_for_bandwidth(double bandwidth_hz);
 // RX channel selection (native-SDK backend): 0 = Rx1 (default),
 // 1 = Rx2, 2 = Rx1+Rx2 dual capture (read with
 // aaronia_source_read_samples_dual). Other values ignored.
@@ -171,6 +207,12 @@ void aaronia_source_info_free(FfiSourceInfo* info);
 // no equivalent surface to ask.
 FfiDeviceCapabilities* aaronia_source_get_capabilities(AaroniaSource* source);
 void aaronia_source_capabilities_free(FfiDeviceCapabilities* caps);
+
+/* Fill *out with the device's live sensors. Returns true when the read
+ * completed (fields may be NaN where unreported; file/native-SDK backends
+ * complete all-NaN), false (out untouched) for a null pointer or a
+ * current-thread runtime. Blocking: one /healthstatus GET on HTTP. */
+bool aaronia_source_read_sensors(AaroniaSource* source, FfiDeviceSensors* out);
 
 // --- Sink FFI --- //
 //
@@ -233,6 +275,11 @@ AaroniaFfiError aaronia_sink_write_samples(
 HttpEndpointsClient* aaronia_endpoints_client_new(const char* base_url);
 void aaronia_endpoints_client_free(HttpEndpointsClient* client);
 FfiServerInfo* aaronia_endpoints_client_get_info(HttpEndpointsClient* client);
+
+/* Fill *out with the device's live sensors through a standalone client,
+ * off the streaming source's read lock. Same reading and return contract
+ * as aaronia_source_read_sensors. */
+bool aaronia_endpoints_client_read_sensors(HttpEndpointsClient* client, FfiDeviceSensors* out);
 void aaronia_server_info_free(FfiServerInfo* info);
 AaroniaFfiError aaronia_endpoints_client_control_streaming(HttpEndpointsClient* client, bool start);
 AaroniaFfiError aaronia_endpoints_client_control_recording(HttpEndpointsClient* client, bool start, const char* name);

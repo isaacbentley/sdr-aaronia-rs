@@ -140,6 +140,74 @@ async fn live_control_plane() {
     println!("remote-config (read-only) status: {:?}", status);
 }
 
+#[tokio::test]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+async fn live_device_sensors() {
+    let c = client();
+
+    // The sensors the SoapySDR plugin surfaces via readSensor. A live V6
+    // reports at least its FPGA temperature and an ADC range; if a
+    // firmware revision renames a `status`/`health` field, the parser
+    // returns None for it and this catches the drift.
+    let sensors = c.get_device_sensors().await.expect("/healthstatus sensors");
+    println!("sensors: {sensors:#?}");
+    assert!(
+        sensors.fpga_temp_c.is_some(),
+        "a live device reports health/fpgatemp"
+    );
+    if let Some(t) = sensors.fpga_temp_c {
+        assert!(
+            (0.0..=125.0).contains(&t),
+            "FPGA temperature {t} °C is outside any plausible range — likely a parse against the wrong field"
+        );
+    }
+    assert!(
+        sensors.adc_range_db.is_some(),
+        "a live device reports status/adcrange"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+async fn live_bandwidth_tracks_sample_rate() {
+    use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource, usable_bandwidth_hz};
+
+    // The Bandwidth API the plugin exposes is a reparametrization of the
+    // sample rate: usable bandwidth is narrower than the rate, and every
+    // rung maps to one. Prefer the device's own advertised ladder, but a
+    // minimal mission may not expose the decimation config — fall back to
+    // the crate's compiled ladder, which is what the plugin's
+    // `listBandwidths` uses in that case anyway.
+    let source = AaroniaSource::new(AaroniaConfig::from_http(&live_url()))
+        .await
+        .expect("unified source over HTTP");
+    let caps = source.device_capabilities().await;
+    let rates = match caps.sample_rates() {
+        Some(rates) if !rates.is_empty() => {
+            println!("using the device's advertised ladder: {rates:?}");
+            rates
+        }
+        _ => {
+            let ladder = sdr_aaronia_rs::iq_sample_rates().to_vec();
+            println!("device advertised no ladder; using the compiled one: {ladder:?}");
+            ladder
+        }
+    };
+    for rate in rates {
+        let bw = usable_bandwidth_hz(rate);
+        assert!(
+            bw > 0.0 && bw < rate,
+            "usable bandwidth {bw} must be positive and below the rate {rate}"
+        );
+        // Round-trips: the rate whose usable bandwidth covers `bw` is `rate`.
+        let back = sdr_aaronia_rs::iq_sample_rate_for_bandwidth(bw);
+        assert!(
+            (back - rate).abs() / rate < 0.01,
+            "bandwidth {bw} should map back to rate {rate}, got {back}"
+        );
+    }
+}
+
 /// Find an input on the server whose current payload matches `want`.
 /// Missions differ in what they wire into the HTTP server (IQ, spectra,
 /// or both), so tests discover instead of assuming. Returns the input

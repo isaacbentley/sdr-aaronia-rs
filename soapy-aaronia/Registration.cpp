@@ -2,6 +2,15 @@
 #include <SoapySDR/Registry.hpp>
 #include <SoapySDR/Logger.hpp>
 
+// Whether the args ask for the native SDK: a serial names an SDK device,
+// and `sdk` must be truthy — `sdk=false` is a request *not* to use it, so
+// checking mere presence would advertise/open the SDK for `sdk=false`.
+static bool wantsNativeSdk(const SoapySDR::Kwargs &args) {
+    if (args.count("serial") != 0) return true;
+    auto it = args.find("sdk");
+    return it != args.end() && (it->second == "true" || it->second == "1");
+}
+
 static std::vector<SoapySDR::Kwargs> findAaronia(const SoapySDR::Kwargs &args) {
     std::vector<SoapySDR::Kwargs> results;
 
@@ -16,18 +25,38 @@ static std::vector<SoapySDR::Kwargs> findAaronia(const SoapySDR::Kwargs &args) {
 
     if (args.count("url") != 0) {
         device["url"] = args.at("url");
+        results.push_back(device);
     } else if (args.count("file") != 0) {
         device["file"] = args.at("file");
-    } else if (args.count("serial") != 0) {
-        device["serial"] = args.at("serial");
+        results.push_back(device);
+    } else if (wantsNativeSdk(args)) {
+        // An explicit native-SDK request: a serial names a device the SDK
+        // enumerates, and sdk=true asks for it without naming one.
+        device["sdk"] = "true";
+        if (args.count("serial") != 0) device["serial"] = args.at("serial");
+        device["label"] = "Aaronia Spectran V6 (sdr-aaronia-rs, native SDK)";
+        results.push_back(device);
     } else {
-        // Default HTTP endpoint. NOTE: no reachability probe is
-        // performed here — find() must not block on the network — so
-        // this candidate may not correspond to a live server.
+        // Nothing chosen: the HTTP server's own default, as before. NOTE:
+        // no reachability probe is performed here - find() must not block
+        // on the network - so this candidate may not correspond to a live
+        // server. When the native SDK is installed, advertise it too:
+        // until it was, the only way to reach the SDK from Soapy was to
+        // already know a serial.
         device["url"] = "http://localhost:54664";
+        results.push_back(device);
+        // Offer the SDK too when it is installed — but not when the
+        // caller wrote `sdk=false`, which reached this branch precisely
+        // because it does not want the SDK.
+        if (aaronia_sdk_installed() && args.count("sdk") == 0) {
+            SoapySDR::Kwargs sdk;
+            sdk["driver"] = "aaronia";
+            sdk["sdk"] = "true";
+            sdk["label"] = "Aaronia Spectran V6 (sdr-aaronia-rs, native SDK)";
+            results.push_back(sdk);
+        }
     }
 
-    results.push_back(device);
     return results;
 }
 
@@ -85,15 +114,18 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
     }
     SourceBuilderGuard builderGuard(builder);
 
+    const bool wantsSdk = wantsNativeSdk(args);
     if (args.count("url") != 0) {
         aaronia_source_builder_http_source(builder, args.at("url").c_str());
     } else if (args.count("file") != 0) {
         aaronia_source_builder_file_source(builder, args.at("file").c_str());
-    } else if (args.count("serial") == 0) {
-        // Default to HTTP localhost only when the caller didn't select
-        // a device by serial: a serial-only open should let the crate
-        // auto-detect the native-SDK backend (the only one that can
-        // honor a serial), which a forced HTTP URL made unreachable.
+    } else if (wantsSdk) {
+        // Pin the backend rather than leaving it to auto-detection: a
+        // serial-only open used to fall back to localhost HTTP, silently,
+        // whenever the SDK was absent. Forced, a missing SDK is an error.
+        aaronia_source_builder_force_source_type(builder, NativeSdk);
+    } else {
+        // Nothing chosen: the HTTP server's own default, as before.
         aaronia_source_builder_http_source(builder, "http://localhost:54664");
     }
 

@@ -604,10 +604,18 @@ impl NativeSdkClient {
             // `LoadLibraryExW` fails with a bare "failed" even though the
             // file resolved fine — the backend was unusable until the
             // caller happened to put the install root on `PATH`. Add the
-            // root to the search list, then load with the
-            // `LOAD_LIBRARY_SEARCH_*` flags that consult it (plus the
-            // DLL's own directory and System32 — not the working
-            // directory, and not `PATH`).
+            // root to the search list, then load with exactly three
+            // `LOAD_LIBRARY_SEARCH_*` locations: the DLL's own directory,
+            // that added root, and System32. Not the working directory,
+            // not `PATH`, and — deliberately — not the *host
+            // application's* directory (`LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`
+            // would include it, searched ahead of the added root): the
+            // SoapySDR plugin loads this library inside hosts such as
+            // radioconda's `SoapySDRUtil`, whose own directory carries
+            // ten of the SDK's dependencies under the same names
+            // (Qt6Core, Qt6Gui, hdf5, …) as a different build. Resolving
+            // those first failed the load in that host while the same
+            // library loaded fine under `cargo test`.
             #[cfg(target_os = "windows")]
             add_sdk_root_to_dll_search_path(&lib_path);
 
@@ -615,12 +623,14 @@ impl NativeSdkClient {
             #[cfg(target_os = "windows")]
             let loaded = {
                 use libloading::os::windows::{
-                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-                    Library as WinLibrary,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+                    LOAD_LIBRARY_SEARCH_USER_DIRS, Library as WinLibrary,
                 };
                 WinLibrary::load_with_flags(
                     &lib_path,
-                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+                        | LOAD_LIBRARY_SEARCH_USER_DIRS
+                        | LOAD_LIBRARY_SEARCH_SYSTEM32,
                 )
                 .map(Library::from)
             };
@@ -1604,18 +1614,22 @@ enum ReadMode {
     Dual,
 }
 
-/// Device health telemetry from the SDK's `AARTSAAPI_ConfigHealth` tree.
+/// Device temperatures and power from the SDK's `AARTSAAPI_ConfigHealth`
+/// tree.
 ///
-/// Field names (`fronttemp`, `fpgatemp`, `boardpower`) are taken from the
-/// `/healthstatus` HTTP endpoint's JSON tree, captured live from a
-/// SPECTRAN V6 ECO — both surfaces read the same underlying device health
-/// model, so the naming is expected to match, but this has not been
-/// directly exercised against the native `AARTSAAPI_ConfigHealth` call on
-/// real hardware (no Windows/Linux dev box with the SDK installed).
-/// Verify against a live device before depending on this in production.
+/// Note what a live V6 ECO showed (RTSA-Suite closed, raw SDK): every
+/// node in this tree reads `0.0` — including while streaming — and the
+/// names differ from the HTTP `/healthstatus` surface (`frontendtemp`,
+/// not `fronttemp`). The live telemetry a client sees over HTTP is
+/// computed and populated by RTSA-Suite, the managing application, not by
+/// the raw SDK. So these fields are populated by the walk but are `0.0`
+/// on the raw SDK path in practice; the crate's sensor surface
+/// ([`crate::http_endpoints::DeviceSensors`]) is HTTP-only for that
+/// reason. Kept because [`NativeSdkSource::get_health_and_gps`] also
+/// yields the GPS state, which some builds do report.
 #[derive(Debug, Clone, Default)]
 pub struct HealthState {
-    /// Frontend temperature in °C (`fronttemp`), if reported.
+    /// Frontend temperature in °C (`frontendtemp`), if reported.
     pub front_temp_c: Option<f64>,
     /// FPGA temperature in °C (`fpgatemp`), if reported.
     pub fpga_temp_c: Option<f64>,
@@ -1734,12 +1748,14 @@ impl NativeSdkSource {
 
             loop {
                 if let Ok(name) = self.client.get_config_name(device, &mut current) {
-                    // Field names verified live against `/healthstatus`
-                    // (see `HealthState`/`GpsState` docs) — the exact
-                    // `AARTSAAPI_ConfigHealth` tree naming is inferred,
-                    // not independently confirmed.
+                    // Names confirmed live against a V6 ECO's
+                    // `AARTSAAPI_ConfigHealth` tree, which differ from the
+                    // HTTP `/healthstatus` surface — `frontendtemp` there
+                    // vs `fronttemp` over HTTP, `gpssats` vs `satellites`.
+                    // The values read `0.0` on the raw SDK path (see
+                    // `HealthState`); the GPS fields are the useful ones.
                     match name.as_str() {
-                        "fronttemp" => {
+                        "frontendtemp" => {
                             health.front_temp_c = self.read_health_value(device, &mut current);
                         }
                         "fpgatemp" => {

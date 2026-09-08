@@ -90,16 +90,19 @@ pub use native_sdk::{NativeSdkClient, NativeSdkSource};
 #[cfg(feature = "ffi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
 pub use c_api::{
-    AaroniaFfiError, CAaroniaSourceType, FfiComplex, FfiServerInfo, FfiSourceInfo,
-    aaronia_endpoints_client_control_recording, aaronia_endpoints_client_control_streaming,
-    aaronia_endpoints_client_free, aaronia_endpoints_client_get_info, aaronia_endpoints_client_new,
-    aaronia_get_error_message, aaronia_server_info_free, aaronia_source_build,
-    aaronia_source_builder_center_frequency, aaronia_source_builder_file_source,
+    AaroniaFfiError, CAaroniaSourceType, FfiComplex, FfiDeviceSensors, FfiServerInfo,
+    FfiSourceInfo, aaronia_endpoints_client_control_recording,
+    aaronia_endpoints_client_control_streaming, aaronia_endpoints_client_free,
+    aaronia_endpoints_client_get_info, aaronia_endpoints_client_new,
+    aaronia_endpoints_client_read_sensors, aaronia_get_error_message,
+    aaronia_iq_sample_rate_for_bandwidth, aaronia_sdk_installed, aaronia_server_info_free,
+    aaronia_source_build, aaronia_source_builder_center_frequency,
+    aaronia_source_builder_file_source, aaronia_source_builder_force_source_type,
     aaronia_source_builder_free, aaronia_source_builder_http_source, aaronia_source_builder_new,
     aaronia_source_builder_reference_level, aaronia_source_builder_span_frequency,
     aaronia_source_free, aaronia_source_get_source_info, aaronia_source_info_free,
-    aaronia_source_read_samples, aaronia_source_start_streaming, aaronia_source_stop_streaming,
-    aaronia_string_free,
+    aaronia_source_read_samples, aaronia_source_read_sensors, aaronia_source_start_streaming,
+    aaronia_source_stop_streaming, aaronia_string_free, aaronia_usable_bandwidth_hz,
 };
 pub use detection::{get_sdk_library_path, get_sdk_path, get_xml_config_path, is_sdk_installed};
 #[cfg(feature = "file")]

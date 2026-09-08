@@ -576,24 +576,26 @@ async fn long_run_is_stable_and_reports_its_drops() {
 
 /// The Seify backend had no tests of any kind. `sdk=true` must reach the
 /// native SDK, not fall through to HTTP.
+///
+/// A plain `#[test]`, deliberately: `AaroniaSeifyDevice` owns a tokio
+/// runtime, and dropping one inside an async context is a tokio panic
+/// ("Cannot drop a runtime in a context where blocking is not
+/// allowed"). The first run of this test on hardware opened the device
+/// fine and then died in teardown for exactly that reason.
 #[cfg(feature = "seify")]
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[ignore = "requires an attached Spectran V6; build with --features seify,native-sdk"]
-async fn seify_backend_reaches_the_native_sdk() {
+fn seify_backend_reaches_the_native_sdk() {
     use seify::{Args, DeviceInfo};
-    let _guard = device_lock().await;
+    let _guard = device_lock_blocking();
 
     let mut args = Args::new();
     args.set("sdk", "true");
     args.set("freq", center_hz().to_string());
     args.set("rate", "15360000");
 
-    let dev = tokio::task::spawn_blocking(move || {
-        sdr_aaronia_rs::seify_impl::AaroniaSeifyDevice::from_args(&args)
-    })
-    .await
-    .expect("join")
-    .expect("seify device must open through the native SDK");
+    let dev = sdr_aaronia_rs::seify_impl::AaroniaSeifyDevice::from_args(&args)
+        .expect("seify device must open through the native SDK");
 
     println!("seify device id = {:?}", dev.id());
 }

@@ -338,6 +338,57 @@ pub unsafe extern "C" fn aaronia_source_builder_device_serial(
     }
 }
 
+/// Pin the source to one backend instead of auto-detecting.
+///
+/// The C ABI had no way to ask for the native SDK: leaving both
+/// `http_source` and `file_source` unset auto-detects, which picks the
+/// SDK when it is installed and *silently* falls back to localhost HTTP
+/// when it is not. With `NativeSdk` forced, a missing SDK is a build
+/// error instead, so a capture never quietly comes from another backend
+/// — the same guarantee `AaroniaConfig::force_native_sdk` gives Rust and
+/// `sdk=True` gives Python.
+///
+/// # Safety
+/// `builder` must be a live pointer from [`aaronia_source_builder_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_builder_force_source_type(
+    builder: *mut AaroniaSourceBuilder,
+    source_type: CAaroniaSourceType,
+) {
+    unsafe {
+        if let Some(builder) = builder.as_mut() {
+            builder.force_source_type(source_type.into());
+        }
+    }
+}
+
+/// Whether the Aaronia native SDK library is present on this machine, by
+/// the same search [`aaronia_source_build`] uses — so a caller can offer
+/// the SDK only where forcing it would not fail. Answers without loading
+/// the library.
+#[unsafe(no_mangle)]
+pub extern "C" fn aaronia_sdk_installed() -> bool {
+    crate::detection::is_sdk_installed()
+}
+
+/// Alias-free bandwidth delivered at an IQ sample rate, Hz. Smaller than
+/// the rate: the width the stream's start..end frequency actually covers.
+/// Stateless — the SoapySDR plugin's `getBandwidth` calls it on the rate
+/// `getSampleRate` reports, so it need not track a rate itself.
+#[unsafe(no_mangle)]
+pub extern "C" fn aaronia_usable_bandwidth_hz(sample_rate_hz: f64) -> f64 {
+    crate::usable_bandwidth_hz(sample_rate_hz)
+}
+
+/// The IQ sample rate whose alias-free bandwidth covers `bandwidth_hz`,
+/// Hz — the inverse of [`aaronia_usable_bandwidth_hz`]. The plugin's
+/// `setBandwidth` maps a requested bandwidth to the rate to ask for, then
+/// drives the already-verified `setSampleRate`. Stateless.
+#[unsafe(no_mangle)]
+pub extern "C" fn aaronia_iq_sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
+    crate::iq_sample_rate_for_bandwidth(bandwidth_hz)
+}
+
 /// Select the RX channel(s) for native-SDK captures: 0 = Rx1 (default),
 /// 1 = Rx2, 2 = Rx1+Rx2 (dual — read with
 /// [`aaronia_source_read_samples_dual`]). Other values are ignored.
@@ -1145,6 +1196,83 @@ pub unsafe extern "C" fn aaronia_source_capabilities_free(ptr: *mut FfiDeviceCap
     }
 }
 
+/// The device's live sensors, filled by [`aaronia_source_read_sensors`].
+///
+/// A plain value struct the caller allocates: every field is a reading,
+/// or `NaN` for "the device did not report it". No pointers, no
+/// ownership, nothing to free. Units are on the Rust
+/// [`DeviceSensors`](crate::http_endpoints::DeviceSensors) fields.
+#[repr(C)]
+pub struct FfiDeviceSensors {
+    pub fpga_temp_c: f64,
+    pub frontend_temp_c: f64,
+    pub board_power_w: f64,
+    pub adc_range_db: f64,
+    pub usb_buffer_fill: f64,
+    pub dsp_buffer_fill: f64,
+    pub errors_per_second: f64,
+    pub usb_overflows_per_second: f64,
+    pub dsp_overflows_per_second: f64,
+    pub gps_satellites: f64,
+    pub gps_latitude: f64,
+    pub gps_longitude: f64,
+}
+
+/// Read the device's live sensors into `out`.
+///
+/// An HTTP-backend feature: a `/healthstatus` GET filled onto
+/// `FfiDeviceSensors`. Returns `true` when the read completed; individual
+/// fields are `NaN` where the device omits them, and the file and
+/// native-SDK backends complete with every field `NaN` (the raw SDK's own
+/// health tree reads all zeros — see [`AaroniaSource::device_sensors`]).
+/// Returns `false`, leaving `out` untouched, only for a null pointer or
+/// when called from a current-thread tokio runtime (where the blocking
+/// GET would deadlock).
+///
+/// Blocking: one `/healthstatus` GET on the HTTP backend.
+///
+/// # Safety
+/// `ptr` must be a live pointer from [`aaronia_source_build`], not used
+/// concurrently from another thread; `out` must point to a writable
+/// `FfiDeviceSensors`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_read_sensors(
+    ptr: *mut c_void,
+    out: *mut FfiDeviceSensors,
+) -> bool {
+    clear_last_error();
+    if ptr.is_null() || out.is_null() {
+        set_last_error("Null pointer".to_string());
+        return false;
+    }
+    let source = unsafe { &*(ptr as *mut AaroniaSource) };
+    let sensors = match ffi_block_on(source.device_sensors()) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return false;
+        }
+    };
+    let f = |v: Option<f64>| v.unwrap_or(f64::NAN);
+    unsafe {
+        *out = FfiDeviceSensors {
+            fpga_temp_c: f(sensors.fpga_temp_c),
+            frontend_temp_c: f(sensors.frontend_temp_c),
+            board_power_w: f(sensors.board_power_w),
+            adc_range_db: f(sensors.adc_range_db),
+            usb_buffer_fill: f(sensors.usb_buffer_fill),
+            dsp_buffer_fill: f(sensors.dsp_buffer_fill),
+            errors_per_second: f(sensors.errors_per_second),
+            usb_overflows_per_second: f(sensors.usb_overflows_per_second),
+            dsp_overflows_per_second: f(sensors.dsp_overflows_per_second),
+            gps_satellites: f(sensors.gps_satellites),
+            gps_latitude: f(sensors.gps_latitude),
+            gps_longitude: f(sensors.gps_longitude),
+        };
+    }
+    true
+}
+
 // --- Remote Control FFI --- //
 
 /// Construct a new HTTP endpoints client. Returns `NULL` on error or if
@@ -1259,6 +1387,59 @@ pub unsafe extern "C" fn aaronia_endpoints_client_get_info(ptr: *mut c_void) -> 
             }
         }
     }
+}
+
+/// Read the device's live sensors through an endpoints client, into
+/// `out`. The same reading as [`aaronia_source_read_sensors`], but off a
+/// standalone client rather than a streaming source — so a caller can
+/// poll sensors during a capture without contending for the source's
+/// read lock, which would stall sample delivery.
+///
+/// Returns `true` when the read completed (fields may be `NaN` where the
+/// device omits them), `false` — leaving `out` untouched — for a null
+/// pointer or a current-thread runtime. A failed GET completes all-`NaN`.
+///
+/// Blocking: one `/healthstatus` GET.
+///
+/// # Safety
+/// `ptr` must be a live pointer from [`aaronia_endpoints_client_new`],
+/// not yet freed; `out` must point to a writable `FfiDeviceSensors`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_endpoints_client_read_sensors(
+    ptr: *mut c_void,
+    out: *mut FfiDeviceSensors,
+) -> bool {
+    clear_last_error();
+    if ptr.is_null() || out.is_null() {
+        set_last_error("aaronia_endpoints_client_read_sensors: null pointer".to_string());
+        return false;
+    }
+    let client = unsafe { &*(ptr as *mut HttpEndpointsClient) };
+    let sensors = match ffi_block_on(client.get_device_sensors()) {
+        Ok(result) => result.unwrap_or_default(),
+        Err(e) => {
+            set_last_error(format!("aaronia_endpoints_client_read_sensors: {e}"));
+            return false;
+        }
+    };
+    let f = |v: Option<f64>| v.unwrap_or(f64::NAN);
+    unsafe {
+        *out = FfiDeviceSensors {
+            fpga_temp_c: f(sensors.fpga_temp_c),
+            frontend_temp_c: f(sensors.frontend_temp_c),
+            board_power_w: f(sensors.board_power_w),
+            adc_range_db: f(sensors.adc_range_db),
+            usb_buffer_fill: f(sensors.usb_buffer_fill),
+            dsp_buffer_fill: f(sensors.dsp_buffer_fill),
+            errors_per_second: f(sensors.errors_per_second),
+            usb_overflows_per_second: f(sensors.usb_overflows_per_second),
+            dsp_overflows_per_second: f(sensors.dsp_overflows_per_second),
+            gps_satellites: f(sensors.gps_satellites),
+            gps_latitude: f(sensors.gps_latitude),
+            gps_longitude: f(sensors.gps_longitude),
+        };
+    }
+    true
 }
 
 /// Free a server-info struct previously returned by
@@ -1805,6 +1986,15 @@ mod tests {
         assert_eq!(std::mem::offset_of!(FfiServerInfo, serial), 24);
         assert_eq!(std::mem::offset_of!(FfiServerInfo, title), 32);
         assert_eq!(std::mem::offset_of!(FfiServerInfo, mission), 40);
+
+        // Twelve tightly packed f64s: the C header declares the same
+        // twelve `double`s in the same order, so 8-byte stride, no
+        // padding, 96 bytes total. Pin the ends and the size; a reordered
+        // or retyped field shifts one of these.
+        assert_eq!(std::mem::size_of::<FfiDeviceSensors>(), 96);
+        assert_eq!(std::mem::offset_of!(FfiDeviceSensors, fpga_temp_c), 0);
+        assert_eq!(std::mem::offset_of!(FfiDeviceSensors, adc_range_db), 24);
+        assert_eq!(std::mem::offset_of!(FfiDeviceSensors, gps_longitude), 88);
     }
 
     #[test]

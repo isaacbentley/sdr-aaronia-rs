@@ -539,6 +539,109 @@ impl DeviceHealthSummary {
     }
 }
 
+/// A snapshot of the device's live sensors, for the SoapySDR `readSensor`
+/// surface and any monitoring caller.
+///
+/// Each field is `None` when the device did not report it — an older
+/// firmware, or a block that has no GPS. Values are as the device states
+/// them; the field docs give the units. Read from the same
+/// `/healthstatus` tree as [`DeviceHealthSummary`], but the fuller set:
+/// that type is the narrow subset the gap cross-check needs, this is
+/// what a monitoring UI wants.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct DeviceSensors {
+    /// `health/fpgatemp` — FPGA die temperature, °C.
+    pub fpga_temp_c: Option<f64>,
+    /// `health/fronttemp` — RF frontend temperature, °C.
+    pub frontend_temp_c: Option<f64>,
+    /// `health/boardpower` — board power draw, watts.
+    pub board_power_w: Option<f64>,
+    /// `status/adcrange` — ADC headroom below full scale, dB. Larger is
+    /// more headroom; near zero means the ADC is close to clipping, so a
+    /// client can raise the reference level before it does.
+    pub adc_range_db: Option<f64>,
+    /// `status/usbbuffer` — USB transfer buffer fill, the device's own
+    /// fraction (0.0–1.0). A climbing value is the first sign the host is
+    /// not draining the stream fast enough.
+    pub usb_buffer_fill: Option<f64>,
+    /// `status/dspbuffer` — DSP buffer fill, fraction (0.0–1.0).
+    pub dsp_buffer_fill: Option<f64>,
+    /// `status/errors` — device errors per second.
+    pub errors_per_second: Option<f64>,
+    /// `status/usboverflows` — USB overflows per second.
+    pub usb_overflows_per_second: Option<f64>,
+    /// `status/dsboverflows` — DSP overflows per second (the wire name is
+    /// `dsb`, Aaronia's spelling).
+    pub dsp_overflows_per_second: Option<f64>,
+    /// `status/satellites` — GPS satellites in view.
+    pub gps_satellites: Option<f64>,
+    /// `status/gpslatitude` — GPS latitude in degrees; 0 with no fix.
+    pub gps_latitude: Option<f64>,
+    /// `status/gpslongitude` — GPS longitude in degrees; 0 with no fix.
+    pub gps_longitude: Option<f64>,
+}
+
+impl DeviceSensors {
+    /// Parse the first device block that publishes a `status` group.
+    ///
+    /// Temperatures live under the sibling `health` group. Both are read
+    /// from the *same* block: resolving each with an independent global
+    /// descent could, in a multi-block mission, pair one block's status
+    /// with another block's temperatures. The block is the first that
+    /// owns a `status` group, matching how [`DeviceHealthSummary`] picks
+    /// blocks.
+    pub fn from_health_status(health: &HealthStatus) -> Self {
+        // The first block (depth-first) that has a direct `status` child.
+        fn block_with_status(item: &ConfigItem) -> Option<&[ConfigItem]> {
+            let ConfigItem::Group { items, .. } = item else {
+                return None;
+            };
+            let has_status = items
+                .iter()
+                .any(|child| matches!(child, ConfigItem::Group { name, .. } if name == "status"));
+            if has_status {
+                return Some(items);
+            }
+            items.iter().find_map(block_with_status)
+        }
+        // A named `fn` rather than a closure: it must tie the returned
+        // slice's lifetime to `block`, which a closure signature cannot
+        // express.
+        fn child_group<'a>(
+            block: Option<&'a [ConfigItem]>,
+            want: &str,
+        ) -> Option<&'a [ConfigItem]> {
+            block.and_then(|items| {
+                items.iter().find_map(|child| match child {
+                    ConfigItem::Group { name, items, .. } if name == want => Some(items.as_slice()),
+                    _ => None,
+                })
+            })
+        }
+        let block = block_with_status(health);
+        let status = child_group(block, "status");
+        let health_grp = child_group(block, "health");
+        let pick = |group: Option<&[ConfigItem]>, key: &str| {
+            group.and_then(|items| number_named(items, key))
+        };
+        Self {
+            fpga_temp_c: pick(health_grp, "fpgatemp"),
+            frontend_temp_c: pick(health_grp, "fronttemp"),
+            board_power_w: pick(health_grp, "boardpower"),
+            adc_range_db: pick(status, "adcrange"),
+            usb_buffer_fill: pick(status, "usbbuffer"),
+            dsp_buffer_fill: pick(status, "dspbuffer"),
+            errors_per_second: pick(status, "errors"),
+            usb_overflows_per_second: pick(status, "usboverflows"),
+            dsp_overflows_per_second: pick(status, "dsboverflows"),
+            gps_satellites: pick(status, "satellites"),
+            gps_latitude: pick(status, "gpslatitude"),
+            gps_longitude: pick(status, "gpslongitude"),
+        }
+    }
+}
+
 /// A numeric setting's declared bounds, as the device states them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ValueRange {
@@ -1790,6 +1893,13 @@ impl HttpEndpointsClient {
         Ok(DeviceHealthSummary::from_health_status(&health))
     }
 
+    /// The device's live sensors — temperatures, ADC headroom, buffer
+    /// fill, GPS — from one `/healthstatus` read. See [`DeviceSensors`].
+    pub async fn get_device_sensors(&self) -> Result<DeviceSensors> {
+        let health = self.get_health_status().await?;
+        Ok(DeviceSensors::from_health_status(&health))
+    }
+
     /// Reads what the device says about itself — identity, and the
     /// bounds it declares on centre frequency, reference level and the
     /// decimation ladder.
@@ -2843,6 +2953,105 @@ mod tests {
             DeviceHealthSummary::from_health_status(&health).is_empty(),
             "a block with no status group has nothing to report"
         );
+    }
+
+    #[test]
+    fn device_sensors_read_temps_adc_buffers_and_gps() {
+        // A tree shaped like a real /healthstatus: temperatures under
+        // `health`, everything else under `status`. `f` builds a float
+        // item with all the fields the parser requires present.
+        fn f(name: &str, label: &str, value: f64) -> serde_json::Value {
+            serde_json::json!({
+                "type": "float", "name": name, "label": label, "flags": "",
+                "value": value, "default": value,
+                "min": null, "max": null, "step": null, "unit": null
+            })
+        }
+        let health = parse_health(serde_json::json!({
+            "type": "group", "name": "healthstatus", "label": "HealthStatus",
+            "flags": "", "items": [{
+                "type": "group", "name": "Block_Spectran_V6Eco_0",
+                "label": "SPECTRAN V6 ECO", "flags": "grp_tree_root", "items": [
+                    { "type": "group", "name": "health", "label": "Health", "flags": "", "items": [
+                        f("fronttemp", "Frontend Temperature", 65.1),
+                        f("fpgatemp", "FPGA Temperature", 54.3),
+                        f("boardpower", "Board Power", 9.0)
+                    ]},
+                    { "type": "group", "name": "status", "label": "Status", "flags": "", "items": [
+                        f("adcrange", "ADC Range", 29.4),
+                        f("usbbuffer", "USB Buffer Fill", 0.0625),
+                        f("dspbuffer", "DSP Buffer Fill", 0.0),
+                        f("errors", "Errors/s", 0.0),
+                        f("usboverflows", "USB Overflows/s", 0.0),
+                        f("dsboverflows", "DSP Overflows/s", 0.0),
+                        f("satellites", "GPS Satellites", 7.0),
+                        f("gpslatitude", "GPS Latitude", 52.5),
+                        f("gpslongitude", "GPS Longitude", 13.4)
+                    ]}
+                ]
+            }]
+        }));
+
+        let s = DeviceSensors::from_health_status(&health);
+        assert_eq!(s.fpga_temp_c, Some(54.3));
+        assert_eq!(s.frontend_temp_c, Some(65.1));
+        assert_eq!(s.board_power_w, Some(9.0));
+        assert_eq!(s.adc_range_db, Some(29.4));
+        assert_eq!(s.usb_buffer_fill, Some(0.0625));
+        assert_eq!(s.dsp_buffer_fill, Some(0.0));
+        assert_eq!(s.gps_satellites, Some(7.0));
+        assert_eq!(s.gps_latitude, Some(52.5));
+        assert_eq!(s.gps_longitude, Some(13.4));
+    }
+
+    #[test]
+    fn device_sensors_pair_status_and_health_from_one_block() {
+        // Two blocks: the first has a `health` group but no `status`, the
+        // second has both. Resolving each group by an independent global
+        // descent would take health from block 1 and status from block 2.
+        // Scoping to the block that owns `status` keeps them together.
+        fn ftmp(name: &str, value: f64) -> serde_json::Value {
+            serde_json::json!({
+                "type": "float", "name": name, "label": name, "flags": "",
+                "value": value, "default": value,
+                "min": null, "max": null, "step": null, "unit": null
+            })
+        }
+        let health = parse_health(serde_json::json!({
+            "type": "group", "name": "healthstatus", "label": "HealthStatus", "flags": "", "items": [
+                { "type": "group", "name": "Block_Other_0", "label": "Other", "flags": "", "items": [
+                    { "type": "group", "name": "health", "label": "Health", "flags": "", "items": [
+                        ftmp("fpgatemp", 99.0)
+                    ]}
+                ]},
+                { "type": "group", "name": "Block_Spectran_V6Eco_0", "label": "V6", "flags": "", "items": [
+                    { "type": "group", "name": "health", "label": "Health", "flags": "", "items": [
+                        ftmp("fpgatemp", 54.3)
+                    ]},
+                    { "type": "group", "name": "status", "label": "Status", "flags": "", "items": [
+                        ftmp("adcrange", 29.4)
+                    ]}
+                ]}
+            ]
+        }));
+        let s = DeviceSensors::from_health_status(&health);
+        // The V6 block's temperature (54.3), not the Other block's (99.0).
+        assert_eq!(s.fpga_temp_c, Some(54.3));
+        assert_eq!(s.adc_range_db, Some(29.4));
+    }
+
+    #[test]
+    fn device_sensors_absent_fields_stay_none() {
+        // The base fixture carries fpgatemp and the counters but no ADC
+        // range, buffers, or GPS: those must read `None`, not 0.0, so a
+        // client can tell "not reported" from "reported zero".
+        let health = parse_health(live_shaped_health("Running", 0.0, 0.0, 0.0));
+        let s = DeviceSensors::from_health_status(&health);
+        assert_eq!(s.fpga_temp_c, Some(53.16));
+        assert_eq!(s.errors_per_second, Some(0.0));
+        assert_eq!(s.adc_range_db, None);
+        assert_eq!(s.usb_buffer_fill, None);
+        assert_eq!(s.gps_latitude, None);
     }
 
     /// Satellite devices arrive nested under `components`, so the walk

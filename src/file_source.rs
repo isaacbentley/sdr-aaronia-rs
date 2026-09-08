@@ -1002,7 +1002,29 @@ impl RtsaSource {
             }
 
             let new_path_buf = new_temp_path.to_path_buf();
-            return Self::open_internal(new_path_buf, Some(new_temp_path));
+            let mut decompressed = Self::open_internal(new_path_buf, Some(new_temp_path))?;
+
+            // RTSAFileTool writes a fresh DSFH whose `creation_time` is the
+            // moment of conversion, so the re-open above reports *now* as
+            // the capture time — the first run of the fixture test on a
+            // machine with RTSA-Suite installed got 2026 for a 2020
+            // capture. `metadata` was built from the original file's own
+            // header before compression was detected; its timestamp is
+            // the one that means anything. The derived start/end fall
+            // backs follow it only when they were derived from it.
+            let tool_creation_ns = (decompressed.metadata.creation_time * 1_000_000_000.0) as u64;
+            if decompressed.metadata.start_time_ns == tool_creation_ns {
+                let span_ns = decompressed
+                    .metadata
+                    .end_time_ns
+                    .saturating_sub(decompressed.metadata.start_time_ns);
+                decompressed.metadata.start_time_ns =
+                    (metadata.creation_time * 1_000_000_000.0) as u64;
+                decompressed.metadata.end_time_ns =
+                    decompressed.metadata.start_time_ns.saturating_add(span_ns);
+            }
+            decompressed.metadata.creation_time = metadata.creation_time;
+            return Ok(decompressed);
         }
 
         Ok(Self {
