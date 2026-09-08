@@ -140,7 +140,9 @@ The stream server supports multiple data formats for high-performance streaming:
 **Parameters**:
 - `format`: Output format (`json`, `int16`, `float16`, `float32`)
 - `limit`: Maximum number of **packets** to stream before the server closes the connection (live-verified: `?limit=N` delivers exactly N packets)
-- `rate_reduction=n`: Reduce sample rate by factor of n
+- `rate_reduction=n`: Documented as reducing the sample rate by a factor
+  of *n*. **Measured as a no-op for IQ** — see "Compression does not
+  help" below. Accepted and ignored at 2, 10 and 64.
 - `rate_adaption=0`: Disable automatic rate adaptation
 - `scale`: Server-side scale factor for integer formats. **Distinct from
   the per-packet `scale` JSON metadata field** — the URL parameter scales
@@ -158,7 +160,7 @@ adjacent data packets." The Rust binding exposes
 ```
 http://localhost:54664/stream?format=float32&limit=1000
 http://localhost:54664/stream?format=int16&scale=1000000
-http://localhost:54664/stream?rate_reduction=10
+http://localhost:54664/stream?rate_reduction=10   # accepted, ignored for IQ
 ```
 
 ### An unknown `format` is not an error
@@ -185,8 +187,10 @@ buffer passes **8 MB**. Nothing announces it; the loss shows up as a
 gap between the timestamps of two adjacent packets, which is what
 `DropDetector` watches for. A slow consumer, a slow link, or a rate
 the network cannot carry all end here, so reducing the wire format
-(`format=int16`) or the rate (`rate_reduction=n`) is the fix rather
-than a larger client-side buffer.
+(`format=int16`) is the fix rather than a larger client-side buffer.
+Narrowing the span works too, since it moves the device down its
+decimation ladder. `rate_reduction=n` does not: measured, it is ignored
+for IQ.
 
 ### Several clients on one server block
 
@@ -1057,9 +1061,19 @@ the ratio collapses to 1.24x; send full-precision `float32` and it is
 1.07x, which is to say nothing. This matches the published result that
 noise-dominated IQ compresses to 53–84% of its original size.
 
-The levers that do work are the wire format (`float32` to `int16` halves
-the byte rate outright) and `rate_reduction=N`, which decimates at the
-server so the samples are never sent.
+What about `rate_reduction=N`, which the endpoint specification presents
+as thinning the stream at the server? **It does nothing for IQ.**
+Measured against RTSA-Suite PRO and a V6 ECO at factors of 2, 10 and 64:
+`sampleFrequency` stays at 15,359,988 Hz and the byte rate does not
+move. The parameter is accepted, returns 200, and is ignored.
+`live_stream_rate_reduction_and_scale` asserts that, so if a future
+version starts honouring it the test fails rather than the document
+quietly going stale.
+
+That leaves one real lever: the wire format. `float32` to `int16` halves
+the byte rate outright. Beyond that, narrow the span — that moves the
+device down its decimation ladder, which genuinely reduces what it
+produces.
 
 ### Format Selection Guidelines
 - **JSON**: Development and debugging, low data rates

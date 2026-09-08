@@ -458,6 +458,37 @@ async fn live_stream_rate_reduction_and_scale() {
     );
     assert!(s.packets > 0 && s.samples > 0);
     assert_eq!(s.errors, 0);
+
+    // `rate_reduction` is a no-op for IQ on RTSA-Suite PRO, measured.
+    // A factor of 64 leaves `sampleFrequency` and the byte rate exactly
+    // where they were, at 2, 10 and 64. The parameter is accepted and
+    // ignored, so it is not a bandwidth lever however the endpoint
+    // specification describes it.
+    //
+    // Asserted rather than merely noted: this test used to check only
+    // that packets arrived, which it does whether or not the reduction
+    // works, so the docs claimed a lever nothing verified. If a future
+    // RTSA version starts honouring it, this fails and says so.
+    let unreduced = pump_stream_with_params(
+        HttpEndpointsClient::stream_params()
+            .format(StreamFormat::Int16)
+            .scale(16384.0)
+            .build(),
+        3,
+    )
+    .await;
+    let ratio = s.rate / unreduced.rate;
+    println!(
+        "  without reduction: {:.0} Hz — ratio {ratio:.3}",
+        unreduced.rate
+    );
+    assert!(
+        (ratio - 1.0).abs() < 0.05,
+        "rate_reduction=64 changed the reported rate ({:.0} -> {:.0} Hz). The \
+         server now honours it; update HTTPSPEC, which records it as ignored.",
+        unreduced.rate,
+        s.rate,
+    );
 }
 
 /// A full-rate IQ device produces ~61.44 Msps of float32 IQ (~490 MB/s)

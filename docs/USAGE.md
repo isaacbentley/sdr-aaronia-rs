@@ -350,7 +350,7 @@ fn main() -> Result<()> {
             password: "secure_pass".to_string(),
         })
         .input("main")                  // Specific input stream
-        .rate_reduction(4)              // Bandwidth optimization
+        .rate_reduction(4)              // Accepted, but ignored for IQ
         .buffer_size(16384)             // Large buffer
         .timeout_ms(1000)               // Fast timeout
         .build()?;

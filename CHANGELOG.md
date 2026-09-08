@@ -29,6 +29,16 @@ All notable changes to this project will be documented in this file.
   is a property of the harness, not of the crate.
 
 ### Documentation
+- **`rate_reduction` is a no-op for IQ, and four documents said
+  otherwise.** Measured against RTSA-Suite PRO and a V6 ECO at factors of
+  2, 10 and 64: `sampleFrequency` holds at 15,359,988 Hz and the byte
+  rate does not move. The parameter is accepted, returns 200, and is
+  ignored. `live_stream_rate_reduction_and_scale` had asserted only that
+  packets arrived — true whether or not the reduction works — so it
+  passed while the docs claimed a bandwidth lever nothing verified. It
+  now compares against an unreduced stream and fails if the ratio moves,
+  which is what a future RTSA version honouring the parameter would look
+  like.
 - **Measured whether compression could widen the link, and it cannot.**
   The server gzips `/remoteconfig` (17,432 to 3,503 bytes) but returns no
   `Content-Encoding` on `/stream` for gzip, deflate, br or zstd. Nor
