@@ -23,7 +23,16 @@ All notable changes to this project will be documented in this file.
 - **`scripts/fake-rtsa-server.py`** serves `/stream` in the real wire
   format at loopback speed, so a decode path can be measured without a
   device or a network. It is how the figures above were taken: over any
-  real link the transport dominates and a CPU change is invisible.
+  real link the transport dominates and a CPU change is invisible. Its
+  docstring carries the caveat that goes with it — over loopback hyper's
+  adaptive read buffer never leaves its 8 KiB floor, so kernel time there
+  is a property of the harness, not of the crate.
+
+### Documentation
+- The reader channel's size comment claimed ~157 KiB chunks and ~10 MB of
+  queue. Measured against a live server it is 64 KiB for 71% of chunks,
+  so the queue is ~4 MB, about 45 ms at the 88 MB/s a WiFi 6E path
+  delivers.
 
 ## [v0.8.1] - 2026-09-07
 

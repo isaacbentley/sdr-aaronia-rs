@@ -18,6 +18,14 @@ configuration.
 Only `/stream` is served. Paths needing `/info`, `/inputs` or `/control`
 (`AaroniaSource`, the live smoke tests) will not work against it; drive
 `HttpEndpointsClient::start_stream` directly.
+
+One caveat, learned the hard way: loopback is not a small network. Over
+loopback hyper's adaptive read buffer stays at its 8 KiB floor and never
+grows, so a client here sees ~82k tiny chunks a second and a kernel-time
+share that looks alarming. Against a real server the same client gets
+64 KiB chunks 71% of the time and spends ~16% of one core. Use this to
+compare two versions of a decode path against each other, not to draw
+conclusions about where time goes on a real link.
 """
 import socket, struct, sys, threading, time
 
