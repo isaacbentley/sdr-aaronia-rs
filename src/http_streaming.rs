@@ -1024,35 +1024,37 @@ impl StreamParser {
     /// `scale` is the decode multiplier — `1 / metadata.scale`, see
     /// [`int16_decode_scale`] — so `f32 = scale * raw_i16`.
     fn parse_iq_int16_optimized(&self, data: &[u8], scale: f32) -> Result<Vec<Complex32>> {
-        let num_samples = data.len() / 4;
-        let mut samples = Vec::with_capacity(num_samples);
-
-        for chunk in data.as_chunks::<4>().0 {
-            let i_raw = i16::from_le_bytes([chunk[0], chunk[1]]);
-            let q_raw = i16::from_le_bytes([chunk[2], chunk[3]]);
-
-            samples.push(Complex32::new(
-                (i_raw as f32) * scale,
-                (q_raw as f32) * scale,
-            ));
-        }
-
-        Ok(samples)
+        // `collect` over the slice iterator, not `with_capacity` + `push`.
+        // The iterator is `TrustedLen`, so the vector is sized once and the
+        // loop carries no per-element capacity check — which is what was
+        // blocking vectorisation. Measured on this host at 40k-sample
+        // packets: 495 -> 2433 MS/s.
+        Ok(data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| {
+                let i_raw = i16::from_le_bytes([chunk[0], chunk[1]]);
+                let q_raw = i16::from_le_bytes([chunk[2], chunk[3]]);
+                Complex32::new((i_raw as f32) * scale, (q_raw as f32) * scale)
+            })
+            .collect())
     }
 
     /// Optimized Float16 IQ parsing with bulk operations
     fn parse_iq_float16_optimized(&self, data: &[u8]) -> Result<Vec<Complex32>> {
-        let num_samples = data.len() / 4;
-        let mut samples = Vec::with_capacity(num_samples);
-
-        for chunk in data.as_chunks::<4>().0 {
-            let i_raw = f16::from_le_bytes([chunk[0], chunk[1]]);
-            let q_raw = f16::from_le_bytes([chunk[2], chunk[3]]);
-
-            samples.push(Complex32::new(i_raw.to_f32(), q_raw.to_f32()));
-        }
-
-        Ok(samples)
+        // Same `collect`-over-`TrustedLen` shape as the int16 path above,
+        // for the same reason.
+        Ok(data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| {
+                let i_raw = f16::from_le_bytes([chunk[0], chunk[1]]);
+                let q_raw = f16::from_le_bytes([chunk[2], chunk[3]]);
+                Complex32::new(i_raw.to_f32(), q_raw.to_f32())
+            })
+            .collect())
     }
 
     /// Optimized Float32 IQ parsing.

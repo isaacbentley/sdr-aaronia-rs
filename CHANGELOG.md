@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Performance
+- **The int16 and float16 IQ decoders are ~23% faster end to end.** Both
+  built their output with `Vec::with_capacity` then `push` per sample,
+  which carries a capacity check the compiler cannot elide and which was
+  blocking vectorisation. Collecting from the slice iterator instead —
+  `TrustedLen`, so the vector is sized once — measured 495 to 2433 MS/s
+  on the decode loop alone, and 123.5 to 152 MS/s over the whole HTTP
+  path including framing and transport. float32 was already a single
+  `copy_nonoverlapping` and is unchanged.
+
+  Worth stating what this does not buy: at 605 MB/s the crate is about
+  2.5x the fastest a V6 can produce and 6x a WiFi 6E link, so it was not
+  the bottleneck before and is not now. What it buys is CPU left over
+  for whatever consumes the samples.
+
+### Added
+- **`scripts/fake-rtsa-server.py`** serves `/stream` in the real wire
+  format at loopback speed, so a decode path can be measured without a
+  device or a network. It is how the figures above were taken: over any
+  real link the transport dominates and a CPU change is invisible.
+
 ## [v0.8.1] - 2026-09-07
 
 ### Fixed

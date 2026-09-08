@@ -127,6 +127,20 @@ cargo bench                                       # Run all benchmarks
 cargo bench --bench parse_int16_packet            # Run a specific harness
 ```
 
+Those measure decode paths in isolation. To measure the whole HTTP path
+end to end without hardware, `scripts/fake-rtsa-server.py` serves
+`/stream` in the real wire format as fast as a client will take it:
+
+```bash
+scripts/fake-rtsa-server.py 54999 int16 &
+# then point HttpEndpointsClient::start_stream at http://127.0.0.1:54999
+```
+
+It saturates loopback at several GB/s, so the client is always the
+bottleneck. Worth reaching for when a change looks like it should be
+faster but a real link hides the difference — over WiFi or even 2.5GbE
+the network dominates and CPU work does not show up at all.
+
 ### 8. Mutation Testing
 
 `cargo mutants` runs in CI on a weekly cron (Mondays) and on manual dispatch, advisory-only. To run it locally:
