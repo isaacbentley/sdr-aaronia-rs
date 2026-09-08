@@ -63,6 +63,11 @@ proptest = "1.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 wiremock = "0.6" # For HTTP endpoint resiliency testing
 
+# The native-SDK live suite uses `#[tokio::test]`, and must build in a
+# `--no-default-features --features native-sdk` configuration where the
+# `http` feature is not pulling `dep:tokio` in.
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
 # Each `[[bench]]` declares one criterion harness binary. Run with
 # `cargo bench --bench <name>`. Coverage:
 #   parse_int16_packet    — HTTP int16 packet parse throughput
