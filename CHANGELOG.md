@@ -164,7 +164,10 @@ Every ladder rung from 3.84 to 49.152 MHz delivers exactly the requested
 rate, 3/3 trials each; 61.44 MHz caps at 59.214 MS/s. Steady-state
 delivery is 100.0% of the reported rate. The `iqreceiver` pipeline
 delivers ~40% of rate for the first ~5 s after start, then settles; the
-rate and soak tests warm up past it.
+rate and soak tests warm up past it. The SoapySDR plugin, built with
+MSVC against radioconda's SoapySDR, streams 15.357 MS/s over the SDK
+into Python; see [docs/VERIFICATION.md](docs/VERIFICATION.md) for the
+two limits found on the way.
 
 ## [v0.8.1] - 2026-09-07
 

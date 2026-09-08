@@ -45,6 +45,9 @@ function Section($name) {
 function Run($label, $cmd) {
     Write-Host "`n--- $label ---" -ForegroundColor Yellow
     "`n--- $label ---`n$cmd" | Out-File -Append $log
+    # Reset first: a step that fails before any executable runs would
+    # otherwise inherit the previous step's code.
+    $global:LASTEXITCODE = 0
     $out = Invoke-Expression "$cmd 2>&1" | Out-String
     $out | Out-File -Append $log
     Write-Host $out
@@ -72,7 +75,7 @@ if ($env:AARONIA_SDK_PATH) {
 } elseif (Test-Path $sdkDefault) {
     Write-Host "SDK    : $sdkDefault (default install)"
 } else {
-    Write-Host "SDK    : NOT FOUND — set AARONIA_SDK_PATH" -ForegroundColor Red
+    Write-Host "SDK    : NOT FOUND - set AARONIA_SDK_PATH" -ForegroundColor Red
 }
 $rtsa = Get-Process -Name "*RTSA*" -ErrorAction SilentlyContinue
 if ($rtsa) {
@@ -86,10 +89,16 @@ if ($rtsa) {
 }
 
 Section "1. Build"
-$results['build'] = Run "cargo build --features native-sdk" `
-    "cargo build --features native-sdk"
+$results['build'] = Run "cargo build --release --features native-sdk" `
+    "cargo build --release --features native-sdk"
 
-Section "2. Non-hardware suite (must be green before hardware means anything)"
+if (-not $results['build']) {
+    Write-Host "Build failed; nothing below can run." -ForegroundColor Red
+    Write-Host "Full log: $log"
+    exit 1
+}
+
+Section "2. Non-hardware suite (a red unit test here is reported alongside the hardware results below)"
 $results['unit'] = Run "cargo test --features native-sdk" `
     "cargo test --features native-sdk"
 
@@ -98,18 +107,20 @@ $results['abi'] = Run "native_sdk_load" `
     "cargo test --features native-sdk --test native_sdk_load -- --ignored --nocapture"
 
 Section "4. Hardware suite"
+# --release: the suite measures throughput against the device's own
+# reported rate, and a debug build is not the thing being validated.
 # --test-threads=1 is belt-and-braces: the suite also takes an internal
 # lock, because the device admits exactly one holder.
 $results['live'] = Run "native_sdk_live" `
-    "cargo test --features native-sdk --test native_sdk_live -- --ignored --nocapture --test-threads=1"
+    "cargo test --release --features native-sdk --test native_sdk_live -- --ignored --nocapture --test-threads=1"
 
 Section "5. Cross-API: Seify over the native SDK"
 $results['seify'] = Run "seify + native-sdk" `
-    "cargo test --features seify,native-sdk --test native_sdk_live -- --ignored --nocapture --test-threads=1 seify_"
+    "cargo test --release --features 'seify,native-sdk' --test native_sdk_live -- --ignored --nocapture --test-threads=1 seify_"
 
 Section "6. Cross-API: C ABI over the native SDK"
 $results['c_abi'] = Run "ffi + native-sdk" `
-    "cargo test --features ffi,native-sdk --test native_sdk_live -- --ignored --nocapture --test-threads=1 c_api_"
+    "cargo test --release --features 'ffi,native-sdk' --test native_sdk_live -- --ignored --nocapture --test-threads=1 c_api_"
 
 Section "Summary"
 $failed = 0

@@ -38,6 +38,7 @@ full V6 are marked unverified.
 | Native SDK from Python (`aaronia.open(sdk=True)`) | Native SDK | **Verified manually** on the same machine against radioconda's Python 3.12: 15.363 MS/s of a 15.36 MS/s request into NumPy, retune, timestamps and drop counters populated |
 | Native SDK from the C ABI | Native SDK | **Live-verified**: a builder with neither URL nor file auto-detects the SDK; there is still no explicit selector over C |
 | Native SDK from Seify (`sdk=true`) | Native SDK | Compiled with `--features seify,native-sdk`; the live test exists but was not run on this pass |
+| SoapySDR plugin over the native SDK | Native SDK | **Verified manually** on Windows 11: built with MSVC (VS 2022 Build Tools) against radioconda's SoapySDR 0.8.1, loads into it, and streams 15.357 MS/s of a 15.36 MS/s request into Python via `driver=aaronia,serial=…` (`SoapySDR.Device("driver=aaronia,serial=…")` — that build's binding rejects the `dict` form for every driver). The plugin reaches the SDK only through `serial=`; a bare `driver=aaronia` still pins to localhost HTTP. In the C++ host `SoapySDRUtil`, which sits beside radioconda's own Qt6 copies, the SDK library failed to load: the loader searched the host's directory ahead of the SDK's, fixed after 0.8.2 |
 | HTTP TX push (`/sample`) | HTTP | Endpoint exercised live; RF output not measured |
 
 "Live-verified" means an `#[ignore]`d test in
