@@ -5,7 +5,7 @@
 [![CI](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/sdr-aaronia-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
-One API for Aaronia SPECTRAN analyzers and SDRs, whether the samples
+One API for Aaronia SPECTRAN analyzers, whether the samples
 come from the native SDK, an RTSA-Suite HTTP server, or a recorded file.
 Python bindings and a SoapySDR plugin come from the same engine.
 
