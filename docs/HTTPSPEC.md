@@ -172,13 +172,16 @@ http://localhost:54664/stream?rate_reduction=10   # accepted, ignored for IQ
 an accepted alias for `int16` — Aaronia's own Qt reference client
 defaults to it — and produces byte-identical framing.
 
-Anything the server does not recognise serves **the RTSA file format**
-instead: a `DSFH` header followed by `STRM`/`ANTA` chunks, with HTTP
-200 and no warning. A typo in `format=` therefore yields a completely
-different wire format rather than an error, and a parser expecting
-JSON-plus-binary will fail somewhere well past the point that would
-have identified the cause. Verified against a live server: `format=`
-with a nonsense value returned `DSFH`.
+`rtsa` is a fifth, deliberate value: it streams the file container and
+is the only format that accepts `compression=N` — see "Compression:
+`format=rtsa`" below.
+
+Anything the server does not recognise falls back to that same container,
+with HTTP 200 and no warning. A typo in `format=` therefore yields a
+completely different wire format rather than an error, and a parser
+expecting JSON-plus-binary will fail somewhere well past the point that
+would have identified the cause. Verified against a live server:
+`format=` with a nonsense value returned `DSFH`.
 
 The SoapySDR plugin warns on an unrecognised `format=` device argument
 rather than silently falling back to the default.
@@ -1039,15 +1042,62 @@ The server supports two types of HTTP authorization:
 - Buffer management with chunked transfer encoding
 - Automatic rate adaptation available via `rate_adaption` parameter
 
-### Compression does not help, and is not offered
+### Compression: `format=rtsa`
 
-The server gzips its **control plane** — `/remoteconfig` comes back
-3,503 bytes against 17,432 uncompressed — but `/stream` returns no
-`Content-Encoding` for any of `gzip`, `deflate`, `br` or `zstd`. Sample
-data crosses the wire raw, and no query parameter changes that.
+**The stream can be compressed, and heavily.** It is not reachable
+through `Accept-Encoding` — the server ignores that on `/stream`,
+answering with no `Content-Encoding` for gzip, deflate, br or zstd. It is
+reached by asking for the RTSA container instead of a raw sample format.
 
-That is no great loss, because IQ barely compresses. Measured on a live
-V6 ECO, 24 MB of payload per row, zlib level 1:
+Captured from RTSA-Suite's own HTTP Client block, which is the only
+documentation of this that exists:
+
+```
+GET /stream?format=rtsa&rate_reduction=8&input=main&compression=5&rate_adaption=0
+Accept-Encoding: deflate
+```
+
+`format=rtsa` streams the file container — `DSFH`, then `STRM`, `ANTA`
+and `SAMP` chunks, the same layout [FILESPEC](FILESPEC.md) describes —
+and `compression=N` applies the file format's own codec to it. Aaronia's
+HTTP Client documentation says so plainly: *"Data is compressed in the
+same way as file compression. With a higher degree of compression, data
+loss also increases."* It is lossy, and the level is the trade.
+
+Measured against a V6 ECO at 15.36 MS/s, byte rate off the socket:
+
+| stream | delivered | vs `int16` |
+| :--- | ---: | ---: |
+| `format=int16` | 61.8 MB/s | 1.00x |
+| `format=rtsa&compression=0` | 73.9 MB/s | 0.84x |
+| `format=rtsa&compression=1` | 45.6 MB/s | 1.36x |
+| `format=rtsa&compression=3` | 37.7 MB/s | 1.64x |
+| `format=rtsa&compression=5` | 28.3 MB/s | 2.19x |
+| `format=rtsa&compression=7` | 18.4 MB/s | 3.36x |
+| `format=rtsa&compression=9` | 9.4 MB/s | 6.55x |
+
+Uncompressed, the container costs 20% *more* than raw `int16` — chunk
+headers and per-packet metadata. Everything above level 0 pays that back
+many times over.
+
+Two things this does not settle. Whether the crate can decode a
+compressed IQ payload is open: it parses the container already
+(`file_source.rs`) and decodes the documented spectra codec
+(`decompression.rs`), but `DSPT_IQ` compression is proprietary and
+undocumented, and the reader rejects it rather than emit wrong samples.
+And how much of the signal survives each level is unmeasured — "data
+loss increases" is Aaronia's phrasing, not a specification.
+
+`rate_reduction=N` rides in the same request but is time compression for
+frame-based payloads. Measured on IQ at 2, 8, 10 and 64, with and without
+`format=rtsa`, it changes neither the reported rate nor the byte rate.
+
+### Generic HTTP compression, and why raw IQ resists it
+
+The server does gzip its **control plane** — `/remoteconfig` comes back
+3,503 bytes against 17,432 — but not `/stream`. That matters less than it
+sounds, because raw IQ barely compresses with a general-purpose codec.
+Measured on a live V6 ECO, 24 MB per row, zlib level 1:
 
 | stream | ratio | distinct values | entropy |
 | :--- | ---: | ---: | ---: |
@@ -1055,30 +1105,13 @@ V6 ECO, 24 MB of payload per row, zlib level 1:
 | `format=int16&scale=1000000` | 1.24x | 7,335 | 11.76 bits/sample |
 | `format=float32` | 1.07x | — | — |
 
-The first row is the trap, not the opportunity. At the default `scale`
-the server has already quantised the signal to a couple of hundred
-distinct levels, so what compresses is information the encoding threw
-away — and `format=int16` already halves the wire against `float32`
-without any compression. Preserve the resolution with `scale=1e6` and
-the ratio collapses to 1.24x; send full-precision `float32` and it is
-1.07x, which is to say nothing. This matches the published result that
-noise-dominated IQ compresses to 53–84% of its original size.
-
-`rate_reduction=N` is not the answer either, and it is worth being
-precise about why. It is **time compression**, the same operation the
-`waterfall` payload is described by — it thins frames over time. A
-continuous IQ stream has no frames, so there is nothing for it to
-compress: measured against RTSA-Suite PRO and a V6 ECO at factors of 2,
-10 and 64, `sampleFrequency` stays at 15,359,988 Hz and the byte rate
-does not move. Accepted, answers 200, no effect. That is the parameter
-working as specified on a payload it was not meant for, not a fault.
-`live_stream_rate_reduction_and_scale` pins the IQ behaviour so the
-claim cannot drift back.
-
-That leaves one real lever: the wire format. `float32` to `int16` halves
-the byte rate outright. Beyond that, narrow the span — that moves the
-device down its decimation ladder, which genuinely reduces what it
-produces.
+The first row is a trap rather than an opportunity: at the default
+`scale` the server has already quantised the signal to a couple of
+hundred levels, so what compresses is information the encoding discarded.
+Preserve the resolution and the ratio collapses to 1.24x; send
+full-precision `float32` and it is 1.07x. This is the published result
+for noise-dominated IQ, 53–84% of original size. Aaronia's own codec beats
+it by being lossy and signal-aware, which is the whole difference.
 
 ### Format Selection Guidelines
 - **JSON**: Development and debugging, low data rates

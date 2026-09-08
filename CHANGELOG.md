@@ -39,15 +39,26 @@ All notable changes to this project will be documented in this file.
   `live_stream_rate_reduction_and_scale` had asserted only that packets
   arrived, which is true either way, so nothing caught the wrong
   description; it now pins the IQ behaviour.
-- **Measured whether compression could widen the link, and it cannot.**
-  The server gzips `/remoteconfig` (17,432 to 3,503 bytes) but returns no
-  `Content-Encoding` on `/stream` for gzip, deflate, br or zstd. Nor
-  would it help much: on a live V6 ECO, zlib manages 1.07x on `float32`
-  and 1.24x on `int16` at a resolution-preserving `scale`. The 2.54x that
-  default-`scale` int16 appears to offer is the default's own
-  quantisation — 218 distinct values, 6.06 bits of entropy per sample —
-  so it compresses well because the encoding already discarded the
-  information. Recorded in HTTPSPEC so it is not re-investigated.
+- **The stream can be compressed, up to 6.55x, via `format=rtsa`.**
+  Captured from RTSA-Suite's own HTTP Client block:
+  `GET /stream?format=rtsa&rate_reduction=8&input=main&compression=5&rate_adaption=0`.
+  `format=rtsa` streams the file container and is the only format that
+  accepts `compression=N`, which applies the file format's own lossy
+  codec. Measured on a V6 ECO at 15.36 MS/s against `format=int16`:
+  level 1 is 1.36x, level 5 is 2.19x, level 9 is 6.55x. Level 0 costs 20%
+  *more* than raw int16, being the container overhead with no codec.
+
+  HTTPSPEC had documented `format=rtsa` only as the thing a typo falls
+  back to — "a completely different wire format rather than an error" —
+  and this release had gone on to claim compression was neither offered
+  nor useful. Both are corrected. Generic HTTP compression is still not
+  available on `/stream` and still would not help (zlib manages 1.07x on
+  `float32`); Aaronia's codec wins by being lossy and signal-aware.
+
+  Two open questions are recorded rather than answered: whether this
+  crate can decode a compressed *IQ* payload, since `DSPT_IQ` compression
+  is proprietary and `decompression.rs` rejects it, and how much signal
+  each level costs.
 - The reader channel's size comment claimed ~157 KiB chunks and ~10 MB of
   queue. Measured against a live server it is 64 KiB for 71% of chunks,
   so the queue is ~4 MB, about 45 ms at the 88 MB/s a WiFi 6E path
