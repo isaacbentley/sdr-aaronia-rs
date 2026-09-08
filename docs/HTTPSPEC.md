@@ -1032,6 +1032,35 @@ The server supports two types of HTTP authorization:
 - Buffer management with chunked transfer encoding
 - Automatic rate adaptation available via `rate_adaption` parameter
 
+### Compression does not help, and is not offered
+
+The server gzips its **control plane** — `/remoteconfig` comes back
+3,503 bytes against 17,432 uncompressed — but `/stream` returns no
+`Content-Encoding` for any of `gzip`, `deflate`, `br` or `zstd`. Sample
+data crosses the wire raw, and no query parameter changes that.
+
+That is no great loss, because IQ barely compresses. Measured on a live
+V6 ECO, 24 MB of payload per row, zlib level 1:
+
+| stream | ratio | distinct values | entropy |
+| :--- | ---: | ---: | ---: |
+| `format=int16`, default `scale` | 2.54x | 218 | 6.06 bits/sample |
+| `format=int16&scale=1000000` | 1.24x | 7,335 | 11.76 bits/sample |
+| `format=float32` | 1.07x | — | — |
+
+The first row is the trap, not the opportunity. At the default `scale`
+the server has already quantised the signal to a couple of hundred
+distinct levels, so what compresses is information the encoding threw
+away — and `format=int16` already halves the wire against `float32`
+without any compression. Preserve the resolution with `scale=1e6` and
+the ratio collapses to 1.24x; send full-precision `float32` and it is
+1.07x, which is to say nothing. This matches the published result that
+noise-dominated IQ compresses to 53–84% of its original size.
+
+The levers that do work are the wire format (`float32` to `int16` halves
+the byte rate outright) and `rate_reduction=N`, which decimates at the
+server so the samples are never sent.
+
 ### Format Selection Guidelines
 - **JSON**: Development and debugging, low data rates
 - **Int16**: High data rates with acceptable quantization

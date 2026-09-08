@@ -29,6 +29,15 @@ All notable changes to this project will be documented in this file.
   is a property of the harness, not of the crate.
 
 ### Documentation
+- **Measured whether compression could widen the link, and it cannot.**
+  The server gzips `/remoteconfig` (17,432 to 3,503 bytes) but returns no
+  `Content-Encoding` on `/stream` for gzip, deflate, br or zstd. Nor
+  would it help much: on a live V6 ECO, zlib manages 1.07x on `float32`
+  and 1.24x on `int16` at a resolution-preserving `scale`. The 2.54x that
+  default-`scale` int16 appears to offer is the default's own
+  quantisation — 218 distinct values, 6.06 bits of entropy per sample —
+  so it compresses well because the encoding already discarded the
+  information. Recorded in HTTPSPEC so it is not re-investigated.
 - The reader channel's size comment claimed ~157 KiB chunks and ~10 MB of
   queue. Measured against a live server it is 64 KiB for 71% of chunks,
   so the queue is ~4 MB, about 45 ms at the 88 MB/s a WiFi 6E path
