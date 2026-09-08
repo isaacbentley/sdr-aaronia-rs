@@ -79,6 +79,93 @@ All notable changes to this project will be documented in this file.
   so the queue is ~4 MB, about 45 ms at the 88 MB/s a WiFi 6E path
   delivers.
 
+## [v0.8.2] - 2026-09-08
+
+The native-SDK backend, validated on a Spectran V6 ECO on Windows 11 for
+the first time. Every item below was found by running against the device;
+the suite that found them ships as `tests/native_sdk_live.rs`.
+
+### Fixed
+
+- **The SDK library could not load on a stock Windows install.** RTSA-Suite
+  PRO puts `AaroniaRTSAAPI.dll` in `sdk\` and its ~23 dependencies (Qt6,
+  avcodec, libcrypto, …) in the install root; `LoadLibraryExW` searches
+  neither, so detection found the file and the load failed with a bare
+  `LoadLibraryExW failed`. The install root is added to the DLL search list
+  (`AddDllDirectory`) and the library loaded with the
+  `LOAD_LIBRARY_SEARCH_*` flags that consult it — not `SetDllDirectory`,
+  which would switch safe search mode off for the whole host process.
+- **A V6 ECO was never found.** `init_native_sdk` enumerated the family
+  `spectranv6` only; the ECO answers to `spectranv6eco`, so a machine
+  holding one reported "No Spectran V6 devices found" with the device on
+  the bus. Each known family is now tried, as `detect_device_family`
+  already documented.
+- **ECO IQ came from the spectrum pipeline at 0.4 MS/s.** The ECO's raw-IQ
+  mode was mapped to `spectranv6eco/rtsa`, which is its spectrum pipeline
+  (`RawSpectrumEco.cpp`); IQ read from it arrived at ~0.4 MS/s whatever
+  rate was asked for. `spectranv6eco/iqreceiver` — the mode Aaronia's own
+  `IQReceiverEco.cpp` opens — is used instead. `/raw` also opens on an ECO
+  but has no `main/spanfreq`, so it cannot honour a requested rate.
+- **The ECO delivered 1.5× the requested rate.** In `iqreceiver` mode
+  `main/spanfreq` is a bandwidth and the pipeline streams at 1.5× it —
+  every rung exactly, 10 MHz → 15.0 MS/s, 15.36 → 23.04 — up to a
+  59.2 MS/s USB ceiling. The request is now translated so the caller gets
+  the rate it named on every backend: a 15.36 MS/s request measures
+  15.360 MS/s over 153 M samples.
+- **Native-SDK loss was invisible.** Packet flags `WARN_DROPPED` and
+  `TIME_DISCONTINUITY` were logged at debug level and nothing else, so
+  `cumulative_drops()` read 0 through any amount of loss and
+  `last_timestamp_ns()` read 0 always. Both, and `take_overrun()`, now
+  report the native source's packets. `WARN_INACCURATE` is deliberately
+  not an overrun: the ECO's fractional resampler sets it routinely.
+- **`sample_rate_hz()` echoed the request on native sources.** It now
+  reports the rate the device's packets carry once one has been read, as
+  the HTTP backend already did.
+- **`read_samples` and `read_samples_dual` returned one packet per call**
+  however large `max_samples` was. Both now drain already-queued packets
+  until the caller is satisfied, waiting only for the first — and not
+  even that when carry-over samples were already handed out, where the
+  old code could sleep out the whole poll deadline on a backlog.
+- **A `device_serial` in the second family was never found.** Family
+  enumeration stopped at the first family holding any device, so a
+  machine with both a V6 and an ECO could not select the ECO by serial.
+  Every family is enumerated and the serial resolved across them.
+- **Python could not ask for the SDK.** `python-aaronia` depended on the
+  crate's default features, which exclude the backend, and `aaronia.open()`
+  with neither `url` nor `file` pinned to localhost HTTP rather than
+  auto-detecting. A `native-sdk` feature and `open(sdk=True, serial=…)` /
+  `AaroniaConfig.native_sdk` select it explicitly; a missing SDK is then
+  an error, never a silent fallback.
+- **A unit test assumed no SDK on the machine.**
+  `test_detect_best_source_type_localhost_fallback` asserted the
+  localhost-HTTP fallback unconditionally, so `cargo test` failed on any
+  machine with RTSA-Suite installed — the one place the backend gets
+  tested. It now asserts the actual rule: the SDK when installed, HTTP
+  otherwise.
+- **The Soapy plugin's Windows build assumed MSVC.** The Rust static-lib
+  name is keyed on the compiler now, not the OS; the windows-gnu toolchain
+  emits `libsdr_aaronia_rs.a`.
+
+### Added
+
+- `tests/native_sdk_live.rs`: thirteen hardware tests — detection,
+  identity, ten open/close cycles, a centre-frequency sweep, mid-stream
+  retune, a span-ladder characterisation that records the device-reported
+  rate per rung, a steady-state rate check, a soak with drop accounting,
+  error-message quality, and the Seify and C-ABI paths.
+- `scripts/native-sdk-validate.ps1`: runs the whole matrix on a Windows
+  machine with a device.
+- `NativeSdkSource::{observed_sample_rate_hz, cumulative_drops,
+  take_overrun, last_timestamp_ns}`.
+
+### Measured on a V6 ECO (Windows 11, RTSA-Suite PRO 3.0.3)
+
+Every ladder rung from 3.84 to 49.152 MHz delivers exactly the requested
+rate, 3/3 trials each; 61.44 MHz caps at 59.214 MS/s. Steady-state
+delivery is 100.0% of the reported rate. The `iqreceiver` pipeline
+delivers ~40% of rate for the first ~5 s after start, then settles; the
+rate and soak tests warm up past it.
+
 ## [v0.8.1] - 2026-09-07
 
 ### Fixed

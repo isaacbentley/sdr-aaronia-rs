@@ -25,6 +25,14 @@ cd python-aaronia
 maturin develop --release
 ```
 
+To reach the Aaronia native SDK as well — a Spectran on this machine's
+USB, with RTSA-Suite PRO installed, on Windows or Linux — build with the
+feature; the default wheel speaks only HTTP and files:
+
+```bash
+maturin develop --release --features native-sdk
+```
+
 Check your setup before writing any code:
 
 ```bash
@@ -55,6 +63,15 @@ own schedule, or for Apache Arrow:
 
 ```python
 src = aaronia.open(freq=2.44e9, rate=15.36e6, format="I16")
+```
+
+`sdk=True` opens the device through the native SDK instead of a server
+(`serial=` picks one of several). It is an error, not a fallback, when
+the SDK is missing — a capture never quietly comes from another backend:
+
+```python
+src = aaronia.open(sdk=True, freq=2.44e9, rate=15.36e6)
+src = aaronia.open(sdk=True, serial="C2-P-03000105", freq=2.44e9)
 samples = src.read_samples_numpy(65536)       # numpy complex64 array
 batch = src.read_samples_arrow(65536)         # pyarrow FixedSizeListArray of [re, im]
 src.set_center_frequency(2.41e9)              # live retune, no teardown
@@ -142,6 +159,7 @@ Every field is readable and writable.
 | `http_base_url` | RTSA-Suite HTTP server URL; pins the HTTP backend |
 | `file_path` | Path to a recorded `.rtsa` file; pins the file backend |
 | `device_serial` | Device selection for the native-SDK backend |
+| `native_sdk` | `True` pins the source to the native SDK; missing SDK is an error |
 | `center_freq` | Center frequency, Hz |
 | `sample_rate` | IQ sample rate, Hz (the Aaronia "span") |
 | `reference_level` | Reference level, dBm |

@@ -72,14 +72,29 @@ RTSA-Suite PRO 3.0.3.16655 for Linux (2026-09-07):
   (`/opt/aaronia-rtsa-suite/Aaronia-RTSA-Suite-PRO/`) beside
   `paths.xml`; `sdk/` holds only the header, licence and samples.
   Earlier layouts put it under `sdk/`, and detection checks both.
+- **Windows is the other way round**, and it matters: the same release
+  puts `AaroniaRTSAAPI.dll` (21 MB, x64) in `sdk\`, while the ~23
+  libraries it imports (Qt6Core, Qt6Gui, avcodec-61, libcrypto-4-x64, …)
+  live in the install root one level up. `LoadLibraryExW` searches
+  neither the DLL's own directory nor its parent, so on a stock install
+  the load failed with a bare `LoadLibraryExW failed` after detection had
+  found the file. The crate now adds the install root with
+  `AddDllDirectory` and loads with `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
+  LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`, so neither `PATH` nor the working
+  directory is consulted; putting the root on `PATH` was the only way to
+  make it load before that.
 - **`gpssats`** is the samples' name for the satellite count under
   `AARTSAAPI_ConfigHealth`; the HTTP tree calls it `satellites`. The
   health walker accepts both. No sample reads a temperature field, so
   `fronttemp` — measured live over HTTP — stands.
-- **`spectranv6eco/raw`** is listed in the samples' Readme, but the
-  SDK's own ECO sample (`RawSpectrumEco.cpp`) opens `spectranv6eco/rtsa`,
-  as this crate does for a bare ECO family. Whether `/raw` opens on an
-  ECO is unverified here.
+- **The ECO's three IQ-capable modes, measured** (V6 ECO, Windows 11,
+  3.0.3.16655, a 15.36 MHz request): `spectranv6eco/rtsa` — the mode
+  `RawSpectrumEco.cpp` opens — is the spectrum pipeline and yields IQ at
+  0.45 MS/s; `spectranv6eco/iqreceiver` — `IQReceiverEco.cpp` — yields
+  14.2 MS/s before the span translation below and exactly the request
+  after it; `spectranv6eco/raw` does open, contrary to the earlier note
+  here, but has no `main/spanfreq` and streamed 38 MS/s regardless of
+  the request. The crate opens `iqreceiver`.
 - **Packet warning flags** (`WARN_OVERFLOW` 0x100, `WARN_DROPPED`
   0x200, `WARN_INACCURATE` 0x400, `TIME_DISCONTINUITY` 0x10000) match
   `native_sdk::tx_flags`; the receive path logs them at debug.
@@ -305,6 +320,35 @@ let devices = source.find_devices("spectranv6/raw")?;
 let devices = source.find_devices("spectranv6")?;
 source.open_device("spectranv6/raw", &serial_wide)?;
 ```
+
+Do not hardcode the family either. `EnumDevice` matches one family at a
+time, so `"spectranv6"` finds nothing on a machine holding a V6 ECO, which
+enumerates under `"spectranv6eco"` — and the failure reads as "no device"
+with the unit sitting on the USB bus. `NativeSdkClient::DEVICE_FAMILIES`
+lists both; try each, or let `open_detected_device` do it. Take the mode
+from whichever answered: the ECO's IQ mode is `iqreceiver`
+(`raw_mode_for_family`) — its `rtsa` is the spectrum pipeline, and IQ
+read from it arrives at ~0.4 MS/s whatever rate was asked. `AaroniaSource`
+does this since 0.8.2; before that it enumerated `spectranv6` only and
+could not open an ECO, and 0.8.1's ECO path opened `rtsa`.
+
+### ECO `iqreceiver`: span is bandwidth, rate is 1.5× it
+
+On `spectranv6eco/iqreceiver`, `main/spanfreq` is a *bandwidth* and the
+pipeline delivers samples at exactly 1.5× it, continuously rather than on
+a `/2ⁿ` ladder: a 10 MHz request streams at 15.0 MS/s, 15.36 at 23.04,
+24.576 at 36.864, capped at 59.214 MS/s (474 MB/s — the USB 3 link).
+Every rung of a request→delivered sweep was ×1.5 to the third decimal.
+This crate's `span_frequency` is the sample rate (the HTTP backend
+delivers exactly it), so `configure_iq_receiver` writes `span / 1.5` on
+this mode and the caller gets the rate it named on every backend; a
+15.36 MS/s request now measures 15.360 MS/s, and `sample_rate_hz` reports
+what the packets carry. Two more measured facts: the pipeline delivers
+~40% of rate for ~5 s after start and flags one `TIME_DISCONTINUITY` as
+it settles, then holds 100.0% with no further flags; and it sets
+`WARN_INACCURATE` on most packets while its fractional resampler runs,
+which is why that flag is not treated as an overrun. `spectranv6/raw` on
+a full V6 has not been measured and is left untranslated.
 
 ### IQ-mode receiver clock constraint
 
@@ -974,7 +1018,7 @@ reads a single stream and deinterleaves it, so it writes `Rx12`.
 | `device/receiverchannel` | Set explicitly | Never set: one receiver |
 | `device/receiverclock` | Set, `"92MHz"` or `"245MHz"` | Never set: fixed |
 | Spectrum packets | Stream index 2 | Stream index 0 |
-| Raw-mode open string | `spectranv6/raw` | `spectranv6eco/rtsa` |
+| IQ-mode open string | `spectranv6/raw` | `spectranv6eco/iqreceiver` |
 
 The clock matters beyond configuration: with `span * 1.5 <=
 receiverclock`, a V6 on the `245MHz` clock reaches roughly 163 MHz of

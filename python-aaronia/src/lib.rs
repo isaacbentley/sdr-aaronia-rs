@@ -276,6 +276,28 @@ impl PyAaroniaConfig {
         self.inner.device_serial.clone()
     }
 
+    /// Pin the source to the Aaronia native SDK (Windows/Linux, with
+    /// RTSA-Suite PRO installed and the wheel built with the
+    /// ``native-sdk`` feature). Unlike leaving ``http_base_url`` and
+    /// ``file_path`` unset — which auto-detects and quietly falls back
+    /// to localhost HTTP when the SDK is absent — this makes a missing
+    /// SDK an error, so a capture never silently comes from the wrong
+    /// backend.
+    #[setter]
+    fn set_native_sdk(&mut self, on: bool) {
+        use sdr_aaronia_rs::unified_source::SourceType;
+        if on {
+            self.inner.force_source_type = Some(SourceType::NativeSdk);
+        } else if self.inner.force_source_type == Some(SourceType::NativeSdk) {
+            self.inner.force_source_type = None;
+        }
+    }
+
+    #[getter]
+    fn get_native_sdk(&self) -> bool {
+        self.inner.force_source_type == Some(sdr_aaronia_rs::unified_source::SourceType::NativeSdk)
+    }
+
     /// Seconds a blocking read waits for samples before raising
     /// `AaroniaTimeoutError` (default 30.0). Must be > 0.
     #[setter]
@@ -635,7 +657,7 @@ fn sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
 /// spectrum you want to see, from which a real rate is chosen). Pass
 /// `file` instead of `url` to play back a recording.
 #[pyfunction]
-#[pyo3(signature = (url=None, *, freq=None, rate=None, bandwidth=None, ref_level=None, file=None, format=None, scale=None, read_timeout=None))]
+#[pyo3(signature = (url=None, *, freq=None, rate=None, bandwidth=None, ref_level=None, file=None, sdk=false, serial=None, format=None, scale=None, read_timeout=None))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
@@ -645,13 +667,25 @@ fn open(
     bandwidth: Option<f64>,
     ref_level: Option<f64>,
     file: Option<String>,
+    sdk: bool,
+    serial: Option<String>,
     format: Option<&str>,
     scale: Option<f64>,
     read_timeout: Option<f64>,
 ) -> PyResult<Py<PyAaroniaSource>> {
-    if url.is_some() && file.is_some() {
+    if [url.is_some(), file.is_some(), sdk]
+        .iter()
+        .filter(|&&b| b)
+        .count()
+        > 1
+    {
         return Err(PyValueError::new_err(
-            "give url or file, not both: they select different backends",
+            "give one of url, file or sdk=True: they select different backends",
+        ));
+    }
+    if serial.is_some() && !sdk {
+        return Err(PyValueError::new_err(
+            "serial selects a device on the native SDK; pass sdk=True with it",
         ));
     }
     if rate.is_some() && bandwidth.is_some() {
@@ -661,12 +695,16 @@ fn open(
     }
 
     let mut cfg = PyAaroniaConfig::new();
-    match (&url, &file) {
-        (Some(u), _) => cfg.set_http_base_url(Some(u.clone())),
-        (None, Some(f)) => cfg.set_file_path(Some(f.clone())),
-        // Neither: the RTSA HTTP server's own default, which is where
-        // it listens on the machine running RTSA-Suite.
-        (None, None) => cfg.set_http_base_url(Some("http://localhost:54664".to_string())),
+    match (&url, &file, sdk) {
+        (Some(u), _, _) => cfg.set_http_base_url(Some(u.clone())),
+        (None, Some(f), _) => cfg.set_file_path(Some(f.clone())),
+        (None, None, true) => {
+            cfg.set_native_sdk(true);
+            cfg.set_device_serial(serial.clone());
+        }
+        // Nothing chosen: the RTSA HTTP server's own default, which is
+        // where it listens on the machine running RTSA-Suite.
+        (None, None, false) => cfg.set_http_base_url(Some("http://localhost:54664".to_string())),
     }
     if let Some(freq) = freq {
         cfg.set_center_freq(freq);

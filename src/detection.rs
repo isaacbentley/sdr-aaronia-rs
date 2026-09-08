@@ -105,7 +105,10 @@ pub fn get_sdk_library_path() -> Option<String> {
     let lib_name = sdk_library_name()?;
     let root = Path::new(&sdk_path);
     let mut roots = vec![root.to_path_buf()];
-    if root.file_name().is_some_and(|n| n == "sdk")
+    if root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("sdk"))
         && let Some(parent) = root.parent()
     {
         roots.push(parent.to_path_buf());

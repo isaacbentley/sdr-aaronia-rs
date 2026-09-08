@@ -1,6 +1,6 @@
 [package]
 name = "python-aaronia"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 description = "Python bindings for sdr-aaronia-rs (Aaronia SPECTRAN V6 SDR source)"
 license = "GPL-3.0-or-later"
@@ -11,6 +11,13 @@ publish = false
 [lib]
 name = "aaronia"
 crate-type = ["cdylib"]
+
+[features]
+# Reach the Aaronia native SDK (Windows/Linux, RTSA-Suite PRO installed):
+#   maturin develop --release --features native-sdk
+# Without it the wheel can only speak HTTP and play back files — the
+# crate's default feature set does not include the SDK backend.
+native-sdk = ["sdr-aaronia-rs/native-sdk"]
 
 [dependencies]
 sdr-aaronia-rs = { path = "../" }

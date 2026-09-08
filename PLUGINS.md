@@ -17,6 +17,12 @@ sdr-aaronia-rs = { version = "0.8", features = ["seify"] }
 
 Instantiate the device with `AaroniaSeifyDevice::from_args` and use it directly (or via `seify::dev::DynDeviceBackend`). The backend is **not** part of seify's built-in enumeration registry — `seify::enumerate()` will not discover it.
 
+`url=` selects the HTTP backend and `file=` playback. `sdk=true` (or
+`serial=<device serial>`) selects the Aaronia native SDK; that needs the
+crate built with both features — `features = ["seify", "native-sdk"]` —
+on Windows or Linux with RTSA-Suite PRO installed. Without the feature
+the request is a clean error, never a fallback to HTTP.
+
 ```rust
 use sdr_aaronia_rs::seify_impl::AaroniaSeifyDevice;
 use seify::{Args, RxDevice, RxStreamer, DeviceInfo};
@@ -63,6 +69,15 @@ The plugin requires `cmake`, `SoapySDR`, and the compiled `sdr-aaronia-rs` stati
    cmake ..
    make
    ```
+
+   On Windows, point CMake at the SoapySDR you will load the module into
+   — `-DSoapySDR_DIR="C:\Program Files\PothosSDR\cmake"` for PothosSDR,
+   or `<radioconda>\Library\cmake` for a GNU Radio (radioconda) install —
+   and build with **MSVC**. Both of those runtimes are MSVC-built, and a
+   SoapySDR module is C++ (virtual classes, `std::string` across the
+   boundary), so a MinGW-built module cannot load into them; the Rust
+   side must then be the `x86_64-pc-windows-msvc` toolchain too. Add
+   `-DAARONIA_NATIVE_SDK=ON` for the native-SDK backend.
 
 3. Ensure SoapySDR can find the plugin. You can install it to your system's Soapy modules directory (e.g. `/usr/local/lib/SoapySDR/modules0.8/`) or set the `SOAPY_SDR_PLUGIN_PATH` environment variable:
    ```bash

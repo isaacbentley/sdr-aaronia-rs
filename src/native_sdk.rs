@@ -14,6 +14,8 @@
 use crate::{Error, Result};
 use libloading::{Library, Symbol};
 use num_complex::Complex32;
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::OsStrExt;
 // `tracing`, not `log`: the rest of the crate emits tracing events, and a
 // split ecosystem meant SDK-path logs vanished for tracing-only
 // subscribers.
@@ -511,6 +513,70 @@ pub struct NativeSdkClient {
     send_packet: AARTSAAPI_SendPacket,
 }
 
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    /// Adds one directory to the list searched when a library is loaded
+    /// with `LOAD_LIBRARY_SEARCH_USER_DIRS`. Declared directly rather
+    /// than pulling in a Windows binding crate for a single call.
+    /// Returns an opaque cookie, null on failure. Chosen over
+    /// `SetDllDirectoryW`, which replaces the process's single directory
+    /// slot and switches safe DLL search mode off for every later load
+    /// in the process — a hijack surface inside a host like Python or
+    /// GNU Radio.
+    fn AddDllDirectory(path: *const u16) -> *mut std::ffi::c_void;
+}
+
+/// Add the SDK install root to the DLL search list so the library's
+/// sibling dependencies resolve when it is loaded with the
+/// `LOAD_LIBRARY_SEARCH_*` flags (see the load site).
+///
+/// `lib_path` is `<root>\sdk\AaroniaRTSAAPI.dll` on a normal install
+/// and `<root>\AaroniaRTSAAPI.dll` on the flatter layout; the
+/// dependencies live in `<root>` either way, so step out of a `sdk`
+/// directory when that is where the library was found. `lib_path` is
+/// already absolute — `AddDllDirectory` requires it — and the `sdk`
+/// name is compared case-insensitively, as the filesystem is. The
+/// entry is deliberately
+/// not removed after loading: Qt resolves its plugins later, from the
+/// same directory.
+#[cfg(target_os = "windows")]
+fn add_sdk_root_to_dll_search_path(lib_path: &str) {
+    let Some(dir) = std::path::Path::new(lib_path).parent() else {
+        return;
+    };
+    let in_sdk_dir = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("sdk"));
+    let root = if in_sdk_dir {
+        dir.parent().unwrap_or(dir)
+    } else {
+        dir
+    };
+    // `lib_path` is absolute by the time it gets here; this guards the
+    // one way a root could still come out empty.
+    if root.as_os_str().is_empty() {
+        return;
+    }
+
+    let wide: Vec<u16> = root
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // A failure here is not fatal: the load may still succeed, and its
+    // error is the one worth reporting.
+    if unsafe { AddDllDirectory(wide.as_ptr()) }.is_null() {
+        warn!(
+            "AddDllDirectory({}) failed; SDK dependencies may not resolve",
+            root.display()
+        );
+    } else {
+        debug!("DLL search list now includes {}", root.display());
+    }
+}
+
 impl NativeSdkClient {
     pub unsafe fn new() -> Result<Self> {
         unsafe {
@@ -520,9 +586,47 @@ impl NativeSdkClient {
                         .to_string(),
                 )
             })?;
+            // Fully qualify it once, here, before anything derives from
+            // it: a relative `AARONIA_SDK_PATH` yields a relative library
+            // path, which `LoadLibraryExW` rejects outright under the
+            // `LOAD_LIBRARY_SEARCH_*` flags, and whose parent-of-parent
+            // is `""` — the working directory — which must never reach
+            // the search list.
+            let lib_path = std::path::absolute(&lib_path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(lib_path);
+
+            // Windows ships `AaroniaRTSAAPI.dll` inside `sdk\\`, but the
+            // ~23 libraries it imports (Qt6Core, Qt6Gui, avcodec,
+            // libcrypto, …) sit in the *install root* one level up. The
+            // default loader searches neither the DLL's own directory
+            // nor its parent, so on a stock RTSA-Suite install
+            // `LoadLibraryExW` fails with a bare "failed" even though the
+            // file resolved fine — the backend was unusable until the
+            // caller happened to put the install root on `PATH`. Add the
+            // root to the search list, then load with the
+            // `LOAD_LIBRARY_SEARCH_*` flags that consult it (plus the
+            // DLL's own directory and System32 — not the working
+            // directory, and not `PATH`).
+            #[cfg(target_os = "windows")]
+            add_sdk_root_to_dll_search_path(&lib_path);
 
             info!("Loading Aaronia SDK library: {}", lib_path);
-            let lib = Library::new(&lib_path).map_err(|e| {
+            #[cfg(target_os = "windows")]
+            let loaded = {
+                use libloading::os::windows::{
+                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+                    Library as WinLibrary,
+                };
+                WinLibrary::load_with_flags(
+                    &lib_path,
+                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+                )
+                .map(Library::from)
+            };
+            #[cfg(not(target_os = "windows"))]
+            let loaded = Library::new(&lib_path);
+            let lib = loaded.map_err(|e| {
                 Error::Sdk(format!("Failed to load SDK library {}: {}", lib_path, e))
             })?;
 
@@ -1308,7 +1412,13 @@ pub(crate) fn split_device_type<'a>(device_type: &'a str, default_mode: &str) ->
 /// `rtsa` on the ECO, which has no `spectranv6eco/raw`.
 pub(crate) fn raw_mode_for_family(family: &str) -> &'static str {
     if family == "spectranv6eco" {
-        "rtsa"
+        // Not `rtsa`: that is the ECO's spectrum pipeline, and IQ read
+        // out of it arrives at ~0.4 MS/s whatever rate was asked for.
+        // `iqreceiver` is the mode Aaronia's IQReceiverEco.cpp opens, and
+        // it delivered 14.2 MS/s of a 15.36 MS/s request on a V6 ECO.
+        // `raw` also opens on an ECO but has no `main/spanfreq`, so it
+        // ignores the requested rate entirely.
+        "iqreceiver"
     } else {
         "raw"
     }
@@ -1381,8 +1491,10 @@ pub enum DeviceOpenMode {
     Raw,
     /// `spectranv6eco/iqreceiver` — IQ receiver on the ECO platform.
     EcoIqReceiver,
-    /// `spectranv6eco/rtsa` — the ECO's raw pipeline, which is what its
-    /// spectrum sample opens. There is no `spectranv6eco/raw`.
+    /// `spectranv6eco/rtsa` — the ECO's spectrum pipeline, which is what
+    /// its `RawSpectrumEco` sample opens. IQ can be read from it, but
+    /// arrives at ~0.4 MS/s regardless of the requested rate; use
+    /// [`Self::EcoIqReceiver`] for IQ.
     EcoRtsa,
     /// `spectranv6/sweepsa` — sweep spectrum analyzer on the V6 platform.
     Sweepsa,
@@ -1400,8 +1512,6 @@ impl DeviceOpenMode {
     pub fn from_open_string(s: &str) -> Self {
         match s {
             "spectranv6/raw" => Self::Raw,
-            // The ECO's equivalent of raw mode is called rtsa; it has no
-            // "spectranv6eco/raw".
             "spectranv6eco/rtsa" => Self::EcoRtsa,
             "spectranv6eco/iqreceiver" => Self::EcoIqReceiver,
             "spectranv6/sweepsa" => Self::Sweepsa,
@@ -1462,6 +1572,28 @@ pub struct NativeSdkSource {
     /// to know which rates exist should read it rather than assume the
     /// default. `None` until the device has been configured.
     receiver_clock_hz: Option<f64>,
+    /// Sample rate the device itself reports in its packets
+    /// (`AARTSAAPI_Packet::stepFrequency`), from the most recent one
+    /// read. This is the ground truth for what is arriving: the
+    /// configured span is only a request, and an ECO opened in the
+    /// wrong mode delivered 3% of it while every report still echoed
+    /// the request. `None` until the first packet, and cleared when
+    /// streaming stops.
+    observed_sample_rate_hz: Option<f64>,
+    /// Packets the device flagged `WARN_DROPPED` or `TIME_DISCONTINUITY`
+    /// since this source was created — the native counterpart of the
+    /// HTTP drop detector's gap count. Until this existed the flags were
+    /// logged at debug level and nothing else, so a caller polling
+    /// `cumulative_drops` saw 0 through any amount of loss.
+    drop_events: u64,
+    /// Set when a packet carried `WARN_OVERFLOW`, `WARN_DROPPED` or
+    /// `TIME_DISCONTINUITY` — the stream is not contiguous. Not
+    /// `WARN_INACCURATE`, which the ECO's resampler sets routinely and
+    /// which loses nothing; cleared by [`Self::take_overrun`].
+    overrun_pending: bool,
+    /// `AARTSAAPI_Packet::endTime` of the most recent packet, seconds
+    /// since the epoch (0.0 before any packet).
+    last_packet_end_time_s: f64,
 }
 
 /// Which of the two packet-consuming read paths a streaming session
@@ -1557,6 +1689,10 @@ impl NativeSdkSource {
                 dual_sample_buffer: VecDeque::new(),
                 read_mode: None,
                 receiver_clock_hz: None,
+                observed_sample_rate_hz: None,
+                drop_events: 0,
+                overrun_pending: false,
+                last_packet_end_time_s: 0.0,
             })
         }
     }
@@ -1996,11 +2132,34 @@ impl NativeSdkSource {
                 warn!("Could not find main/centerfreq config");
             }
 
-            // Configure span frequency (for IQ receiver mode)
+            // Configure span frequency (for IQ receiver mode).
+            //
+            // On `spectranv6eco/iqreceiver` the key is a *bandwidth*, and
+            // the pipeline delivers samples at 1.5x it — measured on a
+            // V6 ECO: a 15.36 MHz request streamed at 23.04 MS/s, 10 MHz
+            // at 15.0, every rung exactly x1.5 up to a 59.2 MS/s USB
+            // ceiling. This crate's `span_frequency` *is* the sample
+            // rate (the HTTP backend delivers exactly it), so ask the
+            // ECO for rate / 1.5 and the caller gets the rate it named
+            // on every backend. `spectranv6/raw` is left as-is: not
+            // measured here.
+            let eco_iq = self.open_mode == Some(DeviceOpenMode::EcoIqReceiver);
+            let span_to_write = if eco_iq {
+                span_freq / crate::utils::IQ_RATE_CLOCK_RATIO
+            } else {
+                span_freq
+            };
             if let Ok(mut config) = self.client.find_config(device, &mut root, "main/spanfreq") {
                 self.client
-                    .set_config_float(device, &mut config, span_freq)?;
-                info!("Set span frequency to {} Hz", span_freq);
+                    .set_config_float(device, &mut config, span_to_write)?;
+                if eco_iq {
+                    info!(
+                        "Set span frequency to {} Hz (bandwidth) for a {} S/s rate",
+                        span_to_write, span_freq
+                    );
+                } else {
+                    info!("Set span frequency to {} Hz", span_freq);
+                }
             } else {
                 warn!("Could not find main/spanfreq config");
             }
@@ -2197,6 +2356,31 @@ impl NativeSdkSource {
     pub const READ_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
     pub const READ_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
 
+    /// The sample rate the device reports in its packets, once one has
+    /// been read — see the field for why this, not the configured span,
+    /// is the number to trust. `None` before the first packet.
+    pub fn observed_sample_rate_hz(&self) -> Option<f64> {
+        self.observed_sample_rate_hz
+    }
+
+    /// Packets the device flagged as dropped or time-discontinuous
+    /// since this source was created. See the field.
+    pub fn cumulative_drops(&self) -> u64 {
+        self.drop_events
+    }
+
+    /// Whether any packet since the last call carried an overflow,
+    /// dropped or time-discontinuity flag. Clears on read.
+    pub fn take_overrun(&mut self) -> bool {
+        std::mem::take(&mut self.overrun_pending)
+    }
+
+    /// End time of the most recent packet in nanoseconds since the
+    /// epoch, or 0 before any packet.
+    pub fn last_timestamp_ns(&self) -> i64 {
+        (self.last_packet_end_time_s * 1e9) as i64
+    }
+
     /// The receiver clock in Hz, once the device has been configured.
     ///
     /// Worth reading rather than assuming: the sample-rate ladder runs
@@ -2359,8 +2543,10 @@ impl NativeSdkSource {
     ///   [`Self::READ_POLL_DEADLINE`].
     /// - The return value counts samples appended to `buffer` by this call,
     ///   not samples taken from the device.
-    /// - A short read still means "no more data right now" — at most one
-    ///   packet is fetched per call, as before.
+    /// - A short read still means "no more data right now": the call waits
+    ///   (up to [`Self::READ_POLL_DEADLINE`]) only for the first packet,
+    ///   then takes whatever else is already queued and returns. It never
+    ///   sleeps to top up a partial read.
     pub unsafe fn read_samples(
         &mut self,
         buffer: &mut Vec<Complex32>,
@@ -2371,8 +2557,8 @@ impl NativeSdkSource {
 
     /// [`Self::read_samples`] with the wait for a packet bounded by
     /// `poll_budget` instead of [`Self::READ_POLL_DEADLINE`]. A zero
-    /// budget drains carry-over and takes one already-queued packet
-    /// without sleeping.
+    /// budget drains carry-over and any already-queued packets without
+    /// sleeping.
     ///
     /// # Safety
     /// Same contract as [`Self::read_samples`].
@@ -2428,29 +2614,46 @@ impl NativeSdkSource {
                 .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
 
             let mut samples_read = from_carry;
+            let mut remaining = remaining;
 
-            // Poll for a packet matching the canonical sample loop:
+            // Poll for the first packet matching the canonical sample loop:
             //   while ((res = AARTSAAPI_GetPacket(...)) == AARTSAAPI_EMPTY)
             //       std::this_thread::sleep_for(std::chrono::milliseconds(5));
             // We additionally bound the total wait so a misbehaving device
             // can't deadlock the caller.
+            //
+            // With one packet in hand, keep taking packets that are
+            // *already queued* — never sleeping — until the caller is
+            // satisfied. This used to return after a single packet, so a
+            // call delivered one packet's worth however large
+            // `max_samples` was: measured on a V6 ECO at 15.36 MS/s, the
+            // caller saw 0.3–0.6 MS/s while the SDK's queue filled behind
+            // it. Only the first packet is ever waited for, so latency is
+            // unchanged — a call still returns as soon as any data exists.
             let started = std::time::Instant::now();
-            let packet_opt = loop {
-                match self.client.get_packet(device, 0, 0)? {
-                    Some(p) => break Some(p),
+            // Samples already handed over from carry-over count as "data
+            // in hand": a caller draining a backlog must not sleep out
+            // the poll budget for a packet that is not there.
+            let mut got_packet = from_carry > 0;
+
+            while remaining > 0 {
+                let packet = match self.client.get_packet(device, 0, 0)? {
+                    Some(p) => p,
+                    // Queue drained: hand back what we have rather than
+                    // waiting for the device to produce more.
+                    None if got_packet => break,
                     None => {
                         let elapsed = started.elapsed();
                         if elapsed >= poll_budget {
-                            break None;
+                            break;
                         }
                         // Never sleep past the budget: a sub-interval
                         // deadline gets the remainder, not a full tick.
                         std::thread::sleep(Self::READ_POLL_INTERVAL.min(poll_budget - elapsed));
+                        continue;
                     }
-                }
-            };
-
-            if let Some(packet) = packet_opt {
+                };
+                got_packet = true;
                 // `stride` is "floats from sample to sample". A tightly packed
                 // IQ pair is 2; interleaved multi-channel layouts are a small
                 // multiple. Accept only that range: a stride < 2 is a non-IQ
@@ -2481,6 +2684,22 @@ impl NativeSdkSource {
                         | tx_flags::WARN_INACCURATE
                         | tx_flags::TIME_DISCONTINUITY);
                 if warned != 0 {
+                    if warned & (tx_flags::WARN_DROPPED | tx_flags::TIME_DISCONTINUITY) != 0 {
+                        self.drop_events += 1;
+                    }
+                    // Not `WARN_INACCURATE`: the ECO's iqreceiver sets it on most
+                    // packets when its fractional resampler is in use (a 30 s soak at
+                    // 15.36 MS/s saw it 4121 times against one real discontinuity).
+                    // It is a quality note, not lost samples; an overrun means the
+                    // stream is not contiguous.
+                    if warned
+                        & (tx_flags::WARN_OVERFLOW
+                            | tx_flags::WARN_DROPPED
+                            | tx_flags::TIME_DISCONTINUITY)
+                        != 0
+                    {
+                        self.overrun_pending = true;
+                    }
                     tracing::debug!(
                         "SDK packet flags 0x{:x}: overflow={} dropped={} inaccurate={} \
                          time_discontinuity={}",
@@ -2524,9 +2743,9 @@ impl NativeSdkSource {
                     let (to_caller, _to_carry) = split_packet(packet_samples, remaining);
 
                     // `packet_samples >= 1` (guarded by `packet.num > 0`
-                    // above) and `remaining >= 1` (a fully-satisfied caller
-                    // returned before polling), so neither the `- 1` below nor
-                    // the slice splits can underflow.
+                    // above) and `remaining >= 1` (the loop guard), so
+                    // neither the `- 1` below nor the slice splits can
+                    // underflow.
                     if stride == 2 {
                         // Tightly packed IQ pairs — the common raw-IQ layout.
                         let complex_slice = std::slice::from_raw_parts(
@@ -2558,6 +2777,13 @@ impl NativeSdkSource {
                             .extend((to_caller..packet_samples).map(sample_at));
                     }
                     samples_read += to_caller;
+                    remaining -= to_caller;
+                    if packet.step_frequency > 0.0 {
+                        self.observed_sample_rate_hz = Some(packet.step_frequency);
+                    }
+                    if packet.end_time > 0.0 {
+                        self.last_packet_end_time_s = packet.end_time;
+                    }
 
                     // `trace!`, not `info!`: this runs on every read call
                     // (thousands/sec at speed), so an enabled info subscriber
@@ -2570,10 +2796,12 @@ impl NativeSdkSource {
 
                 // Consume the packet
                 self.client.consume_packets(device, 0, 1)?;
-            } else {
+            }
+
+            if !got_packet {
                 debug!(
                     "read_samples: no packet within {:?} (stream live but idle)",
-                    Self::READ_POLL_DEADLINE
+                    poll_budget
                 );
             }
 
@@ -2656,19 +2884,27 @@ impl NativeSdkSource {
             let mut pairs_read = from_carry;
 
             let started = std::time::Instant::now();
-            let packet_opt = loop {
-                match self.client.get_packet(device, 0, 0)? {
-                    Some(p) => break Some(p),
+            // The same drain as `read_samples_within`: wait, up to the
+            // deadline, for the first packet only, then take whatever
+            // else is already queued until the caller is satisfied.
+            // Carry-over already handed out counts as data in hand, so a
+            // caller draining a backlog never sleeps out the deadline.
+            let mut remaining = remaining;
+            let mut got_packet = from_carry > 0;
+
+            while remaining > 0 {
+                let packet = match self.client.get_packet(device, 0, 0)? {
+                    Some(p) => p,
+                    None if got_packet => break,
                     None => {
                         if started.elapsed() >= Self::READ_POLL_DEADLINE {
-                            break None;
+                            break;
                         }
                         std::thread::sleep(Self::READ_POLL_INTERVAL);
+                        continue;
                     }
-                }
-            };
-
-            if let Some(packet) = packet_opt {
+                };
+                got_packet = true;
                 if !packet.fp32.is_null() && packet.num > 0 {
                     // Same corruption backstop as `read_samples`; the
                     // dual lower bound (4 floats per sample) is enforced
@@ -2750,6 +2986,41 @@ impl NativeSdkSource {
                         }
                     }
                     pairs_read += to_caller;
+                    remaining -= to_caller;
+                    if packet.step_frequency > 0.0 {
+                        self.observed_sample_rate_hz = Some(packet.step_frequency);
+                    }
+                    if packet.end_time > 0.0 {
+                        self.last_packet_end_time_s = packet.end_time;
+                    }
+                    // The device's own loss report. The mono path decodes
+                    // these where it logs them; this path never looked, so
+                    // a dual capture could lose packets with no signal at
+                    // all to `cumulative_drops` or `take_overrun`.
+                    let warned = packet.flags
+                        & (tx_flags::WARN_OVERFLOW
+                            | tx_flags::WARN_DROPPED
+                            | tx_flags::WARN_INACCURATE
+                            | tx_flags::TIME_DISCONTINUITY);
+                    if warned != 0 {
+                        if warned & (tx_flags::WARN_DROPPED | tx_flags::TIME_DISCONTINUITY) != 0 {
+                            self.drop_events += 1;
+                        }
+                        // Not `WARN_INACCURATE`: the ECO's iqreceiver sets it on most
+                        // packets when its fractional resampler is in use (a 30 s soak at
+                        // 15.36 MS/s saw it 4121 times against one real discontinuity).
+                        // It is a quality note, not lost samples; an overrun means the
+                        // stream is not contiguous.
+                        if warned
+                            & (tx_flags::WARN_OVERFLOW
+                                | tx_flags::WARN_DROPPED
+                                | tx_flags::TIME_DISCONTINUITY)
+                            != 0
+                        {
+                            self.overrun_pending = true;
+                        }
+                        tracing::debug!("SDK dual packet flags 0x{:x}", packet.flags);
+                    }
 
                     trace!(
                         "Read {} dual IQ sample pairs (sample rate: {} Hz)",
@@ -2758,7 +3029,9 @@ impl NativeSdkSource {
                 }
 
                 self.client.consume_packets(device, 0, 1)?;
-            } else {
+            }
+
+            if !got_packet {
                 debug!(
                     "read_samples_dual: no packet within {:?} (stream live but idle)",
                     Self::READ_POLL_DEADLINE
@@ -2810,6 +3083,7 @@ impl NativeSdkSource {
             self.sample_buffer.clear();
             self.dual_sample_buffer.clear();
             self.read_mode = None;
+            self.observed_sample_rate_hz = None;
 
             if self.device_connected {
                 if let Some(device) = self.device.as_mut() {
@@ -3532,6 +3806,10 @@ mod tests {
             dual_sample_buffer: VecDeque::new(),
             read_mode: None,
             receiver_clock_hz: None,
+            observed_sample_rate_hz: None,
+            drop_events: 0,
+            overrun_pending: false,
+            last_packet_end_time_s: 0.0,
         };
 
         assert!(!source.is_streaming());

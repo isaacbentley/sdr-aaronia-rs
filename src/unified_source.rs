@@ -669,14 +669,50 @@ impl AaroniaSource {
             // mode-qualified form ("spectranv6/raw"). Passing the qualified
             // form to enumeration causes the SDK to silently return zero
             // devices.
-            let device_family = "spectranv6";
-            let open_mode = "spectranv6/raw";
-
-            let devices = source.find_devices(device_family)?;
-
-            if devices.is_empty() {
-                return Err(Error::Config("No Spectran V6 devices found".to_string()));
+            //
+            // The family cannot be hardcoded either: `EnumDevice` matches
+            // one family at a time, so asking for `spectranv6` on a
+            // machine holding a V6 ECO — which enumerates under
+            // `spectranv6eco` — returned zero devices and surfaced as
+            // "No Spectran V6 devices found" with the device sitting
+            // right there on the USB bus. Try each known family, as
+            // `NativeSdkClient::detect_device_family` documents, and take
+            // the mode from whichever answered: the ECO's raw-IQ pipeline
+            // is spelled `rtsa`, not `raw`.
+            // Enumerate every family rather than stopping at the first
+            // with a device: a machine holding both a V6 and an ECO must
+            // still honour a `device_serial` that names the second one.
+            let mut populated = Vec::new();
+            for family in crate::native_sdk::NativeSdkClient::DEVICE_FAMILIES {
+                let devices = source.find_devices(family)?;
+                if !devices.is_empty() {
+                    populated.push((family, devices));
+                }
             }
+            if populated.is_empty() {
+                return Err(Error::Config(format!(
+                    "no Aaronia device found in any known family ({})",
+                    crate::native_sdk::NativeSdkClient::DEVICE_FAMILIES.join(", ")
+                )));
+            }
+            let (device_family, devices) = match &self.config.device_serial {
+                Some(serial) => populated
+                    .into_iter()
+                    .find(|(_, devices)| {
+                        devices
+                            .iter()
+                            .any(|d| NativeSdkSource::get_device_serial(d) == *serial)
+                    })
+                    .ok_or_else(|| {
+                        Error::Config(format!("Device with serial '{}' not found", serial))
+                    })?,
+                None => populated.swap_remove(0),
+            };
+
+            let open_mode = format!(
+                "{device_family}/{}",
+                crate::native_sdk::raw_mode_for_family(device_family)
+            );
 
             // Select device (use specified serial or first available)
             let device_info = if let Some(ref serial) = self.config.device_serial {
@@ -703,7 +739,7 @@ impl AaroniaSource {
             // parameter of configure_iq_receiver (not a follow-up call)
             // so every reconfiguration path — including retunes —
             // re-applies it automatically.
-            source.open_device(open_mode, &serial_wide)?;
+            source.open_device(&open_mode, &serial_wide)?;
             source.configure_iq_receiver(
                 self.config.center_frequency,
                 self.config.span_frequency,
@@ -1363,19 +1399,82 @@ impl AaroniaSource {
     pub fn take_overrun(&mut self) -> bool {
         let overrun = self.pending_overrun;
         self.pending_overrun = false;
-        overrun
+        overrun | self.native_take_overrun()
     }
 
     /// Number of timestamp gaps the drop detector has seen since the
     /// source was created: one per gap event, however many samples it
     /// spanned.
     pub fn cumulative_drops(&self) -> u64 {
-        self.cumulative_drops
+        self.cumulative_drops + self.native_cumulative_drops()
     }
 
     /// Return the hardware timestamp of the last received block (in nanoseconds).
     pub fn last_timestamp_ns(&self) -> i64 {
-        self.last_timestamp_ns
+        if self.last_timestamp_ns != 0 {
+            self.last_timestamp_ns
+        } else {
+            self.native_last_timestamp_ns()
+        }
+    }
+
+    // The native source's counters, or zero when this is not a native
+    // source. One concrete accessor per statistic rather than a generic
+    // closure-taking helper: a closure's parameter is typed against
+    // whichever cfg variant is compiled, so `|s| s.cumulative_drops()`
+    // fails to type-check on platforms where the fallback takes `&()`.
+    #[cfg(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn native_cumulative_drops(&self) -> u64 {
+        self.native_source
+            .as_ref()
+            .map_or(0, |s| s.cumulative_drops())
+    }
+
+    #[cfg(not(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    fn native_cumulative_drops(&self) -> u64 {
+        0
+    }
+
+    #[cfg(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn native_last_timestamp_ns(&self) -> i64 {
+        self.native_source
+            .as_ref()
+            .map_or(0, |s| s.last_timestamp_ns())
+    }
+
+    #[cfg(not(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    fn native_last_timestamp_ns(&self) -> i64 {
+        0
+    }
+
+    #[cfg(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn native_take_overrun(&mut self) -> bool {
+        self.native_source
+            .as_mut()
+            .is_some_and(|s| s.take_overrun())
+    }
+
+    #[cfg(not(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    fn native_take_overrun(&mut self) -> bool {
+        false
     }
 
     /// Borrow the reusable staging buffer for one read.
@@ -1728,8 +1827,36 @@ impl AaroniaSource {
         if observed > 0.0 {
             observed
         } else {
-            self.config.span_frequency
+            let native = self.native_observed_rate_hz();
+            if native > 0.0 {
+                native
+            } else {
+                self.config.span_frequency
+            }
         }
+    }
+
+    /// What the native SDK's packets say the rate is, or `0.0` when this
+    /// is not a native source or nothing has been read yet. Kept
+    /// separate from the HTTP observation so each backend reports only
+    /// what it has actually seen.
+    #[cfg(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn native_observed_rate_hz(&self) -> f64 {
+        self.native_source
+            .as_ref()
+            .and_then(|s| s.observed_sample_rate_hz())
+            .unwrap_or(0.0)
+    }
+
+    #[cfg(not(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    fn native_observed_rate_hz(&self) -> f64 {
+        0.0
     }
 
     fn observed_stream(&self) -> ObservedStream {
@@ -1745,15 +1872,23 @@ impl AaroniaSource {
     /// On HTTP sources the frequency, rate and bandwidth come from the
     /// stream's own metadata once packets are flowing, which is not
     /// always what was requested: the device snaps a sample rate to a
-    /// rung of its ladder. Before the first packet, and on other
-    /// backends, the configured values are reported.
+    /// rung of its ladder. Native-SDK sources likewise report the rate
+    /// their packets carry once one has been read. Before the first
+    /// packet, and on file sources, the configured values are reported.
     pub fn get_source_info(&self) -> SourceInfo {
         let observed = self.observed_stream();
         let pick = |seen: f64, configured: f64| if seen > 0.0 { seen } else { configured };
         SourceInfo {
             source_type: self.source_type.clone(),
             center_frequency: pick(observed.center_frequency, self.config.center_frequency),
-            span_frequency: pick(observed.sample_rate, self.config.span_frequency),
+            span_frequency: pick(
+                if observed.sample_rate > 0.0 {
+                    observed.sample_rate
+                } else {
+                    self.native_observed_rate_hz()
+                },
+                self.config.span_frequency,
+            ),
             bandwidth_hz: pick(observed.bandwidth, self.config.bandwidth_hz),
             reference_level: self.config.reference_level,
             device_serial: self.config.device_serial.clone(),
@@ -2346,7 +2481,26 @@ mod tests {
             .await
             .expect("Should detect source type");
         // Should fallback to HTTP (since SDK detection is complex in unit tests)
-        assert_eq!(detected_type, SourceType::Http);
+        // Two machines, one rule: with nothing configured, auto-detection
+        // takes the native SDK when it is installed and localhost HTTP when
+        // it is not. Asserting HTTP unconditionally held only on machines
+        // without the SDK and failed on the very box the backend is tested
+        // on.
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        let expected = if is_sdk_installed() {
+            SourceType::NativeSdk
+        } else {
+            SourceType::Http
+        };
+        #[cfg(not(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        )))]
+        let expected = SourceType::Http;
+        assert_eq!(detected_type, expected);
     }
 
     #[test]

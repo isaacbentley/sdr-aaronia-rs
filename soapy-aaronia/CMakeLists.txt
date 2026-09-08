@@ -55,7 +55,13 @@ if (NOT DEFINED CARGO_TARGET_DIR)
     set(CARGO_TARGET_DIR ${CARGO_MANIFEST_DIR}/target)
 endif()
 
-if (WIN32)
+# The staticlib's name follows the Rust toolchain, not the OS: the
+# msvc target emits `sdr_aaronia_rs.lib`, the windows-gnu (MinGW) target
+# `libsdr_aaronia_rs.a` like Unix. Keying this on WIN32 pointed a MinGW
+# build at a file cargo never produces. Note that a MinGW-built module
+# still cannot load into an MSVC-built SoapySDR (PothosSDR, radioconda):
+# the plugin interface is C++, and the two runtimes' C++ ABIs differ.
+if (MSVC)
     set(RUST_STATIC_LIB ${CARGO_TARGET_DIR}/release/sdr_aaronia_rs.lib)
 else()
     set(RUST_STATIC_LIB ${CARGO_TARGET_DIR}/release/libsdr_aaronia_rs.a)

@@ -94,7 +94,7 @@ fn sdk_config(span_hz: f64) -> AaroniaConfig {
 /// Open, stream briefly, and report how many samples arrived. Returns
 /// the error rather than panicking so callers can characterise
 /// failures instead of aborting the run on the first one.
-async fn try_capture(span_hz: f64, samples_wanted: usize) -> Result<usize, String> {
+async fn try_capture(span_hz: f64, samples_wanted: usize) -> Result<(usize, f64), String> {
     let mut source = AaroniaSource::new(sdk_config(span_hz))
         .await
         .map_err(|e| format!("open: {e}"))?;
@@ -128,12 +128,14 @@ async fn try_capture(span_hz: f64, samples_wanted: usize) -> Result<usize, Strin
         }
     }
 
+    // Read before stopping: the report is cleared when streaming stops.
+    let reported = source.sample_rate_hz();
     let _ = source.stop_streaming().await;
 
     match (total, last_err) {
         (0, Some(e)) => Err(e),
         (0, None) => Err("read: no samples within 10 s".to_string()),
-        (n, _) => Ok(n),
+        (n, _) => Ok((n, reported)),
     }
 }
 
@@ -213,7 +215,7 @@ async fn repeated_open_close_cycles_do_not_degrade() {
 
     for cycle in 1..=CYCLES {
         match try_capture(15.36e6, 65_536).await {
-            Ok(n) => println!("cycle {cycle:2}: ok, {n} samples"),
+            Ok((n, _)) => println!("cycle {cycle:2}: ok, {n} samples"),
             Err(e) => {
                 println!("cycle {cycle:2}: FAILED — {e}");
                 failures.push((cycle, e));
@@ -239,11 +241,8 @@ async fn read_before_start_streaming_errors_rather_than_hanging() {
         .expect("device must open");
 
     let mut buf: Vec<Complex32> = Vec::new();
-    let result = tokio::time::timeout(
-        Duration::from_secs(15),
-        source.read_samples(&mut buf, 1024),
-    )
-    .await;
+    let result =
+        tokio::time::timeout(Duration::from_secs(15), source.read_samples(&mut buf, 1024)).await;
 
     match result {
         Err(_) => panic!("read_samples before start_streaming blocked past its timeout"),
@@ -312,12 +311,20 @@ async fn mid_stream_retune_keeps_samples_flowing() {
         .expect("device must open");
     source.start_streaming().await.expect("start");
 
+    // Poll to a deadline rather than trusting a single read: the first
+    // read after `start_streaming` can land before the device has
+    // produced its first packet, and one packet is all a read returns.
     let mut buf: Vec<Complex32> = Vec::new();
-    let before = source
-        .read_samples(&mut buf, 65_536)
-        .await
-        .expect("read before retune");
-    assert!(before > 0, "must receive samples before retuning");
+    let mut before = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while before == 0 && Instant::now() < deadline {
+        before = source.read_samples(&mut buf, 65_536).await.unwrap_or(0);
+        buf.clear();
+    }
+    assert!(
+        before > 0,
+        "must receive samples within 10 s before retuning"
+    );
 
     source
         .set_center_frequency(1.09e9)
@@ -328,6 +335,7 @@ async fn mid_stream_retune_keeps_samples_flowing() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while after == 0 && Instant::now() < deadline {
         after = source.read_samples(&mut buf, 65_536).await.unwrap_or(0);
+        buf.clear();
     }
 
     let _ = source.stop_streaming().await;
@@ -360,18 +368,22 @@ async fn span_ladder_characterisation() {
     ];
 
     println!();
-    println!("  span (MHz)   trials   ok   failed   MB/s at float32   first error");
-    println!("  ----------   ------   --   ------   ---------------   -----------");
+    println!("  requested (MHz)   device reports (MS/s)   trials   ok   failed   first error");
+    println!("  ---------------   ---------------------   ------   --   ------   -----------");
 
     let mut table = Vec::new();
 
     for span in rungs {
         let mut ok = 0usize;
         let mut first_err: Option<String> = None;
+        let mut reported = 0.0f64;
 
         for _ in 0..trials {
             match try_capture(span, 262_144).await {
-                Ok(_) => ok += 1,
+                Ok((_, rate)) => {
+                    ok += 1;
+                    reported = rate;
+                }
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -384,14 +396,13 @@ async fn span_ladder_characterisation() {
         }
 
         let failed = trials - ok;
-        let mbps = span * 8.0 / 1e6;
         println!(
-            "  {:>10.3}   {:>6}   {:>2}   {:>6}   {:>15.1}   {}",
+            "  {:>15.3}   {:>21.3}   {:>6}   {:>2}   {:>6}   {}",
             span / 1e6,
+            reported / 1e6,
             trials,
             ok,
             failed,
-            mbps,
             first_err.as_deref().unwrap_or("-")
         );
         table.push((span, ok, trials));
@@ -404,9 +415,8 @@ async fn span_ladder_characterisation() {
         .map(|(span, _, _)| *span)
         .fold(0.0f64, f64::max);
     println!(
-        "  highest fully-reliable span on this unit: {:.3} MHz ({:.1} MB/s at float32)",
-        highest_reliable / 1e6,
-        highest_reliable * 8.0 / 1e6
+        "  highest fully-reliable requested span on this unit: {:.3} MHz",
+        highest_reliable / 1e6
     );
 
     assert!(
@@ -458,27 +468,43 @@ async fn observed_sample_rate_matches_the_request() {
     source.start_streaming().await.expect("start");
 
     let mut buf: Vec<Complex32> = Vec::new();
-    // Prime: the first read carries the connect backlog and would skew
-    // the rate measurement.
-    let _ = source.read_samples(&mut buf, 65_536).await;
+    // Prime for a fixed interval rather than one read. The ECO's
+    // iqreceiver pipeline delivers ~40% of its rate for the first ~5 s
+    // after starting, then settles at ~98%; a 5 s window that begins
+    // at start measures the transient, not the stream. Measured on a
+    // V6 ECO: 9.65 MS/s over the first 5 s, 22.6 MS/s over the next 25.
+    let warmup = Instant::now();
+    while warmup.elapsed() < Duration::from_secs(8) {
+        let _ = source.read_samples(&mut buf, 262_144).await;
+        buf.clear();
+    }
 
     let start = Instant::now();
     let mut total = 0usize;
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < Duration::from_secs(10) {
         total += source.read_samples(&mut buf, 262_144).await.unwrap_or(0);
+        buf.clear();
     }
     let measured = total as f64 / start.elapsed().as_secs_f64();
+    // What the device's own packets say it is sending — the number the
+    // stream must be held to. `sample_rate_hz` reports it once a
+    // packet has been read; before this existed it echoed the request.
+    let reported = source.sample_rate_hz();
     let _ = source.stop_streaming().await;
 
     println!(
-        "requested {:.3} MS/s, measured {:.3} MS/s over {} samples",
+        "requested {:.3} MS/s, device reports {:.3} MS/s, measured {:.3} MS/s over {} samples \
+         (reported/requested = {:.3})",
         span / 1e6,
+        reported / 1e6,
         measured / 1e6,
-        total
+        total,
+        reported / span
     );
     assert!(
-        (measured - span).abs() / span < 0.05,
-        "sustained rate {measured:.0} S/s is more than 5% from the requested {span:.0} S/s"
+        (measured - reported).abs() / reported < 0.05,
+        "sustained {measured:.0} S/s is more than 5% from the {reported:.0} S/s the device reports: \
+         samples are being lost between the SDK and the caller"
     );
 }
 
@@ -494,27 +520,54 @@ async fn long_run_is_stable_and_reports_its_drops() {
     source.start_streaming().await.expect("start");
 
     let mut buf: Vec<Complex32> = Vec::new();
+
+    // Run past the startup transient before counting anything: the
+    // ECO's iqreceiver delivers ~40% of rate for ~5 s after start and
+    // flags one discontinuity as it settles. Counting from t=0 measured
+    // that every time and called it instability. Baseline the counters
+    // once the stream is steady, then hold the next `secs` to zero.
+    let warmup = Instant::now();
+    while warmup.elapsed() < Duration::from_secs(8) {
+        let _ = source.read_samples(&mut buf, 262_144).await;
+        buf.clear();
+    }
+    let drops_at_start = source.cumulative_drops();
+    let _ = source.take_overrun();
+
     let mut total = 0usize;
     let mut overruns = 0usize;
     let start = Instant::now();
-
     while start.elapsed().as_secs_f64() < secs {
         total += source.read_samples(&mut buf, 262_144).await.unwrap_or(0);
+        buf.clear();
         if source.take_overrun() {
             overruns += 1;
         }
     }
 
-    let drops = source.cumulative_drops();
+    let drops = source.cumulative_drops() - drops_at_start;
+    let reported = source.sample_rate_hz();
     let elapsed = start.elapsed().as_secs_f64();
     let _ = source.stop_streaming().await;
 
+    let measured = total as f64 / elapsed;
     println!(
-        "soak: {total} samples in {elapsed:.1}s = {:.3} MS/s, {drops} gap events, {overruns} overruns",
-        total as f64 / elapsed / 1e6
+        "soak: {total} samples in {elapsed:.1}s = {:.3} MS/s against {:.3} reported \
+         ({:.1}%), {drops} gap events, {overruns} overruns, {drops_at_start} gaps during warm-up",
+        measured / 1e6,
+        reported / 1e6,
+        100.0 * measured / reported
     );
     assert!(total > 0, "soak produced no samples at all");
-    assert_eq!(drops, 0, "a stable 15.36 MS/s soak should see no timestamp gaps");
+    assert_eq!(drops, 0, "a steady-state soak should see no timestamp gaps");
+    assert_eq!(
+        overruns, 0,
+        "a steady-state soak should see no overrun-flagged packets"
+    );
+    assert!(
+        (measured - reported).abs() / reported < 0.05,
+        "steady-state delivery {measured:.0} S/s is more than 5% from the reported {reported:.0} S/s"
+    );
 }
 
 // ---------------------------------------------------------------------

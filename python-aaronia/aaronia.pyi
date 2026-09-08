@@ -57,6 +57,7 @@ class AaroniaConfig:
     http_base_url: Optional[str]
     file_path: Optional[str]
     device_serial: Optional[str]
+    native_sdk: bool
 
     # RF parameters.
     center_freq: float
@@ -194,6 +195,8 @@ def open(
     bandwidth: Optional[float] = None,
     ref_level: Optional[float] = None,
     file: Optional[str] = None,
+    sdk: bool = False,
+    serial: Optional[str] = None,
     format: Optional[WireFormat] = None,
     scale: Optional[float] = None,
     read_timeout: Optional[float] = None,
