@@ -723,6 +723,16 @@ pub struct DeviceCapabilities {
     /// reporting accurately: an operator who wired that reference up
     /// for frequency accuracy needs to see it took.
     pub clock_source: Option<String>,
+    /// Every GPS mode `device/gpsmode` offers that the device will
+    /// currently accept — `Disabled`, `Location`, `Time`, `Location and
+    /// Time` on a measured V6 ECO. This is what governs whether GPS
+    /// disciplines the clock and whether `gps_time_ns` ever reports a
+    /// fix; the device ships on `Disabled`, in which state GPS time
+    /// never arrives and the API looks broken. Empty when the item is
+    /// absent.
+    pub gps_modes: Vec<String>,
+    /// The GPS mode `gpsmode` currently selects.
+    pub gps_mode: Option<String>,
     /// The RX input the device's `devicemode` names — `"RX1"` or
     /// `"RX2"`. Read-only on a V6 ECO, which reports `RX1 LO1 SWEEP`.
     /// `None` when the mode names no RX input (a TX-only mode) or the
@@ -755,6 +765,10 @@ impl DeviceCapabilities {
             let (sources, selected) = enum_options(config, "sclksource");
             caps.clock_sources = sources;
             caps.clock_source = selected;
+
+            let (modes, mode) = enum_options(config, "gpsmode");
+            caps.gps_modes = modes;
+            caps.gps_mode = mode;
 
             // `devicemode` reads like `"RX1 LO1 SWEEP"` / `"RX2 LO1"` /
             // `"TX1 LO1"`: the first whitespace-separated token names the
@@ -912,6 +926,7 @@ fn enum_options(item: &ConfigItem, want: &str) -> (Vec<String>, Option<String>) 
                 name,
                 values,
                 value,
+                disabled,
                 ..
             } if name == want => {
                 // Trailing commas and empty strings are not options. The
@@ -924,10 +939,24 @@ fn enum_options(item: &ConfigItem, want: &str) -> (Vec<String>, Option<String>) 
                     .and_then(|i| raw.get(i))
                     .filter(|v| !v.is_empty())
                     .map(|v| v.to_string());
+                // Drop what the device says it will refuse. The list
+                // exists to answer "what may I pass to the setter", and
+                // an option that is advertised but rejected turns a
+                // capability query into a trap. `disabled` is indexed by
+                // the *unfiltered* position, like `value`.
                 let options: Vec<String> = raw
                     .into_iter()
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string)
+                    .enumerate()
+                    .filter(|(i, v)| {
+                        // A 64-bit mask cannot describe a 65th option.
+                        // Clamping the shift would alias every index past
+                        // 63 onto bit 63, so one set high bit would
+                        // silently mask an unbounded tail. Past the
+                        // mask's reach, leave it to the device to refuse.
+                        let masked = *i < 64 && (*disabled as u64) & (1u64 << i) != 0;
+                        !v.is_empty() && !masked
+                    })
+                    .map(|(_, v)| v.to_string())
                     .collect();
                 Some((options, selected))
             }
@@ -1108,6 +1137,18 @@ pub enum ConfigItem {
         value: i64,
         default: i64,
         values: String, // Comma-separated list
+        /// Bitmask of options the device will not accept right now, one
+        /// bit per position in `values`. A measured V6 ECO reports 68 for
+        /// `sclksource` -- bits 2 and 6, `GPS` and `GPS Provider` -- with
+        /// no GPS fix. Absent on trees that do not carry it, hence the
+        /// default of "nothing disabled".
+        ///
+        /// Signed on purpose: a mask with bit 63 set arrives from a C
+        /// `int64` as a negative number, which `u64` would refuse --
+        /// taking the whole capability fetch down with it. It is read as
+        /// `u64` at the point of test.
+        #[serde(default)]
+        disabled: i64,
     },
     Button {
         name: String,
@@ -1669,6 +1710,60 @@ impl HttpEndpointsClient {
             None => {
                 warn!(
                     "RTSA {block}: could not confirm sclksource (leaf absent, or the read-back \
+                     failed); the write itself was accepted"
+                );
+                Ok(got)
+            }
+        }
+    }
+
+    /// Set the device's GPS mode (`device/gpsmode`) over `/remoteconfig`.
+    /// `source` is a label the device reports — `"Disabled"`,
+    /// `"Location"`, `"Time"`, `"Location and Time"` on a measured V6
+    /// ECO. Same shape as [`Self::set_clock_source`]: auto-discover the
+    /// block, write, then re-read to confirm, because a PUT naming a
+    /// block outside the running mission answers 200 and changes
+    /// nothing.
+    ///
+    /// This is the switch that makes GPS time exist. The device ships on
+    /// `Disabled`, and in that state the telemetry behind
+    /// [`crate::SpectranSource::gps_time_ns`] never reports a fix, so the
+    /// getter returns `None` forever and reads as broken. `Time` or
+    /// `Location and Time` is what turns it on; allow the receiver time
+    /// to acquire afterwards.
+    ///
+    /// Returns the mode the device reports afterward, with the same rule
+    /// as the clock source: a confirmed mismatch is an error naming what
+    /// this device does offer, while a read-back that yields nothing is
+    /// reported as unconfirmed rather than failed.
+    pub async fn set_gps_mode(&self, source: &str) -> Result<Option<String>> {
+        let block = self.find_block_name_with_field("centerfreq0").await?;
+
+        let mut device = serde_json::Map::new();
+        device.insert("gpsmode".to_string(), serde_json::json!(source));
+        let mut groups = serde_json::Map::new();
+        groups.insert("device".to_string(), serde_json::Value::Object(device));
+        self.simple_remote_config(&block, groups).await?;
+
+        let caps = self.get_device_capabilities().await;
+        let got = caps.gps_mode;
+        match got.as_deref() {
+            Some(g) if g.eq_ignore_ascii_case(source) => {
+                info!("RTSA {block}: gpsmode = {g} (requested {source})");
+                Ok(got)
+            }
+            Some(g) => Err(Error::Config(format!(
+                "GPS mode did not take on {block}: requested `{source}`, device reports \
+                 `{g}`. This device offers: {}",
+                if caps.gps_modes.is_empty() {
+                    "(none reported)".to_string()
+                } else {
+                    caps.gps_modes.join(", ")
+                }
+            ))),
+            None => {
+                warn!(
+                    "RTSA {block}: could not confirm gpsmode (leaf absent, or the read-back \
                      failed); the write itself was accepted"
                 );
                 Ok(got)
@@ -2889,6 +2984,112 @@ mod tests {
             "index 2 is the device's position, blank included",
         );
         assert_eq!(caps.decimation_steps, Some(10), "real rungs only");
+    }
+
+    /// The device publishes a bitmask of options it will refuse. Values
+    /// taken from a live V6 ECO: `sclksource` reports `disabled: 68` —
+    /// bits 2 and 6, `GPS` and `GPS Provider` — on a unit with no GPS
+    /// fix, while sitting on `10MHz` at index 4.
+    #[test]
+    fn enum_options_hide_what_the_device_says_it_will_refuse() {
+        let mut value = live_shaped_config();
+        value["items"][0]["items"][1]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "group", "name": "device", "label": "Board Config",
+                "flags": "", "items": [
+                    { "type": "enum", "name": "sclksource", "label": "Stream Clock Source",
+                      "flags": "", "value": 4, "default": 0, "disabled": 68,
+                      "values": "Consumer,Oscillator,GPS,PPS,10MHz,Oscillator Provider,GPS Provider,PPS Provider" },
+                    { "type": "enum", "name": "gpsmode", "label": "GPS Mode",
+                      "flags": "", "value": 0, "default": 0, "disabled": 0,
+                      "values": "Disabled,Location,Time,Location and Time" }
+                ]
+            }));
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+
+        assert_eq!(
+            caps.clock_sources,
+            vec![
+                "Consumer",
+                "Oscillator",
+                "PPS",
+                "10MHz",
+                "Oscillator Provider",
+                "PPS Provider"
+            ],
+            "the two GPS entries are masked off and must not be advertised"
+        );
+        assert_eq!(
+            caps.clock_source.as_deref(),
+            Some("10MHz"),
+            "the selected index counts unfiltered positions"
+        );
+        // A zero mask must not filter anything.
+        assert_eq!(
+            caps.gps_modes,
+            vec!["Disabled", "Location", "Time", "Location and Time"]
+        );
+        assert_eq!(caps.gps_mode.as_deref(), Some("Disabled"));
+    }
+
+    /// A 64-bit mask cannot describe a 65th option. Clamping the shift
+    /// would alias every index past 63 onto bit 63, so one set high bit
+    /// would silently mask an unbounded tail. Anything beyond the mask's
+    /// reach stays selectable.
+    #[test]
+    fn enum_options_do_not_alias_indices_past_the_mask() {
+        let names: Vec<String> = (0..66).map(|i| format!("opt{i}")).collect();
+        let mut value = live_shaped_config();
+        value["items"][0]["items"][1]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "group", "name": "device", "label": "Device",
+                "flags": "", "items": [
+                    { "type": "enum", "name": "sclksource", "label": "Stream Clock Source",
+                      "flags": "", "value": 0, "default": 0,
+                      // Bit 63 set, as a C int64 hands it over.
+                      "disabled": i64::MIN,
+                      "values": names.join(",") }
+                ]
+            }));
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+
+        assert!(
+            !caps.clock_sources.iter().any(|s| s == "opt63"),
+            "bit 63 is set, so opt63 must be masked"
+        );
+        for keep in ["opt62", "opt64", "opt65"] {
+            assert!(
+                caps.clock_sources.iter().any(|s| s == keep),
+                "{keep} is outside the mask's reach and must stay selectable"
+            );
+        }
+    }
+
+    /// A tree without the field at all keeps every option: `disabled`
+    /// defaults to "nothing disabled", not "everything".
+    #[test]
+    fn enum_options_keep_everything_when_the_mask_is_absent() {
+        let mut value = live_shaped_config();
+        value["items"][0]["items"][1]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "group", "name": "device", "label": "Device",
+                "flags": "", "items": [
+                    { "type": "enum", "name": "sclksource", "label": "Stream Clock Source",
+                      "flags": "", "value": 0, "default": 0,
+                      "values": "Consumer,GPS,10MHz" }
+                ]
+            }));
+        let config: ConfigItem = serde_json::from_value(value).unwrap();
+        let caps = DeviceCapabilities::from_trees(Some(&config), None);
+        assert_eq!(caps.clock_sources, vec!["Consumer", "GPS", "10MHz"]);
     }
 
     /// Identity comes from the block that owns `centerfreq0`, not the

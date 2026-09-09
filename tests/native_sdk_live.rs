@@ -24,6 +24,7 @@
 ))]
 
 use sdr_aaronia_rs::Complex32;
+use sdr_aaronia_rs::native_sdk::NativeSdkSource;
 use sdr_aaronia_rs::unified_source::{SourceType, SpectranConfig, SpectranSource};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -651,4 +652,96 @@ fn c_api_reaches_the_native_sdk_by_autodetection() {
         sdr_aaronia_rs::spectran_source_info_free(info);
         sdr_aaronia_rs::spectran_source_free(source);
     }
+}
+
+/// Read real spectra off the ECO's `rtsa` pipeline.
+///
+/// `read_spectra` had no coverage at all before this — not a unit test,
+/// not a live one — and `DeviceOpenMode::EcoRtsa` appeared only in the
+/// enum and its parser. Everything about the path was inference from
+/// Aaronia's `RawSpectrumEco` sample: that spectra arrive on stream 0
+/// rather than the `raw` mode's stream 2, and that the packet's
+/// `start`/`step` frequencies describe the bins.
+///
+/// This asserts the shape rather than the values. What a bin *is* in
+/// dBm depends on calibration this test cannot check; what it can check
+/// is that frames arrive, that the bin count and spacing are coherent,
+/// and that the span they describe is a real slice of spectrum.
+#[tokio::test]
+#[ignore = "requires an attached Spectran V6; RTSA-Suite must be closed"]
+async fn spectra_stream_delivers_coherent_frames() {
+    let _guard = device_lock().await;
+
+    let mut sdk = unsafe { NativeSdkSource::new() }.expect("load the SDK");
+    unsafe { sdk.initialize() }.expect("initialize");
+
+    let devices = unsafe { sdk.find_devices("spectranv6eco") }.expect("enumerate");
+    assert!(!devices.is_empty(), "a V6 ECO must be attached and free");
+    let serial = devices[0].serial_number;
+
+    // The ECO's spectrum pipeline. `spectranv6eco/raw` opens but carries
+    // no `main/spanfreq`, and its `iqreceiver` is the IQ path.
+    unsafe { sdk.open_device("spectranv6eco/rtsa", &serial) }.expect("open rtsa mode");
+    unsafe { sdk.start_streaming() }.expect("start streaming");
+
+    let mut bins: Vec<f32> = Vec::new();
+    let mut frames_seen = 0usize;
+    let mut last: Option<sdr_aaronia_rs::native_sdk::SpectraRead> = None;
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && frames_seen == 0 {
+        bins.clear();
+        match unsafe { sdk.read_spectra(&mut bins) }.expect("read_spectra must not error") {
+            Some(read) => {
+                frames_seen = read.frames;
+                last = Some(read);
+            }
+            None => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let _ = unsafe { sdk.stop_streaming() };
+
+    let read = last.expect("no spectra packet arrived within 20 s on spectranv6eco/rtsa");
+    println!(
+        "spectra: {} frames x {} bins, {:.3} MHz start, {:.1} Hz/bin, span {:.3} MHz, t={:.3}",
+        read.frames,
+        read.bins_per_frame,
+        read.start_frequency_hz / 1e6,
+        read.step_frequency_hz,
+        read.bins_per_frame as f64 * read.step_frequency_hz / 1e6,
+        read.start_time
+    );
+
+    assert!(read.frames > 0, "a returned packet must carry frames");
+    assert!(read.bins_per_frame > 0, "a spectrum must have bins");
+    assert_eq!(
+        bins.len(),
+        read.frames * read.bins_per_frame,
+        "the flat buffer must hold exactly frames x bins values"
+    );
+    assert!(
+        read.step_frequency_hz > 0.0,
+        "bin spacing must be positive, got {}",
+        read.step_frequency_hz
+    );
+    // The ECO tunes 1e-05..6000 MHz; anything outside that is a decode
+    // error rather than a reading.
+    assert!(
+        read.start_frequency_hz >= 0.0 && read.start_frequency_hz <= 6.1e9,
+        "start frequency {} Hz is outside the device's range",
+        read.start_frequency_hz
+    );
+    let end_hz = read.start_frequency_hz + read.bins_per_frame as f64 * read.step_frequency_hz;
+    assert!(
+        end_hz <= 6.1e9,
+        "the span ends at {end_hz} Hz, past the device's range -- bins and spacing disagree"
+    );
+    assert!(
+        bins.iter().all(|v| v.is_finite()),
+        "every bin must be a finite value"
+    );
+    assert!(
+        bins.iter().any(|v| *v != 0.0),
+        "an all-zero spectrum means the packet was not decoded"
+    );
 }

@@ -2198,6 +2198,32 @@ impl NativeSdkSource {
         }
     }
 
+    /// Write the device's GPS mode (`device/gpsmode`) live —
+    /// `"Disabled"`, `"Location"`, `"Time"`, `"Location and Time"` on a
+    /// measured V6 ECO. The SDK takes the enum label.
+    ///
+    /// This is what makes GPS time exist. The device ships on
+    /// `Disabled`, and until it is `Time` or `Location and Time` the
+    /// health tree never reports a fix, so `gps_time_ns` returns `None`
+    /// forever and reads as broken. Aaronia's own `GPSTime` sample sets
+    /// this together with `sclksource = "GPS Provider"` before starting.
+    pub unsafe fn set_gps_mode(&mut self, source: &str) -> Result<()> {
+        unsafe {
+            let device = self
+                .device
+                .as_mut()
+                .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
+            let mut root = self.client.get_config_root(device)?;
+            let mut config = self
+                .client
+                .find_config(device, &mut root, "device/gpsmode")
+                .map_err(|_| Error::Sdk("device/gpsmode config key not found".to_string()))?;
+            self.client.set_config_string(device, &mut config, source)?;
+            info!("Set GPS mode to {}", source);
+            Ok(())
+        }
+    }
+
     /// Resolve `device/receiverclock` to a real rate in Hz.
     ///
     /// The ConfigItem labels the SDK exposes are *rounded* — `"92MHz"` is

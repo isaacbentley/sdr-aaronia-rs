@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **The GPS mode can be set, not just the clock source.** `device/gpsmode`
+  decides whether GPS supplies location, time, both, or nothing, and the device
+  ships on `Disabled` — in which state no fix is ever reported and
+  `gps_time_ns` returns `None` forever, reading as broken rather than
+  unconfigured. `SpectranSource::set_gps_mode` writes it on both backends,
+  with the same confirm-by-read-back rule as the clock source.
+- **`clock_source()`, `clock_sources()`, `gps_mode()`, `gps_modes()`** on
+  `SpectranSource`, so reading the current reference no longer means fetching
+  the whole capability tree. These read over HTTP; the writes work on both
+  backends.
+
+### Fixed
+- **Capability lists no longer advertise options the device will refuse.** The
+  config tree carries a bitmask of enum entries the device is currently
+  rejecting, and it was ignored: a V6 ECO with no GPS antenna offered `GPS` and
+  `GPS Provider` as clock sources, and `set_clock_source("GPS")` then failed
+  against a list that said it would not. Those entries are filtered out, so what
+  `clock_sources()` and `gps_modes()` return is what the device accepts.
+  Verified live: the six sources advertised are exactly the six it takes.
+
 ## [v0.10.0] - 2026-09-08
 
 ### Breaking changes

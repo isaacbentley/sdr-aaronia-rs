@@ -1822,6 +1822,94 @@ impl SpectranSource {
         Ok(())
     }
 
+    /// Set the device's GPS mode (`device/gpsmode`) — `"Disabled"`,
+    /// `"Location"`, `"Time"`, `"Location and Time"` on a measured V6
+    /// ECO. Native SDK and HTTP both write it; a file source is a no-op.
+    ///
+    /// This is the switch [`Self::gps_time_ns`] depends on. The device
+    /// ships on `Disabled`, and until this is `Time` or `Location and
+    /// Time` no fix is ever reported, so the getter returns `None`
+    /// forever and looks broken rather than merely unconfigured. Allow
+    /// the receiver time to acquire after setting it.
+    ///
+    /// [`Self::gps_modes`] lists what the device will currently accept,
+    /// already excluding anything it is refusing — but that list is read
+    /// over HTTP, so on a native-SDK source without an `http_base_url` it
+    /// comes back empty. The write itself works on both backends.
+    pub async fn set_gps_mode(&mut self, source: &str) -> Result<()> {
+        match self.source_type {
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            SourceType::NativeSdk => {
+                if let Some(ref mut source_impl) = self.native_source {
+                    unsafe { source_impl.set_gps_mode(source)? };
+                } else {
+                    return Err(Error::Config(
+                        "Native SDK source not initialized".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            )))]
+            SourceType::NativeSdk => {
+                return Err(Error::Config("Native SDK not available".to_string()));
+            }
+            SourceType::Http => {
+                let client = self
+                    .http_client
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                client.set_gps_mode(source).await?;
+            }
+            SourceType::File => {
+                warn!("set_gps_mode called on file source (no-op)");
+            }
+        }
+        Ok(())
+    }
+
+    /// The stream clock source the device currently reports, or `None`
+    /// when it does not say. A convenience over
+    /// [`Self::device_capabilities`], which fetches the whole tree.
+    ///
+    /// Read over HTTP, like the capabilities behind it: a native-SDK
+    /// source with no `http_base_url` configured has nothing to query and
+    /// reports `None` here and an empty list from
+    /// [`Self::clock_sources`]. The *writes* work on both backends.
+    pub async fn clock_source(&self) -> Option<String> {
+        self.device_capabilities().await.clock_source
+    }
+
+    /// Every stream clock source the device will currently accept —
+    /// `Consumer`, `Oscillator`, `PPS`, `10MHz` and the `... Provider`
+    /// variants on a measured V6 ECO.
+    ///
+    /// This is what may be passed to [`Self::set_clock_source`], not
+    /// merely what the enum lists: the device publishes a mask of options
+    /// it is refusing, and those are already filtered out. On a unit with
+    /// no GPS fix, `GPS` and `GPS Provider` are absent for that reason
+    /// and would fail if asked for.
+    pub async fn clock_sources(&self) -> Vec<String> {
+        self.device_capabilities().await.clock_sources
+    }
+
+    /// The GPS mode the device currently reports (`device/gpsmode`), or
+    /// `None` when it does not say.
+    pub async fn gps_mode(&self) -> Option<String> {
+        self.device_capabilities().await.gps_mode
+    }
+
+    /// Every GPS mode the device will currently accept, filtered the same
+    /// way as [`Self::clock_sources`]. Pass one to
+    /// [`Self::set_gps_mode`].
+    pub async fn gps_modes(&self) -> Vec<String> {
+        self.device_capabilities().await.gps_modes
+    }
+
     /// Probe the RTSA-Suite Remote Config license status, returning
     /// [`crate::http_endpoints::RemoteConfigStatus::Active`] for non-HTTP
     /// sources (they don't need it). This concerns **`/remoteconfig`

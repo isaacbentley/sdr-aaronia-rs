@@ -899,3 +899,96 @@ async fn live_auto_reconnect_stream_is_continuous() {
     println!("read {total} samples over 10 s with auto-reconnect enabled");
     assert!(total > 65_536, "expected sustained streaming");
 }
+
+/// Round-trip the stream clock source and the GPS mode against the real
+/// device, restoring both afterwards.
+///
+/// These are the only live tests here that *write* device state rather
+/// than reading or streaming, so they restore what they found and are
+/// deliberately the last thing in the file. Run the suite with
+/// `--test-threads=1` when including them, or a concurrent streaming
+/// test can see the reference change underneath it.
+///
+/// What this proves that a mock cannot: the enum label is what the
+/// device accepts, the read-back reflects the write, and the options the
+/// capability list advertises are ones the device will actually take.
+#[tokio::test]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+async fn live_clock_and_gps_mode_round_trip() {
+    let c = client();
+    let caps = c.get_device_capabilities().await;
+
+    let Some(original_clock) = caps.clock_source.clone() else {
+        println!("SKIP clock source: device reports none");
+        return;
+    };
+    println!(
+        "clock source: {original_clock:?} of {:?}",
+        caps.clock_sources
+    );
+    if !caps.clock_sources.contains(&original_clock) {
+        // Legitimate: the device reports its selection independently of
+        // the disabled mask, so unplugging a GPS antenna can leave it on
+        // a source it would now refuse. Nothing to round-trip safely.
+        println!(
+            "SKIP clock source write: device is on {original_clock:?}, which it no longer \
+             offers ({:?})",
+            caps.clock_sources
+        );
+        return;
+    }
+
+    // Anything the device offers that is not what it is already on. The
+    // list is already filtered to what it will accept.
+    if let Some(other) = caps
+        .clock_sources
+        .iter()
+        .find(|s| **s != original_clock)
+        .cloned()
+    {
+        // Restore first, assert second. A panic between the write and the
+        // restore would leave real hardware on whatever this set, and the
+        // GPS-mode half below would never run.
+        let wrote = c.set_clock_source(&other).await;
+        let restored = c.set_clock_source(&original_clock).await;
+        let back = c.get_device_capabilities().await.clock_source;
+
+        let got = wrote.unwrap_or_else(|e| panic!("set_clock_source({other}) failed: {e:#}"));
+        assert_eq!(
+            got.as_deref(),
+            Some(other.as_str()),
+            "device did not adopt {other}"
+        );
+        restored.expect("restore clock source");
+        assert_eq!(back.as_deref(), Some(original_clock.as_str()), "restored");
+        println!("clock source: {original_clock} -> {other} -> restored");
+    } else {
+        println!("SKIP clock source write: device offers only {original_clock}");
+    }
+
+    // GPS mode. `Disabled` is the shipped state and what `gps_time_ns`
+    // needs moved off; this proves the write lands without requiring a fix.
+    let Some(original_mode) = caps.gps_mode.clone() else {
+        println!("SKIP gps mode: device reports none");
+        return;
+    };
+    println!("gps mode: {original_mode:?} of {:?}", caps.gps_modes);
+    if let Some(other) = caps
+        .gps_modes
+        .iter()
+        .find(|s| **s != original_mode)
+        .cloned()
+    {
+        let wrote = c.set_gps_mode(&other).await;
+        let restored = c.set_gps_mode(&original_mode).await;
+        let back = c.get_device_capabilities().await.gps_mode;
+
+        let got = wrote.unwrap_or_else(|e| panic!("set_gps_mode({other}) failed: {e:#}"));
+        assert_eq!(got.as_deref(), Some(other.as_str()));
+        restored.expect("restore gps mode");
+        assert_eq!(back.as_deref(), Some(original_mode.as_str()), "restored");
+        println!("gps mode: {original_mode} -> {other} -> restored");
+    } else {
+        println!("SKIP gps mode write: device offers only {original_mode}");
+    }
+}
