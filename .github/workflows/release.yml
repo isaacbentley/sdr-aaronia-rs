@@ -21,12 +21,22 @@ jobs:
           lfs: false
       - name: Compare tag and manifest versions
         run: |
+          # Every manifest this release publishes from, not just the root.
+          # python-aaronia carries its own version and ships to PyPI; when
+          # only the root was checked, forgetting it would have shipped
+          # PyPI 0.9.0 beside crates.io 0.10.0 with no gate firing.
+          # pyproject.toml takes its version from Cargo.toml (dynamic), so
+          # it needs no separate check.
           tag="${GITHUB_REF_NAME#v}"
-          crate=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-          if [ "$tag" != "$crate" ]; then
-            echo "tag v$tag != Cargo.toml version $crate" >&2
-            exit 1
-          fi
+          rc=0
+          for manifest in Cargo.toml python-aaronia/Cargo.toml; do
+            got=$(grep -m1 '^version' "$manifest" | sed 's/.*"\(.*\)"/\1/')
+            if [ "$tag" != "$got" ]; then
+              echo "tag v$tag != $manifest version $got" >&2
+              rc=1
+            fi
+          done
+          exit $rc
 
   # Real gate (no continue-on-error): a breaking API change must be caught
   # here, before it's published, not merely reported per-PR where it can
