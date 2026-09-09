@@ -306,9 +306,9 @@ mod tests {
 
         assert!(debug_str.contains("SdkConfig"));
         assert!(debug_str.contains("device_type"));
-        assert!(debug_str.contains("center_frequency"));
-        assert!(debug_str.contains("span_frequency"));
-        assert!(debug_str.contains("reference_level"));
+        assert!(debug_str.contains("center_frequency_hz"));
+        assert!(debug_str.contains("sample_rate_hz"));
+        assert!(debug_str.contains("reference_level_dbm"));
         assert!(debug_str.contains("timeout"));
     }
 
