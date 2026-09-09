@@ -473,6 +473,11 @@ pub struct SpectranSource {
     /// a consumer is trying to keep up. Taken with `mem::take` for the
     /// duration of a read and put back, so its capacity survives.
     read_scratch: Vec<Complex32>,
+    /// The Rx2 half of the same staging pair, for the dual-channel read
+    /// path. Separate from `read_scratch` only because the two channels
+    /// must be handed to the caller as two contiguous slices; a stream
+    /// is latched to one read mode, so the two are never live at once.
+    read_scratch_rx2: Vec<Complex32>,
 }
 
 impl SpectranSource {
@@ -544,6 +549,7 @@ impl SpectranSource {
             cumulative_drops: 0,
             last_timestamp_ns: 0,
             read_scratch: Vec::new(),
+            read_scratch_rx2: Vec::new(),
         };
 
         // Determine the best source type
@@ -1163,6 +1169,73 @@ impl SpectranSource {
         }
     }
 
+    /// [`Self::read_samples_dual`] bounded by `timeout`, the dual
+    /// counterpart of [`Self::read_samples_deadline`] and for the same
+    /// caller: the SoapySDR plugin's `readStream`, which must honour the
+    /// application's `timeoutUs`.
+    ///
+    /// Both vectors grow by exactly the returned count, so they stay
+    /// index-aligned in time even on a partial read. Hitting the
+    /// deadline with some pairs collected returns them; only a deadline
+    /// with **zero** pairs yields `Error::Io(TimedOut)`. A `timeout` of
+    /// zero drains what is already buffered without waiting.
+    ///
+    /// Polls on the calling thread, exactly as
+    /// [`Self::read_samples_deadline`] does — see its note.
+    pub async fn read_samples_dual_deadline(
+        &mut self,
+        rx1: &mut Vec<Complex32>,
+        rx2: &mut Vec<Complex32>,
+        max_samples: usize,
+        timeout: Duration,
+    ) -> Result<usize> {
+        match self.source_type {
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            SourceType::NativeSdk => {
+                let deadline = tokio::time::Instant::now() + timeout;
+                let start_len = rx1.len();
+                loop {
+                    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let want = max_samples - (rx1.len() - start_len);
+                    let n = match self.native_source.as_mut() {
+                        Some(source) => unsafe {
+                            source.read_samples_dual_within(rx1, rx2, want, budget)?
+                        },
+                        None => {
+                            return Err(Error::Config(
+                                "Native SDK source not initialized".to_string(),
+                            ));
+                        }
+                    };
+                    let total = rx1.len() - start_len;
+                    if total >= max_samples
+                        || tokio::time::Instant::now() >= deadline
+                        || (n == 0 && total > 0)
+                    {
+                        if total == 0 && max_samples > 0 {
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "no sample pairs arrived within the read deadline",
+                            )));
+                        }
+                        return Ok(total);
+                    }
+                }
+            }
+            _ => {
+                let _ = (rx1, rx2, max_samples, timeout);
+                Err(Error::Config(format!(
+                    "read_samples_dual_deadline requires the native SDK backend with \
+                     receiver_channel = Rx1And2; current backend is {:?}",
+                    self.source_type
+                )))
+            }
+        }
+    }
+
     /// Deadline-bounded read for latency-sensitive callers (the
     /// SoapySDR plugin's `readStream`, which must honour the
     /// application's `timeoutUs` — `read_samples`'s fixed 30-second
@@ -1179,6 +1252,11 @@ impl SpectranSource {
     /// File reads delegate to the existing read (disk reads don't wait).
     /// The native-SDK path polls the device with what is left of
     /// `timeout` on each round, so a zero timeout drains without waiting.
+    ///
+    /// That poll sleeps on the calling thread rather than yielding, so
+    /// awaiting this on a tokio worker occupies it for the duration.
+    /// The C ABI wraps it in `block_in_place`; a Rust caller inside a
+    /// runtime should do the same, or call it from a plain thread.
     pub async fn read_samples_deadline(
         &mut self,
         buffer: &mut Vec<Complex32>,
@@ -1509,6 +1587,25 @@ impl SpectranSource {
     /// Hand a buffer from [`Self::take_scratch`] back.
     pub fn return_scratch(&mut self, scratch: Vec<Complex32>) {
         self.read_scratch = scratch;
+    }
+
+    /// The dual-channel counterpart of [`Self::take_scratch`]: both
+    /// staging buffers, cleared, for one `(Rx1, Rx2)` read.
+    ///
+    /// Hand them back with [`Self::return_dual_scratch`] in the same
+    /// order. The Rx1 buffer is the same one [`Self::take_scratch`]
+    /// lends out — a stream is latched to one read path, so no caller
+    /// holds both at once.
+    pub fn take_dual_scratch(&mut self) -> (Vec<Complex32>, Vec<Complex32>) {
+        let mut rx2 = std::mem::take(&mut self.read_scratch_rx2);
+        rx2.clear();
+        (self.take_scratch(), rx2)
+    }
+
+    /// Hand back the pair from [`Self::take_dual_scratch`].
+    pub fn return_dual_scratch(&mut self, rx1: Vec<Complex32>, rx2: Vec<Complex32>) {
+        self.read_scratch = rx1;
+        self.read_scratch_rx2 = rx2;
     }
 
     /// Stop streaming
@@ -2503,6 +2600,7 @@ mod tests {
             cumulative_drops: 0,
             last_timestamp_ns: 0,
             read_scratch: Vec::new(),
+            read_scratch_rx2: Vec::new(),
         };
 
         let detected_type = source
@@ -2583,6 +2681,7 @@ mod tests {
             cumulative_drops: 0,
             last_timestamp_ns: 0,
             read_scratch: Vec::new(),
+            read_scratch_rx2: Vec::new(),
         };
 
         let result = source.detect_best_source_type().await;
@@ -2615,6 +2714,7 @@ mod tests {
             cumulative_drops: 0,
             last_timestamp_ns: 0,
             read_scratch: Vec::new(),
+            read_scratch_rx2: Vec::new(),
         };
 
         let detected_type = source
@@ -2649,6 +2749,7 @@ mod tests {
             cumulative_drops: 0,
             last_timestamp_ns: 0,
             read_scratch: Vec::new(),
+            read_scratch_rx2: Vec::new(),
         };
 
         let detected_type = source
@@ -2847,6 +2948,7 @@ mod tests {
             cumulative_drops: 0,
             last_timestamp_ns: 0,
             read_scratch: Vec::new(),
+            read_scratch_rx2: Vec::new(),
         };
 
         assert!(!source.take_overrun(), "no chunk received yet");

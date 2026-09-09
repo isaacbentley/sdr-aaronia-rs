@@ -167,8 +167,17 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
     // itself streams channel 0; Rx2 selects the second antenna input.
     if (args.count("rx_channel") != 0) {
         const std::string &ch = args.at("rx_channel");
-        int32_t sel = ch == "Rx2" ? 1 : (ch == "Rx1And2" ? 2 : 0);
-        spectran_source_builder_receiver_channel(builder, sel);
+        // Warn rather than silently fall back to Rx1: a typo used to
+        // hand back a single-channel Rx1 stream that looked exactly
+        // like a working dual request.
+        if (ch != "Rx1" && ch != "Rx2" && ch != "Rx1And2") {
+            SoapySDR::logf(SOAPY_SDR_WARNING,
+                           "aaronia: ignoring rx_channel=%s; expected Rx1, Rx2 or Rx1And2",
+                           ch.c_str());
+        } else {
+            int32_t sel = ch == "Rx2" ? 1 : (ch == "Rx1And2" ? 2 : 0);
+            spectran_source_builder_receiver_channel(builder, sel);
+        }
     }
     // read_timeout=<seconds>: only affects the crate's own blocking
     // reads. readStream always passes SoapySDR's per-call timeoutUs, so

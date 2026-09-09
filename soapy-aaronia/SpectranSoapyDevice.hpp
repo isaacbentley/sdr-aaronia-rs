@@ -139,6 +139,21 @@ private:
     int _txStreamTag;
     bool _isStreaming;
     std::vector<FfiComplex> _tempFloatBuffer;
+    std::vector<FfiComplex> _tempFloatBufferRx2;
+    // How many RX channels this device presents: 2 only when the source
+    // was built for dual capture (rx_channel=Rx1And2 on the native-SDK
+    // backend), otherwise 1. It cannot be derived from the model: dual
+    // capture has to be requested before the device is opened, so a full
+    // V6 opened single-channel really does have one channel to offer.
+    size_t _rxChannels;
+    // Whether the RX stream was set up across both channels. A dual
+    // device may still be streamed one channel at a time; only a
+    // two-channel setupStream switches readStream to the paired read.
+    bool _rxDualStream;
+    // Whether that setupStream listed the channels as {1, 0}. The order
+    // of the channel vector decides which receiver each `buffs[]` entry
+    // gets, so a reversed list has to reverse the two writes.
+    bool _rxSwapped;
 
     // What the device said about itself, read once at construction.
     //

@@ -3102,6 +3102,27 @@ impl NativeSdkSource {
         rx2: &mut Vec<Complex32>,
         max_samples: usize,
     ) -> Result<usize> {
+        unsafe { self.read_samples_dual_within(rx1, rx2, max_samples, Self::READ_POLL_DEADLINE) }
+    }
+
+    /// [`Self::read_samples_dual`] with the wait for a packet bounded by
+    /// `poll_budget` instead of [`Self::READ_POLL_DEADLINE`]. A zero
+    /// budget drains carry-over and any already-queued packets without
+    /// sleeping.
+    ///
+    /// This is the dual counterpart of [`Self::read_samples_within`],
+    /// and exists for the same reason: the SoapySDR plugin must honour
+    /// the application's `timeoutUs`, which a fixed deadline ignores.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::read_samples_dual`].
+    pub unsafe fn read_samples_dual_within(
+        &mut self,
+        rx1: &mut Vec<Complex32>,
+        rx2: &mut Vec<Complex32>,
+        max_samples: usize,
+        poll_budget: std::time::Duration,
+    ) -> Result<usize> {
         unsafe {
             if !self.stream_active {
                 return Err(Error::Sdk("Streaming not active".to_string()));
@@ -3156,10 +3177,14 @@ impl NativeSdkSource {
                     Some(p) => p,
                     None if got_packet => break,
                     None => {
-                        if started.elapsed() >= Self::READ_POLL_DEADLINE {
+                        let elapsed = started.elapsed();
+                        if elapsed >= poll_budget {
                             break;
                         }
-                        std::thread::sleep(Self::READ_POLL_INTERVAL);
+                        // Never sleep past the budget, as the mono path
+                        // does not: a sub-interval deadline gets the
+                        // remainder, not a full tick.
+                        std::thread::sleep(Self::READ_POLL_INTERVAL.min(poll_budget - elapsed));
                         continue;
                     }
                 };
@@ -3293,7 +3318,7 @@ impl NativeSdkSource {
             if !got_packet {
                 debug!(
                     "read_samples_dual: no packet within {:?} (stream live but idle)",
-                    Self::READ_POLL_DEADLINE
+                    poll_budget
                 );
             }
 

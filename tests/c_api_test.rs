@@ -1,9 +1,10 @@
 use sdr_aaronia_rs::c_api::{
-    SpectranFfiError, spectran_endpoints_client_free, spectran_endpoints_client_new,
+    FfiComplex, SpectranFfiError, spectran_endpoints_client_free, spectran_endpoints_client_new,
     spectran_get_error_message, spectran_last_error, spectran_source_build,
     spectran_source_builder_center_frequency_hz, spectran_source_builder_free,
     spectran_source_builder_http_source, spectran_source_builder_new,
     spectran_source_builder_reference_level_dbm, spectran_source_builder_sample_rate_hz,
+    spectran_source_read_samples_dual, spectran_source_read_samples_dual_timeout,
     spectran_string_free,
 };
 use std::ffi::{CStr, CString};
@@ -68,5 +69,39 @@ fn test_spectran_get_error_message() {
         let msg = CStr::from_ptr(msg_ptr).to_string_lossy();
         assert_eq!(msg, "Null pointer provided");
         spectran_string_free(msg_ptr);
+    }
+}
+
+/// The dual reads must reject a missing second buffer rather than
+/// writing through it. `readStream` hands `buffs[1]` straight down when
+/// an application sets up two channels, and a caller that asked for two
+/// channels but supplied one buffer is exactly the mistake worth
+/// catching at the boundary — not one page fault later.
+#[test]
+fn dual_reads_reject_a_null_buffer() {
+    let mut buf: [FfiComplex; 4] = std::array::from_fn(|_| FfiComplex { re: 0.0, im: 0.0 });
+    let p = buf.as_mut_ptr();
+    unsafe {
+        // The source pointer is dangling on purpose. A *null* one would
+        // short-circuit the guard before the buffers are ever examined,
+        // so the buffer checks would go untested; a non-null one reaches
+        // them. Nothing dereferences it, because every case below has at
+        // least one null buffer — and if a future edit moves the
+        // dereference ahead of the guard, this test crashes rather than
+        // passing quietly, which is the regression worth catching.
+        for (rx1, rx2) in [
+            (std::ptr::null_mut(), p),
+            (p, std::ptr::null_mut()),
+            (std::ptr::null_mut(), std::ptr::null_mut()),
+        ] {
+            assert_eq!(
+                spectran_source_read_samples_dual(std::ptr::dangling_mut(), rx1, rx2, 4),
+                -1
+            );
+            assert_eq!(
+                spectran_source_read_samples_dual_timeout(std::ptr::dangling_mut(), rx1, rx2, 4, 0),
+                -1
+            );
+        }
     }
 }

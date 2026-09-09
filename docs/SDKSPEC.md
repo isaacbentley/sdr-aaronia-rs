@@ -541,6 +541,13 @@ never sees), so the second path errors instead of corrupting silently.
 `stop_streaming` clears both carry buffers and the latch, so a
 restarted session starts clean.
 
+The SoapySDR plugin exposes the same capture as two RX channels:
+`rx_channel=Rx1And2` at open time makes `getNumChannels(RX)` report 2,
+and `setupStream(RX, …, {0, 1})` switches `readStream` onto the paired
+read. The channel count follows the request rather than the model,
+because dual capture must be configured before the device is opened —
+a full V6 opened single-channel really does have one channel to offer.
+
 > **Hardware-unverified:** like the rest of the `Rx2`/`Rx1+Rx2` paths,
 > the interleave layout follows the packet contract (`stride` = floats
 > from sample to sample), not a live dual-channel capture — the

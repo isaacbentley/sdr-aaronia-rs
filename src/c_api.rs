@@ -679,12 +679,17 @@ pub unsafe extern "C" fn spectran_source_read_samples_timeout(
                 "spectran_source_read_samples_timeout failed: {}",
                 e
             ));
+            // Yield the code rather than `return`ing it: an early
+            // return here skipped `return_scratch`, so every timeout
+            // dropped the staging buffer and the next read reallocated
+            // it — the allocation this path exists to avoid.
             if let crate::Error::Io(ref io_err) = e
                 && io_err.kind() == std::io::ErrorKind::TimedOut
             {
-                return -3;
+                -3
+            } else {
+                -1
             }
-            -1
         }
         Err(ctx) => {
             set_last_error(format!("spectran_source_read_samples_timeout: {}", ctx));
@@ -738,6 +743,81 @@ pub unsafe extern "C" fn spectran_source_read_samples_dual(
             -1
         }
     }
+}
+
+/// Deadline-bounded variant of [`spectran_source_read_samples_dual`],
+/// the pair to [`spectran_source_read_samples_timeout`] and for the same
+/// caller: the SoapySDR plugin's `readStream`, which must honour the
+/// application's `timeoutUs`.
+///
+/// Waits at most `timeout_us` microseconds. A partial read within the
+/// deadline returns the pair count collected; only a deadline with zero
+/// pairs returns `-3` (the timeout code). `timeout_us == 0` performs a
+/// non-blocking drain. Both buffers are written with the same count, so
+/// they stay index-aligned in time.
+///
+/// # Safety
+/// Same contract as [`spectran_source_read_samples_dual`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_source_read_samples_dual_timeout(
+    ptr: *mut c_void,
+    rx1: *mut FfiComplex,
+    rx2: *mut FfiComplex,
+    len: usize,
+    timeout_us: u64,
+) -> isize {
+    clear_last_error();
+    if ptr.is_null() || rx1.is_null() || rx2.is_null() {
+        set_last_error("spectran_source_read_samples_dual_timeout: null pointer");
+        return -1;
+    }
+    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+
+    // The reusable staging pair, not two fresh Vecs per call: this is
+    // the SoapySDR readStream path, for the same reason
+    // `spectran_source_read_samples_timeout` takes the mono scratch.
+    let (mut buf1, mut buf2) = source.take_dual_scratch();
+    buf1.reserve(len.min(READ_RESERVE_CAP));
+    buf2.reserve(len.min(READ_RESERVE_CAP));
+    let timeout = std::time::Duration::from_micros(timeout_us);
+
+    let result =
+        match ffi_block_on(source.read_samples_dual_deadline(&mut buf1, &mut buf2, len, timeout)) {
+            Ok(Ok(pairs)) => {
+                let pairs = pairs.min(len).min(buf1.len()).min(buf2.len());
+                // SAFETY: identical layout argument as in
+                // `spectran_source_read_samples_dual` above; `pairs` is
+                // clamped to both the caller's `len` and each buffer's own
+                // length, so neither copy can overrun.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(buf1.as_ptr() as *const FfiComplex, rx1, pairs);
+                    std::ptr::copy_nonoverlapping(buf2.as_ptr() as *const FfiComplex, rx2, pairs);
+                }
+                pairs as isize
+            }
+            Ok(Err(e)) => {
+                set_last_error(format!(
+                    "spectran_source_read_samples_dual_timeout failed: {}",
+                    e
+                ));
+                if let crate::Error::Io(ref io_err) = e
+                    && io_err.kind() == std::io::ErrorKind::TimedOut
+                {
+                    -3
+                } else {
+                    -1
+                }
+            }
+            Err(ctx) => {
+                set_last_error(format!(
+                    "spectran_source_read_samples_dual_timeout: {}",
+                    ctx
+                ));
+                -1
+            }
+        };
+    source.return_dual_scratch(buf1, buf2);
+    result
 }
 
 /// Read and clear the latched overrun flag from the source.

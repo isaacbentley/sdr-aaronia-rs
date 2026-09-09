@@ -15,8 +15,28 @@ All notable changes to this project will be documented in this file.
   `SpectranSource`, so reading the current reference no longer means fetching
   the whole capability tree. These read over HTTP; the writes work on both
   backends.
+- **Dual-channel RX reaches SoapySDR.** A full V6's two inputs were readable
+  from Rust, C and Python but not through the plugin, which reported one
+  channel and refused any other. Open with `rx_channel=Rx1And2` and
+  `getNumChannels(RX)` reports 2; `setupStream(RX, …, {0, 1})` puts
+  `readStream` on the paired read, filling both buffers with the same count.
+  The count follows the request, not the model — dual capture is configured
+  before the device opens, so a V6 opened single-channel has one channel to
+  offer. Still hardware-unverified: the development device is a single-channel
+  ECO.
+- **`read_samples_dual_deadline`** (Rust) and
+  **`spectran_source_read_samples_dual_timeout`** (C), the dual counterparts of
+  the existing deadline-bounded reads. `readStream` must honour the
+  application's `timeoutUs`, which the blocking dual read ignored.
 
 ### Fixed
+- **A timed-out read no longer discards the staging buffer.**
+  `spectran_source_read_samples_timeout` returned early on timeout, past the
+  point where it hands the buffer back, so the next read reallocated it — the
+  allocation that path exists to avoid.
+- **An unrecognised `rx_channel=` is reported, not silently taken as `Rx1`.**
+  A typo used to yield a single-channel stream indistinguishable from a working
+  dual request.
 - **Reading the wrong payload for the open mode is refused instead of answered.**
   Neither the SDK nor the packet says what a stream carries, so asking a
   spectrum pipeline for IQ returned dBm bins reinterpreted as voltages, and

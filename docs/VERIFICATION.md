@@ -25,7 +25,7 @@ nothing asserts it.
 | SoapySDR plugin | Manual | Manual |
 | `.rtsa` file playback | **Verified against real captures** | — |
 | TX (`UnifiedSink`, `spectran_sink_*`) | Endpoint only, no RF measured | Unverified |
-| Dual-channel RX (`read_samples_dual`) | — | Unverified |
+| Dual-channel RX (Rust, C, Python, SoapySDR) | — | Unverified — needs a full V6 |
 | GPS time (`gps_time_ns`) | — | Unverified |
 
 ## What is not verified, and why

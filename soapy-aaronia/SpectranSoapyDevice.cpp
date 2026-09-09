@@ -5,6 +5,17 @@
 #include <cstdio>
 #include <stdexcept>
 
+// One channel's worth of a read, CF32 -> interleaved CS16. Shared by
+// the mono and dual read paths so the rounding and clamping cannot
+// drift between them.
+static void convertToCS16(const FfiComplex *in, int16_t *out, intptr_t n) {
+    for (intptr_t i = 0; i < n; ++i) {
+        // lrintf: round-to-nearest instead of truncation.
+        out[i * 2]     = static_cast<int16_t>(std::lrintf(std::clamp(in[i].re * 32767.0f, -32768.0f, 32767.0f)));
+        out[i * 2 + 1] = static_cast<int16_t>(std::lrintf(std::clamp(in[i].im * 32767.0f, -32768.0f, 32767.0f)));
+    }
+}
+
 // Fetch-and-free the thread-local Rust error string.
 static std::string lastErrorOr(const char *fallback) {
     char *msg = spectran_last_error();
@@ -17,7 +28,7 @@ SpectranSoapyDevice::SpectranSoapyDevice(SpectranSource* source, SpectranSink* s
     : _source(source), _sink(sink), _centerFrequency(100e6), _sampleRate(1e6),
       _txSampleRate(0.0), _referenceLevel(-20.0),
       _rxSetup(false), _txSetup(false), _rxStreamTag(0), _txStreamTag(0),
-      _isStreaming(false),
+      _isStreaming(false), _rxChannels(1), _rxDualStream(false), _rxSwapped(false),
       _hasFreqRange(false), _freqMinHz(0.0), _freqMaxHz(0.0), _freqStepHz(0.0),
       _hasRefRange(false), _refMinDbm(0.0), _refMaxDbm(0.0), _refStepDb(0.0),
       _sourceType(Http)
@@ -42,6 +53,24 @@ SpectranSoapyDevice::SpectranSoapyDevice(SpectranSource* source, SpectranSink* s
         _referenceLevel = info->reference_level_dbm;
         _sourceType = info->source_type;
         spectran_source_info_free(info);
+    }
+
+    // Two RX channels exist only when this source was built for dual
+    // capture. Registration.cpp passed the same arg to the builder; the
+    // string is re-read here rather than queried back, because the
+    // request is what decides the channel count and the device has no
+    // way to report it. A full V6 opened single-channel genuinely has
+    // one channel to offer, so the model cannot stand in for this.
+    if (args.count("rx_channel") != 0 && args.at("rx_channel") == "Rx1And2") {
+        if (_sourceType == NativeSdk) {
+            _rxChannels = 2;
+            SoapySDR::log(SOAPY_SDR_INFO,
+                          "aaronia: dual RX (Rx1+Rx2); channel 1 is the second receiver");
+        } else {
+            SoapySDR::log(SOAPY_SDR_WARNING,
+                          "aaronia: rx_channel=Rx1And2 needs the native-SDK backend; "
+                          "advertising one RX channel");
+        }
     }
 
     // Ask the device what it can do, once, before anything is opened —
@@ -146,7 +175,7 @@ SoapySDR::Kwargs SpectranSoapyDevice::getHardwareInfo() const {
 }
 
 size_t SpectranSoapyDevice::getNumChannels(const int direction) const {
-    if (direction == SOAPY_SDR_RX) return 1;
+    if (direction == SOAPY_SDR_RX) return _rxChannels;
     // TX exists only when a sink backend was constructed (native-sdk
     // builds on Windows/Linux). Advertising a TX channel that every
     // write rejects (the old behaviour) breaks apps at stream time
@@ -157,7 +186,9 @@ size_t SpectranSoapyDevice::getNumChannels(const int direction) const {
 
 std::vector<std::string> SpectranSoapyDevice::getStreamFormats(const int direction, const size_t channel) const {
     std::vector<std::string> formats;
-    if (channel != 0) return formats;
+    // TX is single-channel whatever RX does.
+    const size_t channels = (direction == SOAPY_SDR_RX) ? _rxChannels : 1;
+    if (channel >= channels) return formats;
     if (direction == SOAPY_SDR_RX) {
         formats.push_back(SOAPY_SDR_CF32);
         formats.push_back(SOAPY_SDR_CS16);
@@ -188,8 +219,35 @@ SoapySDR::Stream *SpectranSoapyDevice::setupStream(
     if (direction != SOAPY_SDR_RX && direction != SOAPY_SDR_TX) {
         throw std::runtime_error("Only RX and TX streams are supported");
     }
-    if (!channels.empty() && (channels.size() != 1 || channels[0] != 0)) {
-        throw std::runtime_error("Invalid channel selection; only channel 0 exists");
+    // TX is single-channel; RX offers channel 1 as well when the source
+    // was built for dual capture. An empty list means "channel 0", per
+    // the SoapySDR default.
+    const size_t available = (direction == SOAPY_SDR_RX) ? _rxChannels : 1;
+    bool dual = false;
+    bool swapped = false;
+    if (!channels.empty()) {
+        for (const size_t ch : channels) {
+            if (ch >= available) {
+                throw std::runtime_error(
+                    "Invalid channel selection; this device has " +
+                    std::to_string(available) + " channel(s) in this direction");
+            }
+        }
+        // Either order of both channels is valid — the list decides
+        // which receiver each buffs[] entry gets — but a repeated
+        // channel would alias two output buffers onto one input.
+        if (channels.size() == 2 && channels[0] != channels[1]) {
+            dual = true;
+            swapped = channels[0] == 1;
+        } else if (channels.size() != 1 || channels[0] != 0) {
+            // Rx2 alone is not a channel subset the SDK can deliver: it
+            // interleaves both receivers into one packet, so Rx2 never
+            // arrives without Rx1. Opening with rx_channel=Rx2 is how a
+            // caller gets a single-channel stream from the second input.
+            throw std::runtime_error(
+                "Invalid channel selection; use {0}, or {0, 1} for dual capture. "
+                "For the second input alone, open with rx_channel=Rx2");
+        }
     }
 
     std::lock_guard<std::mutex> lock(_mutex);
@@ -199,6 +257,8 @@ SoapySDR::Stream *SpectranSoapyDevice::setupStream(
             throw std::runtime_error("Unsupported RX stream format: " + format);
         }
         _rxFormat = format;
+        _rxDualStream = dual;
+        _rxSwapped = swapped;
         _rxSetup = true;
         return reinterpret_cast<SoapySDR::Stream *>(&_rxStreamTag);
     }
@@ -225,6 +285,8 @@ void SpectranSoapyDevice::closeStream(SoapySDR::Stream *stream) {
     std::lock_guard<std::mutex> lock(_mutex);
     if (stream == reinterpret_cast<SoapySDR::Stream *>(&_rxStreamTag)) {
         _rxSetup = false;
+        _rxDualStream = false;
+        _rxSwapped = false;
     } else if (stream == reinterpret_cast<SoapySDR::Stream *>(&_txStreamTag)) {
         if (_sink) spectran_sink_stop_streaming(_sink);
         _txSetup = false;
@@ -310,7 +372,36 @@ int SpectranSoapyDevice::readStream(
     const uint64_t timeout_us = timeoutUs > 0 ? static_cast<uint64_t>(timeoutUs) : 0;
 
     intptr_t read = -1;
-    if (_rxFormat == SOAPY_SDR_CF32) {
+    if (_rxDualStream) {
+        // A two-channel setupStream requires a second output buffer;
+        // the SDK delivers both receivers in one interleaved packet, so
+        // the paired read is the only way to get either without losing
+        // the other.
+        if (!buffs[1]) return SOAPY_SDR_STREAM_ERROR;
+        // setupStream's channel list decides which receiver each buffer
+        // gets; {1, 0} asks for Rx2 first.
+        void *rx1Buf = _rxSwapped ? buffs[1] : buffs[0];
+        void *rx2Buf = _rxSwapped ? buffs[0] : buffs[1];
+        if (_rxFormat == SOAPY_SDR_CF32) {
+            read = spectran_source_read_samples_dual_timeout(
+                _source,
+                static_cast<FfiComplex *>(rx1Buf),
+                static_cast<FfiComplex *>(rx2Buf),
+                numElems, timeout_us);
+        } else if (_rxFormat == SOAPY_SDR_CS16) {
+            if (_tempFloatBuffer.size() < numElems) _tempFloatBuffer.resize(numElems);
+            if (_tempFloatBufferRx2.size() < numElems) _tempFloatBufferRx2.resize(numElems);
+            read = spectran_source_read_samples_dual_timeout(
+                _source, _tempFloatBuffer.data(), _tempFloatBufferRx2.data(),
+                numElems, timeout_us);
+            if (read > 0) {
+                convertToCS16(_tempFloatBuffer.data(), static_cast<int16_t *>(rx1Buf), read);
+                convertToCS16(_tempFloatBufferRx2.data(), static_cast<int16_t *>(rx2Buf), read);
+            }
+        } else {
+            return SOAPY_SDR_STREAM_ERROR;
+        }
+    } else if (_rxFormat == SOAPY_SDR_CF32) {
         FfiComplex *out = static_cast<FfiComplex *>(buffs[0]);
         read = spectran_source_read_samples_timeout(_source, out, numElems, timeout_us);
     } else if (_rxFormat == SOAPY_SDR_CS16) {
@@ -319,12 +410,7 @@ int SpectranSoapyDevice::readStream(
         }
         read = spectran_source_read_samples_timeout(_source, _tempFloatBuffer.data(), numElems, timeout_us);
         if (read > 0) {
-            int16_t *out = static_cast<int16_t *>(buffs[0]);
-            for (intptr_t i = 0; i < read; ++i) {
-                // lrintf: round-to-nearest instead of truncation.
-                out[i * 2]     = static_cast<int16_t>(std::lrintf(std::clamp(_tempFloatBuffer[i].re * 32767.0f, -32768.0f, 32767.0f)));
-                out[i * 2 + 1] = static_cast<int16_t>(std::lrintf(std::clamp(_tempFloatBuffer[i].im * 32767.0f, -32768.0f, 32767.0f)));
-            }
+            convertToCS16(_tempFloatBuffer.data(), static_cast<int16_t *>(buffs[0]), read);
         }
     } else {
         return SOAPY_SDR_STREAM_ERROR;
@@ -532,12 +618,15 @@ std::string SpectranSoapyDevice::getClockSource(void) const {
 
 std::vector<std::string> SpectranSoapyDevice::listAntennas(const int direction, const size_t channel) const {
     std::vector<std::string> ant;
-    if (channel != 0) return ant;
+    if (channel >= ((direction == SOAPY_SDR_RX) ? _rxChannels : 1u)) return ant;
     if (direction == SOAPY_SDR_RX) {
         // Named by the device's own `devicemode` — "RX1 LO1 SWEEP" on a
         // V6 ECO, where the mode is read-only. Hardcoding RX1 happened
         // to be right there and would misname a V6 running an RX2 mode.
-        ant.push_back(_rxAntenna.empty() ? std::string("RX1") : _rxAntenna);
+        // Channel 1 is the second receiver by construction, so it is
+        // named for the input rather than for the device mode.
+        if (channel == 1) ant.push_back("RX2");
+        else ant.push_back(_rxAntenna.empty() ? std::string("RX1") : _rxAntenna);
     } else if (direction == SOAPY_SDR_TX && _sink) {
         ant.push_back("TX1");
     }
@@ -552,11 +641,11 @@ void SpectranSoapyDevice::setAntenna(const int direction, const size_t channel, 
 }
 
 std::string SpectranSoapyDevice::getAntenna(const int direction, const size_t channel) const {
-    (void)channel;
     // Must be a member of listAntennas(): applications select the
     // combo entry matching this, and gr-soapy validates set_antenna
     // against the list.
     if (direction == SOAPY_SDR_TX) return _sink ? "TX1" : "";
+    if (channel == 1 && _rxChannels > 1) return "RX2";
     return _rxAntenna.empty() ? std::string("RX1") : _rxAntenna;
 }
 

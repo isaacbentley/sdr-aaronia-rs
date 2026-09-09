@@ -187,6 +187,12 @@ intptr_t spectran_source_read_samples_timeout(SpectranSource* source, FfiComplex
 // the native-SDK backend): fills rx1/rx2 with equal numbers of
 // time-aligned samples; returns the pair count or -1.
 intptr_t spectran_source_read_samples_dual(SpectranSource* source, FfiComplex* rx1, FfiComplex* rx2, uintptr_t len);
+// Deadline-bounded dual read, the pair to
+// spectran_source_read_samples_timeout: waits at most timeout_us and
+// returns the pairs collected within the deadline; returns -3 only when
+// the deadline passes with zero pairs. timeout_us == 0 drains without
+// waiting. Both buffers receive the same count, so they stay aligned.
+intptr_t spectran_source_read_samples_dual_timeout(SpectranSource* source, FfiComplex* rx1, FfiComplex* rx2, uintptr_t len, uint64_t timeout_us);
 bool spectran_source_take_overrun(SpectranSource* source);
 uint64_t spectran_source_get_cumulative_drops(SpectranSource* source);
 int64_t spectran_source_get_last_timestamp_ns(SpectranSource* source);

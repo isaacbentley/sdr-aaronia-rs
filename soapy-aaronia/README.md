@@ -120,6 +120,39 @@ receiver clock and reaches higher, by how much is unsettled — see [the
 note in HTTPSPEC](../docs/HTTPSPEC.md#unresolved-the-full-v6s-top-rate).
 There, `getSampleRate` while streaming is the number to trust.
 
+## Dual-channel RX
+
+A full SPECTRAN V6 has two RF inputs. Ask for both at open time and the
+plugin advertises two RX channels:
+
+```python
+sdr = SoapySDR.Device("driver=aaronia,sdk=1,rx_channel=Rx1And2")
+sdr.getNumChannels(SOAPY_SDR_RX)          # 2
+stream = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [0, 1])
+```
+
+`readStream` then fills both buffers with the same number of samples,
+index-aligned in time. Channel 0 is Rx1, channel 1 is Rx2.
+
+It has to be requested before the device opens, so a V6 opened without
+it reports one channel — the count describes this session, not the
+model. The request needs the native-SDK backend; over HTTP it is
+ignored with a warning.
+
+Valid channel sets are `{0}`, `{0, 1}` and `{1, 0}` — the list order
+decides which receiver each buffer gets. `{1}` is not one: the SDK
+interleaves both receivers into a single packet, so Rx2 never arrives
+without Rx1. Open with `rx_channel=Rx2` for a single-channel stream from
+the second input.
+
+Both channels share one tuner: centre frequency, sample rate and
+reference level are device-wide, and setting them on either channel sets
+them for both.
+
+> **Hardware-unverified.** The development device is a single-channel V6
+> ECO, so this path follows the packet contract rather than a live
+> capture. See [VERIFICATION.md](../docs/VERIFICATION.md).
+
 ## What the probe reports
 
 Over the HTTP backend, `SoapySDRUtil --probe` reports the attached
@@ -174,8 +207,6 @@ it does offer. `listClockSources` reports the device's own vocabulary.
 
 ## Known limitations
 
-- One RX channel through the plugin. `rx_channel=Rx2` selects the second
-  antenna input; simultaneous dual-channel reads are available through
-  the crate's Rust, Python and C APIs, not the SoapySDR interface.
+- Dual RX is hardware-unverified — see [Dual-channel RX](#dual-channel-rx).
 - Enumeration advertises a default localhost candidate without probing
   it, because `find()` must not block on the network.
