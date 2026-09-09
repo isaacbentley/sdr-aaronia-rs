@@ -175,13 +175,13 @@ pub struct FfiServerInfo {
 #[repr(C)]
 pub struct FfiSourceInfo {
     pub source_type: CAaroniaSourceType,
-    pub center_frequency: f64,
-    /// IQ sample rate (Fs) in Hz — see `SourceInfo::span_frequency`.
-    pub span_frequency: f64,
+    pub center_frequency_hz: f64,
+    /// IQ sample rate (Fs) in Hz — see `SourceInfo::sample_rate_hz`.
+    pub sample_rate_hz: f64,
     /// Usable RX/real-time bandwidth in Hz; `0.0` = unknown. Always
-    /// `<= span_frequency`.
+    /// `<= sample_rate_hz`.
     pub bandwidth_hz: f64,
-    pub reference_level: f64,
+    pub reference_level_dbm: f64,
     pub device_serial: *const c_char,
 }
 
@@ -221,13 +221,13 @@ pub unsafe extern "C" fn aaronia_source_builder_free(builder: *mut AaroniaSource
 /// not yet freed. The pointer must remain valid for the duration of the
 /// call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_center_frequency(
+pub unsafe extern "C" fn aaronia_source_builder_center_frequency_hz(
     builder: *mut AaroniaSourceBuilder,
-    freq: f64,
+    hz: f64,
 ) {
     unsafe {
         if let Some(builder) = builder.as_mut() {
-            builder.center_frequency_hz(freq);
+            builder.center_frequency_hz(hz);
         }
     }
 }
@@ -240,13 +240,13 @@ pub unsafe extern "C" fn aaronia_source_builder_center_frequency(
 /// not yet freed. The pointer must remain valid for the duration of the
 /// call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_span_frequency(
+pub unsafe extern "C" fn aaronia_source_builder_sample_rate_hz(
     builder: *mut AaroniaSourceBuilder,
-    freq: f64,
+    hz: f64,
 ) {
     unsafe {
         if let Some(builder) = builder.as_mut() {
-            builder.sample_rate_hz(freq);
+            builder.sample_rate_hz(hz);
         }
     }
 }
@@ -259,13 +259,13 @@ pub unsafe extern "C" fn aaronia_source_builder_span_frequency(
 /// not yet freed. The pointer must remain valid for the duration of the
 /// call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_reference_level(
+pub unsafe extern "C" fn aaronia_source_builder_reference_level_dbm(
     builder: *mut AaroniaSourceBuilder,
-    level: f64,
+    dbm: f64,
 ) {
     unsafe {
         if let Some(builder) = builder.as_mut() {
-            builder.reference_level_dbm(level);
+            builder.reference_level_dbm(dbm);
         }
     }
 }
@@ -864,26 +864,29 @@ pub unsafe extern "C" fn aaronia_source_stop_streaming(ptr: *mut c_void) -> Aaro
 /// # Safety
 /// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_set_center_frequency(
+pub unsafe extern "C" fn aaronia_source_set_center_frequency_hz(
     ptr: *mut c_void,
-    freq_hz: f64,
+    hz: f64,
 ) -> AaroniaFfiError {
     clear_last_error();
     if ptr.is_null() {
-        set_last_error("aaronia_source_set_center_frequency: source pointer is null");
+        set_last_error("aaronia_source_set_center_frequency_hz: source pointer is null");
         return AaroniaFfiError::NullPointer;
     }
 
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    match ffi_block_on(source.set_center_frequency_hz(freq_hz)) {
+    match ffi_block_on(source.set_center_frequency_hz(hz)) {
         Ok(Ok(())) => AaroniaFfiError::Success,
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_set_center_frequency failed: {}", e));
+            set_last_error(format!(
+                "aaronia_source_set_center_frequency_hz failed: {}",
+                e
+            ));
             AaroniaFfiError::InternalError
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_set_center_frequency: {}", ctx));
+            set_last_error(format!("aaronia_source_set_center_frequency_hz: {}", ctx));
             AaroniaFfiError::RuntimeContext
         }
     }
@@ -894,26 +897,26 @@ pub unsafe extern "C" fn aaronia_source_set_center_frequency(
 /// # Safety
 /// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_set_span_frequency(
+pub unsafe extern "C" fn aaronia_source_set_sample_rate_hz(
     ptr: *mut c_void,
-    span_hz: f64,
+    hz: f64,
 ) -> AaroniaFfiError {
     clear_last_error();
     if ptr.is_null() {
-        set_last_error("aaronia_source_set_span_frequency: source pointer is null");
+        set_last_error("aaronia_source_set_sample_rate_hz: source pointer is null");
         return AaroniaFfiError::NullPointer;
     }
 
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    match ffi_block_on(source.set_sample_rate_hz(span_hz)) {
+    match ffi_block_on(source.set_sample_rate_hz(hz)) {
         Ok(Ok(())) => AaroniaFfiError::Success,
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_set_span_frequency failed: {}", e));
+            set_last_error(format!("aaronia_source_set_sample_rate_hz failed: {}", e));
             AaroniaFfiError::InternalError
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_set_span_frequency: {}", ctx));
+            set_last_error(format!("aaronia_source_set_sample_rate_hz: {}", ctx));
             AaroniaFfiError::RuntimeContext
         }
     }
@@ -924,26 +927,29 @@ pub unsafe extern "C" fn aaronia_source_set_span_frequency(
 /// # Safety
 /// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_set_reference_level(
+pub unsafe extern "C" fn aaronia_source_set_reference_level_dbm(
     ptr: *mut c_void,
-    ref_level_dbm: f64,
+    dbm: f64,
 ) -> AaroniaFfiError {
     clear_last_error();
     if ptr.is_null() {
-        set_last_error("aaronia_source_set_reference_level: source pointer is null");
+        set_last_error("aaronia_source_set_reference_level_dbm: source pointer is null");
         return AaroniaFfiError::NullPointer;
     }
 
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    match ffi_block_on(source.set_reference_level_dbm(ref_level_dbm)) {
+    match ffi_block_on(source.set_reference_level_dbm(dbm)) {
         Ok(Ok(())) => AaroniaFfiError::Success,
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_set_reference_level failed: {}", e));
+            set_last_error(format!(
+                "aaronia_source_set_reference_level_dbm failed: {}",
+                e
+            ));
             AaroniaFfiError::InternalError
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_set_reference_level: {}", ctx));
+            set_last_error(format!("aaronia_source_set_reference_level_dbm: {}", ctx));
             AaroniaFfiError::RuntimeContext
         }
     }
@@ -1024,10 +1030,10 @@ pub unsafe extern "C" fn aaronia_source_get_source_info(ptr: *mut c_void) -> *mu
 
     let ffi_info = Box::new(FfiSourceInfo {
         source_type: info.source_type.into(),
-        center_frequency: info.center_frequency_hz,
-        span_frequency: info.sample_rate_hz,
+        center_frequency_hz: info.center_frequency_hz,
+        sample_rate_hz: info.sample_rate_hz,
         bandwidth_hz: info.bandwidth_hz,
-        reference_level: info.reference_level_dbm,
+        reference_level_dbm: info.reference_level_dbm,
         device_serial,
     });
 
@@ -1245,7 +1251,7 @@ pub unsafe extern "C" fn aaronia_source_capabilities_free(ptr: *mut FfiDeviceCap
     }
 }
 
-/// The device's live sensors, filled by [`aaronia_source_read_sensors`].
+/// The device's live sensors, filled by [`aaronia_source_get_sensors`].
 ///
 /// A plain value struct the caller allocates: every field is a reading,
 /// or `NaN` for "the device did not report it". No pointers, no
@@ -1285,7 +1291,7 @@ pub struct FfiDeviceSensors {
 /// concurrently from another thread; `out` must point to a writable
 /// `FfiDeviceSensors`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_read_sensors(
+pub unsafe extern "C" fn aaronia_source_get_sensors(
     ptr: *mut c_void,
     out: *mut FfiDeviceSensors,
 ) -> bool {
@@ -1439,7 +1445,7 @@ pub unsafe extern "C" fn aaronia_endpoints_client_get_info(ptr: *mut c_void) -> 
 }
 
 /// Read the device's live sensors through an endpoints client, into
-/// `out`. The same reading as [`aaronia_source_read_sensors`], but off a
+/// `out`. The same reading as [`aaronia_source_get_sensors`], but off a
 /// standalone client rather than a streaming source — so a caller can
 /// poll sensors during a capture without contending for the source's
 /// read lock, which would stall sample delivery.
@@ -1454,20 +1460,20 @@ pub unsafe extern "C" fn aaronia_endpoints_client_get_info(ptr: *mut c_void) -> 
 /// `ptr` must be a live pointer from [`aaronia_endpoints_client_new`],
 /// not yet freed; `out` must point to a writable `FfiDeviceSensors`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_endpoints_client_read_sensors(
+pub unsafe extern "C" fn aaronia_endpoints_client_get_sensors(
     ptr: *mut c_void,
     out: *mut FfiDeviceSensors,
 ) -> bool {
     clear_last_error();
     if ptr.is_null() || out.is_null() {
-        set_last_error("aaronia_endpoints_client_read_sensors: null pointer".to_string());
+        set_last_error("aaronia_endpoints_client_get_sensors: null pointer".to_string());
         return false;
     }
     let client = unsafe { &*(ptr as *mut HttpEndpointsClient) };
     let sensors = match ffi_block_on(client.get_device_sensors()) {
         Ok(result) => result.unwrap_or_default(),
         Err(e) => {
-            set_last_error(format!("aaronia_endpoints_client_read_sensors: {e}"));
+            set_last_error(format!("aaronia_endpoints_client_get_sensors: {e}"));
             return false;
         }
     };
@@ -1716,7 +1722,7 @@ pub unsafe extern "C" fn aaronia_sink_builder_free(builder: *mut AaroniaSinkBuil
 /// # Safety
 /// `builder` must be a live pointer from [`aaronia_sink_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_builder_center_frequency(
+pub unsafe extern "C" fn aaronia_sink_builder_center_frequency_hz(
     builder: *mut AaroniaSinkBuilder,
     hz: f64,
 ) {
@@ -1731,7 +1737,7 @@ pub unsafe extern "C" fn aaronia_sink_builder_center_frequency(
 /// # Safety
 /// `builder` must be a live pointer from [`aaronia_sink_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_builder_sample_rate(
+pub unsafe extern "C" fn aaronia_sink_builder_sample_rate_hz(
     builder: *mut AaroniaSinkBuilder,
     hz: f64,
 ) {
@@ -1746,7 +1752,7 @@ pub unsafe extern "C" fn aaronia_sink_builder_sample_rate(
 /// # Safety
 /// `builder` must be a live pointer from [`aaronia_sink_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_builder_trans_gain(
+pub unsafe extern "C" fn aaronia_sink_builder_trans_gain_db(
     builder: *mut AaroniaSinkBuilder,
     db: f64,
 ) {
@@ -2022,10 +2028,10 @@ mod tests {
     fn ffi_info_struct_layouts_match_the_c_header() {
         assert_eq!(std::mem::size_of::<FfiSourceInfo>(), 48);
         assert_eq!(std::mem::offset_of!(FfiSourceInfo, source_type), 0);
-        assert_eq!(std::mem::offset_of!(FfiSourceInfo, center_frequency), 8);
-        assert_eq!(std::mem::offset_of!(FfiSourceInfo, span_frequency), 16);
+        assert_eq!(std::mem::offset_of!(FfiSourceInfo, center_frequency_hz), 8);
+        assert_eq!(std::mem::offset_of!(FfiSourceInfo, sample_rate_hz), 16);
         assert_eq!(std::mem::offset_of!(FfiSourceInfo, bandwidth_hz), 24);
-        assert_eq!(std::mem::offset_of!(FfiSourceInfo, reference_level), 32);
+        assert_eq!(std::mem::offset_of!(FfiSourceInfo, reference_level_dbm), 32);
         assert_eq!(std::mem::offset_of!(FfiSourceInfo, device_serial), 40);
 
         assert_eq!(std::mem::size_of::<FfiServerInfo>(), 48);
@@ -2132,9 +2138,9 @@ mod tests {
             assert!(!builder.is_null());
 
             // Apply some settings (should not crash)
-            aaronia_source_builder_center_frequency(builder, 2.4e9);
-            aaronia_source_builder_span_frequency(builder, 10e6);
-            aaronia_source_builder_reference_level(builder, -20.0);
+            aaronia_source_builder_center_frequency_hz(builder, 2.4e9);
+            aaronia_source_builder_sample_rate_hz(builder, 10e6);
+            aaronia_source_builder_reference_level_dbm(builder, -20.0);
 
             // Free the builder
             aaronia_source_builder_free(builder);

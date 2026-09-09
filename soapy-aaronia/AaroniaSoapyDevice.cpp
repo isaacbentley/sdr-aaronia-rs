@@ -37,9 +37,9 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
 
     FfiSourceInfo* info = aaronia_source_get_source_info(_source);
     if (info) {
-        _centerFrequency = info->center_frequency;
-        _sampleRate = info->span_frequency;
-        _referenceLevel = info->reference_level;
+        _centerFrequency = info->center_frequency_hz;
+        _sampleRate = info->sample_rate_hz;
+        _referenceLevel = info->reference_level_dbm;
         _sourceType = info->source_type;
         aaronia_source_info_free(info);
     }
@@ -566,7 +566,7 @@ void AaroniaSoapyDevice::setFrequency(const int direction, const size_t channel,
     if (direction != SOAPY_SDR_RX) return;
     std::lock_guard<std::mutex> lock(_mutex);
 
-    AaroniaFfiError err = aaronia_source_set_center_frequency(_source, frequency);
+    AaroniaFfiError err = aaronia_source_set_center_frequency_hz(_source, frequency);
     if (err == Success) {
         _centerFrequency = frequency;
     } else {
@@ -640,7 +640,7 @@ void AaroniaSoapyDevice::setSampleRate(const int direction, const size_t channel
                        wanted, snapped);
     }
 
-    AaroniaFfiError err = aaronia_source_set_span_frequency(_source, snapped);
+    AaroniaFfiError err = aaronia_source_set_sample_rate_hz(_source, snapped);
     if (err == Success) {
         _sampleRate = snapped;
     } else {
@@ -660,7 +660,7 @@ double AaroniaSoapyDevice::getSampleRate(const int direction, const size_t chann
     // snapped request before the first packet arrives.
     if (_isStreaming && _source) {
         if (FfiSourceInfo *info = aaronia_source_get_source_info(_source)) {
-            const double actual = info->span_frequency;
+            const double actual = info->sample_rate_hz;
             aaronia_source_info_free(info);
             if (actual > 0.0) return actual;
         }
@@ -739,7 +739,7 @@ void AaroniaSoapyDevice::setGain(const int direction, const size_t channel, cons
     // amplifier gain: RAISING it reduces sensitivity. Exposed under the
     // name "REF" so applications' generic gain sliders at least carry
     // the correct label.
-    AaroniaFfiError err = aaronia_source_set_reference_level(_source, value);
+    AaroniaFfiError err = aaronia_source_set_reference_level_dbm(_source, value);
     if (err == Success) {
         _referenceLevel = value;
     } else {
@@ -870,7 +870,7 @@ bool AaroniaSoapyDevice::refreshSensorsLocked(void) const {
     if (_sensorsCacheValid && now - _sensorsCacheTime < milliseconds(250)) {
         return true;
     }
-    if (aaronia_endpoints_client_read_sensors(_sensorClient, &_sensorsCache)) {
+    if (aaronia_endpoints_client_get_sensors(_sensorClient, &_sensorsCache)) {
         _sensorsCacheTime = now;
         _sensorsCacheValid = true;
         return true;

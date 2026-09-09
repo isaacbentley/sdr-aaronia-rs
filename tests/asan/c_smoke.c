@@ -60,9 +60,9 @@ static void test_builder_lifecycle(void) {
     CHECK(b != NULL, "aaronia_source_builder_new returned non-null");
     if (!b) return;
 
-    aaronia_source_builder_center_frequency(b, 2.4e9);
-    aaronia_source_builder_span_frequency(b, 20e6);
-    aaronia_source_builder_reference_level(b, -20.0);
+    aaronia_source_builder_center_frequency_hz(b, 2.4e9);
+    aaronia_source_builder_sample_rate_hz(b, 20e6);
+    aaronia_source_builder_reference_level_dbm(b, -20.0);
     aaronia_source_builder_file_source(b, "/dev/null");
 
     /* Passing NULL strings should not crash. */
@@ -76,9 +76,9 @@ static void test_builder_lifecycle(void) {
 /* Setters accept NULL builder gracefully (no segfault). */
 static void test_setters_null_builder(void) {
     printf("test_setters_null_builder:\n");
-    aaronia_source_builder_center_frequency(NULL, 1e9);
-    aaronia_source_builder_span_frequency(NULL, 1e6);
-    aaronia_source_builder_reference_level(NULL, 0.0);
+    aaronia_source_builder_center_frequency_hz(NULL, 1e9);
+    aaronia_source_builder_sample_rate_hz(NULL, 1e6);
+    aaronia_source_builder_reference_level_dbm(NULL, 0.0);
     aaronia_source_builder_http_source(NULL, "http://example.com");
     aaronia_source_builder_file_source(NULL, "/dev/null");
     CHECK(1, "setters with NULL builder returned without UB");

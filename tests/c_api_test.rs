@@ -1,9 +1,9 @@
 use sdr_aaronia_rs::c_api::{
     AaroniaFfiError, aaronia_endpoints_client_free, aaronia_endpoints_client_new,
     aaronia_get_error_message, aaronia_last_error, aaronia_source_build,
-    aaronia_source_builder_center_frequency, aaronia_source_builder_free,
+    aaronia_source_builder_center_frequency_hz, aaronia_source_builder_free,
     aaronia_source_builder_http_source, aaronia_source_builder_new,
-    aaronia_source_builder_reference_level, aaronia_source_builder_span_frequency,
+    aaronia_source_builder_reference_level_dbm, aaronia_source_builder_sample_rate_hz,
     aaronia_string_free,
 };
 use std::ffi::{CStr, CString};
@@ -14,9 +14,9 @@ fn test_c_api_builder_lifecycle() {
         let builder = aaronia_source_builder_new();
         assert!(!builder.is_null());
 
-        aaronia_source_builder_center_frequency(builder, 2.4e9);
-        aaronia_source_builder_span_frequency(builder, 20e6);
-        aaronia_source_builder_reference_level(builder, 0.0);
+        aaronia_source_builder_center_frequency_hz(builder, 2.4e9);
+        aaronia_source_builder_sample_rate_hz(builder, 20e6);
+        aaronia_source_builder_reference_level_dbm(builder, 0.0);
 
         let url = CString::new("http://example.com").unwrap();
         aaronia_source_builder_http_source(builder, url.as_ptr());

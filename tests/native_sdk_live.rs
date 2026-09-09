@@ -623,8 +623,8 @@ fn c_api_reaches_the_native_sdk_by_autodetection() {
         let builder = sdr_aaronia_rs::aaronia_source_builder_new();
         assert!(!builder.is_null(), "builder allocation");
 
-        sdr_aaronia_rs::aaronia_source_builder_center_frequency(builder, center_hz());
-        sdr_aaronia_rs::aaronia_source_builder_span_frequency(builder, 15.36e6);
+        sdr_aaronia_rs::aaronia_source_builder_center_frequency_hz(builder, center_hz());
+        sdr_aaronia_rs::aaronia_source_builder_sample_rate_hz(builder, 15.36e6);
         // Deliberately no http_source/file_source: that is what selects
         // auto-detection, and hence the SDK.
 

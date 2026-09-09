@@ -49,13 +49,13 @@ typedef struct FfiServerInfo {
 // --- C-compatible SourceInfo struct --- //
 typedef struct FfiSourceInfo {
     CAaroniaSourceType source_type;
-    double center_frequency;
+    double center_frequency_hz;
     // IQ sample rate (Fs) in Hz.
-    double span_frequency;
+    double sample_rate_hz;
     // Usable RX/real-time bandwidth in Hz; 0.0 = unknown.
-    // Always <= span_frequency.
+    // Always <= sample_rate_hz.
     double bandwidth_hz;
-    double reference_level;
+    double reference_level_dbm;
     const char* device_serial;
 } FfiSourceInfo;
 
@@ -98,7 +98,7 @@ typedef struct FfiDeviceCapabilities {
 
 /* Live sensor readings. A plain value struct the caller allocates; every
  * field is a reading or NaN for "not reported". No ownership, nothing to
- * free. Fill it with aaronia_source_read_sensors. */
+ * free. Fill it with aaronia_source_get_sensors. */
 typedef struct FfiDeviceSensors {
     double fpga_temp_c;
     double frontend_temp_c;
@@ -128,9 +128,9 @@ typedef struct HttpEndpointsClient HttpEndpointsClient;
 
 AaroniaSourceBuilder* aaronia_source_builder_new();
 void aaronia_source_builder_free(AaroniaSourceBuilder* builder);
-void aaronia_source_builder_center_frequency(AaroniaSourceBuilder* builder, double freq);
-void aaronia_source_builder_span_frequency(AaroniaSourceBuilder* builder, double freq);
-void aaronia_source_builder_reference_level(AaroniaSourceBuilder* builder, double level);
+void aaronia_source_builder_center_frequency_hz(AaroniaSourceBuilder* builder, double hz);
+void aaronia_source_builder_sample_rate_hz(AaroniaSourceBuilder* builder, double hz);
+void aaronia_source_builder_reference_level_dbm(AaroniaSourceBuilder* builder, double dbm);
 void aaronia_source_builder_http_source(AaroniaSourceBuilder* builder, const char* base_url);
 void aaronia_source_builder_file_source(AaroniaSourceBuilder* builder, const char* file_path);
 void aaronia_source_builder_device_serial(AaroniaSourceBuilder* builder, const char* serial);
@@ -193,9 +193,9 @@ int64_t aaronia_source_get_last_timestamp_ns(AaroniaSource* source);
 bool aaronia_source_get_gps_time(AaroniaSource* source, double* out_gps_time);
 AaroniaFfiError aaronia_source_start_streaming(AaroniaSource* source);
 AaroniaFfiError aaronia_source_stop_streaming(AaroniaSource* source);
-AaroniaFfiError aaronia_source_set_center_frequency(AaroniaSource* source, double freq_hz);
-AaroniaFfiError aaronia_source_set_span_frequency(AaroniaSource* source, double span_hz);
-AaroniaFfiError aaronia_source_set_reference_level(AaroniaSource* source, double ref_level_dbm);
+AaroniaFfiError aaronia_source_set_center_frequency_hz(AaroniaSource* source, double hz);
+AaroniaFfiError aaronia_source_set_sample_rate_hz(AaroniaSource* source, double hz);
+AaroniaFfiError aaronia_source_set_reference_level_dbm(AaroniaSource* source, double dbm);
 AaroniaFfiError aaronia_source_set_clock_source(AaroniaSource* source, const char* clock_source);
 FfiSourceInfo* aaronia_source_get_source_info(AaroniaSource* source);
 void aaronia_source_info_free(FfiSourceInfo* info);
@@ -213,7 +213,7 @@ void aaronia_source_capabilities_free(FfiDeviceCapabilities* caps);
  * completed (fields may be NaN where unreported; file/native-SDK backends
  * complete all-NaN), false (out untouched) for a null pointer or a
  * current-thread runtime. Blocking: one /healthstatus GET on HTTP. */
-bool aaronia_source_read_sensors(AaroniaSource* source, FfiDeviceSensors* out);
+bool aaronia_source_get_sensors(AaroniaSource* source, FfiDeviceSensors* out);
 
 // --- Sink FFI --- //
 //
@@ -248,9 +248,9 @@ bool aaronia_sink_supported(void);
 
 AaroniaSinkBuilder* aaronia_sink_builder_new(void);
 void aaronia_sink_builder_free(AaroniaSinkBuilder* builder);
-void aaronia_sink_builder_center_frequency(AaroniaSinkBuilder* builder, double hz);
-void aaronia_sink_builder_sample_rate(AaroniaSinkBuilder* builder, double hz);
-void aaronia_sink_builder_trans_gain(AaroniaSinkBuilder* builder, double db);
+void aaronia_sink_builder_center_frequency_hz(AaroniaSinkBuilder* builder, double hz);
+void aaronia_sink_builder_sample_rate_hz(AaroniaSinkBuilder* builder, double hz);
+void aaronia_sink_builder_trans_gain_db(AaroniaSinkBuilder* builder, double db);
 AaroniaSink* aaronia_sink_build(AaroniaSinkBuilder* builder);
 void aaronia_sink_free(AaroniaSink* sink);
 // Loads the native SDK, opens the first matching device, configures
@@ -279,8 +279,8 @@ FfiServerInfo* aaronia_endpoints_client_get_info(HttpEndpointsClient* client);
 
 /* Fill *out with the device's live sensors through a standalone client,
  * off the streaming source's read lock. Same reading and return contract
- * as aaronia_source_read_sensors. */
-bool aaronia_endpoints_client_read_sensors(HttpEndpointsClient* client, FfiDeviceSensors* out);
+ * as aaronia_source_get_sensors. */
+bool aaronia_endpoints_client_get_sensors(HttpEndpointsClient* client, FfiDeviceSensors* out);
 void aaronia_server_info_free(FfiServerInfo* info);
 AaroniaFfiError aaronia_endpoints_client_control_streaming(HttpEndpointsClient* client, bool start);
 AaroniaFfiError aaronia_endpoints_client_control_recording(HttpEndpointsClient* client, bool start, const char* name);

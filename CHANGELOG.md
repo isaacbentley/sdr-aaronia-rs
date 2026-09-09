@@ -43,6 +43,31 @@ because they take a string carrying its own units (`"146.52M"`), not a bare
 number. `DeviceCapabilities` is `#[non_exhaustive]`, so this is a field rename
 on a struct callers construct through the API rather than by literal.
 
+**The C ABI is renamed with no forwarders.** A C consumer gets an undefined
+symbol at link time rather than a deprecation warning, so this table is the
+migration guide. The `FfiSourceInfo` struct fields moved too — those are
+positional, so a stale header keeps reading the correct bytes under the old
+name forever, which is exactly why the header changed in the same commit.
+
+| Old C symbol | New |
+| --- | --- |
+| `aaronia_source_builder_center_frequency` | `aaronia_source_builder_center_frequency_hz` |
+| `aaronia_source_builder_span_frequency` | `aaronia_source_builder_sample_rate_hz` |
+| `aaronia_source_builder_reference_level` | `aaronia_source_builder_reference_level_dbm` |
+| `aaronia_source_set_center_frequency` | `aaronia_source_set_center_frequency_hz` |
+| `aaronia_source_set_span_frequency` | `aaronia_source_set_sample_rate_hz` |
+| `aaronia_source_set_reference_level` | `aaronia_source_set_reference_level_dbm` |
+| `aaronia_sink_builder_center_frequency` | `aaronia_sink_builder_center_frequency_hz` |
+| `aaronia_sink_builder_sample_rate` | `aaronia_sink_builder_sample_rate_hz` |
+| `aaronia_sink_builder_trans_gain` | `aaronia_sink_builder_trans_gain_db` |
+| `aaronia_source_read_sensors` | `aaronia_source_get_sensors` |
+| `aaronia_endpoints_client_read_sensors` | `aaronia_endpoints_client_get_sensors` |
+| `FfiSourceInfo::center_frequency` / `span_frequency` / `reference_level` | `center_frequency_hz` / `sample_rate_hz` / `reference_level_dbm` |
+
+The two `read_sensors` are not a unit change but a verb one: `read_` advances a
+stream in this ABI (`aaronia_source_read_samples`), while sensors are a
+snapshot, so they read as `get_` alongside `aaronia_source_get_capabilities`.
+
 `CaptureControl`'s fields gained units too, but its JSON keys did not move: the
 struct now pins each one with an explicit `#[serde(rename)]` instead of deriving
 them from Rust field names, so a future rename cannot change the wire format by

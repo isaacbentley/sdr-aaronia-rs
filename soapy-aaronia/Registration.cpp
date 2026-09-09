@@ -136,10 +136,10 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         aaronia_source_builder_device_serial(builder, args.at("serial").c_str());
     }
 
-    if (hasFreq) aaronia_source_builder_center_frequency(builder, freq);
-    if (hasRate) aaronia_source_builder_span_frequency(builder, rate);
+    if (hasFreq) aaronia_source_builder_center_frequency_hz(builder, freq);
+    if (hasRate) aaronia_source_builder_sample_rate_hz(builder, rate);
     if (args.count("ref_level") != 0) {
-        aaronia_source_builder_reference_level(builder, parseArgDouble(args, "ref_level"));
+        aaronia_source_builder_reference_level_dbm(builder, parseArgDouble(args, "ref_level"));
     }
     // format=I16 enables the genuine low-bandwidth HTTP wire mode
     // (int16 from the server), optionally with scale=N.
@@ -222,8 +222,8 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         SinkBuilderGuard sinkBuilderGuard(sink_builder);
         if (sink_builder) {
             // TX shares the tuning args with RX unless retuned later.
-            if (hasFreq) aaronia_sink_builder_center_frequency(sink_builder, freq);
-            if (hasRate) aaronia_sink_builder_sample_rate(sink_builder, rate);
+            if (hasFreq) aaronia_sink_builder_center_frequency_hz(sink_builder, freq);
+            if (hasRate) aaronia_sink_builder_sample_rate_hz(sink_builder, rate);
             sink.p = aaronia_sink_build(sink_builder);
         }
     }
