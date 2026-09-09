@@ -802,8 +802,8 @@ async fn live_retune_full_tuple_applies() {
     // comfortably inside the V6 tuning range for any plausible mission.
     let target = center0 - 2.0 * span0;
     let retune = |center: f64| CaptureControl {
-        frequency_center: Some(center),
-        frequency_span: Some(span0),
+        frequency_center_hz: Some(center),
+        frequency_span_hz: Some(span0),
         control_type: ControlType::Capture,
         ..Default::default()
     };

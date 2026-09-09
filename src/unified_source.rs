@@ -786,9 +786,9 @@ impl AaroniaSource {
         );
         retry_connect("Initial tuning", || {
             client.configure_capture(crate::http_endpoints::CaptureControl {
-                frequency_center: Some(self.config.center_frequency),
-                frequency_span: Some(self.config.span_frequency),
-                reference_level: Some(self.config.reference_level as f32),
+                frequency_center_hz: Some(self.config.center_frequency),
+                frequency_span_hz: Some(self.config.span_frequency),
+                reference_level_dbm: Some(self.config.reference_level as f32),
                 control_type: crate::http_endpoints::ControlType::Capture,
                 ..Default::default()
             })
@@ -983,9 +983,9 @@ impl AaroniaSource {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Err(e) = client_for_task
                     .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center: Some(desired.center),
-                        frequency_span: Some(desired.span),
-                        reference_level: Some(desired.reference_level as f32),
+                        frequency_center_hz: Some(desired.center),
+                        frequency_span_hz: Some(desired.span),
+                        reference_level_dbm: Some(desired.reference_level as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
@@ -1626,9 +1626,9 @@ impl AaroniaSource {
                 // doc comment above).
                 client
                     .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center: Some(freq),
-                        frequency_span: Some(self.config.span_frequency),
-                        reference_level: Some(self.config.reference_level as f32),
+                        frequency_center_hz: Some(freq),
+                        frequency_span_hz: Some(self.config.span_frequency),
+                        reference_level_dbm: Some(self.config.reference_level as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
@@ -1690,9 +1690,9 @@ impl AaroniaSource {
                 // by the server (see `set_center_frequency`).
                 client
                     .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center: Some(self.config.center_frequency),
-                        frequency_span: Some(span),
-                        reference_level: Some(self.config.reference_level as f32),
+                        frequency_center_hz: Some(self.config.center_frequency),
+                        frequency_span_hz: Some(span),
+                        reference_level_dbm: Some(self.config.reference_level as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
@@ -1748,9 +1748,9 @@ impl AaroniaSource {
                 // by the server (see `set_center_frequency`).
                 client
                     .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center: Some(self.config.center_frequency),
-                        frequency_span: Some(self.config.span_frequency),
-                        reference_level: Some(ref_level as f32),
+                        frequency_center_hz: Some(self.config.center_frequency),
+                        frequency_span_hz: Some(self.config.span_frequency),
+                        reference_level_dbm: Some(ref_level as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })

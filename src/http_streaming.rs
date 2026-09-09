@@ -253,6 +253,12 @@ where
 
 /// Complete packet metadata from RTSA HTTP stream
 /// Enhanced to capture all real-time streaming parameters
+/// **Do not rename these fields.** `rename_all = "camelCase"` derives every
+/// JSON key from the Rust field name, so a rename silently moves the wire.
+/// On an `Option` field it is quieter still: an unrecognised key
+/// deserialises to `None` rather than failing, so the value simply goes
+/// missing. The keys are documented in `docs/HTTPSPEC.md` and pinned by
+/// `tests/wire_contract.rs`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PacketMetadata {

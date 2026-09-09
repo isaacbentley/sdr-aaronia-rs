@@ -257,6 +257,12 @@ pub enum InputProcessingType {
 }
 
 /// Represents the payload for pushing IQ samples to the RTSA device via the `/sample` endpoint.
+/// **Do not rename these fields.** `rename_all = "camelCase"` derives every
+/// JSON key from the Rust field name, so a rename silently moves the wire.
+/// On an `Option` field it is quieter still: an unrecognised key
+/// deserialises to `None` rather than failing, so the value simply goes
+/// missing. The keys are documented in `docs/HTTPSPEC.md` and pinned by
+/// `tests/wire_contract.rs`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TxSampleRequest<'a> {
@@ -296,22 +302,38 @@ pub struct StreamingControl {
     pub control_type: ControlType,
 }
 
-/// Defines the command for configuring capture parameters like frequency and span.
+/// The `/control` capture command: what to tune to, and how wide.
+///
+/// **Every wire key is pinned explicitly rather than derived.** This used
+/// to carry `#[serde(rename_all = "camelCase")]`, which makes each JSON key
+/// a silent function of its Rust field name — so renaming a field moves the
+/// wire, and the server answers 200 to a payload it does not understand.
+/// With the keys written out, a field can be renamed for clarity without
+/// touching what leaves the process, and `tests/wire_contract.rs` asserts
+/// the exact key set.
+///
+/// Field names here keep the wire's own vocabulary rather than this
+/// crate's, because the server owns the meaning. In particular
+/// `frequency_span_hz` is deliberately *not* called a sample rate: the
+/// endpoint specification calls it "a usable-bandwidth request, not a
+/// sample rate" (see `docs/HTTPSPEC.md`), while this crate currently
+/// passes its sample rate into it. Until that is settled against
+/// hardware, the name asserts neither reading.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub struct CaptureControl {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_center: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_span: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_start: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_end: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "frequencyCenter", skip_serializing_if = "Option::is_none")]
+    pub frequency_center_hz: Option<f64>,
+    #[serde(rename = "frequencySpan", skip_serializing_if = "Option::is_none")]
+    pub frequency_span_hz: Option<f64>,
+    #[serde(rename = "frequencyStart", skip_serializing_if = "Option::is_none")]
+    pub frequency_start_hz: Option<f64>,
+    #[serde(rename = "frequencyEnd", skip_serializing_if = "Option::is_none")]
+    pub frequency_end_hz: Option<f64>,
+    /// A count, so no unit suffix.
+    #[serde(rename = "frequencyBins", skip_serializing_if = "Option::is_none")]
     pub frequency_bins: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference_level: Option<f32>,
+    #[serde(rename = "referenceLevel", skip_serializing_if = "Option::is_none")]
+    pub reference_level_dbm: Option<f32>,
     #[serde(rename = "type")]
     pub control_type: ControlType,
 }
@@ -1890,8 +1912,10 @@ impl HttpEndpointsClient {
     /// field logs a warning here and is still sent, since other server
     /// versions may accept it.
     pub async fn configure_capture(&self, config: CaptureControl) -> Result<()> {
-        let has_range = config.frequency_start.is_some() && config.frequency_end.is_some();
-        if !has_range && (config.frequency_center.is_some() != config.frequency_span.is_some()) {
+        let has_range = config.frequency_start_hz.is_some() && config.frequency_end_hz.is_some();
+        if !has_range
+            && (config.frequency_center_hz.is_some() != config.frequency_span_hz.is_some())
+        {
             warn!(
                 "Partial capture PUT ({:?}): RTSA servers are known to accept a lone \
                  frequencyCenter/frequencySpan with success=true but silently ignore it; \
@@ -3231,12 +3255,12 @@ mod tests {
     #[test]
     fn test_capture_control_serialization() {
         let capture_cmd = CaptureControl {
-            frequency_center: Some(1920e6),
-            frequency_span: Some(200e6),
-            frequency_start: None,
-            frequency_end: None,
+            frequency_center_hz: Some(1920e6),
+            frequency_span_hz: Some(200e6),
+            frequency_start_hz: None,
+            frequency_end_hz: None,
             frequency_bins: Some(448),
-            reference_level: Some(-20.0),
+            reference_level_dbm: Some(-20.0),
             control_type: ControlType::Capture,
         };
 

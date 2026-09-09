@@ -446,7 +446,7 @@ async fn test_configure_capture_success() {
 
     let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
     let control = sdr_aaronia_rs::http_endpoints::CaptureControl {
-        frequency_center: Some(1e9),
+        frequency_center_hz: Some(1e9),
         ..Default::default()
     };
     let result = client.configure_capture(control).await;

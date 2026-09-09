@@ -31,12 +31,12 @@ fn keys_of<T: serde::Serialize>(value: &T) -> BTreeSet<String> {
 #[test]
 fn capture_control_wire_keys_are_pinned() {
     let cmd = CaptureControl {
-        frequency_center: Some(1920e6),
-        frequency_span: Some(200e6),
-        frequency_start: Some(1820e6),
-        frequency_end: Some(2020e6),
+        frequency_center_hz: Some(1920e6),
+        frequency_span_hz: Some(200e6),
+        frequency_start_hz: Some(1820e6),
+        frequency_end_hz: Some(2020e6),
         frequency_bins: Some(448),
-        reference_level: Some(-20.0),
+        reference_level_dbm: Some(-20.0),
         control_type: ControlType::Capture,
     };
 

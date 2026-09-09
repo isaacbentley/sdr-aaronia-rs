@@ -1585,9 +1585,9 @@ impl HttpSource {
                 let fallback = self
                     .endpoints_client
                     .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center: Some(self.current_frequency),
-                        frequency_span: Some(self.current_sample_rate),
-                        reference_level: self.reference_level.map(|dbm| dbm as f32),
+                        frequency_center_hz: Some(self.current_frequency),
+                        frequency_span_hz: Some(self.current_sample_rate),
+                        reference_level_dbm: self.reference_level.map(|dbm| dbm as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })

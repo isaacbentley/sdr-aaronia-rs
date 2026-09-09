@@ -289,9 +289,9 @@ async fn main() -> Result<()> {
 
     // Apply capture configuration
     let config = CaptureControl {
-        frequency_center: Some(162.4e6),
-        frequency_span: Some(25e3),
-        reference_level: Some(-20.0),
+        frequency_center_hz: Some(162.4e6),
+        frequency_span_hz: Some(25e3),
+        reference_level_dbm: Some(-20.0),
         control_type: ControlType::Capture,
         ..Default::default()
     };
