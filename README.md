@@ -42,7 +42,7 @@ selects a backend and presents the same interface either way.
 
 Three backends feed one engine that a range of consumers read from:
 
-```
+```text
                ┌── Native SDK (C FFI)
 Backends:      ├── HTTP Streaming (REST + binary chunked)
                └── Offline .rtsa Files (binary parser)
