@@ -267,8 +267,8 @@ async fn pump_stream_with_params(params: StreamParams, secs: u64) -> PumpStats {
             Ok(Some(Ok(pkt))) => {
                 stats.packets += 1;
                 stats.samples += pkt.samples.len() as u64;
-                stats.rate = pkt.sdr_config.sample_rate;
-                stats.center = pkt.sdr_config.center_frequency;
+                stats.rate = pkt.sdr_config.sample_rate_hz;
+                stats.center = pkt.sdr_config.center_frequency_hz;
                 for s in &pkt.samples {
                     stats.max_abs = stats.max_abs.max(s.re.abs()).max(s.im.abs());
                 }

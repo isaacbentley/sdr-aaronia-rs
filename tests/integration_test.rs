@@ -277,10 +277,10 @@ fn test_rtsa_file_opens_and_parses_metadata() {
     let utc_2020_11_24 = 1_606_204_800.0; // 2020-11-24 00:00:00 UTC
     let utc_2020_11_25 = 1_606_291_200.0; // 2020-11-25 00:00:00 UTC
     assert!(
-        meta.creation_time >= utc_2020_11_24 && meta.creation_time < utc_2020_11_25,
+        meta.creation_time_s >= utc_2020_11_24 && meta.creation_time_s < utc_2020_11_25,
         "DSFH creation_time {} should normalise into 2020-11-24 UTC \
          (expected [{}, {}))",
-        meta.creation_time,
+        meta.creation_time_s,
         utc_2020_11_24,
         utc_2020_11_25
     );
@@ -299,8 +299,8 @@ fn test_rtsa_file_opens_and_parses_metadata() {
     // always populate `meta.sample_rate` directly (it can be derived from
     // SSTR.frequency_step or, when neither STRM.sample_rate nor SSTR has
     // it, left at 0.0). Probe both candidate sources before giving up.
-    let sample_rate_candidate = if meta.sample_rate > 0.0 {
-        meta.sample_rate
+    let sample_rate_candidate = if meta.sample_rate_hz > 0.0 {
+        meta.sample_rate_hz
     } else {
         source
             .sub_stream_info()
@@ -442,8 +442,8 @@ fn test_rtsa_lte_capture_opens() {
 
     // 10 MHz nominal sample rate; the SDK may not populate `sample_rate`
     // directly, so probe SSTR.frequency_step as a fallback.
-    let candidate = if meta.sample_rate > 0.0 {
-        meta.sample_rate
+    let candidate = if meta.sample_rate_hz > 0.0 {
+        meta.sample_rate_hz
     } else {
         source
             .sub_stream_info()

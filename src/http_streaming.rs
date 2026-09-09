@@ -313,11 +313,11 @@ pub struct PacketMetadata {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamingSdrConfig {
     /// Current center frequency in Hz
-    pub center_frequency: f64,
+    pub center_frequency_hz: f64,
     /// Total bandwidth being captured in Hz
-    pub bandwidth: f64,
+    pub bandwidth_hz: f64,
     /// Sample rate in Hz
-    pub sample_rate: f64,
+    pub sample_rate_hz: f64,
     /// Current reference level range
     pub power_range: (i32, i32), // (min, max)
     /// Physical unit of measurements
@@ -355,11 +355,11 @@ impl PacketMetadata {
 impl StreamingSdrConfig {
     /// Create SDR config from packet metadata
     pub fn from_metadata(metadata: &PacketMetadata) -> Self {
-        let center_freq = (metadata.start_frequency + metadata.end_frequency) / 2.0;
-        let bandwidth = metadata.end_frequency - metadata.start_frequency;
+        let center_frequency_hz = (metadata.start_frequency + metadata.end_frequency) / 2.0;
+        let bandwidth_hz = metadata.end_frequency - metadata.start_frequency;
         let duration = metadata.end_time - metadata.start_time;
         let duration_ms = duration * 1000.0;
-        let sample_rate = metadata.sample_rate();
+        let sample_rate_hz = metadata.sample_rate();
         let antenna_name = metadata
             .antenna
             .as_ref()
@@ -367,9 +367,9 @@ impl StreamingSdrConfig {
             .unwrap_or_else(|| "Unknown".to_string());
 
         Self {
-            center_frequency: center_freq,
-            bandwidth,
-            sample_rate,
+            center_frequency_hz,
+            bandwidth_hz,
+            sample_rate_hz,
             power_range: (metadata.min_power, metadata.max_power),
             unit: metadata.unit.clone(),
             data_format: format!("{:?}", metadata.payload),
@@ -381,19 +381,19 @@ impl StreamingSdrConfig {
 
     /// Get human-readable frequency range
     pub fn frequency_range_mhz(&self) -> (f64, f64) {
-        let start_mhz = (self.center_frequency - self.bandwidth / 2.0) / 1e6;
-        let end_mhz = (self.center_frequency + self.bandwidth / 2.0) / 1e6;
+        let start_mhz = (self.center_frequency_hz - self.bandwidth_hz / 2.0) / 1e6;
+        let end_mhz = (self.center_frequency_hz + self.bandwidth_hz / 2.0) / 1e6;
         (start_mhz, end_mhz)
     }
 
     /// Get sample rate in MHz
     pub fn sample_rate_mhz(&self) -> f64 {
-        self.sample_rate / 1e6
+        self.sample_rate_hz / 1e6
     }
 
     /// Get bandwidth in MHz
     pub fn bandwidth_mhz(&self) -> f64 {
-        self.bandwidth / 1e6
+        self.bandwidth_hz / 1e6
     }
 }
 

@@ -2144,9 +2144,9 @@ impl NativeSdkSource {
     /// pipeline has no `device/receiverchannel` key to honour it with.
     pub unsafe fn configure_iq_receiver(
         &mut self,
-        center_freq: f64,
-        span_freq: f64,
-        ref_level: f64,
+        center_frequency_hz: f64,
+        sample_rate_hz: f64,
+        reference_level_dbm: f64,
         channel: Option<RxChannel>,
     ) -> Result<()> {
         unsafe {
@@ -2164,8 +2164,8 @@ impl NativeSdkSource {
                 .find_config(device, &mut root, "main/centerfreq")
             {
                 self.client
-                    .set_config_float(device, &mut config, center_freq)?;
-                info!("Set center frequency to {} Hz", center_freq);
+                    .set_config_float(device, &mut config, center_frequency_hz)?;
+                info!("Set center frequency to {} Hz", center_frequency_hz);
             } else {
                 warn!("Could not find main/centerfreq config");
             }
@@ -2182,21 +2182,21 @@ impl NativeSdkSource {
             // on every backend. `spectranv6/raw` is left as-is: not
             // measured here.
             let eco_iq = self.open_mode == Some(DeviceOpenMode::EcoIqReceiver);
-            let span_to_write = if eco_iq {
-                span_freq / crate::utils::IQ_RATE_CLOCK_RATIO
+            let spanfreq_to_write = if eco_iq {
+                sample_rate_hz / crate::utils::IQ_RATE_CLOCK_RATIO
             } else {
-                span_freq
+                sample_rate_hz
             };
             if let Ok(mut config) = self.client.find_config(device, &mut root, "main/spanfreq") {
                 self.client
-                    .set_config_float(device, &mut config, span_to_write)?;
+                    .set_config_float(device, &mut config, spanfreq_to_write)?;
                 if eco_iq {
                     info!(
                         "Set span frequency to {} Hz (bandwidth) for a {} S/s rate",
-                        span_to_write, span_freq
+                        spanfreq_to_write, sample_rate_hz
                     );
                 } else {
-                    info!("Set span frequency to {} Hz", span_freq);
+                    info!("Set span frequency to {} Hz", sample_rate_hz);
                 }
             } else {
                 warn!("Could not find main/spanfreq config");
@@ -2205,8 +2205,8 @@ impl NativeSdkSource {
             // Configure reference level
             if let Ok(mut config) = self.client.find_config(device, &mut root, "main/reflevel") {
                 self.client
-                    .set_config_float(device, &mut config, ref_level)?;
-                info!("Set reference level to {} dBm", ref_level);
+                    .set_config_float(device, &mut config, reference_level_dbm)?;
+                info!("Set reference level to {} dBm", reference_level_dbm);
             } else {
                 warn!("Could not find main/reflevel config");
             }
@@ -2309,7 +2309,7 @@ impl NativeSdkSource {
             };
 
             self.receiver_clock_hz = Some(actual_clock_hz);
-            crate::utils::validate_iq_mode(span_freq, actual_clock_hz)?;
+            crate::utils::validate_iq_mode(sample_rate_hz, actual_clock_hz)?;
 
             info!("IQ Receiver configuration completed");
             Ok(())
@@ -2323,9 +2323,9 @@ impl NativeSdkSource {
     /// > confirmed against a live TX-capable device.
     pub unsafe fn configure_iq_transmitter(
         &mut self,
-        center_freq: f64,
-        span_freq: f64,
-        trans_gain: f64,
+        center_frequency_hz: f64,
+        sample_rate_hz: f64,
+        trans_gain_db: f64,
     ) -> Result<()> {
         unsafe {
             let device = self
@@ -2340,24 +2340,24 @@ impl NativeSdkSource {
                 .find_config(device, &mut root, "main/centerfreq")
             {
                 self.client
-                    .set_config_float(device, &mut config, center_freq)?;
-                info!("Set TX center frequency to {} Hz", center_freq);
+                    .set_config_float(device, &mut config, center_frequency_hz)?;
+                info!("Set TX center frequency to {} Hz", center_frequency_hz);
             } else {
                 warn!("Could not find main/centerfreq config");
             }
 
             if let Ok(mut config) = self.client.find_config(device, &mut root, "main/spanfreq") {
                 self.client
-                    .set_config_float(device, &mut config, span_freq)?;
-                info!("Set TX span frequency to {} Hz", span_freq);
+                    .set_config_float(device, &mut config, sample_rate_hz)?;
+                info!("Set TX span frequency to {} Hz", sample_rate_hz);
             } else {
                 warn!("Could not find main/spanfreq config");
             }
 
             if let Ok(mut config) = self.client.find_config(device, &mut root, "main/transgain") {
                 self.client
-                    .set_config_float(device, &mut config, trans_gain)?;
-                info!("Set TX gain to {} dB", trans_gain);
+                    .set_config_float(device, &mut config, trans_gain_db)?;
+                info!("Set TX gain to {} dB", trans_gain_db);
             } else {
                 warn!("Could not find main/transgain config");
             }

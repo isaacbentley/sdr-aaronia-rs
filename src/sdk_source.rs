@@ -46,11 +46,11 @@ pub struct SdkConfig {
     /// requested rate).
     pub device_type: String,
     /// Center frequency in Hz.
-    pub center_frequency: f64,
+    pub center_frequency_hz: f64,
     /// IQ span (sample rate) in Hz.
-    pub span_frequency: f64,
+    pub sample_rate_hz: f64,
     /// Reference level in dBm.
-    pub reference_level: f64,
+    pub reference_level_dbm: f64,
     /// Device operation timeout.
     ///
     /// **Currently not applied.** Nothing in this wrapper or in
@@ -80,9 +80,9 @@ impl Default for SdkConfig {
             // The SDK family string. The earlier default "Spectran_V6"
             // matched nothing: AARTSAAPI_EnumDevice expects "spectranv6".
             device_type: "spectranv6".to_string(),
-            center_frequency: 1e9,  // 1 GHz
-            span_frequency: 10e6,   // 10 MHz
-            reference_level: -20.0, // -20 dBm
+            center_frequency_hz: 1e9,   // 1 GHz
+            sample_rate_hz: 10e6,       // 10 MHz
+            reference_level_dbm: -20.0, // -20 dBm
             timeout: Duration::from_secs(30),
             receiver_channel: None,
         }
@@ -185,9 +185,9 @@ impl SdkSource {
             // configure_iq_receiver (not a follow-up call) so any future
             // reconfiguration path re-applies it automatically.
             native_source.configure_iq_receiver(
-                self.config.center_frequency,
-                self.config.span_frequency,
-                self.config.reference_level,
+                self.config.center_frequency_hz,
+                self.config.sample_rate_hz,
+                self.config.reference_level_dbm,
                 self.config.receiver_channel,
             )?;
 
@@ -263,9 +263,9 @@ mod tests {
     fn test_sdk_config_default() {
         let config = SdkConfig::default();
         assert_eq!(config.device_type, "spectranv6");
-        assert_eq!(config.center_frequency, 1e9);
-        assert_eq!(config.span_frequency, 10e6);
-        assert_eq!(config.reference_level, -20.0);
+        assert_eq!(config.center_frequency_hz, 1e9);
+        assert_eq!(config.sample_rate_hz, 10e6);
+        assert_eq!(config.reference_level_dbm, -20.0);
         assert_eq!(config.timeout, Duration::from_secs(30));
     }
 
@@ -273,17 +273,17 @@ mod tests {
     fn test_sdk_config_creation() {
         let config = SdkConfig {
             device_type: "Test_Device".to_string(),
-            center_frequency: 2.4e9,
-            span_frequency: 20e6,
-            reference_level: -30.0,
+            center_frequency_hz: 2.4e9,
+            sample_rate_hz: 20e6,
+            reference_level_dbm: -30.0,
             timeout: Duration::from_secs(60),
             receiver_channel: None,
         };
 
         assert_eq!(config.device_type, "Test_Device");
-        assert_eq!(config.center_frequency, 2.4e9);
-        assert_eq!(config.span_frequency, 20e6);
-        assert_eq!(config.reference_level, -30.0);
+        assert_eq!(config.center_frequency_hz, 2.4e9);
+        assert_eq!(config.sample_rate_hz, 20e6);
+        assert_eq!(config.reference_level_dbm, -30.0);
         assert_eq!(config.timeout, Duration::from_secs(60));
     }
 
@@ -293,9 +293,9 @@ mod tests {
         let cloned = config.clone();
 
         assert_eq!(config.device_type, cloned.device_type);
-        assert_eq!(config.center_frequency, cloned.center_frequency);
-        assert_eq!(config.span_frequency, cloned.span_frequency);
-        assert_eq!(config.reference_level, cloned.reference_level);
+        assert_eq!(config.center_frequency_hz, cloned.center_frequency_hz);
+        assert_eq!(config.sample_rate_hz, cloned.sample_rate_hz);
+        assert_eq!(config.reference_level_dbm, cloned.reference_level_dbm);
         assert_eq!(config.timeout, cloned.timeout);
     }
 
@@ -326,9 +326,9 @@ mod tests {
     fn test_sdk_source_with_config() {
         let config = SdkConfig {
             device_type: "Custom_Device".to_string(),
-            center_frequency: 5.8e9,
-            span_frequency: 40e6,
-            reference_level: -10.0,
+            center_frequency_hz: 5.8e9,
+            sample_rate_hz: 40e6,
+            reference_level_dbm: -10.0,
             timeout: Duration::from_secs(15),
             receiver_channel: Some(RxChannel::Rx2),
         };
@@ -337,9 +337,15 @@ mod tests {
         let source_config = source.get_config();
 
         assert_eq!(source_config.device_type, config.device_type);
-        assert_eq!(source_config.center_frequency, config.center_frequency);
-        assert_eq!(source_config.span_frequency, config.span_frequency);
-        assert_eq!(source_config.reference_level, config.reference_level);
+        assert_eq!(
+            source_config.center_frequency_hz,
+            config.center_frequency_hz
+        );
+        assert_eq!(source_config.sample_rate_hz, config.sample_rate_hz);
+        assert_eq!(
+            source_config.reference_level_dbm,
+            config.reference_level_dbm
+        );
         assert_eq!(source_config.timeout, config.timeout);
         assert_eq!(source_config.receiver_channel, Some(RxChannel::Rx2));
     }
@@ -354,8 +360,8 @@ mod tests {
             source2.get_config().device_type
         );
         assert_eq!(
-            source1.get_config().center_frequency,
-            source2.get_config().center_frequency
+            source1.get_config().center_frequency_hz,
+            source2.get_config().center_frequency_hz
         );
     }
 
@@ -365,9 +371,9 @@ mod tests {
 
         let new_config = SdkConfig {
             device_type: "Updated_Device".to_string(),
-            center_frequency: 3.5e9,
-            span_frequency: 50e6,
-            reference_level: -15.0,
+            center_frequency_hz: 3.5e9,
+            sample_rate_hz: 50e6,
+            reference_level_dbm: -15.0,
             timeout: Duration::from_secs(45),
             receiver_channel: Some(RxChannel::Rx1And2),
         };
@@ -376,9 +382,15 @@ mod tests {
         let updated_config = source.get_config();
 
         assert_eq!(updated_config.device_type, new_config.device_type);
-        assert_eq!(updated_config.center_frequency, new_config.center_frequency);
-        assert_eq!(updated_config.span_frequency, new_config.span_frequency);
-        assert_eq!(updated_config.reference_level, new_config.reference_level);
+        assert_eq!(
+            updated_config.center_frequency_hz,
+            new_config.center_frequency_hz
+        );
+        assert_eq!(updated_config.sample_rate_hz, new_config.sample_rate_hz);
+        assert_eq!(
+            updated_config.reference_level_dbm,
+            new_config.reference_level_dbm
+        );
         assert_eq!(updated_config.timeout, new_config.timeout);
         assert_eq!(updated_config.receiver_channel, Some(RxChannel::Rx1And2));
     }
@@ -521,23 +533,26 @@ mod tests {
     fn test_config_frequency_relationships() {
         let config = SdkConfig {
             device_type: "Test".to_string(),
-            center_frequency: 1e9,
-            span_frequency: 10e6,
-            reference_level: -20.0,
+            center_frequency_hz: 1e9,
+            sample_rate_hz: 10e6,
+            reference_level_dbm: -20.0,
             timeout: Duration::from_secs(30),
             receiver_channel: None,
         };
 
         // Span should be much smaller than center frequency for typical use
-        assert!(config.span_frequency < config.center_frequency);
+        assert!(config.sample_rate_hz < config.center_frequency_hz);
 
         // Calculate frequency ranges
-        let start_freq = config.center_frequency - config.span_frequency / 2.0;
-        let end_freq = config.center_frequency + config.span_frequency / 2.0;
+        let start_frequency_hz = config.center_frequency_hz - config.sample_rate_hz / 2.0;
+        let end_frequency_hz = config.center_frequency_hz + config.sample_rate_hz / 2.0;
 
-        assert!(start_freq > 0.0, "Start frequency should be positive");
         assert!(
-            end_freq > start_freq,
+            start_frequency_hz > 0.0,
+            "Start frequency should be positive"
+        );
+        assert!(
+            end_frequency_hz > start_frequency_hz,
             "End frequency should be greater than start"
         );
     }
@@ -547,7 +562,7 @@ mod tests {
         let config = SdkConfig::default();
 
         // For IQ mode, sample rate typically equals span frequency
-        let expected_sample_rate = config.span_frequency;
+        let expected_sample_rate = config.sample_rate_hz;
 
         // Calculate expected samples per second
         let samples_per_second = expected_sample_rate as usize;
@@ -564,7 +579,7 @@ mod tests {
 
         // Calculate memory requirements for different buffer sizes
         let complex_size = std::mem::size_of::<num_complex::Complex32>();
-        let samples_per_second = config.span_frequency as usize;
+        let samples_per_second = config.sample_rate_hz as usize;
 
         let memory_1sec = samples_per_second * complex_size;
         let memory_10sec = memory_1sec * 10;

@@ -656,22 +656,22 @@ pub struct ValidationReport {
 #[derive(Debug, Clone)]
 pub struct RtsaMetadata {
     // Core timing and frequency information
-    pub sample_rate: f64,
-    pub center_frequency: Option<f64>,
-    pub bandwidth: f64,
+    pub sample_rate_hz: f64,
+    pub center_frequency_hz: Option<f64>,
+    pub bandwidth_hz: f64,
     pub total_samples: u64,
     pub start_time_ns: u64,
     pub end_time_ns: u64,
 
     // File structure information
-    pub creation_time: f64,
+    pub creation_time_s: f64,
     pub num_streams: u32,
     pub file_format_version: String,
 
     // Stream information
     pub primary_stream_id: u64,
     pub stream_type: Option<String>,
-    pub stream_start_time: f64,
+    pub stream_start_time_s: f64,
 
     // Sub-stream information (for spectral data)
     pub sub_streams: Vec<SubStreamInfo>,
@@ -1012,18 +1012,18 @@ impl RtsaSource {
             // header before compression was detected; its timestamp is
             // the one that means anything. The derived start/end fall
             // backs follow it only when they were derived from it.
-            let tool_creation_ns = (decompressed.metadata.creation_time * 1_000_000_000.0) as u64;
+            let tool_creation_ns = (decompressed.metadata.creation_time_s * 1_000_000_000.0) as u64;
             if decompressed.metadata.start_time_ns == tool_creation_ns {
                 let span_ns = decompressed
                     .metadata
                     .end_time_ns
                     .saturating_sub(decompressed.metadata.start_time_ns);
                 decompressed.metadata.start_time_ns =
-                    (metadata.creation_time * 1_000_000_000.0) as u64;
+                    (metadata.creation_time_s * 1_000_000_000.0) as u64;
                 decompressed.metadata.end_time_ns =
                     decompressed.metadata.start_time_ns.saturating_add(span_ns);
             }
-            decompressed.metadata.creation_time = metadata.creation_time;
+            decompressed.metadata.creation_time_s = metadata.creation_time_s;
             return Ok(decompressed);
         }
 
@@ -1147,9 +1147,9 @@ impl RtsaSource {
         // Determine core timing and frequency information based on available chunks
         // Prioritize SAMP/STRT data when available as it's more detailed
         let (
-            mut sample_rate,
-            mut center_frequency,
-            mut bandwidth,
+            mut sample_rate_hz,
+            mut center_frequency_hz,
+            mut bandwidth_hz,
             mut total_samples,
             mut start_time_ns,
             mut end_time_ns,
@@ -1214,16 +1214,16 @@ impl RtsaSource {
         };
 
         // Fallback sample rate and center frequency logic
-        if sample_rate <= 0.0
+        if sample_rate_hz <= 0.0
             && let Some(ssr) = sub_streams.iter().find(|s| s.frequency_step > 0.0)
         {
-            sample_rate = ssr.frequency_step;
+            sample_rate_hz = ssr.frequency_step;
         }
 
-        if center_frequency.is_none()
+        if center_frequency_hz.is_none()
             && let Some(ssr) = sub_streams.first()
         {
-            center_frequency = Some(ssr.frequency_start + ssr.frequency_span / 2.0);
+            center_frequency_hz = Some(ssr.frequency_start + ssr.frequency_span / 2.0);
         }
 
         // Fallback for total_samples: sum samples from parsed SAMP chunks if STRT was missing/reported 0
@@ -1245,17 +1245,17 @@ impl RtsaSource {
         // samples if missing. Saturating for the same reason as the
         // STRT-anchored path above: both operands derive from
         // file-controlled values.
-        if end_time_ns == 0 && sample_rate > 0.0 && total_samples > 0 {
+        if end_time_ns == 0 && sample_rate_hz > 0.0 && total_samples > 0 {
             end_time_ns = start_time_ns
-                .saturating_add(((total_samples as f64 / sample_rate) * 1_000_000_000.0) as u64);
+                .saturating_add(((total_samples as f64 / sample_rate_hz) * 1_000_000_000.0) as u64);
         }
 
-        // Fallback for bandwidth: use the first sub-stream span, or fall back to the sample rate
-        if bandwidth <= 0.0 {
+        // Fallback for bandwidth_hz: use the first sub-stream span, or fall back to the sample rate
+        if bandwidth_hz <= 0.0 {
             if let Some(ssr) = sub_streams.first() {
-                bandwidth = ssr.frequency_span;
+                bandwidth_hz = ssr.frequency_span;
             } else {
-                bandwidth = sample_rate;
+                bandwidth_hz = sample_rate_hz;
             }
         }
 
@@ -1268,9 +1268,9 @@ impl RtsaSource {
 
         Ok(RtsaMetadata {
             // Core timing and frequency information
-            sample_rate,
-            center_frequency,
-            bandwidth,
+            sample_rate_hz,
+            center_frequency_hz,
+            bandwidth_hz,
             total_samples,
             start_time_ns,
             end_time_ns,
@@ -1279,14 +1279,14 @@ impl RtsaSource {
             // DSFH.creation_time has been observed to decode as
             // *microseconds* since the Unix epoch on real captures even
             // though the spec describes it as seconds. Normalise here.
-            creation_time: rtsa_epoch_seconds(dsfh_chunk.creation_time),
+            creation_time_s: rtsa_epoch_seconds(dsfh_chunk.creation_time),
             num_streams: strm_chunks.len() as u32,
             file_format_version: "RTSA".to_string(),
 
             // Stream information
             primary_stream_id: iq_stream_id,
             stream_type,
-            stream_start_time: primary_strm_chunk.start_time,
+            stream_start_time_s: primary_strm_chunk.start_time,
 
             // Comprehensive chunk information
             sub_streams,
@@ -1769,7 +1769,7 @@ impl RtsaSource {
     /// Get comprehensive file structure information
     pub fn file_info(&self) -> (f64, u32, &str) {
         (
-            self.metadata.creation_time,
+            self.metadata.creation_time_s,
             self.metadata.num_streams,
             &self.metadata.file_format_version,
         )
@@ -1780,7 +1780,7 @@ impl RtsaSource {
         (
             self.metadata.primary_stream_id,
             self.metadata.stream_type.as_deref(),
-            self.metadata.stream_start_time,
+            self.metadata.stream_start_time_s,
         )
     }
 
@@ -1821,8 +1821,8 @@ impl RtsaSource {
                 "Start: {:.3}s, End: {:.3}s, Duration: {:.3}s",
                 start_seconds, end_seconds, duration
             )
-        } else if self.metadata.sample_rate > 0.0 && self.metadata.total_samples > 0 {
-            let duration = self.metadata.total_samples as f64 / self.metadata.sample_rate;
+        } else if self.metadata.sample_rate_hz > 0.0 && self.metadata.total_samples > 0 {
+            let duration = self.metadata.total_samples as f64 / self.metadata.sample_rate_hz;
             format!(
                 "Start: {:.3}s, Duration: {:.3}s (calculated)",
                 start_seconds, duration
@@ -1838,11 +1838,11 @@ impl RtsaSource {
         let mut errors = Vec::new();
 
         // Validate core metadata consistency
-        if self.metadata.sample_rate <= 0.0 && !self.metadata.sub_streams.is_empty() {
+        if self.metadata.sample_rate_hz <= 0.0 && !self.metadata.sub_streams.is_empty() {
             warnings.push("Sample rate is unknown but sub-streams are present".to_string());
         }
 
-        if self.metadata.center_frequency.is_none() && !self.metadata.sub_streams.is_empty() {
+        if self.metadata.center_frequency_hz.is_none() && !self.metadata.sub_streams.is_empty() {
             warnings.push("Center frequency is unknown but sub-streams are present".to_string());
         }
 
@@ -1925,13 +1925,13 @@ impl RtsaSource {
 
         // Core timing and frequency (weight: 20)
         total += 20;
-        if self.metadata.sample_rate > 0.0 {
+        if self.metadata.sample_rate_hz > 0.0 {
             score += 5;
         }
-        if self.metadata.center_frequency.is_some() {
+        if self.metadata.center_frequency_hz.is_some() {
             score += 5;
         }
-        if self.metadata.bandwidth > 0.0 {
+        if self.metadata.bandwidth_hz > 0.0 {
             score += 5;
         }
         if self.metadata.total_samples > 0 {
@@ -3703,18 +3703,18 @@ mod tests {
     #[test]
     fn test_rtsa_metadata_structure() {
         let metadata = RtsaMetadata {
-            sample_rate: 2048000.0,
-            center_frequency: Some(915000000.0),
-            bandwidth: 2048000.0,
+            sample_rate_hz: 2048000.0,
+            center_frequency_hz: Some(915000000.0),
+            bandwidth_hz: 2048000.0,
             total_samples: 1048576,
             start_time_ns: 1609459200000000000,
             end_time_ns: 1609459201000000000,
-            creation_time: 1609459200.0,
+            creation_time_s: 1609459200.0,
             num_streams: 1,
             file_format_version: "RTSA".to_string(),
             primary_stream_id: 1,
             stream_type: Some("IQ_SAMPLES".to_string()),
-            stream_start_time: 1609459200.0,
+            stream_start_time_s: 1609459200.0,
             sub_streams: Vec::new(),
             antennas: Vec::new(),
             previews: Vec::new(),
@@ -3724,9 +3724,9 @@ mod tests {
             metadata_definitions: Vec::new(),
         };
 
-        assert_eq!(metadata.sample_rate, 2048000.0);
-        assert_eq!(metadata.center_frequency, Some(915000000.0));
-        assert_eq!(metadata.bandwidth, 2048000.0);
+        assert_eq!(metadata.sample_rate_hz, 2048000.0);
+        assert_eq!(metadata.center_frequency_hz, Some(915000000.0));
+        assert_eq!(metadata.bandwidth_hz, 2048000.0);
         assert_eq!(metadata.total_samples, 1048576);
         assert_eq!(metadata.start_time_ns, 1609459200000000000);
         assert_eq!(metadata.end_time_ns, 1609459201000000000);
@@ -3948,10 +3948,10 @@ mod tests {
         .unwrap();
 
         // Validate core metadata
-        assert_eq!(metadata.sample_rate, 2_000_000.0);
-        assert_eq!(metadata.center_frequency, Some(100_000_000.0));
+        assert_eq!(metadata.sample_rate_hz, 2_000_000.0);
+        assert_eq!(metadata.center_frequency_hz, Some(100_000_000.0));
         assert_eq!(metadata.total_samples, 1_000_000);
-        assert_eq!(metadata.creation_time, 1640995200.0);
+        assert_eq!(metadata.creation_time_s, 1640995200.0);
         assert_eq!(metadata.num_streams, 1);
 
         // Validate antenna information
@@ -3983,18 +3983,18 @@ mod tests {
     fn test_metadata_validation_report() {
         // Create test metadata with some issues
         let metadata = RtsaMetadata {
-            sample_rate: 0.0, // Invalid: should be > 0
-            center_frequency: None,
-            bandwidth: -1.0, // Invalid: should be >= 0
+            sample_rate_hz: 0.0, // Invalid: should be > 0
+            center_frequency_hz: None,
+            bandwidth_hz: -1.0, // Invalid: should be >= 0
             total_samples: 1000,
             start_time_ns: 1_640_995_200_000_000_000,
             end_time_ns: 1_640_995_199_000_000_000, // Invalid: before start time
-            creation_time: 1640995200.0,
+            creation_time_s: 1640995200.0,
             num_streams: 1,
             file_format_version: "RTSA".to_string(),
             primary_stream_id: 1,
             stream_type: Some("IQ_SAMPLES".to_string()),
-            stream_start_time: 1640995200.0,
+            stream_start_time_s: 1640995200.0,
             sub_streams: vec![SubStreamInfo {
                 stream_id: 1,
                 sub_stream_id: 1,
@@ -4053,18 +4053,18 @@ mod tests {
 
     fn rtsa_source_with_sub_streams(sub_streams: Vec<SubStreamInfo>) -> RtsaSource {
         let metadata = RtsaMetadata {
-            sample_rate: 1.0,
-            center_frequency: None,
-            bandwidth: 0.0,
+            sample_rate_hz: 1.0,
+            center_frequency_hz: None,
+            bandwidth_hz: 0.0,
             total_samples: 0,
             start_time_ns: 0,
             end_time_ns: 0,
-            creation_time: 0.0,
+            creation_time_s: 0.0,
             num_streams: 1,
             file_format_version: "RTSA".to_string(),
             primary_stream_id: 1,
             stream_type: None,
-            stream_start_time: 0.0,
+            stream_start_time_s: 0.0,
             sub_streams,
             antennas: Vec::new(),
             previews: Vec::new(),
@@ -4188,18 +4188,18 @@ mod tests {
         };
 
         let metadata = RtsaMetadata {
-            sample_rate: 2_000_000.0,
-            center_frequency: Some(100_000_000.0),
-            bandwidth: 2_000_000.0,
+            sample_rate_hz: 2_000_000.0,
+            center_frequency_hz: Some(100_000_000.0),
+            bandwidth_hz: 2_000_000.0,
             total_samples: 1_000_000,
             start_time_ns: 1_640_995_200_000_000_000,
             end_time_ns: 1_640_995_201_000_000_000,
-            creation_time: 1640995200.0,
+            creation_time_s: 1640995200.0,
             num_streams: 1,
             file_format_version: "RTSA".to_string(),
             primary_stream_id: 1,
             stream_type: Some("IQ_SAMPLES".to_string()),
-            stream_start_time: 1640995200.0,
+            stream_start_time_s: 1640995200.0,
             sub_streams: Vec::new(),
             antennas: vec![antenna_info],
             previews: Vec::new(),

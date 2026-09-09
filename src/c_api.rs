@@ -1721,7 +1721,7 @@ pub unsafe extern "C" fn aaronia_sink_builder_center_frequency(
     hz: f64,
 ) {
     if let Some(b) = unsafe { builder.as_mut() } {
-        let updated = std::mem::take(b).center_frequency(hz);
+        let updated = std::mem::take(b).center_frequency_hz(hz);
         *b = updated;
     }
 }
@@ -1736,7 +1736,7 @@ pub unsafe extern "C" fn aaronia_sink_builder_sample_rate(
     hz: f64,
 ) {
     if let Some(b) = unsafe { builder.as_mut() } {
-        let updated = std::mem::take(b).sample_rate(hz);
+        let updated = std::mem::take(b).sample_rate_hz(hz);
         *b = updated;
     }
 }
@@ -1751,7 +1751,7 @@ pub unsafe extern "C" fn aaronia_sink_builder_trans_gain(
     db: f64,
 ) {
     if let Some(b) = unsafe { builder.as_mut() } {
-        let updated = std::mem::take(b).trans_gain(db);
+        let updated = std::mem::take(b).trans_gain_db(db);
         *b = updated;
     }
 }

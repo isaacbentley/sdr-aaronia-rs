@@ -44,16 +44,16 @@ fn test_cw_meta() {
     // metadata must reflect that tuning.
     let meta = source.metadata();
     let center = meta
-        .center_frequency
+        .center_frequency_hz
         .expect("CW fixture must report a center frequency");
     assert!(
         (center - 2_410_000_000.0).abs() < 1_000.0,
         "expected ~2410 MHz center, got {center} Hz"
     );
     assert!(
-        (meta.sample_rate - 1_000_000.0).abs() < 1_000.0,
+        (meta.sample_rate_hz - 1_000_000.0).abs() < 1_000.0,
         "expected ~1 MSPS sample rate, got {} Hz",
-        meta.sample_rate
+        meta.sample_rate_hz
     );
     assert!(meta.total_samples > 0, "fixture must report sample count");
 

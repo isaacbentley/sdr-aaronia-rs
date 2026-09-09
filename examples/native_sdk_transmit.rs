@@ -29,9 +29,9 @@ async fn main() -> anyhow::Result<()> {
     // Configure the sink
     let config = SdkSinkConfig {
         device_type: "spectranv6/iqtransmitter".to_string(),
-        center_frequency: 2.44e9, // 2.44 GHz
-        span_frequency: 10e6,     // 10 MHz span/sample rate
-        trans_gain: -20.0,        // -20 dB
+        center_frequency_hz: 2.44e9, // 2.44 GHz
+        sample_rate_hz: 10e6,        // 10 MHz span/sample rate
+        trans_gain_db: -20.0,        // -20 dB
         timeout: std::time::Duration::from_secs(30),
     };
 
@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     // Pre-buffer by scheduling the first packet 200 ms in the future
     current_time += 0.2;
 
-    let duration_per_burst = SAMPLES_PER_BURST as f64 / config.span_frequency;
+    let duration_per_burst = SAMPLES_PER_BURST as f64 / config.sample_rate_hz;
 
     for i in 0..NUM_BURSTS {
         for sample in iq_buffer.iter_mut() {
@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Phase increment per sample: 2 * pi * f * dt
             // where dt = 1 / sample_rate
-            let phase_inc = std::f64::consts::TAU * instantaneous_freq / config.span_frequency;
+            let phase_inc = std::f64::consts::TAU * instantaneous_freq / config.sample_rate_hz;
 
             phase = (phase + phase_inc) % std::f64::consts::TAU;
 
@@ -106,8 +106,8 @@ async fn main() -> anyhow::Result<()> {
         let burst = TxBurst {
             start_time: current_time,
             end_time: current_time + duration_per_burst,
-            center_frequency_hz: config.center_frequency,
-            sample_rate_hz: config.span_frequency,
+            center_frequency_hz: config.center_frequency_hz,
+            sample_rate_hz: config.sample_rate_hz,
             flags,
         };
 

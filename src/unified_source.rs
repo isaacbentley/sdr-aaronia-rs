@@ -96,9 +96,9 @@ const RECONNECT_HEALTHY_AFTER: Duration = Duration::from_secs(30);
 /// happening. These fields are `0.0` until the first packet arrives.
 #[derive(Debug, Clone, Copy, Default)]
 struct ObservedStream {
-    sample_rate: f64,
-    center_frequency: f64,
-    bandwidth: f64,
+    sample_rate_hz: f64,
+    center_frequency_hz: f64,
+    bandwidth_hz: f64,
 }
 
 /// Whether the reader task should attempt another reconnect, counting
@@ -891,18 +891,18 @@ impl AaroniaSource {
                                     let cfg = &packet.sdr_config;
                                     let mut obs =
                                         observed_for_task.lock().unwrap_or_else(|p| p.into_inner());
-                                    if cfg.sample_rate > 0.0 {
-                                        obs.sample_rate = cfg.sample_rate;
+                                    if cfg.sample_rate_hz > 0.0 {
+                                        obs.sample_rate_hz = cfg.sample_rate_hz;
                                         rate_bits_for_task.store(
-                                            cfg.sample_rate.to_bits(),
+                                            cfg.sample_rate_hz.to_bits(),
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
                                     }
-                                    if cfg.center_frequency > 0.0 {
-                                        obs.center_frequency = cfg.center_frequency;
+                                    if cfg.center_frequency_hz > 0.0 {
+                                        obs.center_frequency_hz = cfg.center_frequency_hz;
                                     }
-                                    if cfg.bandwidth > 0.0 {
-                                        obs.bandwidth = cfg.bandwidth;
+                                    if cfg.bandwidth_hz > 0.0 {
+                                        obs.bandwidth_hz = cfg.bandwidth_hz;
                                     }
                                 }
 
@@ -1038,15 +1038,15 @@ impl AaroniaSource {
         // so any absolute frequency a downstream consumer derives — e.g.
         // a DJI OcuSync detection — is meaningless.
         let meta = source.metadata();
-        self.config.span_frequency = meta.sample_rate;
+        self.config.span_frequency = meta.sample_rate_hz;
         // The RTSA sub-stream span is the usable RX bandwidth, distinct
         // from (and smaller than) the sample rate above. Surface it so
         // consumers don't mistake the sample rate for the captured RF
         // window.
-        if meta.bandwidth > 0.0 {
-            self.config.bandwidth_hz = meta.bandwidth;
+        if meta.bandwidth_hz > 0.0 {
+            self.config.bandwidth_hz = meta.bandwidth_hz;
         }
-        if let Some(center) = meta.center_frequency
+        if let Some(center) = meta.center_frequency_hz
             && center > 0.0
         {
             self.config.center_frequency = center;
@@ -1921,16 +1921,16 @@ impl AaroniaSource {
         let pick = |seen: f64, configured: f64| if seen > 0.0 { seen } else { configured };
         SourceInfo {
             source_type: self.source_type.clone(),
-            center_frequency: pick(observed.center_frequency, self.config.center_frequency),
+            center_frequency: pick(observed.center_frequency_hz, self.config.center_frequency),
             span_frequency: pick(
-                if observed.sample_rate > 0.0 {
-                    observed.sample_rate
+                if observed.sample_rate_hz > 0.0 {
+                    observed.sample_rate_hz
                 } else {
                     self.native_observed_rate_hz()
                 },
                 self.config.span_frequency,
             ),
-            bandwidth_hz: pick(observed.bandwidth, self.config.bandwidth_hz),
+            bandwidth_hz: pick(observed.bandwidth_hz, self.config.bandwidth_hz),
             reference_level: self.config.reference_level,
             device_serial: self.config.device_serial.clone(),
         }

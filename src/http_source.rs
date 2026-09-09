@@ -1248,7 +1248,7 @@ impl HttpSource {
             // Update current stream metadata from the parsed packet. The
             // packet reports its frequency *range*; the tuned frequency is
             // the center of that range, not its lower edge.
-            self.current_frequency = packet.sdr_config.center_frequency;
+            self.current_frequency = packet.sdr_config.center_frequency_hz;
 
             // The parser derives the rate from `sampleFrequency` when
             // present and from `samples / duration` otherwise; adopt it
@@ -1259,7 +1259,7 @@ impl HttpSource {
             // link check into restarting on every interleaved packet and
             // hand it a nonsense yardstick on non-IQ-dominated streams.
             let is_iq = packet.metadata.payload == crate::http_streaming::PayloadType::Iq;
-            let inferred_rate = packet.sdr_config.sample_rate;
+            let inferred_rate = packet.sdr_config.sample_rate_hz;
             if is_iq {
                 self.note_device_rate(inferred_rate);
                 if inferred_rate > 0.0

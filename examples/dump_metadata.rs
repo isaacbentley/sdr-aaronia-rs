@@ -21,21 +21,21 @@ fn main() -> anyhow::Result<()> {
     println!("stream_type         : {:?}", m.stream_type);
     println!();
     println!(
-        "sample_rate         : {} Hz ({:.6} MHz)",
-        m.sample_rate,
-        m.sample_rate / 1e6
+        "sample_rate_hz      : {} Hz ({:.6} MHz)",
+        m.sample_rate_hz,
+        m.sample_rate_hz / 1e6
     );
     println!(
-        "center_frequency    : {:?} ({})",
-        m.center_frequency,
-        m.center_frequency
+        "center_frequency_hz : {:?} ({})",
+        m.center_frequency_hz,
+        m.center_frequency_hz
             .map(|f| format!("{:.6} MHz", f / 1e6))
             .unwrap_or_else(|| "None".into())
     );
     println!(
-        "bandwidth           : {} Hz ({:.6} MHz)",
-        m.bandwidth,
-        m.bandwidth / 1e6
+        "bandwidth_hz        : {} Hz ({:.6} MHz)",
+        m.bandwidth_hz,
+        m.bandwidth_hz / 1e6
     );
     println!("total_samples       : {}", m.total_samples);
     println!("total_sample_chunks : {}", m.total_sample_chunks);

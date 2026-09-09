@@ -25,11 +25,11 @@ pub struct SdkSinkConfig {
     /// bare family, and opening uses the qualified form.
     pub device_type: String,
     /// Center frequency in Hz.
-    pub center_frequency: f64,
+    pub center_frequency_hz: f64,
     /// IQ span (sample rate) in Hz.
-    pub span_frequency: f64,
+    pub sample_rate_hz: f64,
     /// Transmission gain in dB (0.0 to -120.0 typically).
-    pub trans_gain: f64,
+    pub trans_gain_db: f64,
     /// Device operation timeout.
     ///
     /// **Currently not applied.** Nothing in this wrapper or in
@@ -49,9 +49,9 @@ impl Default for SdkSinkConfig {
     fn default() -> Self {
         Self {
             device_type: "spectranv6/iqtransmitter".to_string(),
-            center_frequency: 1e9, // 1 GHz
-            span_frequency: 10e6,  // 10 MHz
-            trans_gain: -20.0,     // -20 dB
+            center_frequency_hz: 1e9, // 1 GHz
+            sample_rate_hz: 10e6,     // 10 MHz
+            trans_gain_db: -20.0,     // -20 dB
             timeout: Duration::from_secs(30),
         }
     }
@@ -140,9 +140,9 @@ impl SdkSink {
 
             // Configure transmitter
             native_source.configure_iq_transmitter(
-                self.config.center_frequency,
-                self.config.span_frequency,
-                self.config.trans_gain,
+                self.config.center_frequency_hz,
+                self.config.sample_rate_hz,
+                self.config.trans_gain_db,
             )?;
 
             // Start streaming

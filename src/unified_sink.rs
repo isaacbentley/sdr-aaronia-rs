@@ -33,20 +33,20 @@ pub struct UnifiedSinkConfig {
     /// (default `"spectranv6"`, opened as `<family>/iqtransmitter`).
     pub device_type: String,
     /// TX center frequency in Hz.
-    pub center_frequency: f64,
+    pub center_frequency_hz: f64,
     /// IQ sample rate (span) in Hz.
-    pub span_frequency: f64,
+    pub sample_rate_hz: f64,
     /// Transmission gain in dB (typically 0.0 to -120.0).
-    pub trans_gain: f64,
+    pub trans_gain_db: f64,
 }
 
 impl Default for UnifiedSinkConfig {
     fn default() -> Self {
         Self {
             device_type: "spectranv6".to_string(),
-            center_frequency: 1.0e9,
-            span_frequency: 10.0e6,
-            trans_gain: -20.0,
+            center_frequency_hz: 1.0e9,
+            sample_rate_hz: 10.0e6,
+            trans_gain_db: -20.0,
         }
     }
 }
@@ -234,8 +234,8 @@ impl UnifiedSink {
             any(target_os = "windows", target_os = "linux")
         ))]
         {
-            let config_center = self.config.center_frequency;
-            let config_rate = self.config.span_frequency;
+            let config_center_frequency_hz = self.config.center_frequency_hz;
+            let config_sample_rate_hz = self.config.sample_rate_hz;
             let backend = self
                 .backend
                 .as_mut()
@@ -243,8 +243,8 @@ impl UnifiedSink {
             let burst = crate::native_sdk::TxBurst {
                 start_time: start_time_s,
                 end_time: end_time_s,
-                center_frequency_hz: config_center,
-                sample_rate_hz: config_rate,
+                center_frequency_hz: config_center_frequency_hz,
+                sample_rate_hz: config_sample_rate_hz,
                 flags,
             };
             backend.write_samples(channel, burst, samples)
@@ -265,9 +265,9 @@ impl UnifiedSink {
     fn sdk_config(&self) -> SdkSinkConfig {
         SdkSinkConfig {
             device_type: self.config.device_type.clone(),
-            center_frequency: self.config.center_frequency,
-            span_frequency: self.config.span_frequency,
-            trans_gain: self.config.trans_gain,
+            center_frequency_hz: self.config.center_frequency_hz,
+            sample_rate_hz: self.config.sample_rate_hz,
+            trans_gain_db: self.config.trans_gain_db,
             ..SdkSinkConfig::default()
         }
     }
@@ -294,22 +294,22 @@ impl AaroniaSinkBuilder {
 
     /// Set the TX center frequency in Hz.
     #[must_use]
-    pub fn center_frequency(mut self, hz: f64) -> Self {
-        self.config.center_frequency = hz;
+    pub fn center_frequency_hz(mut self, hz: f64) -> Self {
+        self.config.center_frequency_hz = hz;
         self
     }
 
     /// Set the IQ sample rate (span) in Hz.
     #[must_use]
-    pub fn sample_rate(mut self, hz: f64) -> Self {
-        self.config.span_frequency = hz;
+    pub fn sample_rate_hz(mut self, hz: f64) -> Self {
+        self.config.sample_rate_hz = hz;
         self
     }
 
     /// Set the transmission gain in dB.
     #[must_use]
-    pub fn trans_gain(mut self, db: f64) -> Self {
-        self.config.trans_gain = db;
+    pub fn trans_gain_db(mut self, db: f64) -> Self {
+        self.config.trans_gain_db = db;
         self
     }
 
