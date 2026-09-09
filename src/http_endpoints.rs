@@ -1597,6 +1597,63 @@ impl HttpEndpointsClient {
         Ok(())
     }
 
+    /// Set the device's stream clock source (`device/sclksource`) over
+    /// `/remoteconfig`. `source` is a label the device reports —
+    /// `"10MHz"`, `"GPS"`, `"PPS"`, and so on; the enum field accepts the
+    /// label. Auto-discovers the receiver block, then re-reads the
+    /// capability to confirm, since a `/remoteconfig` PUT to a wrong block
+    /// returns HTTP 200 and changes nothing.
+    ///
+    /// Returns the source the device reports afterward. **A confirmed
+    /// mismatch is an error**, naming the sources this device does offer —
+    /// asking for a reference and being told you got one you did not is
+    /// worse than failing. When the read-back yields nothing at all (the
+    /// leaf is absent, or that read failed) the write is *not* failed: it
+    /// may well have taken, so this warns and returns `None`.
+    pub async fn set_clock_source(&self, source: &str) -> Result<Option<String>> {
+        let block = self.find_block_name_with_field("centerfreq0").await?;
+
+        let mut device = serde_json::Map::new();
+        device.insert("sclksource".to_string(), serde_json::json!(source));
+        let mut groups = serde_json::Map::new();
+        groups.insert("device".to_string(), serde_json::Value::Object(device));
+        self.simple_remote_config(&block, groups).await?;
+
+        let caps = self.get_device_capabilities().await;
+        let got = caps.clock_source;
+        match got.as_deref() {
+            Some(g) if g.eq_ignore_ascii_case(source) => {
+                info!("RTSA {block}: sclksource = {g} (requested {source})");
+                Ok(got)
+            }
+            // The device answered and is demonstrably on something else, so
+            // the write did not take — nearly always a source this device
+            // does not offer. This has to be an error: a caller that asked
+            // for a specific reference must not be told it got one, and the
+            // only other signal would be a log line nobody reads.
+            Some(g) => Err(Error::Config(format!(
+                "clock source did not take on {block}: requested `{source}`, device reports \
+                 `{g}`. This device offers: {}",
+                if caps.clock_sources.is_empty() {
+                    "(none reported)".to_string()
+                } else {
+                    caps.clock_sources.join(", ")
+                }
+            ))),
+            // Nothing to compare against — the leaf is absent, or the
+            // read-back itself failed. Do not fail a write that may well
+            // have worked; say it could not be confirmed and let the caller
+            // re-read if it must be certain.
+            None => {
+                warn!(
+                    "RTSA {block}: could not confirm sclksource (leaf absent, or the read-back \
+                     failed); the write itself was accepted"
+                );
+                Ok(got)
+            }
+        }
+    }
+
     /// Discover the running mission's IQ-demodulator block name (e.g.
     /// `Block_IQDemodulator_0`) by querying `/remoteconfig` and walking
     /// the config tree depth-first for an item whose `name` starts with

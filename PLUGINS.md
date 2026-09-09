@@ -227,3 +227,32 @@ print(sdr.listBandwidths(SoapySDR.SOAPY_SDR_RX, 0))
 `setBandwidth` maps the request to the nearest sample-rate rung and
 drives `setSampleRate`; the two stay consistent, so setting either
 updates the other.
+
+### Clock source
+
+`device/sclksource` selects what disciplines the receiver's clock. A V6 ECO
+offers `Consumer`, `Oscillator`, `GPS`, `PPS`, `10MHz` and three `... Provider`
+variants; `listClockSources` reports whatever the device actually offers.
+
+```python
+print(sdr.listClockSources())   # ['Consumer', 'Oscillator', 'GPS', 'PPS', '10MHz', ...]
+sdr.setClockSource("10MHz")     # lock to a house 10 MHz reference
+print(sdr.getClockSource())
+```
+
+`setClockSource` now writes the device; it previously only reported the current
+source and told you to change it in RTSA-Suite. Over HTTP the write is read back
+to confirm, because a `/remoteconfig` PUT naming a block that is not in the
+running mission answers 200 and changes nothing.
+
+If the device does not take the source — usually because it does not offer it —
+the plugin logs a `SOAPY_SDR_ERROR` naming the sources it *does* offer, and does
+not cache the requested value. `getClockSource()` therefore keeps reporting what
+the device is actually running on, never what you asked for.
+
+**Why this matters for multi-device work.** Point several receivers at one
+10 MHz / PPS / GPS reference and their per-packet hardware timestamps share a
+timebase, so captures can be correlated afterwards. There is no commanded
+synchronous start: the SDK exposes no set-time and no arm-at-time call, so you
+align on timestamps in post rather than arming devices at an instant.
+

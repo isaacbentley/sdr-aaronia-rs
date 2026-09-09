@@ -499,3 +499,160 @@ async fn test_set_remote_config() {
         .await;
     assert!(result.is_ok());
 }
+
+/// The clock-source write must land on the `device` group's `sclksource`
+/// leaf, carry the **label** (not the enum index), and be confirmed by a
+/// read-back — a `/remoteconfig` PUT naming a block that is not in the
+/// mission answers 200 and changes nothing, so the status code proves
+/// nothing on its own.
+///
+/// This pins the contract confirmed against a live V6 ECO, whose
+/// `sclksource` offers `Consumer, Oscillator, GPS, PPS, 10MHz` and three
+/// `… Provider` variants.
+#[tokio::test]
+async fn set_clock_source_writes_device_sclksource_by_label_and_confirms() {
+    let mock_server = MockServer::start().await;
+
+    // A device block carrying `centerfreq0` (how the receiver block is
+    // discovered) and a `device/sclksource` enum already selecting 10MHz,
+    // which is what the read-back should report.
+    let tree = serde_json::json!({
+        "request": 0,
+        "config": {
+            "type": "group", "name": "remoteconfig", "label": "RemoteConfig",
+            "flags": "", "items": [{
+                "type": "group", "name": "Block_Spectran_V6Eco_0",
+                "label": "SPECTRAN V6 ECO", "flags": "grp_tree_root", "items": [
+                    { "type": "group", "name": "config", "label": "Config", "flags": "", "items": [
+                        { "type": "group", "name": "main", "label": "Main", "flags": "", "items": [
+                            { "type": "float", "name": "centerfreq0", "label": "Center Channel 1",
+                              "flags": "", "min": 5500000.0, "max": 8000000000.0, "step": 1000.0,
+                              "value": 854000000.0, "default": 2440000000.0, "unit": "Frequency" }
+                        ]},
+                        { "type": "group", "name": "device", "label": "Device", "flags": "", "items": [
+                            { "type": "enum", "name": "sclksource", "label": "Stream Clock Source",
+                              "flags": "", "value": 4, "default": 0,
+                              "values": "Consumer,Oscillator,GPS,PPS,10MHz" }
+                        ]}
+                    ]}
+                ]
+            }]
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/remoteconfig"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&tree))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/healthstatus"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "type": "group", "name": "healthstatus", "label": "Health",
+            "flags": "", "items": []
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // The write itself: the exact body is the contract under test.
+    Mock::given(method("PUT"))
+        .and(path("/remoteconfig"))
+        .and(body_json(serde_json::json!({
+            "receiverName": "Block_Spectran_V6Eco_0",
+            "simpleconfig": { "device": { "sclksource": "10MHz" } }
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+
+    let confirmed = client
+        .set_clock_source("10MHz")
+        .await
+        .expect("set_clock_source should succeed against a well-formed tree");
+
+    assert_eq!(
+        confirmed.as_deref(),
+        Some("10MHz"),
+        "the read-back must report the source the device now selects",
+    );
+}
+
+/// A write the device did not take must be an error, not a cheerful `Ok`.
+/// The `/remoteconfig` PUT answers 200 even when nothing changed, so the
+/// read-back is the only evidence — and the error must name what the device
+/// *does* offer, since the usual cause is asking for a source it lacks.
+#[tokio::test]
+async fn set_clock_source_errors_when_the_device_did_not_take_it() {
+    let mock_server = MockServer::start().await;
+
+    // The device stays on `Consumer` (index 0) no matter what is written,
+    // and does not offer GPS at all.
+    let tree = serde_json::json!({
+        "request": 0,
+        "config": {
+            "type": "group", "name": "remoteconfig", "label": "RemoteConfig",
+            "flags": "", "items": [{
+                "type": "group", "name": "Block_Spectran_V6Eco_0",
+                "label": "SPECTRAN V6 ECO", "flags": "grp_tree_root", "items": [
+                    { "type": "group", "name": "config", "label": "Config", "flags": "", "items": [
+                        { "type": "group", "name": "main", "label": "Main", "flags": "", "items": [
+                            { "type": "float", "name": "centerfreq0", "label": "Center Channel 1",
+                              "flags": "", "min": 5500000.0, "max": 8000000000.0, "step": 1000.0,
+                              "value": 854000000.0, "default": 2440000000.0, "unit": "Frequency" }
+                        ]},
+                        { "type": "group", "name": "device", "label": "Device", "flags": "", "items": [
+                            { "type": "enum", "name": "sclksource", "label": "Stream Clock Source",
+                              "flags": "", "value": 0, "default": 0,
+                              "values": "Consumer,Oscillator,10MHz" }
+                        ]}
+                    ]}
+                ]
+            }]
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/remoteconfig"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&tree))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/healthstatus"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "type": "group", "name": "healthstatus", "label": "Health",
+            "flags": "", "items": []
+        })))
+        .mount(&mock_server)
+        .await;
+    // Accepts the write and changes nothing — exactly the silent-ignore case.
+    Mock::given(method("PUT"))
+        .and(path("/remoteconfig"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+
+    let err = client
+        .set_clock_source("GPS")
+        .await
+        .expect_err("a write the device ignored must not report success");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("GPS"),
+        "error should name what was requested: {msg}"
+    );
+    assert!(
+        msg.contains("Consumer"),
+        "error should name what the device reports: {msg}"
+    );
+    assert!(
+        msg.contains("10MHz"),
+        "error should list the sources this device does offer: {msg}"
+    );
+}

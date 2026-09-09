@@ -2108,6 +2108,28 @@ impl NativeSdkSource {
         }
     }
 
+    /// Write the device's stream clock source (`device/sclksource`) live —
+    /// `"10MHz"`, `"GPS"`, `"PPS"`, `"Oscillator"`, and the `… Provider`
+    /// variants a V6 offers. The SDK takes the enum label. This selects the
+    /// receiver's frequency/timing reference, the basis for correlating
+    /// captures across devices that share one.
+    pub unsafe fn set_clock_source(&mut self, source: &str) -> Result<()> {
+        unsafe {
+            let device = self
+                .device
+                .as_mut()
+                .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
+            let mut root = self.client.get_config_root(device)?;
+            let mut config = self
+                .client
+                .find_config(device, &mut root, "device/sclksource")
+                .map_err(|_| Error::Sdk("device/sclksource config key not found".to_string()))?;
+            self.client.set_config_string(device, &mut config, source)?;
+            info!("Set stream clock source to {}", source);
+            Ok(())
+        }
+    }
+
     /// Configure the IQ receiver pipeline: tuning, level, and — on raw
     /// mode — the receiver channel.
     ///

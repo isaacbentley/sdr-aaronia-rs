@@ -949,6 +949,55 @@ pub unsafe extern "C" fn aaronia_source_set_reference_level(
     }
 }
 
+/// Set the device's stream clock source — the frequency/timing reference
+/// (`"10MHz"`, `"GPS"`, `"PPS"`, `"Oscillator"`, and the `... Provider`
+/// variants a V6 offers). This is the basis for correlating captures across
+/// devices that share a reference. Native SDK and HTTP only; a no-op on file
+/// sources. Returns `Success`, or an error whose detail is in
+/// `aaronia_last_error()`.
+///
+/// # Safety
+/// `ptr` must be a live `AaroniaSource` from `aaronia_source_builder_build`;
+/// `source` must be a valid NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aaronia_source_set_clock_source(
+    ptr: *mut c_void,
+    source: *const c_char,
+) -> AaroniaFfiError {
+    clear_last_error();
+    if ptr.is_null() {
+        set_last_error("aaronia_source_set_clock_source: source pointer is null");
+        return AaroniaFfiError::NullPointer;
+    }
+    if source.is_null() {
+        set_last_error("aaronia_source_set_clock_source: clock-source string is null");
+        return AaroniaFfiError::NullPointer;
+    }
+    let clock_source = match unsafe { CStr::from_ptr(source) }.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!(
+                "aaronia_source_set_clock_source: clock source is not valid UTF-8: {}",
+                e
+            ));
+            return AaroniaFfiError::InvalidString;
+        }
+    };
+
+    let source_ref = unsafe { &mut *(ptr as *mut AaroniaSource) };
+    match ffi_block_on(source_ref.set_clock_source(clock_source)) {
+        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Err(e)) => {
+            set_last_error(format!("aaronia_source_set_clock_source failed: {}", e));
+            AaroniaFfiError::InternalError
+        }
+        Err(ctx) => {
+            set_last_error(format!("aaronia_source_set_clock_source: {}", ctx));
+            AaroniaFfiError::RuntimeContext
+        }
+    }
+}
+
 /// Return a heap-allocated [`FfiSourceInfo`] describing the source. The
 /// caller must free it with [`aaronia_source_info_free`]. Returns `NULL`
 /// on null input.

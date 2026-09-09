@@ -483,15 +483,11 @@ std::vector<std::string> AaroniaSoapyDevice::listClockSources(void) const {
 }
 
 void AaroniaSoapyDevice::setClockSource(const std::string &source) {
-    // Setting the source the device already reports is a no-op, so
-    // accept it: an application that reads the list and writes back
-    // what it found should not be warned at.
-    // The clock source is the one cached field an operator changes
-    // out of band (in RTSA-Suite, as the warning below says to), so
-    // re-read it before deciding whether this is a no-op: comparing
-    // against the construction-time value warned on the *correct* new
-    // name. Rare and user-initiated, so the two GETs are acceptable.
     std::lock_guard<std::mutex> lock(_mutex);
+
+    // Refresh the cached list/selection first — an operator may have
+    // changed it out of band — so a no-op write is recognised and any
+    // warning names the real current source.
     if (FfiDeviceCapabilities* caps = aaronia_source_get_capabilities(_source)) {
         if (caps->clock_source) _clockSource = caps->clock_source;
         if (caps->clock_sources) {
@@ -502,13 +498,19 @@ void AaroniaSoapyDevice::setClockSource(const std::string &source) {
         }
         aaronia_source_capabilities_free(caps);
     }
-    const std::string current = currentClockSourceLocked();
-    if (source == current) return;
-    SoapySDR::logf(SOAPY_SDR_WARNING,
-                   "setClockSource('%s'): this driver reports the device's stream "
-                   "clock source but does not change it; the device is on '%s'. "
-                   "Change it in RTSA-Suite (Device > Stream Clock Source).",
-                   source.c_str(), current.c_str());
+    if (source == currentClockSourceLocked()) return;
+
+    // `device/sclksource` is settable on both the native SDK and HTTP
+    // backends; the crate reads the value back to confirm the write.
+    AaroniaFfiError err = aaronia_source_set_clock_source(_source, source.c_str());
+    if (err != Success) {
+        SoapySDR::logf(SOAPY_SDR_ERROR, "setClockSource('%s') failed: %s",
+                       source.c_str(), lastErrorOr("clock-source write failed").c_str());
+        return;
+    }
+    _clockSource = source;
+    SoapySDR::logf(SOAPY_SDR_INFO,
+                   "setClockSource: stream clock source set to '%s'", source.c_str());
 }
 
 std::string AaroniaSoapyDevice::currentClockSourceLocked(void) const {

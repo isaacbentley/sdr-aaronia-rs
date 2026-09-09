@@ -1764,6 +1764,47 @@ impl AaroniaSource {
         Ok(())
     }
 
+    /// Set the device's stream clock source — the frequency/timing
+    /// reference (`"10MHz"`, `"GPS"`, `"PPS"`, `"Oscillator"`, and the
+    /// `... Provider` variants a V6 offers). This is the basis for
+    /// correlating captures across devices that share a reference. Native
+    /// SDK and HTTP only; a no-op on file sources.
+    pub async fn set_clock_source(&mut self, source: &str) -> Result<()> {
+        match self.source_type {
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            SourceType::NativeSdk => {
+                if let Some(ref mut source_impl) = self.native_source {
+                    unsafe { source_impl.set_clock_source(source)? };
+                } else {
+                    return Err(Error::Config(
+                        "Native SDK source not initialized".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            )))]
+            SourceType::NativeSdk => {
+                return Err(Error::Config("Native SDK not available".to_string()));
+            }
+            SourceType::Http => {
+                let client = self
+                    .http_client
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                client.set_clock_source(source).await?;
+            }
+            SourceType::File => {
+                warn!("set_clock_source called on file source (no-op)");
+            }
+        }
+        Ok(())
+    }
+
     /// Probe the RTSA-Suite Remote Config license status, returning
     /// [`crate::http_endpoints::RemoteConfigStatus::Active`] for non-HTTP
     /// sources (they don't need it). This concerns **`/remoteconfig`

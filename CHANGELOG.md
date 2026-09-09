@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **The stream clock source can be set, not just read.** `device/sclksource`
+  selects what disciplines the receiver's clock — a V6 ECO offers `Consumer`,
+  `Oscillator`, `GPS`, `PPS`, `10MHz` and three `... Provider` variants. It was
+  readable but read-only: SoapySDR's `setClockSource` logged a warning telling
+  the operator to go and change it in RTSA-Suite. `AaroniaSource::set_clock_source`,
+  `aaronia_source_set_clock_source` and the plugin's `setClockSource` now write
+  it on both backends — native SDK via `ConfigSetString`, HTTP via a
+  `simpleconfig` PUT that is read back to confirm, because a `/remoteconfig` PUT
+  naming a block outside the running mission answers 200 and changes nothing.
+  A confirmed mismatch is an **error** naming the sources the device does offer —
+  being told you are on a reference you are not is worse than a failed call. If
+  the read-back yields nothing at all the write is not failed, only reported as
+  unconfirmed.
+
+  This is the enabling piece for correlating captures across receivers: lock a
+  fleet to one 10 MHz / PPS / GPS reference and their per-packet hardware
+  timestamps share a timebase. Note what is *not* possible — the SDK's C API has
+  no set-time and no arm-at-time entry point, so multi-device work is
+  shared-reference plus post-alignment on timestamps, never a commanded
+  synchronous start.
+
 ## [v0.9.0] - 2026-09-08
 
 ### Added

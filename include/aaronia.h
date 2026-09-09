@@ -196,6 +196,7 @@ AaroniaFfiError aaronia_source_stop_streaming(AaroniaSource* source);
 AaroniaFfiError aaronia_source_set_center_frequency(AaroniaSource* source, double freq_hz);
 AaroniaFfiError aaronia_source_set_span_frequency(AaroniaSource* source, double span_hz);
 AaroniaFfiError aaronia_source_set_reference_level(AaroniaSource* source, double ref_level_dbm);
+AaroniaFfiError aaronia_source_set_clock_source(AaroniaSource* source, const char* clock_source);
 FfiSourceInfo* aaronia_source_get_source_info(AaroniaSource* source);
 void aaronia_source_info_free(FfiSourceInfo* info);
 
