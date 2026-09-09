@@ -146,7 +146,7 @@ impl SdkSource {
     }
 
     /// Get the current configuration
-    pub fn get_config(&self) -> &SdkConfig {
+    pub fn config(&self) -> &SdkConfig {
         &self.config
     }
 
@@ -318,7 +318,7 @@ mod tests {
         assert!(!source.is_available()); // Should not be available until initialized
         assert!(!source.is_streaming());
 
-        let config = source.get_config();
+        let config = source.config();
         assert_eq!(config.device_type, "spectranv6");
     }
 
@@ -334,7 +334,7 @@ mod tests {
         };
 
         let source = SdkSource::with_config(config.clone());
-        let source_config = source.get_config();
+        let source_config = source.config();
 
         assert_eq!(source_config.device_type, config.device_type);
         assert_eq!(
@@ -355,13 +355,10 @@ mod tests {
         let source1 = SdkSource::new();
         let source2 = SdkSource::default();
 
+        assert_eq!(source1.config().device_type, source2.config().device_type);
         assert_eq!(
-            source1.get_config().device_type,
-            source2.get_config().device_type
-        );
-        assert_eq!(
-            source1.get_config().center_frequency_hz,
-            source2.get_config().center_frequency_hz
+            source1.config().center_frequency_hz,
+            source2.config().center_frequency_hz
         );
     }
 
@@ -379,7 +376,7 @@ mod tests {
         };
 
         source.update_config(new_config.clone());
-        let updated_config = source.get_config();
+        let updated_config = source.config();
 
         assert_eq!(updated_config.device_type, new_config.device_type);
         assert_eq!(

@@ -657,7 +657,7 @@ async fn live_unified_source() {
     println!(
         "unified source: {} samples, info: {}",
         n,
-        source.get_source_info()
+        source.source_info()
     );
     assert!(n > 0, "unified HTTP source must yield samples");
     assert_eq!(n, buffer.len());

@@ -167,7 +167,7 @@ impl SdrSource for SpectranSdrSource {
                     let mut source = builder.build().await.map_err(|e| {
                         Error::Config(format!("SpectranSourceBuilder::build failed: {e}"))
                     })?;
-                    let source_info = source.get_source_info();
+                    let source_info = source.source_info();
                     info!("Aaronia source: {:?}", source_info);
                     // For file backends the RTSA metadata is authoritative
                     // for the center frequency — the caller passes a 0.0
@@ -189,12 +189,12 @@ impl SdrSource for SpectranSdrSource {
                     // File backends always run single-channel: RTSA files
                     // carry one frequency in their metadata, so hopping is
                     // meaningless and would just spew warnings from
-                    // `set_center_frequency`. Other backends hop if and
+                    // `set_center_frequency_hz`. Other backends hop if and
                     // only if the orchestrator handed us a non-empty
                     // channel list (USRP-style hop config).
                     //
                     // Retuning (both hop-mode and the WS-B live-view
-                    // override) always goes through `set_center_frequency`,
+                    // override) always goes through `set_center_frequency_hz`,
                     // which on HTTP backends is `configure_capture` on the
                     // free `/control` endpoint — never the licensed
                     // `/remoteconfig` write path. We deliberately don't
@@ -290,7 +290,7 @@ impl SdrSource for SpectranSdrSource {
 /// rapid mid-stream hopping) is the light case `configure_capture` on
 /// `/control` always handles, licensed or not. Returns to
 /// `center_frequency_hz` once the override clears. On a file-backed
-/// source `set_center_frequency` is already a documented no-op (RTSA
+/// source `set_center_frequency_hz` is already a documented no-op (RTSA
 /// files carry their own frequency — Phase A's wideband replay covers
 /// the requested channel without any retune), so this degrades safely
 /// there.

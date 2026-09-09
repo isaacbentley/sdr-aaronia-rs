@@ -46,7 +46,7 @@ if (APPLE)
         "${CMAKE_SHARED_MODULE_CREATE_CXX_FLAGS}")
 endif()
 
-# Include path to aaronia.h
+# Include path to spectran.h
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
 # --- Rust static library -------------------------------------------------
@@ -87,7 +87,7 @@ endif()
 # link after this target.
 #
 # TX through the plugin needs the crate's `native-sdk` feature, which
-# is not a default feature — without it `aaronia_sink_supported()` is
+# is not a default feature — without it `spectran_sink_supported()` is
 # compile-time false and no build of this plugin can transmit. Opt in:
 #   cmake -S soapy-aaronia -B soapy-aaronia/build -DAARONIA_NATIVE_SDK=ON
 # Windows and Linux only, and the Aaronia SDK must be installed at run
@@ -108,7 +108,7 @@ add_custom_target(sdr_aaronia_rs_static ALL
 
 # Source files
 set(AaroniaSupport_SOURCES
-    AaroniaSoapyDevice.cpp
+    SpectranSoapyDevice.cpp
     Registration.cpp
 )
 

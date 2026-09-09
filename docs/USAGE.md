@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
         .reference_level_dbm(-30.0);   // -30 dBm
 
     let mut source = SpectranSource::new(config).await?;
-    println!("Selected Source: {:?}", source.get_source_info());
+    println!("Selected Source: {:?}", source.source_info());
 
     // Read IQ samples using the unified interface
     let mut samples = Vec::with_capacity(1024);
@@ -305,7 +305,9 @@ async fn main() -> Result<()> {
 
 For existing [FutureSDR](https://github.com/FutureSDR/FutureSDR) users, the low-level block API integrates high-throughput streams (both RX and TX) into a flowgraph. `HttpSourceBuilder`, `HttpSinkBuilder`, and the corresponding blocks require the `futuresdr` feature:
 
-```rust,ignore
+```rust,no_run
+# #[cfg(feature = "futuresdr")]
+# mod gated {
 use sdr_aaronia_rs::{HttpSourceBuilder, HttpSinkBuilder};
 use futuresdr::runtime::Flowgraph;
 use anyhow::Result;
@@ -330,13 +332,17 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+# }
+# fn main() {}
 ```
 
 ## Streaming with authentication
 
 The low-level `HttpSourceBuilder` (also part of the `futuresdr` feature) offers advanced properties (e.g., `buffer_size`, `timeout_ms`, `rate_reduction`) and authentication settings:
 
-```rust,ignore
+```rust,no_run
+# #[cfg(feature = "futuresdr")]
+# mod gated {
 use sdr_aaronia_rs::{AuthMethod, HttpSourceBuilder, StreamFormat};
 use anyhow::Result;
 
@@ -356,6 +362,8 @@ fn main() -> Result<()> {
         .build()?;
     Ok(())
 }
+# }
+# fn main() {}
 ```
 
 ## Low-level asynchronous stream reading

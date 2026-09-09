@@ -20,6 +20,10 @@ mod quickstart_guide {}
 #[doc = include_str!("../docs/USAGE.md")]
 mod usage_guide {}
 
+#[cfg(doctest)]
+#[doc = include_str!("../PLUGINS.md")]
+mod plugins_guide {}
+
 #[cfg(feature = "ffi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
 pub mod c_api;
@@ -90,19 +94,19 @@ pub use native_sdk::{NativeSdkClient, NativeSdkSource};
 #[cfg(feature = "ffi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
 pub use c_api::{
-    AaroniaFfiError, CAaroniaSourceType, FfiComplex, FfiDeviceSensors, FfiServerInfo,
-    FfiSourceInfo, aaronia_endpoints_client_control_recording,
-    aaronia_endpoints_client_control_streaming, aaronia_endpoints_client_free,
-    aaronia_endpoints_client_get_info, aaronia_endpoints_client_get_sensors,
-    aaronia_endpoints_client_new, aaronia_get_error_message, aaronia_iq_sample_rate_for_bandwidth,
-    aaronia_sdk_installed, aaronia_server_info_free, aaronia_source_build,
-    aaronia_source_builder_center_frequency_hz, aaronia_source_builder_file_source,
-    aaronia_source_builder_force_source_type, aaronia_source_builder_free,
-    aaronia_source_builder_http_source, aaronia_source_builder_new,
-    aaronia_source_builder_reference_level_dbm, aaronia_source_builder_sample_rate_hz,
-    aaronia_source_free, aaronia_source_get_sensors, aaronia_source_get_source_info,
-    aaronia_source_info_free, aaronia_source_read_samples, aaronia_source_start_streaming,
-    aaronia_source_stop_streaming, aaronia_string_free, aaronia_usable_bandwidth_hz,
+    CSpectranSourceType, FfiComplex, FfiDeviceSensors, FfiServerInfo, FfiSourceInfo,
+    SpectranFfiError, spectran_endpoints_client_control_recording,
+    spectran_endpoints_client_control_streaming, spectran_endpoints_client_free,
+    spectran_endpoints_client_get_info, spectran_endpoints_client_get_sensors,
+    spectran_endpoints_client_new, spectran_get_error_message,
+    spectran_iq_sample_rate_for_bandwidth, spectran_sdk_installed, spectran_server_info_free,
+    spectran_source_build, spectran_source_builder_center_frequency_hz,
+    spectran_source_builder_file_source, spectran_source_builder_force_source_type,
+    spectran_source_builder_free, spectran_source_builder_http_source, spectran_source_builder_new,
+    spectran_source_builder_reference_level_dbm, spectran_source_builder_sample_rate_hz,
+    spectran_source_free, spectran_source_get_sensors, spectran_source_get_source_info,
+    spectran_source_info_free, spectran_source_read_samples, spectran_source_start_streaming,
+    spectran_source_stop_streaming, spectran_string_free, spectran_usable_bandwidth_hz,
 };
 pub use detection::{get_sdk_library_path, get_sdk_path, get_xml_config_path, is_sdk_installed};
 #[cfg(feature = "file")]

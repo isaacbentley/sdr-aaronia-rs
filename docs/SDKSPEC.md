@@ -466,7 +466,7 @@ whole and fractional seconds separately. That is not pedantry: epoch
 nanoseconds are around `1.7e18`, where an `f64`'s step is 256 ns, so a single
 `seconds * 1e9` multiply discards tens of nanoseconds the reading still had.
 The SoapySDR plugin used to carry that split itself; the library now owns it
-and `aaronia_source_get_gps_time_ns` hands out the `int64_t`.
+and `spectran_source_get_gps_time_ns` hands out the `int64_t`.
 
 What this means for multi-device work: ~240 ns of timing uncertainty is ~70 m
 of ranging uncertainty, so GPS time is for disciplining the receiver and for

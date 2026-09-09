@@ -2239,7 +2239,7 @@ impl NativeSdkSource {
     /// a parameter rather than a follow-up [`Self::set_receiver_channel`]
     /// call so that *retunes cannot silently revert the channel*: this
     /// function used to write `"Rx1"` unconditionally, which meant a
-    /// mid-stream `set_center_frequency` switched an `Rx2`/`Rx1And2`
+    /// mid-stream `set_center_frequency_hz` switched an `Rx2`/`Rx1And2`
     /// capture back to the Rx1 antenna with no error. On non-raw open
     /// modes an explicit `Some(channel)` is a hard error — the eco
     /// pipeline has no `device/receiverchannel` key to honour it with.
@@ -2337,7 +2337,7 @@ impl NativeSdkSource {
                         spanfreq_to_write, sample_rate_hz
                     );
                 } else {
-                    info!("Set span frequency to {} Hz", sample_rate_hz);
+                    info!("Set sample rate to {} Hz", sample_rate_hz);
                 }
             } else {
                 warn!("Could not find main/spanfreq config");
@@ -2481,7 +2481,7 @@ impl NativeSdkSource {
             if let Ok(mut config) = self.client.find_config(device, &mut root, "main/spanfreq") {
                 self.client
                     .set_config_float(device, &mut config, sample_rate_hz)?;
-                info!("Set TX span frequency to {} Hz", sample_rate_hz);
+                info!("Set TX sample rate to {} Hz", sample_rate_hz);
             } else {
                 warn!("Could not find main/spanfreq config");
             }
@@ -4115,27 +4115,6 @@ mod tests {
     }
 
     #[test]
-    fn test_span_frequency_validation() {
-        // Test span frequency validation
-        let test_spans = vec![
-            (1e6, true),   // 1 MHz span - valid
-            (10e6, true),  // 10 MHz span - valid
-            (100e6, true), // 100 MHz span - valid
-            (0.0, false),  // 0 Hz span - invalid
-            (-1e6, false), // Negative span - invalid
-        ];
-
-        for (span, should_be_valid) in test_spans {
-            let is_valid = span > 0.0;
-            assert_eq!(
-                is_valid, should_be_valid,
-                "Span {} Hz validation failed",
-                span
-            );
-        }
-    }
-
-    #[test]
     fn test_reference_level_range() {
         // Test reference level ranges (typical for RF devices)
         let test_levels = vec![
@@ -4154,22 +4133,6 @@ mod tests {
                 "Reference level {} dBm validation failed",
                 level
             );
-        }
-    }
-
-    #[test]
-    fn test_sample_rate_calculation() {
-        // Test sample rate calculations
-        let span_frequencies = vec![1e6, 10e6, 100e6]; // 1 MHz, 10 MHz, 100 MHz
-
-        for span in span_frequencies {
-            // For IQ mode, sample rate typically equals span frequency
-            let expected_sample_rate = span;
-            assert_eq!(span, expected_sample_rate);
-
-            // Calculate samples per second
-            let samples_per_second = span as usize;
-            assert!(samples_per_second > 0);
         }
     }
 }

@@ -1439,7 +1439,7 @@ impl HttpSource {
         info!("Configuring RTSA device for streaming...");
 
         // Get current configuration to understand request structure
-        let config = self.endpoints_client.get_config().await?;
+        let config = self.endpoints_client.config().await?;
         info!(
             "Retrieved device configuration, request ID: {}",
             config.request
@@ -1532,9 +1532,9 @@ impl HttpSource {
         );
 
         let request = crate::http_endpoints::CaptureConfig {
-            center_freq_hz: (self.current_frequency > 0.0).then_some(self.current_frequency),
+            center_frequency_hz: (self.current_frequency > 0.0).then_some(self.current_frequency),
             decimation_index,
-            reflevel_dbm: self.reference_level_dbm,
+            reference_level_dbm: self.reference_level_dbm,
         };
 
         match self.endpoints_client.apply_capture_config(&request).await {
@@ -1542,9 +1542,9 @@ impl HttpSource {
                 info!(
                     "RTSA device reports center={:?} Hz, decimation={:?}, \
                      ref_level={:?} dBm (block {})",
-                    applied.center_freq_hz,
+                    applied.center_frequency_hz,
                     applied.decimation_index,
-                    applied.reflevel_dbm,
+                    applied.reference_level_dbm,
                     applied.receiver_name,
                 );
 
@@ -1553,7 +1553,8 @@ impl HttpSource {
                 // that did not move at all means the write was accepted and
                 // discarded, which is the failure this read-back exists to
                 // catch.
-                if let (Some(want), Some(got)) = (request.center_freq_hz, applied.center_freq_hz)
+                if let (Some(want), Some(got)) =
+                    (request.center_frequency_hz, applied.center_frequency_hz)
                     && (want - got).abs() > 1e3
                 {
                     warn!(

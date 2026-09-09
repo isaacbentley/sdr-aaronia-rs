@@ -1051,7 +1051,7 @@ impl SpectranSource {
         // backends (it can't know them ahead of time), so pull the real
         // sample rate *and* center frequency out of the parsed chunk
         // metadata. Without the center-frequency propagation,
-        // `get_source_info()` (and every emitted packet) reports 0 Hz,
+        // `source_info()` (and every emitted packet) reports 0 Hz,
         // so any absolute frequency a downstream consumer derives — e.g.
         // a DJI OcuSync detection — is meaningless.
         let meta = source.metadata();
@@ -1653,7 +1653,7 @@ impl SpectranSource {
             }
             SourceType::File => {
                 warn!(
-                    "set_center_frequency called on file source (no-op); RTSA files carry their own frequency"
+                    "set_center_frequency_hz called on file source (no-op); RTSA files carry their own frequency"
                 );
             }
         }
@@ -1830,7 +1830,7 @@ impl SpectranSource {
     /// need this probe. (An earlier revision claimed unlicensed
     /// `configure_capture` calls were silently ignored; live testing
     /// showed the silent ignore was caused by partial capture payloads,
-    /// not licensing — see `set_center_frequency`.)
+    /// not licensing — see `set_center_frequency_hz`.)
     ///
     /// **On HTTP sources this is an active probe that temporarily
     /// perturbs device state**: it adjusts the reference level by +1 dB
@@ -1875,7 +1875,7 @@ impl SpectranSource {
     /// The sample rate in Hz: what the stream reports once packets are
     /// flowing on HTTP sources, otherwise the configured span. Cheap
     /// enough to call per packet: a relaxed atomic load, no lock, unlike
-    /// [`Self::get_source_info`].
+    /// [`Self::source_info`].
     pub fn sample_rate_hz(&self) -> f64 {
         let observed = self
             .http_rate_bits
@@ -1933,7 +1933,7 @@ impl SpectranSource {
     /// rung of its ladder. Native-SDK sources likewise report the rate
     /// their packets carry once one has been read. Before the first
     /// packet, and on file sources, the configured values are reported.
-    pub fn get_source_info(&self) -> SourceInfo {
+    pub fn source_info(&self) -> SourceInfo {
         let observed = self.observed_stream();
         let pick = |seen: f64, configured: f64| if seen > 0.0 { seen } else { configured };
         SourceInfo {
@@ -2028,7 +2028,7 @@ impl SpectranSource {
     }
 
     /// Get the current configuration
-    pub fn get_config(&self) -> &SpectranConfig {
+    pub fn config(&self) -> &SpectranConfig {
         &self.config
     }
 
@@ -2428,7 +2428,7 @@ mod tests {
     async fn file_source_propagates_center_and_rate_from_metadata() {
         // Regression test for the center-frequency wiring: the file
         // source must surface the RTSA metadata's tuning through
-        // `get_source_info()`, overriding the builder's placeholder
+        // `source_info()`, overriding the builder's placeholder
         // defaults (2.44 GHz center / 15.36 MS/s). The CW fixture is
         // tuned to 2410 MHz at 1 MSPS — *both* differ from the defaults,
         // so passing assertions prove the file values win rather than a
@@ -2456,7 +2456,7 @@ mod tests {
             Err(e) => panic!("CW fixture should open: {}", e),
         };
 
-        let info = source.get_source_info();
+        let info = source.source_info();
         assert_eq!(info.source_type, SourceType::File);
         assert!(
             (info.center_frequency_hz - 2_410_000_000.0).abs() < 1_000.0,

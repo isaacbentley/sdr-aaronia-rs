@@ -181,7 +181,7 @@ whose usable span is closest. Asking for 2.5 MHz gives Fs = 3.84 MHz,
 whose usable span is 3.07 MHz, rather than the numerically closer
 1.92 MHz. Verified across nine requests on a V6 ECO.
 
-`SpectranSource::get_source_info()` reports the rate the server is
+`SpectranSource::source_info()` reports the rate the server is
 actually sending once packets are flowing, so read it back rather than
 assuming.
 
@@ -192,7 +192,7 @@ before streaming starts, but it does not second-guess the ladder.
 The `/control` endpoint applies a frequency change only when
 `frequencyCenter` and `frequencySpan` are both present. A request
 carrying one of them returns `{"success":true}` and is ignored. This
-crate always sends the complete tuple, so use `set_center_frequency`
+crate always sends the complete tuple, so use `set_center_frequency_hz`
 instead of issuing PUTs directly. No Aaronia licence is involved: the
 crate tunes through `/control`, which needs none.
 

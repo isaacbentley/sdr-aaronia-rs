@@ -107,7 +107,7 @@ impl SdkSink {
     }
 
     /// Get the current configuration
-    pub fn get_config(&self) -> &SdkSinkConfig {
+    pub fn config(&self) -> &SdkSinkConfig {
         &self.config
     }
 
@@ -324,7 +324,7 @@ pub mod futuresdr_sink {
             // wrong — `start_time: 0.0` asks the device to transmit at the
             // Unix epoch, decades in the past. Derive a real window from the
             // device clock instead.
-            let sample_rate_hz = self.sink.get_config().sample_rate_hz;
+            let sample_rate_hz = self.sink.config().sample_rate_hz;
             let duration_s = if sample_rate_hz > 0.0 {
                 n as f64 / sample_rate_hz
             } else {
@@ -350,7 +350,7 @@ pub mod futuresdr_sink {
             let burst = crate::native_sdk::TxBurst {
                 start_time,
                 end_time,
-                center_frequency_hz: self.sink.get_config().center_frequency_hz,
+                center_frequency_hz: self.sink.config().center_frequency_hz,
                 sample_rate_hz,
                 flags,
             };

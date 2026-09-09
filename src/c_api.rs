@@ -14,9 +14,9 @@ use tokio::runtime::{Handle, Runtime};
 // Backwards-compatible diagnostic surface for the FFI layer: every
 // function that returns an opaque code (or a null pointer) now also
 // stashes a free-form error string in this thread-local. Embedders
-// can call `aaronia_last_error()` to retrieve a human-readable
+// can call `spectran_last_error()` to retrieve a human-readable
 // message about whatever just failed, then free it with
-// `aaronia_string_free`. Mirrors the `fpv_drone_dji_last_error`
+// `spectran_string_free`. Mirrors the `fpv_drone_dji_last_error`
 // pattern in the sibling DJI crate.
 
 thread_local! {
@@ -41,7 +41,7 @@ fn clear_last_error() {
 /// Return the last error message recorded on the calling thread, or
 /// `NULL` if no error has been recorded since the last successful
 /// call. Ownership of the returned string transfers to the caller —
-/// free it with [`aaronia_string_free`] when done. Repeated calls
+/// free it with [`spectran_string_free`] when done. Repeated calls
 /// without an intervening error return the same message until the
 /// next FFI call that touches the slot.
 ///
@@ -50,7 +50,7 @@ fn clear_last_error() {
 /// thread; the `unsafe` qualifier is required only because the
 /// returned pointer transfers ownership to the caller.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_last_error() -> *mut c_char {
+pub unsafe extern "C" fn spectran_last_error() -> *mut c_char {
     LAST_ERROR.with(|e| match e.borrow().as_ref() {
         Some(msg) => CString::new(msg.as_str())
             .map(|s| s.into_raw())
@@ -106,9 +106,9 @@ fn ffi_block_on<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
 
 // --- FFI Error Handling --- //
 
-/// AaroniaFfiError enumeration.
+/// SpectranFfiError enumeration.
 #[repr(C)]
-pub enum AaroniaFfiError {
+pub enum SpectranFfiError {
     Success = 0,
     NullPointer = 1,
     InvalidString = 2,
@@ -122,30 +122,30 @@ pub enum AaroniaFfiError {
 }
 
 // --- C-compatible SourceType --- //
-/// CAaroniaSourceType enumeration.
+/// CSpectranSourceType enumeration.
 #[repr(C)]
-pub enum CAaroniaSourceType {
+pub enum CSpectranSourceType {
     NativeSdk,
     Http,
     File,
 }
 
-impl From<CAaroniaSourceType> for SourceType {
-    fn from(item: CAaroniaSourceType) -> Self {
+impl From<CSpectranSourceType> for SourceType {
+    fn from(item: CSpectranSourceType) -> Self {
         match item {
-            CAaroniaSourceType::NativeSdk => SourceType::NativeSdk,
-            CAaroniaSourceType::Http => SourceType::Http,
-            CAaroniaSourceType::File => SourceType::File,
+            CSpectranSourceType::NativeSdk => SourceType::NativeSdk,
+            CSpectranSourceType::Http => SourceType::Http,
+            CSpectranSourceType::File => SourceType::File,
         }
     }
 }
 
-impl From<SourceType> for CAaroniaSourceType {
+impl From<SourceType> for CSpectranSourceType {
     fn from(item: SourceType) -> Self {
         match item {
-            SourceType::NativeSdk => CAaroniaSourceType::NativeSdk,
-            SourceType::Http => CAaroniaSourceType::Http,
-            SourceType::File => CAaroniaSourceType::File,
+            SourceType::NativeSdk => CSpectranSourceType::NativeSdk,
+            SourceType::Http => CSpectranSourceType::Http,
+            SourceType::File => CSpectranSourceType::File,
         }
     }
 }
@@ -174,7 +174,7 @@ pub struct FfiServerInfo {
 /// FfiSourceInfo structure.
 #[repr(C)]
 pub struct FfiSourceInfo {
-    pub source_type: CAaroniaSourceType,
+    pub source_type: CSpectranSourceType,
     pub center_frequency_hz: f64,
     /// IQ sample rate (Fs) in Hz — see `SourceInfo::sample_rate_hz`.
     pub sample_rate_hz: f64,
@@ -189,24 +189,24 @@ pub struct FfiSourceInfo {
 
 /// Aaronia source builder new.
 #[unsafe(no_mangle)]
-pub extern "C" fn aaronia_source_builder_new() -> *mut SpectranSourceBuilder {
+pub extern "C" fn spectran_source_builder_new() -> *mut SpectranSourceBuilder {
     Box::into_raw(Box::new(SpectranSourceBuilder::new()))
 }
 
-/// Free a builder previously returned by [`aaronia_source_builder_new`].
+/// Free a builder previously returned by [`spectran_source_builder_new`].
 ///
 /// # Safety
 /// `builder` must either be null or a pointer previously returned by
-/// [`aaronia_source_builder_new`] that has not yet been freed. After this
+/// [`spectran_source_builder_new`] that has not yet been freed. After this
 /// call the pointer must not be used again. Passing a pointer obtained any
 /// other way (e.g. constructed in C, or already freed) is undefined
 /// behaviour.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_free(builder: *mut SpectranSourceBuilder) {
+pub unsafe extern "C" fn spectran_source_builder_free(builder: *mut SpectranSourceBuilder) {
     unsafe {
         if !builder.is_null() {
             // SAFETY: per the function-level contract, the caller guarantees the
-            // pointer originated from `aaronia_source_builder_new` and has not
+            // pointer originated from `spectran_source_builder_new` and has not
             // been freed.
             drop(Box::from_raw(builder));
         }
@@ -217,11 +217,11 @@ pub unsafe extern "C" fn aaronia_source_builder_free(builder: *mut SpectranSourc
 ///
 /// # Safety
 /// `builder` must either be null (no-op) or a valid pointer to a live
-/// `SpectranSourceBuilder` returned by [`aaronia_source_builder_new`] and
+/// `SpectranSourceBuilder` returned by [`spectran_source_builder_new`] and
 /// not yet freed. The pointer must remain valid for the duration of the
 /// call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_center_frequency_hz(
+pub unsafe extern "C" fn spectran_source_builder_center_frequency_hz(
     builder: *mut SpectranSourceBuilder,
     hz: f64,
 ) {
@@ -236,11 +236,11 @@ pub unsafe extern "C" fn aaronia_source_builder_center_frequency_hz(
 ///
 /// # Safety
 /// `builder` must either be null (no-op) or a valid pointer to a live
-/// `SpectranSourceBuilder` returned by [`aaronia_source_builder_new`] and
+/// `SpectranSourceBuilder` returned by [`spectran_source_builder_new`] and
 /// not yet freed. The pointer must remain valid for the duration of the
 /// call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_sample_rate_hz(
+pub unsafe extern "C" fn spectran_source_builder_sample_rate_hz(
     builder: *mut SpectranSourceBuilder,
     hz: f64,
 ) {
@@ -255,11 +255,11 @@ pub unsafe extern "C" fn aaronia_source_builder_sample_rate_hz(
 ///
 /// # Safety
 /// `builder` must either be null (no-op) or a valid pointer to a live
-/// `SpectranSourceBuilder` returned by [`aaronia_source_builder_new`] and
+/// `SpectranSourceBuilder` returned by [`spectran_source_builder_new`] and
 /// not yet freed. The pointer must remain valid for the duration of the
 /// call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_reference_level_dbm(
+pub unsafe extern "C" fn spectran_source_builder_reference_level_dbm(
     builder: *mut SpectranSourceBuilder,
     dbm: f64,
 ) {
@@ -274,12 +274,12 @@ pub unsafe extern "C" fn aaronia_source_builder_reference_level_dbm(
 ///
 /// # Safety
 /// - `builder` must either be null (no-op) or a valid pointer to a live
-///   `SpectranSourceBuilder` returned by [`aaronia_source_builder_new`].
+///   `SpectranSourceBuilder` returned by [`spectran_source_builder_new`].
 /// - `base_url`, if non-null, must point to a NUL-terminated C string that
 ///   remains valid for the duration of the call. Non-UTF-8 bytes are
 ///   replaced with the Unicode replacement character.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_http_source(
+pub unsafe extern "C" fn spectran_source_builder_http_source(
     builder: *mut SpectranSourceBuilder,
     base_url: *const c_char,
 ) {
@@ -297,12 +297,12 @@ pub unsafe extern "C" fn aaronia_source_builder_http_source(
 ///
 /// # Safety
 /// - `builder` must either be null (no-op) or a valid pointer to a live
-///   `SpectranSourceBuilder` returned by [`aaronia_source_builder_new`].
+///   `SpectranSourceBuilder` returned by [`spectran_source_builder_new`].
 /// - `file_path`, if non-null, must point to a NUL-terminated C string
 ///   that remains valid for the duration of the call. Non-UTF-8 bytes are
 ///   replaced with the Unicode replacement character.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_file_source(
+pub unsafe extern "C" fn spectran_source_builder_file_source(
     builder: *mut SpectranSourceBuilder,
     file_path: *const c_char,
 ) {
@@ -321,10 +321,10 @@ pub unsafe extern "C" fn aaronia_source_builder_file_source(
 ///
 /// # Safety
 /// `builder` must be a live pointer from
-/// [`aaronia_source_builder_new`]; `serial` must be a valid
+/// [`spectran_source_builder_new`]; `serial` must be a valid
 /// NUL-terminated C string or null (null is a no-op).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_device_serial(
+pub unsafe extern "C" fn spectran_source_builder_device_serial(
     builder: *mut SpectranSourceBuilder,
     serial: *const c_char,
 ) {
@@ -349,11 +349,11 @@ pub unsafe extern "C" fn aaronia_source_builder_device_serial(
 /// `sdk=True` gives Python.
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_source_builder_new`].
+/// `builder` must be a live pointer from [`spectran_source_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_force_source_type(
+pub unsafe extern "C" fn spectran_source_builder_force_source_type(
     builder: *mut SpectranSourceBuilder,
-    source_type: CAaroniaSourceType,
+    source_type: CSpectranSourceType,
 ) {
     unsafe {
         if let Some(builder) = builder.as_mut() {
@@ -363,11 +363,11 @@ pub unsafe extern "C" fn aaronia_source_builder_force_source_type(
 }
 
 /// Whether the Aaronia native SDK library is present on this machine, by
-/// the same search [`aaronia_source_build`] uses — so a caller can offer
+/// the same search [`spectran_source_build`] uses — so a caller can offer
 /// the SDK only where forcing it would not fail. Answers without loading
 /// the library.
 #[unsafe(no_mangle)]
-pub extern "C" fn aaronia_sdk_installed() -> bool {
+pub extern "C" fn spectran_sdk_installed() -> bool {
     crate::detection::is_sdk_installed()
 }
 
@@ -376,27 +376,27 @@ pub extern "C" fn aaronia_sdk_installed() -> bool {
 /// Stateless — the SoapySDR plugin's `getBandwidth` calls it on the rate
 /// `getSampleRate` reports, so it need not track a rate itself.
 #[unsafe(no_mangle)]
-pub extern "C" fn aaronia_usable_bandwidth_hz(sample_rate_hz: f64) -> f64 {
+pub extern "C" fn spectran_usable_bandwidth_hz(sample_rate_hz: f64) -> f64 {
     crate::usable_bandwidth_hz(sample_rate_hz)
 }
 
 /// The IQ sample rate whose alias-free bandwidth covers `bandwidth_hz`,
-/// Hz — the inverse of [`aaronia_usable_bandwidth_hz`]. The plugin's
+/// Hz — the inverse of [`spectran_usable_bandwidth_hz`]. The plugin's
 /// `setBandwidth` maps a requested bandwidth to the rate to ask for, then
 /// drives the already-verified `setSampleRate`. Stateless.
 #[unsafe(no_mangle)]
-pub extern "C" fn aaronia_iq_sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
+pub extern "C" fn spectran_iq_sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
     crate::iq_sample_rate_for_bandwidth(bandwidth_hz)
 }
 
 /// Select the RX channel(s) for native-SDK captures: 0 = Rx1 (default),
 /// 1 = Rx2, 2 = Rx1+Rx2 (dual — read with
-/// [`aaronia_source_read_samples_dual`]). Other values are ignored.
+/// [`spectran_source_read_samples_dual`]). Other values are ignored.
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_source_builder_new`].
+/// `builder` must be a live pointer from [`spectran_source_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_receiver_channel(
+pub unsafe extern "C" fn spectran_source_builder_receiver_channel(
     builder: *mut SpectranSourceBuilder,
     channel: i32,
 ) {
@@ -418,10 +418,10 @@ pub unsafe extern "C" fn aaronia_source_builder_receiver_channel(
 /// strings are ignored.
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_source_builder_new`];
+/// `builder` must be a live pointer from [`spectran_source_builder_new`];
 /// `format` must be a valid NUL-terminated C string or null (no-op).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_stream_format(
+pub unsafe extern "C" fn spectran_source_builder_stream_format(
     builder: *mut SpectranSourceBuilder,
     format: *const c_char,
 ) {
@@ -444,9 +444,9 @@ pub unsafe extern "C" fn aaronia_source_builder_stream_format(
 /// formats (`/stream?scale=N`).
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_source_builder_new`].
+/// `builder` must be a live pointer from [`spectran_source_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_stream_scale(
+pub unsafe extern "C" fn spectran_source_builder_stream_scale(
     builder: *mut SpectranSourceBuilder,
     scale: f64,
 ) {
@@ -459,14 +459,14 @@ pub unsafe extern "C" fn aaronia_source_builder_stream_scale(
 
 /// Set how long a blocking read waits for samples before returning the
 /// timeout code (default 30 s). Affects
-/// [`aaronia_source_read_samples`]; the deadline-taking
-/// [`aaronia_source_read_samples_timeout`] uses its own per-call value.
+/// [`spectran_source_read_samples`]; the deadline-taking
+/// [`spectran_source_read_samples_timeout`] uses its own per-call value.
 /// `0` is ignored (it would make every read time out immediately).
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_source_builder_new`].
+/// `builder` must be a live pointer from [`spectran_source_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_read_timeout_us(
+pub unsafe extern "C" fn spectran_source_builder_read_timeout_us(
     builder: *mut SpectranSourceBuilder,
     timeout_us: u64,
 ) {
@@ -485,9 +485,9 @@ pub unsafe extern "C" fn aaronia_source_builder_read_timeout_us(
 /// report an error.
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_source_builder_new`].
+/// `builder` must be a live pointer from [`spectran_source_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_builder_auto_reconnect(
+pub unsafe extern "C" fn spectran_source_builder_auto_reconnect(
     builder: *mut SpectranSourceBuilder,
     enabled: bool,
 ) {
@@ -500,18 +500,18 @@ pub unsafe extern "C" fn aaronia_source_builder_auto_reconnect(
 
 /// Consume the builder and asynchronously build a `SpectranSource`. Returns
 /// an opaque pointer that must later be freed with
-/// [`aaronia_source_free`], or `NULL` on error.
+/// [`spectran_source_free`], or `NULL` on error.
 ///
 /// # Safety
 /// `builder` must either be null (returns `NULL`) or a valid pointer to a
-/// live `SpectranSourceBuilder` returned by [`aaronia_source_builder_new`]
+/// live `SpectranSourceBuilder` returned by [`spectran_source_builder_new`]
 /// and not yet freed. The builder is borrowed (not consumed) so the caller
 /// retains ownership and must still free it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_build(builder: *mut SpectranSourceBuilder) -> *mut c_void {
+pub unsafe extern "C" fn spectran_source_build(builder: *mut SpectranSourceBuilder) -> *mut c_void {
     clear_last_error();
     if builder.is_null() {
-        set_last_error("aaronia_source_build: builder pointer is null");
+        set_last_error("spectran_source_build: builder pointer is null");
         return std::ptr::null_mut();
     }
     let builder = unsafe { &*builder };
@@ -519,11 +519,11 @@ pub unsafe extern "C" fn aaronia_source_build(builder: *mut SpectranSourceBuilde
     match ffi_block_on(builder.build()) {
         Ok(Ok(s)) => Box::into_raw(Box::new(s)) as *mut c_void,
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_build failed: {}", e));
+            set_last_error(format!("spectran_source_build failed: {}", e));
             std::ptr::null_mut()
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_build: {}", ctx));
+            set_last_error(format!("spectran_source_build: {}", ctx));
             std::ptr::null_mut()
         }
     }
@@ -531,19 +531,19 @@ pub unsafe extern "C" fn aaronia_source_build(builder: *mut SpectranSourceBuilde
 
 // --- SpectranSource FFI --- //
 
-/// Free a source previously returned by [`aaronia_source_build`].
+/// Free a source previously returned by [`spectran_source_build`].
 ///
 /// # Safety
 /// `ptr` must either be null or a pointer previously returned by
-/// [`aaronia_source_build`] that has not yet been freed. After this call
+/// [`spectran_source_build`] that has not yet been freed. After this call
 /// the pointer must not be used again.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_free(ptr: *mut c_void) {
+pub unsafe extern "C" fn spectran_source_free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
     // SAFETY: per the function-level contract, the caller guarantees the
-    // pointer originated from `aaronia_source_build` and has not been freed.
+    // pointer originated from `spectran_source_build` and has not been freed.
     unsafe {
         drop(Box::from_raw(ptr as *mut SpectranSource));
     }
@@ -558,24 +558,24 @@ const READ_RESERVE_CAP: usize = 1 << 22;
 /// the number of samples written, or a negative error code.
 ///
 /// # Safety
-/// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
+/// - `ptr` must be a valid pointer returned by [`spectran_source_build`]
 ///   and not yet freed; null returns `-1`.
 /// - `buffer` must be a non-null, properly aligned pointer to at least
 ///   `len` writable [`FfiComplex`] elements; null returns `-1`.
 /// - The buffer must remain valid for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_read_samples(
+pub unsafe extern "C" fn spectran_source_read_samples(
     ptr: *mut c_void,
     buffer: *mut FfiComplex,
     len: usize,
 ) -> isize {
     clear_last_error();
     if ptr.is_null() || buffer.is_null() {
-        set_last_error("aaronia_source_read_samples: source or buffer pointer is null");
+        set_last_error("spectran_source_read_samples: source or buffer pointer is null");
         return -1; // Null pointer error
     }
 
-    // SAFETY: ptr is verified non-null above and was created by Box::into_raw in aaronia_source_build.
+    // SAFETY: ptr is verified non-null above and was created by Box::into_raw in spectran_source_build.
     let source = unsafe { &mut *(ptr as *mut SpectranSource) };
 
     let mut temp_samples = Vec::with_capacity(len.min(READ_RESERVE_CAP));
@@ -606,9 +606,9 @@ pub unsafe extern "C" fn aaronia_source_read_samples(
             samples_to_copy as isize
         }
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_read_samples failed: {}", e));
+            set_last_error(format!("spectran_source_read_samples failed: {}", e));
             // Timeout maps to this API's private -3 convention (documented
-            // in aaronia.h); the SoapySDR plugin translates -3 to
+            // in spectran.h); the SoapySDR plugin translates -3 to
             // SOAPY_SDR_TIMEOUT on its side.
             if let crate::Error::Io(ref io_err) = e
                 && io_err.kind() == std::io::ErrorKind::TimedOut
@@ -618,13 +618,13 @@ pub unsafe extern "C" fn aaronia_source_read_samples(
             -1 // Generic stream error
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_read_samples: {}", ctx));
+            set_last_error(format!("spectran_source_read_samples: {}", ctx));
             -1 // Generic stream error
         }
     }
 }
 
-/// Deadline-bounded variant of [`aaronia_source_read_samples`] for
+/// Deadline-bounded variant of [`spectran_source_read_samples`] for
 /// callers with latency budgets (the SoapySDR plugin's `readStream`).
 ///
 /// Waits at most `timeout_us` microseconds. A partial read within the
@@ -633,9 +633,9 @@ pub unsafe extern "C" fn aaronia_source_read_samples(
 /// a non-blocking drain of already-buffered samples.
 ///
 /// # Safety
-/// Same contract as [`aaronia_source_read_samples`].
+/// Same contract as [`spectran_source_read_samples`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_read_samples_timeout(
+pub unsafe extern "C" fn spectran_source_read_samples_timeout(
     ptr: *mut c_void,
     buffer: *mut FfiComplex,
     len: usize,
@@ -643,12 +643,12 @@ pub unsafe extern "C" fn aaronia_source_read_samples_timeout(
 ) -> isize {
     clear_last_error();
     if ptr.is_null() || buffer.is_null() {
-        set_last_error("aaronia_source_read_samples_timeout: source or buffer pointer is null");
+        set_last_error("spectran_source_read_samples_timeout: source or buffer pointer is null");
         return -1;
     }
 
     // SAFETY: ptr is verified non-null above and was created by
-    // Box::into_raw in aaronia_source_build.
+    // Box::into_raw in spectran_source_build.
     let source = unsafe { &mut *(ptr as *mut SpectranSource) };
 
     // The source's reusable staging buffer, not a fresh Vec per call:
@@ -664,7 +664,7 @@ pub unsafe extern "C" fn aaronia_source_read_samples_timeout(
         Ok(Ok(samples_to_copy)) => {
             let samples_to_copy = samples_to_copy.min(len).min(temp_samples.len());
             // SAFETY: identical layout argument as in
-            // `aaronia_source_read_samples` above.
+            // `spectran_source_read_samples` above.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     temp_samples.as_ptr() as *const FfiComplex,
@@ -675,7 +675,10 @@ pub unsafe extern "C" fn aaronia_source_read_samples_timeout(
             samples_to_copy as isize
         }
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_read_samples_timeout failed: {}", e));
+            set_last_error(format!(
+                "spectran_source_read_samples_timeout failed: {}",
+                e
+            ));
             if let crate::Error::Io(ref io_err) = e
                 && io_err.kind() == std::io::ErrorKind::TimedOut
             {
@@ -684,7 +687,7 @@ pub unsafe extern "C" fn aaronia_source_read_samples_timeout(
             -1
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_read_samples_timeout: {}", ctx));
+            set_last_error(format!("spectran_source_read_samples_timeout: {}", ctx));
             -1
         }
     };
@@ -696,13 +699,13 @@ pub unsafe extern "C" fn aaronia_source_read_samples_timeout(
 /// (`Rx1+Rx2`) native-SDK stream into two caller buffers. Returns the
 /// number of pairs written to both buffers (always equal), `-1` on
 /// error. Requires the source to have been built with
-/// [`aaronia_source_builder_receiver_channel`]`(…, 2)`.
+/// [`spectran_source_builder_receiver_channel`]`(…, 2)`.
 ///
 /// # Safety
-/// `ptr` must be a live pointer from [`aaronia_source_build`]; `rx1`
+/// `ptr` must be a live pointer from [`spectran_source_build`]; `rx1`
 /// and `rx2` must each point to `len` writable [`FfiComplex`] elements.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_read_samples_dual(
+pub unsafe extern "C" fn spectran_source_read_samples_dual(
     ptr: *mut c_void,
     rx1: *mut FfiComplex,
     rx2: *mut FfiComplex,
@@ -710,7 +713,7 @@ pub unsafe extern "C" fn aaronia_source_read_samples_dual(
 ) -> isize {
     clear_last_error();
     if ptr.is_null() || rx1.is_null() || rx2.is_null() {
-        set_last_error("aaronia_source_read_samples_dual: null pointer");
+        set_last_error("spectran_source_read_samples_dual: null pointer");
         return -1;
     }
     let source = unsafe { &mut *(ptr as *mut SpectranSource) };
@@ -727,11 +730,11 @@ pub unsafe extern "C" fn aaronia_source_read_samples_dual(
             pairs as isize
         }
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_read_samples_dual failed: {}", e));
+            set_last_error(format!("spectran_source_read_samples_dual failed: {}", e));
             -1
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_read_samples_dual: {}", ctx));
+            set_last_error(format!("spectran_source_read_samples_dual: {}", ctx));
             -1
         }
     }
@@ -740,10 +743,10 @@ pub unsafe extern "C" fn aaronia_source_read_samples_dual(
 /// Read and clear the latched overrun flag from the source.
 ///
 /// # Safety
-/// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
+/// - `ptr` must be a valid pointer returned by [`spectran_source_build`]
 ///   and not yet freed; null returns `false`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_take_overrun(ptr: *mut c_void) -> bool {
+pub unsafe extern "C" fn spectran_source_take_overrun(ptr: *mut c_void) -> bool {
     if ptr.is_null() {
         return false;
     }
@@ -754,10 +757,10 @@ pub unsafe extern "C" fn aaronia_source_take_overrun(ptr: *mut c_void) -> bool {
 /// Get the cumulative number of dropped packets.
 ///
 /// # Safety
-/// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
+/// - `ptr` must be a valid pointer returned by [`spectran_source_build`]
 ///   and not yet freed; null returns `0`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_get_cumulative_drops(ptr: *mut c_void) -> u64 {
+pub unsafe extern "C" fn spectran_source_get_cumulative_drops(ptr: *mut c_void) -> u64 {
     if ptr.is_null() {
         return 0;
     }
@@ -768,10 +771,10 @@ pub unsafe extern "C" fn aaronia_source_get_cumulative_drops(ptr: *mut c_void) -
 /// Get the hardware timestamp of the last received block (in nanoseconds since epoch).
 ///
 /// # Safety
-/// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
+/// - `ptr` must be a valid pointer returned by [`spectran_source_build`]
 ///   and not yet freed; null returns `0`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_get_last_timestamp_ns(ptr: *mut c_void) -> i64 {
+pub unsafe extern "C" fn spectran_source_get_last_timestamp_ns(ptr: *mut c_void) -> i64 {
     if ptr.is_null() {
         return 0;
     }
@@ -783,7 +786,7 @@ pub unsafe extern "C" fn aaronia_source_get_last_timestamp_ns(ptr: *mut c_void) 
 /// available and valid. Returns `true` when `out_gps_time_ns` was written,
 /// otherwise `false`.
 ///
-/// Nanoseconds, matching [`aaronia_source_get_last_timestamp_ns`]. The
+/// Nanoseconds, matching [`spectran_source_get_last_timestamp_ns`]. The
 /// device reports seconds as a `double`; converting that to epoch
 /// nanoseconds correctly needs the whole and fractional parts handled
 /// separately, because the product lands where a `double`'s step is
@@ -798,11 +801,11 @@ pub unsafe extern "C" fn aaronia_source_get_last_timestamp_ns(ptr: *mut c_void) 
 /// variable to point at.
 ///
 /// # Safety
-/// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
+/// - `ptr` must be a valid pointer returned by [`spectran_source_build`]
 ///   and not yet freed; null returns `false`.
 /// - `out_gps_time_ns`, when not null, must be a valid pointer to an `i64`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_get_gps_time_ns(
+pub unsafe extern "C" fn spectran_source_get_gps_time_ns(
     ptr: *mut c_void,
     out_gps_time_ns: *mut i64,
 ) -> bool {
@@ -821,58 +824,58 @@ pub unsafe extern "C" fn aaronia_source_get_gps_time_ns(
     }
 }
 
-/// Start streaming on the source. Returns an `AaroniaFfiError`.
+/// Start streaming on the source. Returns a `SpectranFfiError`.
 ///
 /// # Safety
-/// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and
-/// not yet freed; null returns [`AaroniaFfiError::NullPointer`].
+/// `ptr` must be a valid pointer returned by [`spectran_source_build`] and
+/// not yet freed; null returns [`SpectranFfiError::NullPointer`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_start_streaming(ptr: *mut c_void) -> AaroniaFfiError {
+pub unsafe extern "C" fn spectran_source_start_streaming(ptr: *mut c_void) -> SpectranFfiError {
     clear_last_error();
     if ptr.is_null() {
-        set_last_error("aaronia_source_start_streaming: source pointer is null");
-        return AaroniaFfiError::NullPointer;
+        set_last_error("spectran_source_start_streaming: source pointer is null");
+        return SpectranFfiError::NullPointer;
     }
 
     let source = unsafe { &mut *(ptr as *mut SpectranSource) };
 
     match ffi_block_on(source.start_streaming()) {
-        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Ok(())) => SpectranFfiError::Success,
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_start_streaming failed: {}", e));
-            AaroniaFfiError::InternalError
+            set_last_error(format!("spectran_source_start_streaming failed: {}", e));
+            SpectranFfiError::InternalError
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_start_streaming: {}", ctx));
-            AaroniaFfiError::RuntimeContext
+            set_last_error(format!("spectran_source_start_streaming: {}", ctx));
+            SpectranFfiError::RuntimeContext
         }
     }
 }
 
-/// Stop streaming on the source. Returns an `AaroniaFfiError`.
+/// Stop streaming on the source. Returns a `SpectranFfiError`.
 ///
 /// # Safety
-/// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and
-/// not yet freed; null returns [`AaroniaFfiError::NullPointer`].
+/// `ptr` must be a valid pointer returned by [`spectran_source_build`] and
+/// not yet freed; null returns [`SpectranFfiError::NullPointer`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_stop_streaming(ptr: *mut c_void) -> AaroniaFfiError {
+pub unsafe extern "C" fn spectran_source_stop_streaming(ptr: *mut c_void) -> SpectranFfiError {
     clear_last_error();
     if ptr.is_null() {
-        set_last_error("aaronia_source_stop_streaming: source pointer is null");
-        return AaroniaFfiError::NullPointer;
+        set_last_error("spectran_source_stop_streaming: source pointer is null");
+        return SpectranFfiError::NullPointer;
     }
 
     let source = unsafe { &mut *(ptr as *mut SpectranSource) };
 
     match ffi_block_on(source.stop_streaming()) {
-        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Ok(())) => SpectranFfiError::Success,
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_stop_streaming failed: {}", e));
-            AaroniaFfiError::InternalError
+            set_last_error(format!("spectran_source_stop_streaming failed: {}", e));
+            SpectranFfiError::InternalError
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_stop_streaming: {}", ctx));
-            AaroniaFfiError::RuntimeContext
+            set_last_error(format!("spectran_source_stop_streaming: {}", ctx));
+            SpectranFfiError::RuntimeContext
         }
     }
 }
@@ -880,32 +883,32 @@ pub unsafe extern "C" fn aaronia_source_stop_streaming(ptr: *mut c_void) -> Aaro
 /// Set the center frequency (in Hz) on a live source.
 ///
 /// # Safety
-/// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and not yet freed.
+/// `ptr` must be a valid pointer returned by [`spectran_source_build`] and not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_set_center_frequency_hz(
+pub unsafe extern "C" fn spectran_source_set_center_frequency_hz(
     ptr: *mut c_void,
     hz: f64,
-) -> AaroniaFfiError {
+) -> SpectranFfiError {
     clear_last_error();
     if ptr.is_null() {
-        set_last_error("aaronia_source_set_center_frequency_hz: source pointer is null");
-        return AaroniaFfiError::NullPointer;
+        set_last_error("spectran_source_set_center_frequency_hz: source pointer is null");
+        return SpectranFfiError::NullPointer;
     }
 
     let source = unsafe { &mut *(ptr as *mut SpectranSource) };
 
     match ffi_block_on(source.set_center_frequency_hz(hz)) {
-        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Ok(())) => SpectranFfiError::Success,
         Ok(Err(e)) => {
             set_last_error(format!(
-                "aaronia_source_set_center_frequency_hz failed: {}",
+                "spectran_source_set_center_frequency_hz failed: {}",
                 e
             ));
-            AaroniaFfiError::InternalError
+            SpectranFfiError::InternalError
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_set_center_frequency_hz: {}", ctx));
-            AaroniaFfiError::RuntimeContext
+            set_last_error(format!("spectran_source_set_center_frequency_hz: {}", ctx));
+            SpectranFfiError::RuntimeContext
         }
     }
 }
@@ -913,29 +916,29 @@ pub unsafe extern "C" fn aaronia_source_set_center_frequency_hz(
 /// Set the span frequency / sample rate (in Hz) on a live source.
 ///
 /// # Safety
-/// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and not yet freed.
+/// `ptr` must be a valid pointer returned by [`spectran_source_build`] and not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_set_sample_rate_hz(
+pub unsafe extern "C" fn spectran_source_set_sample_rate_hz(
     ptr: *mut c_void,
     hz: f64,
-) -> AaroniaFfiError {
+) -> SpectranFfiError {
     clear_last_error();
     if ptr.is_null() {
-        set_last_error("aaronia_source_set_sample_rate_hz: source pointer is null");
-        return AaroniaFfiError::NullPointer;
+        set_last_error("spectran_source_set_sample_rate_hz: source pointer is null");
+        return SpectranFfiError::NullPointer;
     }
 
     let source = unsafe { &mut *(ptr as *mut SpectranSource) };
 
     match ffi_block_on(source.set_sample_rate_hz(hz)) {
-        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Ok(())) => SpectranFfiError::Success,
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_set_sample_rate_hz failed: {}", e));
-            AaroniaFfiError::InternalError
+            set_last_error(format!("spectran_source_set_sample_rate_hz failed: {}", e));
+            SpectranFfiError::InternalError
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_set_sample_rate_hz: {}", ctx));
-            AaroniaFfiError::RuntimeContext
+            set_last_error(format!("spectran_source_set_sample_rate_hz: {}", ctx));
+            SpectranFfiError::RuntimeContext
         }
     }
 }
@@ -943,32 +946,32 @@ pub unsafe extern "C" fn aaronia_source_set_sample_rate_hz(
 /// Set the reference level (in dBm) on a live source.
 ///
 /// # Safety
-/// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and not yet freed.
+/// `ptr` must be a valid pointer returned by [`spectran_source_build`] and not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_set_reference_level_dbm(
+pub unsafe extern "C" fn spectran_source_set_reference_level_dbm(
     ptr: *mut c_void,
     dbm: f64,
-) -> AaroniaFfiError {
+) -> SpectranFfiError {
     clear_last_error();
     if ptr.is_null() {
-        set_last_error("aaronia_source_set_reference_level_dbm: source pointer is null");
-        return AaroniaFfiError::NullPointer;
+        set_last_error("spectran_source_set_reference_level_dbm: source pointer is null");
+        return SpectranFfiError::NullPointer;
     }
 
     let source = unsafe { &mut *(ptr as *mut SpectranSource) };
 
     match ffi_block_on(source.set_reference_level_dbm(dbm)) {
-        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Ok(())) => SpectranFfiError::Success,
         Ok(Err(e)) => {
             set_last_error(format!(
-                "aaronia_source_set_reference_level_dbm failed: {}",
+                "spectran_source_set_reference_level_dbm failed: {}",
                 e
             ));
-            AaroniaFfiError::InternalError
+            SpectranFfiError::InternalError
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_set_reference_level_dbm: {}", ctx));
-            AaroniaFfiError::RuntimeContext
+            set_last_error(format!("spectran_source_set_reference_level_dbm: {}", ctx));
+            SpectranFfiError::RuntimeContext
         }
     }
 }
@@ -978,65 +981,65 @@ pub unsafe extern "C" fn aaronia_source_set_reference_level_dbm(
 /// variants a V6 offers). This is the basis for correlating captures across
 /// devices that share a reference. Native SDK and HTTP only; a no-op on file
 /// sources. Returns `Success`, or an error whose detail is in
-/// `aaronia_last_error()`.
+/// `spectran_last_error()`.
 ///
 /// # Safety
-/// `ptr` must be a live `SpectranSource` from `aaronia_source_builder_build`;
+/// `ptr` must be a live `SpectranSource` from `spectran_source_builder_build`;
 /// `source` must be a valid NUL-terminated UTF-8 string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_set_clock_source(
+pub unsafe extern "C" fn spectran_source_set_clock_source(
     ptr: *mut c_void,
     source: *const c_char,
-) -> AaroniaFfiError {
+) -> SpectranFfiError {
     clear_last_error();
     if ptr.is_null() {
-        set_last_error("aaronia_source_set_clock_source: source pointer is null");
-        return AaroniaFfiError::NullPointer;
+        set_last_error("spectran_source_set_clock_source: source pointer is null");
+        return SpectranFfiError::NullPointer;
     }
     if source.is_null() {
-        set_last_error("aaronia_source_set_clock_source: clock-source string is null");
-        return AaroniaFfiError::NullPointer;
+        set_last_error("spectran_source_set_clock_source: clock-source string is null");
+        return SpectranFfiError::NullPointer;
     }
     let clock_source = match unsafe { CStr::from_ptr(source) }.to_str() {
         Ok(s) => s,
         Err(e) => {
             set_last_error(format!(
-                "aaronia_source_set_clock_source: clock source is not valid UTF-8: {}",
+                "spectran_source_set_clock_source: clock source is not valid UTF-8: {}",
                 e
             ));
-            return AaroniaFfiError::InvalidString;
+            return SpectranFfiError::InvalidString;
         }
     };
 
     let source_ref = unsafe { &mut *(ptr as *mut SpectranSource) };
     match ffi_block_on(source_ref.set_clock_source(clock_source)) {
-        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Ok(())) => SpectranFfiError::Success,
         Ok(Err(e)) => {
-            set_last_error(format!("aaronia_source_set_clock_source failed: {}", e));
-            AaroniaFfiError::InternalError
+            set_last_error(format!("spectran_source_set_clock_source failed: {}", e));
+            SpectranFfiError::InternalError
         }
         Err(ctx) => {
-            set_last_error(format!("aaronia_source_set_clock_source: {}", ctx));
-            AaroniaFfiError::RuntimeContext
+            set_last_error(format!("spectran_source_set_clock_source: {}", ctx));
+            SpectranFfiError::RuntimeContext
         }
     }
 }
 
 /// Return a heap-allocated [`FfiSourceInfo`] describing the source. The
-/// caller must free it with [`aaronia_source_info_free`]. Returns `NULL`
+/// caller must free it with [`spectran_source_info_free`]. Returns `NULL`
 /// on null input.
 ///
 /// # Safety
-/// `ptr` must be a valid pointer returned by [`aaronia_source_build`] and
+/// `ptr` must be a valid pointer returned by [`spectran_source_build`] and
 /// not yet freed; null returns `NULL`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_get_source_info(ptr: *mut c_void) -> *mut FfiSourceInfo {
+pub unsafe extern "C" fn spectran_source_get_source_info(ptr: *mut c_void) -> *mut FfiSourceInfo {
     if ptr.is_null() {
         return std::ptr::null_mut();
     }
 
     let source = unsafe { &*(ptr as *mut SpectranSource) };
-    let info = source.get_source_info();
+    let info = source.source_info();
 
     let device_serial = if let Some(serial) = info.device_serial {
         CString::new(serial)
@@ -1059,14 +1062,14 @@ pub unsafe extern "C" fn aaronia_source_get_source_info(ptr: *mut c_void) -> *mu
 }
 
 /// Free a source-info struct previously returned by
-/// [`aaronia_source_get_source_info`].
+/// [`spectran_source_get_source_info`].
 ///
 /// # Safety
 /// `ptr` must either be null or a pointer previously returned by
-/// [`aaronia_source_get_source_info`] that has not yet been freed. After
+/// [`spectran_source_get_source_info`] that has not yet been freed. After
 /// this call the pointer must not be used again.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_info_free(ptr: *mut FfiSourceInfo) {
+pub unsafe extern "C" fn spectran_source_info_free(ptr: *mut FfiSourceInfo) {
     if ptr.is_null() {
         return;
     }
@@ -1141,11 +1144,11 @@ pub struct FfiDeviceCapabilities {
 /// report everything absent — they have no equivalent surface to ask.
 ///
 /// # Safety
-/// `ptr` must be a live pointer from [`aaronia_source_build`], not used
+/// `ptr` must be a live pointer from [`spectran_source_build`], not used
 /// concurrently from another thread. The returned pointer must be freed
-/// exactly once with [`aaronia_source_capabilities_free`].
+/// exactly once with [`spectran_source_capabilities_free`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_get_capabilities(
+pub unsafe extern "C" fn spectran_source_get_capabilities(
     ptr: *mut c_void,
 ) -> *mut FfiDeviceCapabilities {
     clear_last_error();
@@ -1218,16 +1221,16 @@ pub unsafe extern "C" fn aaronia_source_get_capabilities(
     }))
 }
 
-/// Free a capabilities struct from [`aaronia_source_get_capabilities`],
+/// Free a capabilities struct from [`spectran_source_get_capabilities`],
 /// including the strings and the sample-rate array it owns.
 ///
 /// # Safety
 /// `ptr` must be null or a pointer returned by
-/// [`aaronia_source_get_capabilities`] that has not already been freed.
+/// [`spectran_source_get_capabilities`] that has not already been freed.
 /// After this call neither it nor any pointer read out of it may be
 /// used again.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_capabilities_free(ptr: *mut FfiDeviceCapabilities) {
+pub unsafe extern "C" fn spectran_source_capabilities_free(ptr: *mut FfiDeviceCapabilities) {
     if ptr.is_null() {
         return;
     }
@@ -1269,7 +1272,7 @@ pub unsafe extern "C" fn aaronia_source_capabilities_free(ptr: *mut FfiDeviceCap
     }
 }
 
-/// The device's live sensors, filled by [`aaronia_source_get_sensors`].
+/// The device's live sensors, filled by [`spectran_source_get_sensors`].
 ///
 /// A plain value struct the caller allocates: every field is a reading,
 /// or `NaN` for "the device did not report it". No pointers, no
@@ -1305,11 +1308,11 @@ pub struct FfiDeviceSensors {
 /// Blocking: one `/healthstatus` GET on the HTTP backend.
 ///
 /// # Safety
-/// `ptr` must be a live pointer from [`aaronia_source_build`], not used
+/// `ptr` must be a live pointer from [`spectran_source_build`], not used
 /// concurrently from another thread; `out` must point to a writable
 /// `FfiDeviceSensors`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_get_sensors(
+pub unsafe extern "C" fn spectran_source_get_sensors(
     ptr: *mut c_void,
     out: *mut FfiDeviceSensors,
 ) -> bool {
@@ -1355,10 +1358,10 @@ pub unsafe extern "C" fn aaronia_source_get_sensors(
 /// `base_url_ptr`, if non-null, must point to a NUL-terminated C string
 /// that remains valid for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_endpoints_client_new(base_url_ptr: *const c_char) -> *mut c_void {
+pub unsafe extern "C" fn spectran_endpoints_client_new(base_url_ptr: *const c_char) -> *mut c_void {
     clear_last_error();
     if base_url_ptr.is_null() {
-        set_last_error("aaronia_endpoints_client_new: base_url pointer is null");
+        set_last_error("spectran_endpoints_client_new: base_url pointer is null");
         return std::ptr::null_mut();
     }
     let base_url_cstr = unsafe { CStr::from_ptr(base_url_ptr) };
@@ -1366,7 +1369,7 @@ pub unsafe extern "C" fn aaronia_endpoints_client_new(base_url_ptr: *const c_cha
         Ok(s) => s,
         Err(e) => {
             set_last_error(format!(
-                "aaronia_endpoints_client_new: base_url is not valid UTF-8: {}",
+                "spectran_endpoints_client_new: base_url is not valid UTF-8: {}",
                 e
             ));
             return std::ptr::null_mut();
@@ -1380,7 +1383,7 @@ pub unsafe extern "C" fn aaronia_endpoints_client_new(base_url_ptr: *const c_cha
         Ok(client) => Box::into_raw(Box::new(client)) as *mut c_void,
         Err(e) => {
             set_last_error(format!(
-                "aaronia_endpoints_client_new failed for {}: {}",
+                "spectran_endpoints_client_new failed for {}: {}",
                 base_url, e
             ));
             std::ptr::null_mut()
@@ -1388,14 +1391,14 @@ pub unsafe extern "C" fn aaronia_endpoints_client_new(base_url_ptr: *const c_cha
     }
 }
 
-/// Free a client previously returned by [`aaronia_endpoints_client_new`].
+/// Free a client previously returned by [`spectran_endpoints_client_new`].
 ///
 /// # Safety
 /// `ptr` must either be null or a pointer previously returned by
-/// [`aaronia_endpoints_client_new`] that has not yet been freed. After
+/// [`spectran_endpoints_client_new`] that has not yet been freed. After
 /// this call the pointer must not be used again.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_endpoints_client_free(ptr: *mut c_void) {
+pub unsafe extern "C" fn spectran_endpoints_client_free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
@@ -1405,19 +1408,21 @@ pub unsafe extern "C" fn aaronia_endpoints_client_free(ptr: *mut c_void) {
 }
 
 /// Query the connected RTSA server's metadata. Returns a heap-allocated
-/// [`FfiServerInfo`] (free with [`aaronia_server_info_free`]) or `NULL` on
+/// [`FfiServerInfo`] (free with [`spectran_server_info_free`]) or `NULL` on
 /// error / null input.
 ///
 /// # Safety
 /// `ptr` must be a valid pointer returned by
-/// [`aaronia_endpoints_client_new`] and not yet freed; null returns
+/// [`spectran_endpoints_client_new`] and not yet freed; null returns
 /// `NULL`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_endpoints_client_get_info(ptr: *mut c_void) -> *mut FfiServerInfo {
+pub unsafe extern "C" fn spectran_endpoints_client_get_info(
+    ptr: *mut c_void,
+) -> *mut FfiServerInfo {
     unsafe {
         clear_last_error();
         if ptr.is_null() {
-            set_last_error("aaronia_endpoints_client_get_info: client pointer is null");
+            set_last_error("spectran_endpoints_client_get_info: client pointer is null");
             return std::ptr::null_mut();
         }
 
@@ -1425,7 +1430,7 @@ pub unsafe extern "C" fn aaronia_endpoints_client_get_info(ptr: *mut c_void) -> 
         let info_result = match ffi_block_on(client.get_info()) {
             Ok(r) => r,
             Err(ctx) => {
-                set_last_error(format!("aaronia_endpoints_client_get_info: {}", ctx));
+                set_last_error(format!("spectran_endpoints_client_get_info: {}", ctx));
                 return std::ptr::null_mut();
             }
         };
@@ -1455,7 +1460,7 @@ pub unsafe extern "C" fn aaronia_endpoints_client_get_info(ptr: *mut c_void) -> 
                 Box::into_raw(ffi_info)
             }
             Err(e) => {
-                set_last_error(format!("aaronia_endpoints_client_get_info failed: {}", e));
+                set_last_error(format!("spectran_endpoints_client_get_info failed: {}", e));
                 std::ptr::null_mut()
             }
         }
@@ -1463,7 +1468,7 @@ pub unsafe extern "C" fn aaronia_endpoints_client_get_info(ptr: *mut c_void) -> 
 }
 
 /// Read the device's live sensors through an endpoints client, into
-/// `out`. The same reading as [`aaronia_source_get_sensors`], but off a
+/// `out`. The same reading as [`spectran_source_get_sensors`], but off a
 /// standalone client rather than a streaming source — so a caller can
 /// poll sensors during a capture without contending for the source's
 /// read lock, which would stall sample delivery.
@@ -1475,23 +1480,23 @@ pub unsafe extern "C" fn aaronia_endpoints_client_get_info(ptr: *mut c_void) -> 
 /// Blocking: one `/healthstatus` GET.
 ///
 /// # Safety
-/// `ptr` must be a live pointer from [`aaronia_endpoints_client_new`],
+/// `ptr` must be a live pointer from [`spectran_endpoints_client_new`],
 /// not yet freed; `out` must point to a writable `FfiDeviceSensors`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_endpoints_client_get_sensors(
+pub unsafe extern "C" fn spectran_endpoints_client_get_sensors(
     ptr: *mut c_void,
     out: *mut FfiDeviceSensors,
 ) -> bool {
     clear_last_error();
     if ptr.is_null() || out.is_null() {
-        set_last_error("aaronia_endpoints_client_get_sensors: null pointer".to_string());
+        set_last_error("spectran_endpoints_client_get_sensors: null pointer".to_string());
         return false;
     }
     let client = unsafe { &*(ptr as *mut HttpEndpointsClient) };
     let sensors = match ffi_block_on(client.get_device_sensors()) {
         Ok(result) => result.unwrap_or_default(),
         Err(e) => {
-            set_last_error(format!("aaronia_endpoints_client_get_sensors: {e}"));
+            set_last_error(format!("spectran_endpoints_client_get_sensors: {e}"));
             return false;
         }
     };
@@ -1516,14 +1521,14 @@ pub unsafe extern "C" fn aaronia_endpoints_client_get_sensors(
 }
 
 /// Free a server-info struct previously returned by
-/// [`aaronia_endpoints_client_get_info`].
+/// [`spectran_endpoints_client_get_info`].
 ///
 /// # Safety
 /// `ptr` must either be null (no-op) or a pointer previously returned by
-/// [`aaronia_endpoints_client_get_info`] that has not yet been freed.
+/// [`spectran_endpoints_client_get_info`] that has not yet been freed.
 /// After this call the pointer must not be used again.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_server_info_free(ptr: *mut FfiServerInfo) {
+pub unsafe extern "C" fn spectran_server_info_free(ptr: *mut FfiServerInfo) {
     if ptr.is_null() {
         return;
     }
@@ -1538,66 +1543,66 @@ pub unsafe extern "C" fn aaronia_server_info_free(ptr: *mut FfiServerInfo) {
     }
 }
 
-/// Start or stop server-side streaming. Returns an `AaroniaFfiError`.
+/// Start or stop server-side streaming. Returns a `SpectranFfiError`.
 ///
 /// # Safety
 /// `ptr` must be a valid pointer returned by
-/// [`aaronia_endpoints_client_new`] and not yet freed; null returns
-/// [`AaroniaFfiError::NullPointer`].
+/// [`spectran_endpoints_client_new`] and not yet freed; null returns
+/// [`SpectranFfiError::NullPointer`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_endpoints_client_control_streaming(
+pub unsafe extern "C" fn spectran_endpoints_client_control_streaming(
     ptr: *mut c_void,
     start: bool,
-) -> AaroniaFfiError {
+) -> SpectranFfiError {
     unsafe {
         clear_last_error();
         if ptr.is_null() {
-            set_last_error("aaronia_endpoints_client_control_streaming: client pointer is null");
-            return AaroniaFfiError::NullPointer;
+            set_last_error("spectran_endpoints_client_control_streaming: client pointer is null");
+            return SpectranFfiError::NullPointer;
         }
 
         let client = &mut *(ptr as *mut HttpEndpointsClient);
 
         match ffi_block_on(client.control_streaming(start)) {
-            Ok(Ok(())) => AaroniaFfiError::Success,
+            Ok(Ok(())) => SpectranFfiError::Success,
             Ok(Err(e)) => {
                 set_last_error(format!(
-                    "aaronia_endpoints_client_control_streaming(start={}) failed: {}",
+                    "spectran_endpoints_client_control_streaming(start={}) failed: {}",
                     start, e
                 ));
-                AaroniaFfiError::InternalError
+                SpectranFfiError::InternalError
             }
             Err(ctx) => {
                 set_last_error(format!(
-                    "aaronia_endpoints_client_control_streaming: {}",
+                    "spectran_endpoints_client_control_streaming: {}",
                     ctx
                 ));
-                AaroniaFfiError::RuntimeContext
+                SpectranFfiError::RuntimeContext
             }
         }
     }
 }
 
 /// Start or stop server-side recording. `name` is the recording label and
-/// may be null. Returns an `AaroniaFfiError`.
+/// may be null. Returns a `SpectranFfiError`.
 ///
 /// # Safety
 /// - `ptr` must be a valid pointer returned by
-///   [`aaronia_endpoints_client_new`] and not yet freed; null returns
-///   [`AaroniaFfiError::NullPointer`].
+///   [`spectran_endpoints_client_new`] and not yet freed; null returns
+///   [`SpectranFfiError::NullPointer`].
 /// - `name`, if non-null, must point to a NUL-terminated C string that
 ///   remains valid for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_endpoints_client_control_recording(
+pub unsafe extern "C" fn spectran_endpoints_client_control_recording(
     ptr: *mut c_void,
     start: bool,
     name: *const c_char,
-) -> AaroniaFfiError {
+) -> SpectranFfiError {
     unsafe {
         clear_last_error();
         if ptr.is_null() {
-            set_last_error("aaronia_endpoints_client_control_recording: client pointer is null");
-            return AaroniaFfiError::NullPointer;
+            set_last_error("spectran_endpoints_client_control_recording: client pointer is null");
+            return SpectranFfiError::NullPointer;
         }
 
         let client = &mut *(ptr as *mut HttpEndpointsClient);
@@ -1609,20 +1614,20 @@ pub unsafe extern "C" fn aaronia_endpoints_client_control_recording(
         };
 
         match ffi_block_on(client.control_recording(start, name_str)) {
-            Ok(Ok(())) => AaroniaFfiError::Success,
+            Ok(Ok(())) => SpectranFfiError::Success,
             Ok(Err(e)) => {
                 set_last_error(format!(
-                    "aaronia_endpoints_client_control_recording(start={}) failed: {}",
+                    "spectran_endpoints_client_control_recording(start={}) failed: {}",
                     start, e
                 ));
-                AaroniaFfiError::InternalError
+                SpectranFfiError::InternalError
             }
             Err(ctx) => {
                 set_last_error(format!(
-                    "aaronia_endpoints_client_control_recording: {}",
+                    "spectran_endpoints_client_control_recording: {}",
                     ctx
                 ));
-                AaroniaFfiError::RuntimeContext
+                SpectranFfiError::RuntimeContext
             }
         }
     }
@@ -1639,7 +1644,7 @@ pub unsafe extern "C" fn aaronia_endpoints_client_control_recording(
 /// elsewhere (e.g. by `malloc`, `strdup`, or another library) is undefined
 /// behaviour.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_string_free(s: *mut c_char) {
+pub unsafe extern "C" fn spectran_string_free(s: *mut c_char) {
     if s.is_null() {
         return;
     }
@@ -1648,26 +1653,28 @@ pub unsafe extern "C" fn aaronia_string_free(s: *mut c_char) {
     }
 }
 
-/// Translate an [`AaroniaFfiError`] into a heap-allocated C string. The
-/// caller must free the returned pointer with [`aaronia_string_free`].
+/// Translate an [`SpectranFfiError`] into a heap-allocated C string. The
+/// caller must free the returned pointer with [`spectran_string_free`].
 ///
 /// # Safety
 /// This function takes only by-value arguments and is sound to call from
 /// any thread; the `unsafe` qualifier is required because the returned
 /// pointer transfers ownership to the caller.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_get_error_message(error_code: std::os::raw::c_int) -> *mut c_char {
+pub unsafe extern "C" fn spectran_get_error_message(
+    error_code: std::os::raw::c_int,
+) -> *mut c_char {
     // Taken as a plain int, not the enum: a C enum is an int and any
     // value can arrive, while an out-of-range Rust enum is undefined
     // behaviour before the match runs.
     let message = match error_code {
-        x if x == AaroniaFfiError::Success as i32 => "Success",
-        x if x == AaroniaFfiError::NullPointer as i32 => "Null pointer provided",
-        x if x == AaroniaFfiError::InvalidString as i32 => "Invalid UTF-8 string provided",
-        x if x == AaroniaFfiError::InternalError as i32 => "Internal Rust error",
-        x if x == AaroniaFfiError::BuildFailed as i32 => "Failed to build Aaronia source",
-        x if x == AaroniaFfiError::ReadError as i32 => "Failed to read from Aaronia source",
-        x if x == AaroniaFfiError::RuntimeContext as i32 => {
+        x if x == SpectranFfiError::Success as i32 => "Success",
+        x if x == SpectranFfiError::NullPointer as i32 => "Null pointer provided",
+        x if x == SpectranFfiError::InvalidString as i32 => "Invalid UTF-8 string provided",
+        x if x == SpectranFfiError::InternalError as i32 => "Internal Rust error",
+        x if x == SpectranFfiError::BuildFailed as i32 => "Failed to build Aaronia source",
+        x if x == SpectranFfiError::ReadError as i32 => "Failed to read from Aaronia source",
+        x if x == SpectranFfiError::RuntimeContext as i32 => {
             "Called from a thread context that cannot block (current-thread tokio runtime)"
         }
         _ => "Unknown error code",
@@ -1683,26 +1690,26 @@ pub unsafe extern "C" fn aaronia_get_error_message(error_code: std::os::raw::c_i
 // > [!WARNING]
 // > The entire TX path is hardware-unverified (see `unified_sink` /
 // > `sdk_sink` module docs) and requires the native SDK on
-// > Windows/Linux; on other builds `aaronia_sink_initialize` fails with
+// > Windows/Linux; on other builds `spectran_sink_initialize` fails with
 // > a descriptive error.
 // -----------------------------------------------------------------------------
 
-/// Create a new sink builder. Free with [`aaronia_sink_builder_free`].
+/// Create a new sink builder. Free with [`spectran_sink_builder_free`].
 ///
 /// # Safety
 /// Takes no arguments; sound to call from any thread. The returned
 /// pointer must be freed exactly once with
-/// [`aaronia_sink_builder_free`] (or consumed by nothing — building
+/// [`spectran_sink_builder_free`] (or consumed by nothing — building
 /// borrows it).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_builder_new() -> *mut SpectranSinkBuilder {
+pub unsafe extern "C" fn spectran_sink_builder_new() -> *mut SpectranSinkBuilder {
     Box::into_raw(Box::new(SpectranSinkBuilder::new()))
 }
 
 /// Whether this build carries a transmit path at all.
 ///
-/// `aaronia_sink_build` succeeds everywhere — it allocates a sink
-/// object, and only `aaronia_sink_initialize` fails where TX is
+/// `spectran_sink_build` succeeds everywhere — it allocates a sink
+/// object, and only `spectran_sink_initialize` fails where TX is
 /// unavailable — so a non-null sink is **not** evidence that anything
 /// can transmit. A caller that has to advertise the capability before
 /// opening anything (the SoapySDR plugin publishes its TX channel count
@@ -1719,7 +1726,7 @@ pub unsafe extern "C" fn aaronia_sink_builder_new() -> *mut SpectranSinkBuilder 
 /// Takes no arguments and touches no state, so it is a safe `fn`: sound
 /// to call from any thread at any time.
 #[unsafe(no_mangle)]
-pub extern "C" fn aaronia_sink_supported() -> bool {
+pub extern "C" fn spectran_sink_supported() -> bool {
     crate::unified_sink::UnifiedSink::tx_supported()
 }
 
@@ -1727,9 +1734,9 @@ pub extern "C" fn aaronia_sink_supported() -> bool {
 ///
 /// # Safety
 /// `builder` must be null or a pointer returned by
-/// [`aaronia_sink_builder_new`] that has not already been freed.
+/// [`spectran_sink_builder_new`] that has not already been freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_builder_free(builder: *mut SpectranSinkBuilder) {
+pub unsafe extern "C" fn spectran_sink_builder_free(builder: *mut SpectranSinkBuilder) {
     if !builder.is_null() {
         unsafe { drop(Box::from_raw(builder)) };
     }
@@ -1738,9 +1745,9 @@ pub unsafe extern "C" fn aaronia_sink_builder_free(builder: *mut SpectranSinkBui
 /// Set the TX center frequency in Hz on a sink builder.
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_sink_builder_new`].
+/// `builder` must be a live pointer from [`spectran_sink_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_builder_center_frequency_hz(
+pub unsafe extern "C" fn spectran_sink_builder_center_frequency_hz(
     builder: *mut SpectranSinkBuilder,
     hz: f64,
 ) {
@@ -1753,9 +1760,9 @@ pub unsafe extern "C" fn aaronia_sink_builder_center_frequency_hz(
 /// Set the TX IQ sample rate (span) in Hz on a sink builder.
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_sink_builder_new`].
+/// `builder` must be a live pointer from [`spectran_sink_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_builder_sample_rate_hz(
+pub unsafe extern "C" fn spectran_sink_builder_sample_rate_hz(
     builder: *mut SpectranSinkBuilder,
     hz: f64,
 ) {
@@ -1768,9 +1775,9 @@ pub unsafe extern "C" fn aaronia_sink_builder_sample_rate_hz(
 /// Set the transmission gain in dB on a sink builder.
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_sink_builder_new`].
+/// `builder` must be a live pointer from [`spectran_sink_builder_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_builder_trans_gain_db(
+pub unsafe extern "C" fn spectran_sink_builder_trans_gain_db(
     builder: *mut SpectranSinkBuilder,
     db: f64,
 ) {
@@ -1782,17 +1789,17 @@ pub unsafe extern "C" fn aaronia_sink_builder_trans_gain_db(
 
 /// Build a sink from the builder's current configuration.
 ///
-/// The builder is **borrowed**, exactly like [`aaronia_source_build`]:
+/// The builder is **borrowed**, exactly like [`spectran_source_build`]:
 /// the caller retains ownership and must still free it with
-/// [`aaronia_sink_builder_free`]. (An earlier revision consumed the
+/// [`spectran_sink_builder_free`]. (An earlier revision consumed the
 /// builder here while the source API borrowed it — following the
 /// source convention then double-freed the builder on every open.)
 ///
 /// # Safety
-/// `builder` must be a live pointer from [`aaronia_sink_builder_new`].
-/// The returned sink must be freed with [`aaronia_sink_free`].
+/// `builder` must be a live pointer from [`spectran_sink_builder_new`].
+/// The returned sink must be freed with [`spectran_sink_free`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_build(builder: *mut SpectranSinkBuilder) -> *mut c_void {
+pub unsafe extern "C" fn spectran_sink_build(builder: *mut SpectranSinkBuilder) -> *mut c_void {
     clear_last_error();
     let Some(builder_ref) = (unsafe { builder.as_ref() }) else {
         set_last_error("Null builder".to_string());
@@ -1805,10 +1812,10 @@ pub unsafe extern "C" fn aaronia_sink_build(builder: *mut SpectranSinkBuilder) -
 /// Free a sink. Null is a no-op.
 ///
 /// # Safety
-/// `ptr` must be null or a pointer returned by [`aaronia_sink_build`]
+/// `ptr` must be null or a pointer returned by [`spectran_sink_build`]
 /// that has not already been freed, with no other thread using it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_free(ptr: *mut c_void) {
+pub unsafe extern "C" fn spectran_sink_free(ptr: *mut c_void) {
     if !ptr.is_null() {
         unsafe { drop(Box::from_raw(ptr as *mut UnifiedSink)) };
     }
@@ -1824,28 +1831,28 @@ pub unsafe extern "C" fn aaronia_sink_free(ptr: *mut c_void) {
 /// call from plain C threads and from multi-threaded tokio contexts.
 ///
 /// # Safety
-/// `ptr` must be a live pointer from [`aaronia_sink_build`], not used
+/// `ptr` must be a live pointer from [`spectran_sink_build`], not used
 /// concurrently from another thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_initialize(ptr: *mut c_void) -> AaroniaFfiError {
+pub unsafe extern "C" fn spectran_sink_initialize(ptr: *mut c_void) -> SpectranFfiError {
     clear_last_error();
     if ptr.is_null() {
         set_last_error("Null pointer".to_string());
-        return AaroniaFfiError::NullPointer;
+        return SpectranFfiError::NullPointer;
     }
     let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
     match ffi_block_on(async {
         sink.initialize().await?;
         sink.start_streaming().await
     }) {
-        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Ok(())) => SpectranFfiError::Success,
         Ok(Err(e)) => {
             set_last_error(format!("Initialize error: {}", e));
-            AaroniaFfiError::InternalError
+            SpectranFfiError::InternalError
         }
         Err(msg) => {
             set_last_error(msg);
-            AaroniaFfiError::InternalError
+            SpectranFfiError::InternalError
         }
     }
 }
@@ -1853,25 +1860,25 @@ pub unsafe extern "C" fn aaronia_sink_initialize(ptr: *mut c_void) -> AaroniaFfi
 /// Stop the TX stream and disconnect the device.
 ///
 /// # Safety
-/// `ptr` must be a live pointer from [`aaronia_sink_build`], not used
+/// `ptr` must be a live pointer from [`spectran_sink_build`], not used
 /// concurrently from another thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_stop_streaming(ptr: *mut c_void) -> AaroniaFfiError {
+pub unsafe extern "C" fn spectran_sink_stop_streaming(ptr: *mut c_void) -> SpectranFfiError {
     clear_last_error();
     if ptr.is_null() {
         set_last_error("Null pointer".to_string());
-        return AaroniaFfiError::NullPointer;
+        return SpectranFfiError::NullPointer;
     }
     let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
     match ffi_block_on(async { sink.stop_streaming().await }) {
-        Ok(Ok(())) => AaroniaFfiError::Success,
+        Ok(Ok(())) => SpectranFfiError::Success,
         Ok(Err(e)) => {
             set_last_error(format!("Stop streaming error: {}", e));
-            AaroniaFfiError::InternalError
+            SpectranFfiError::InternalError
         }
         Err(msg) => {
             set_last_error(msg);
-            AaroniaFfiError::InternalError
+            SpectranFfiError::InternalError
         }
     }
 }
@@ -1886,10 +1893,10 @@ pub unsafe extern "C" fn aaronia_sink_stop_streaming(ptr: *mut c_void) -> Aaroni
 /// C99 `_Complex`, which MSVC rejects in C++.
 ///
 /// # Safety
-/// `ptr` must be a live pointer from [`aaronia_sink_build`]; `samples`
+/// `ptr` must be a live pointer from [`spectran_sink_build`]; `samples`
 /// must point to `num_samples` readable [`FfiComplex`] elements.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_sink_write_samples(
+pub unsafe extern "C" fn spectran_sink_write_samples(
     ptr: *mut c_void,
     channel: i32,
     start_time_s: f64,
@@ -1897,11 +1904,11 @@ pub unsafe extern "C" fn aaronia_sink_write_samples(
     flags: u64,
     samples: *const FfiComplex,
     num_samples: usize,
-) -> AaroniaFfiError {
+) -> SpectranFfiError {
     clear_last_error();
     if ptr.is_null() || samples.is_null() {
         set_last_error("Null pointer".to_string());
-        return AaroniaFfiError::NullPointer;
+        return SpectranFfiError::NullPointer;
     }
 
     // A length that cannot describe a real buffer (more than isize::MAX
@@ -1910,7 +1917,7 @@ pub unsafe extern "C" fn aaronia_sink_write_samples(
         set_last_error(format!(
             "num_samples {num_samples} exceeds the maximum slice length"
         ));
-        return AaroniaFfiError::InternalError;
+        return SpectranFfiError::InternalError;
     }
 
     let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
@@ -1919,10 +1926,10 @@ pub unsafe extern "C" fn aaronia_sink_write_samples(
     let slice = unsafe { std::slice::from_raw_parts(samples as *const Complex32, num_samples) };
 
     match sink.write_samples(channel, start_time_s, end_time_s, flags, slice) {
-        Ok(_) => AaroniaFfiError::Success,
+        Ok(_) => SpectranFfiError::Success,
         Err(e) => {
             set_last_error(format!("Write error: {}", e));
-            AaroniaFfiError::InternalError
+            SpectranFfiError::InternalError
         }
     }
 }
@@ -1940,7 +1947,7 @@ mod tests {
     /// so this is exercised under whatever sanitiser CI runs.
     #[test]
     fn ffi_device_capabilities_layout_matches_the_c_header() {
-        // Offsets measured from the C side by compiling include/aaronia.h:
+        // Offsets measured from the C side by compiling include/spectran.h:
         //   cc -I include abi_check.c ... && ./abi_check
         // A mismatch here is silent memory corruption across the ABI, not a
         // compile error, so the two layouts are pinned against each other.
@@ -2104,7 +2111,7 @@ mod tests {
         unsafe {
             assert_eq!((*caps).sample_rate_count, 3);
             assert_eq!(*(*caps).sample_rates.add(2), 15_360_000.0);
-            aaronia_source_capabilities_free(caps);
+            spectran_source_capabilities_free(caps);
         }
     }
 
@@ -2132,14 +2139,14 @@ mod tests {
             sample_rate_count: 0,
             sample_rates: ptr::null(),
         }));
-        unsafe { aaronia_source_capabilities_free(caps) };
+        unsafe { spectran_source_capabilities_free(caps) };
         // Null is a no-op, as every free in this ABI is.
-        unsafe { aaronia_source_capabilities_free(ptr::null_mut()) };
+        unsafe { spectran_source_capabilities_free(ptr::null_mut()) };
     }
 
     #[test]
     fn capabilities_of_a_null_source_are_null() {
-        let caps = unsafe { aaronia_source_get_capabilities(ptr::null_mut()) };
+        let caps = unsafe { spectran_source_get_capabilities(ptr::null_mut()) };
         assert!(caps.is_null());
     }
 
@@ -2147,108 +2154,108 @@ mod tests {
     fn test_ffi_builder_lifecycle() {
         unsafe {
             // Null builder tests
-            aaronia_source_builder_free(ptr::null_mut());
-            let null_build = aaronia_source_build(ptr::null_mut());
+            spectran_source_builder_free(ptr::null_mut());
+            let null_build = spectran_source_build(ptr::null_mut());
             assert!(null_build.is_null());
 
             // Valid builder lifecycle
-            let builder = aaronia_source_builder_new();
+            let builder = spectran_source_builder_new();
             assert!(!builder.is_null());
 
             // Apply some settings (should not crash)
-            aaronia_source_builder_center_frequency_hz(builder, 2.4e9);
-            aaronia_source_builder_sample_rate_hz(builder, 10e6);
-            aaronia_source_builder_reference_level_dbm(builder, -20.0);
+            spectran_source_builder_center_frequency_hz(builder, 2.4e9);
+            spectran_source_builder_sample_rate_hz(builder, 10e6);
+            spectran_source_builder_reference_level_dbm(builder, -20.0);
 
             // Free the builder
-            aaronia_source_builder_free(builder);
+            spectran_source_builder_free(builder);
         }
     }
 
     #[test]
     fn test_ffi_null_pointer_handling() {
         unsafe {
-            assert!(aaronia_source_read_samples(ptr::null_mut(), ptr::null_mut(), 10) == -1);
+            assert!(spectran_source_read_samples(ptr::null_mut(), ptr::null_mut(), 10) == -1);
 
-            // Enum equality check since we don't derive PartialEq on AaroniaFfiError
+            // Enum equality check since we don't derive PartialEq on SpectranFfiError
             assert!(matches!(
-                aaronia_source_start_streaming(ptr::null_mut()),
-                AaroniaFfiError::NullPointer
+                spectran_source_start_streaming(ptr::null_mut()),
+                SpectranFfiError::NullPointer
             ));
             assert!(matches!(
-                aaronia_source_stop_streaming(ptr::null_mut()),
-                AaroniaFfiError::NullPointer
+                spectran_source_stop_streaming(ptr::null_mut()),
+                SpectranFfiError::NullPointer
             ));
 
-            assert!(aaronia_source_get_source_info(ptr::null_mut()).is_null());
+            assert!(spectran_source_get_source_info(ptr::null_mut()).is_null());
 
-            assert!(aaronia_endpoints_client_new(ptr::null_mut()).is_null());
-            assert!(aaronia_endpoints_client_get_info(ptr::null_mut()).is_null());
+            assert!(spectran_endpoints_client_new(ptr::null_mut()).is_null());
+            assert!(spectran_endpoints_client_get_info(ptr::null_mut()).is_null());
 
             assert!(matches!(
-                aaronia_endpoints_client_control_streaming(ptr::null_mut(), true),
-                AaroniaFfiError::NullPointer
+                spectran_endpoints_client_control_streaming(ptr::null_mut(), true),
+                SpectranFfiError::NullPointer
             ));
             assert!(matches!(
-                aaronia_endpoints_client_control_recording(ptr::null_mut(), true, ptr::null_mut()),
-                AaroniaFfiError::NullPointer
+                spectran_endpoints_client_control_recording(ptr::null_mut(), true, ptr::null_mut()),
+                SpectranFfiError::NullPointer
             ));
 
             // Safe to free null
-            aaronia_source_free(ptr::null_mut());
-            aaronia_endpoints_client_free(ptr::null_mut());
-            aaronia_string_free(ptr::null_mut());
-            aaronia_source_info_free(ptr::null_mut());
-            aaronia_server_info_free(ptr::null_mut());
+            spectran_source_free(ptr::null_mut());
+            spectran_endpoints_client_free(ptr::null_mut());
+            spectran_string_free(ptr::null_mut());
+            spectran_source_info_free(ptr::null_mut());
+            spectran_server_info_free(ptr::null_mut());
         }
     }
 
     #[test]
     fn test_ffi_error_message_mapping() {
         unsafe {
-            let msg_ptr = aaronia_get_error_message(AaroniaFfiError::NullPointer as i32);
+            let msg_ptr = spectran_get_error_message(SpectranFfiError::NullPointer as i32);
             assert!(!msg_ptr.is_null());
             let msg = CStr::from_ptr(msg_ptr).to_string_lossy();
             assert_eq!(msg, "Null pointer provided");
-            aaronia_string_free(msg_ptr);
+            spectran_string_free(msg_ptr);
 
-            let msg_ptr = aaronia_get_error_message(AaroniaFfiError::Success as i32);
+            let msg_ptr = spectran_get_error_message(SpectranFfiError::Success as i32);
             assert!(!msg_ptr.is_null());
             let msg = CStr::from_ptr(msg_ptr).to_string_lossy();
             assert_eq!(msg, "Success");
-            aaronia_string_free(msg_ptr);
+            spectran_string_free(msg_ptr);
 
             // A C caller can pass any int; it must answer, not misbehave.
-            let msg_ptr = aaronia_get_error_message(42);
+            let msg_ptr = spectran_get_error_message(42);
             assert!(!msg_ptr.is_null());
             let msg = CStr::from_ptr(msg_ptr).to_string_lossy();
             assert_eq!(msg, "Unknown error code");
-            aaronia_string_free(msg_ptr);
+            spectran_string_free(msg_ptr);
         }
     }
 
     /// Round-trip the thread-local last-error slot via FFI: trigger a
-    /// known failure (passing a null pointer), call `aaronia_last_error`,
+    /// known failure (passing a null pointer), call `spectran_last_error`,
     /// confirm the message mentions the right function. Then call a
     /// successful no-op (a null free), confirm the slot was cleared.
     #[test]
     fn test_aaronia_last_error_roundtrip() {
         unsafe {
             // Trigger a null-pointer failure from a fallible FFI entry
-            // point. `aaronia_source_start_streaming` is convenient
+            // point. `spectran_source_start_streaming` is convenient
             // because it returns an error code AND populates the slot.
-            let err = aaronia_source_start_streaming(std::ptr::null_mut());
-            assert!(matches!(err, AaroniaFfiError::NullPointer));
+            let err = spectran_source_start_streaming(std::ptr::null_mut());
+            assert!(matches!(err, SpectranFfiError::NullPointer));
 
-            let msg_ptr = aaronia_last_error();
+            let msg_ptr = spectran_last_error();
             assert!(
                 !msg_ptr.is_null(),
-                "expected aaronia_last_error to return a non-null message after a failure"
+                "expected spectran_last_error to return a non-null message after a failure"
             );
             let msg = CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
-            aaronia_string_free(msg_ptr);
+            spectran_string_free(msg_ptr);
             assert!(
-                msg.contains("aaronia_source_start_streaming"),
+                msg.contains("spectran_source_start_streaming"),
                 "expected last_error to identify the failing function; got: {msg}"
             );
             assert!(
@@ -2257,22 +2264,22 @@ mod tests {
             );
 
             // A successful (or no-op) call should clear the slot for
-            // the next failure. `aaronia_string_free(NULL)` is a no-op
+            // the next failure. `spectran_string_free(NULL)` is a no-op
             // and doesn't touch the slot, so trigger a *successful*
             // fallible call instead by re-running with another null —
             // the API contract is that the slot is cleared at function
             // entry. After clear_last_error runs, the slot should be
             // empty; the failure then immediately repopulates it.
             // Confirm by directly calling clear_last_error via a fresh
-            // call path: use aaronia_source_build (clear_last_error +
+            // call path: use spectran_source_build (clear_last_error +
             // null check is the very first thing).
-            let _ = aaronia_source_build(std::ptr::null_mut());
-            let msg_ptr2 = aaronia_last_error();
+            let _ = spectran_source_build(std::ptr::null_mut());
+            let msg_ptr2 = spectran_last_error();
             assert!(
                 !msg_ptr2.is_null(),
-                "aaronia_last_error should report the latest failure"
+                "spectran_last_error should report the latest failure"
             );
-            aaronia_string_free(msg_ptr2);
+            spectran_string_free(msg_ptr2);
         }
     }
 }

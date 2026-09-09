@@ -172,7 +172,7 @@ const ENFORCED: &[InvariantRow] = &[
     },
     InvariantRow {
         area: Area::Sdk,
-        invariant: "aaronia_get_error_message maps every error code to a non-empty string",
+        invariant: "spectran_get_error_message maps every error code to a non-empty string",
         test_fn: "test_ffi_error_message_mapping",
         test_file: "src/c_api.rs",
     },

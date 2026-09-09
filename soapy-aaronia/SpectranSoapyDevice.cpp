@@ -1,4 +1,4 @@
-#include "AaroniaSoapyDevice.hpp"
+#include "SpectranSoapyDevice.hpp"
 #include <SoapySDR/Logger.hpp>
 #include <algorithm>
 #include <cmath>
@@ -7,13 +7,13 @@
 
 // Fetch-and-free the thread-local Rust error string.
 static std::string lastErrorOr(const char *fallback) {
-    char *msg = aaronia_last_error();
+    char *msg = spectran_last_error();
     std::string out = msg ? msg : fallback;
-    if (msg) aaronia_string_free(msg);
+    if (msg) spectran_string_free(msg);
     return out;
 }
 
-AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink, const SoapySDR::Kwargs &args)
+SpectranSoapyDevice::SpectranSoapyDevice(SpectranSource* source, SpectranSink* sink, const SoapySDR::Kwargs &args)
     : _source(source), _sink(sink), _centerFrequency(100e6), _sampleRate(1e6),
       _txSampleRate(0.0), _referenceLevel(-20.0),
       _rxSetup(false), _txSetup(false), _rxStreamTag(0), _txStreamTag(0),
@@ -23,7 +23,7 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
       _sourceType(Http)
 {
     if (!_source) {
-        throw std::runtime_error("AaroniaSoapyDevice initialized with null source pointer");
+        throw std::runtime_error("SpectranSoapyDevice initialized with null source pointer");
     }
 
     // The URL the source streams from, for the standalone sensor client
@@ -35,20 +35,20 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
         _httpUrl = "http://localhost:54664";
     }
 
-    FfiSourceInfo* info = aaronia_source_get_source_info(_source);
+    FfiSourceInfo* info = spectran_source_get_source_info(_source);
     if (info) {
         _centerFrequency = info->center_frequency_hz;
         _sampleRate = info->sample_rate_hz;
         _referenceLevel = info->reference_level_dbm;
         _sourceType = info->source_type;
-        aaronia_source_info_free(info);
+        spectran_source_info_free(info);
     }
 
     // Ask the device what it can do, once, before anything is opened —
     // a probe queries ranges without ever streaming. Everything here is
     // best-effort: a null result, or any field the device did not
     // report, leaves the corresponding getter on its own constant.
-    if (FfiDeviceCapabilities* caps = aaronia_source_get_capabilities(_source)) {
+    if (FfiDeviceCapabilities* caps = spectran_source_get_capabilities(_source)) {
         if (caps->model)   _model   = caps->model;
         if (caps->serial)  _serial  = caps->serial;
         if (caps->version) _version = caps->version;
@@ -74,7 +74,7 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
         }
         if (caps->clock_source) _clockSource = caps->clock_source;
         if (caps->rx_antenna)   _rxAntenna   = caps->rx_antenna;
-        aaronia_source_capabilities_free(caps);
+        spectran_source_capabilities_free(caps);
 
         SoapySDR::logf(SOAPY_SDR_INFO,
                        "aaronia: device reports %s%s%s, %zu sample rates",
@@ -90,7 +90,7 @@ AaroniaSoapyDevice::AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink,
     }
 }
 
-AaroniaSoapyDevice::~AaroniaSoapyDevice() {
+SpectranSoapyDevice::~SpectranSoapyDevice() {
     // Two separate lock scopes, `_mutex` released before `_sensorMutex` is
     // taken: no live code path takes them in the other order, and keeping
     // them un-nested here means none can deadlock the destructor if one
@@ -99,33 +99,33 @@ AaroniaSoapyDevice::~AaroniaSoapyDevice() {
         std::lock_guard<std::mutex> lock(_mutex);
         if (_source) {
             if (_isStreaming) {
-                aaronia_source_stop_streaming(_source);
+                spectran_source_stop_streaming(_source);
             }
-            aaronia_source_free(_source);
+            spectran_source_free(_source);
             _source = nullptr;
         }
         if (_sink) {
             // Stop unconditionally: the sink's stream lifecycle (started
             // at setupStream) is independent of the RX _isStreaming flag.
-            aaronia_sink_stop_streaming(_sink);
-            aaronia_sink_free(_sink);
+            spectran_sink_stop_streaming(_sink);
+            spectran_sink_free(_sink);
             _sink = nullptr;
         }
     }
     {
         std::lock_guard<std::mutex> slock(_sensorMutex);
         if (_sensorClient) {
-            aaronia_endpoints_client_free(_sensorClient);
+            spectran_endpoints_client_free(_sensorClient);
             _sensorClient = nullptr;
         }
     }
 }
 
-std::string AaroniaSoapyDevice::getDriverKey() const {
+std::string SpectranSoapyDevice::getDriverKey() const {
     return "Aaronia";
 }
 
-std::string AaroniaSoapyDevice::getHardwareKey() const {
+std::string SpectranSoapyDevice::getHardwareKey() const {
     // The device's own name for itself. "Spectran V6" was hardcoded, so
     // every model reported as the base V6 — a V6 ECO included, which is
     // a different instrument with a different frequency range and no
@@ -134,7 +134,7 @@ std::string AaroniaSoapyDevice::getHardwareKey() const {
     return _model.empty() ? std::string("Spectran V6") : _model;
 }
 
-SoapySDR::Kwargs AaroniaSoapyDevice::getHardwareInfo() const {
+SoapySDR::Kwargs SpectranSoapyDevice::getHardwareInfo() const {
     SoapySDR::Kwargs info;
     info["driver"] = "Aaronia";
     info["hardware"] = getHardwareKey();
@@ -145,7 +145,7 @@ SoapySDR::Kwargs AaroniaSoapyDevice::getHardwareInfo() const {
     return info;
 }
 
-size_t AaroniaSoapyDevice::getNumChannels(const int direction) const {
+size_t SpectranSoapyDevice::getNumChannels(const int direction) const {
     if (direction == SOAPY_SDR_RX) return 1;
     // TX exists only when a sink backend was constructed (native-sdk
     // builds on Windows/Linux). Advertising a TX channel that every
@@ -155,7 +155,7 @@ size_t AaroniaSoapyDevice::getNumChannels(const int direction) const {
     return 0;
 }
 
-std::vector<std::string> AaroniaSoapyDevice::getStreamFormats(const int direction, const size_t channel) const {
+std::vector<std::string> SpectranSoapyDevice::getStreamFormats(const int direction, const size_t channel) const {
     std::vector<std::string> formats;
     if (channel != 0) return formats;
     if (direction == SOAPY_SDR_RX) {
@@ -167,7 +167,7 @@ std::vector<std::string> AaroniaSoapyDevice::getStreamFormats(const int directio
     return formats;
 }
 
-std::string AaroniaSoapyDevice::getNativeStreamFormat(const int direction, const size_t channel, double &fullScale) const {
+std::string SpectranSoapyDevice::getNativeStreamFormat(const int direction, const size_t channel, double &fullScale) const {
     (void)direction;
     (void)channel;
     // The C ABI transfers CF32 in both directions; CS16 is a
@@ -178,7 +178,7 @@ std::string AaroniaSoapyDevice::getNativeStreamFormat(const int direction, const
     return SOAPY_SDR_CF32;
 }
 
-SoapySDR::Stream *AaroniaSoapyDevice::setupStream(
+SoapySDR::Stream *SpectranSoapyDevice::setupStream(
     const int direction,
     const std::string &format,
     const std::vector<size_t> &channels,
@@ -212,7 +212,7 @@ SoapySDR::Stream *AaroniaSoapyDevice::setupStream(
         // Soapy contract — not on the first write.
         throw std::runtime_error("Unsupported TX stream format: " + format + " (TX is CF32-only)");
     }
-    AaroniaFfiError err = aaronia_sink_initialize(_sink);
+    SpectranFfiError err = spectran_sink_initialize(_sink);
     if (err != Success) {
         throw std::runtime_error(lastErrorOr("Failed to initialize sink"));
     }
@@ -221,17 +221,17 @@ SoapySDR::Stream *AaroniaSoapyDevice::setupStream(
     return reinterpret_cast<SoapySDR::Stream *>(&_txStreamTag);
 }
 
-void AaroniaSoapyDevice::closeStream(SoapySDR::Stream *stream) {
+void SpectranSoapyDevice::closeStream(SoapySDR::Stream *stream) {
     std::lock_guard<std::mutex> lock(_mutex);
     if (stream == reinterpret_cast<SoapySDR::Stream *>(&_rxStreamTag)) {
         _rxSetup = false;
     } else if (stream == reinterpret_cast<SoapySDR::Stream *>(&_txStreamTag)) {
-        if (_sink) aaronia_sink_stop_streaming(_sink);
+        if (_sink) spectran_sink_stop_streaming(_sink);
         _txSetup = false;
     }
 }
 
-int AaroniaSoapyDevice::activateStream(
+int SpectranSoapyDevice::activateStream(
     SoapySDR::Stream *stream,
     const int flags,
     const long long timeNs,
@@ -254,7 +254,7 @@ int AaroniaSoapyDevice::activateStream(
     }
 
     if (_isStreaming) return 0;
-    AaroniaFfiError err = aaronia_source_start_streaming(_source);
+    SpectranFfiError err = spectran_source_start_streaming(_source);
     if (err != Success) {
         SoapySDR::logf(SOAPY_SDR_ERROR, "activateStream failed: %s",
                        lastErrorOr("Failed to start streaming").c_str());
@@ -264,7 +264,7 @@ int AaroniaSoapyDevice::activateStream(
     return 0;
 }
 
-int AaroniaSoapyDevice::deactivateStream(
+int SpectranSoapyDevice::deactivateStream(
     SoapySDR::Stream *stream,
     const int flags,
     const long long timeNs)
@@ -274,19 +274,19 @@ int AaroniaSoapyDevice::deactivateStream(
     std::lock_guard<std::mutex> lock(_mutex);
 
     if (stream == reinterpret_cast<SoapySDR::Stream *>(&_txStreamTag)) {
-        if (_sink) aaronia_sink_stop_streaming(_sink);
+        if (_sink) spectran_sink_stop_streaming(_sink);
         return 0;
     }
     if (stream != reinterpret_cast<SoapySDR::Stream *>(&_rxStreamTag)) {
         return SOAPY_SDR_STREAM_ERROR;
     }
     if (!_isStreaming) return 0;
-    aaronia_source_stop_streaming(_source);
+    spectran_source_stop_streaming(_source);
     _isStreaming = false;
     return 0;
 }
 
-int AaroniaSoapyDevice::readStream(
+int SpectranSoapyDevice::readStream(
     SoapySDR::Stream *stream,
     void * const *buffs,
     const size_t numElems,
@@ -312,12 +312,12 @@ int AaroniaSoapyDevice::readStream(
     intptr_t read = -1;
     if (_rxFormat == SOAPY_SDR_CF32) {
         FfiComplex *out = static_cast<FfiComplex *>(buffs[0]);
-        read = aaronia_source_read_samples_timeout(_source, out, numElems, timeout_us);
+        read = spectran_source_read_samples_timeout(_source, out, numElems, timeout_us);
     } else if (_rxFormat == SOAPY_SDR_CS16) {
         if (_tempFloatBuffer.size() < numElems) {
             _tempFloatBuffer.resize(numElems);
         }
-        read = aaronia_source_read_samples_timeout(_source, _tempFloatBuffer.data(), numElems, timeout_us);
+        read = spectran_source_read_samples_timeout(_source, _tempFloatBuffer.data(), numElems, timeout_us);
         if (read > 0) {
             int16_t *out = static_cast<int16_t *>(buffs[0]);
             for (intptr_t i = 0; i < read; ++i) {
@@ -338,21 +338,21 @@ int AaroniaSoapyDevice::readStream(
     }
 
     if (read > 0) {
-        if (aaronia_source_take_overrun(_source)) {
+        if (spectran_source_take_overrun(_source)) {
             flags |= SOAPY_SDR_END_ABRUPT;
         }
         // Timestamp of the most recently received network block — an
         // approximation for the first returned sample when older
         // buffered samples are included (HTTP backend only; 0 when
         // unavailable, in which case HAS_TIME stays unset).
-        timeNs = aaronia_source_get_last_timestamp_ns(_source);
+        timeNs = spectran_source_get_last_timestamp_ns(_source);
         if (timeNs != 0) flags |= SOAPY_SDR_HAS_TIME;
     }
 
     return static_cast<int>(read);
 }
 
-int AaroniaSoapyDevice::writeStream(
+int SpectranSoapyDevice::writeStream(
     SoapySDR::Stream *stream,
     const void * const *buffs,
     const size_t numElems,
@@ -391,7 +391,7 @@ int AaroniaSoapyDevice::writeStream(
     const uint64_t burstFlags =
         AARONIA_TX_SEGMENT_START | AARONIA_TX_SEGMENT_END | AARONIA_TX_PUSH;
 
-    AaroniaFfiError err = aaronia_sink_write_samples(
+    SpectranFfiError err = spectran_sink_write_samples(
         _sink,
         0,
         0.0,
@@ -412,13 +412,13 @@ int AaroniaSoapyDevice::writeStream(
 }
 
 // --- Time API ---
-bool AaroniaSoapyDevice::hasHardwareTime(const std::string &what) const {
+bool SpectranSoapyDevice::hasHardwareTime(const std::string &what) const {
     if (what == "GPS") {
         // Truthful probe: GPS time exists only on the native-SDK
         // backend with a valid fix. Answering "true" unconditionally
         // (the old behaviour) made apps timestamp data to 1970.
         std::lock_guard<std::mutex> lock(_mutex);
-        return aaronia_source_get_gps_time_ns(_source, nullptr);
+        return spectran_source_get_gps_time_ns(_source, nullptr);
     }
     if (what.empty()) {
         // A capability, not a current value. Every RTSA packet header
@@ -445,7 +445,7 @@ bool AaroniaSoapyDevice::hasHardwareTime(const std::string &what) const {
     return false;
 }
 
-long long AaroniaSoapyDevice::getHardwareTime(const std::string &what) const {
+long long SpectranSoapyDevice::getHardwareTime(const std::string &what) const {
     std::lock_guard<std::mutex> lock(_mutex);
     if (what == "GPS") {
         // Nanoseconds straight from the ABI. This used to receive
@@ -458,7 +458,7 @@ long long AaroniaSoapyDevice::getHardwareTime(const std::string &what) const {
         // them the same type, so the mismatch only shows up on the Linux
         // build.
         int64_t gps_time_ns = 0;
-        if (aaronia_source_get_gps_time_ns(_source, &gps_time_ns)) {
+        if (spectran_source_get_gps_time_ns(_source, &gps_time_ns)) {
             return gps_time_ns;
         }
         return 0;
@@ -468,11 +468,11 @@ long long AaroniaSoapyDevice::getHardwareTime(const std::string &what) const {
     // caller that must not stamp data to 1970 should take its time from
     // readStream's SOAPY_SDR_HAS_TIME buffers rather than polling this
     // before the stream is running.
-    return aaronia_source_get_last_timestamp_ns(_source);
+    return spectran_source_get_last_timestamp_ns(_source);
 }
 
 // --- Clocking API ---
-std::vector<std::string> AaroniaSoapyDevice::listClockSources(void) const {
+std::vector<std::string> SpectranSoapyDevice::listClockSources(void) const {
     // The device's own vocabulary, from `device/sclksource`: a V6 ECO
     // offers Consumer, Oscillator, GPS, PPS, 10MHz and three
     // "... Provider" variants. "Internal" was not among them — it was
@@ -483,13 +483,13 @@ std::vector<std::string> AaroniaSoapyDevice::listClockSources(void) const {
     return {"Internal"};
 }
 
-void AaroniaSoapyDevice::setClockSource(const std::string &source) {
+void SpectranSoapyDevice::setClockSource(const std::string &source) {
     std::lock_guard<std::mutex> lock(_mutex);
 
     // Refresh the cached list/selection first — an operator may have
     // changed it out of band — so a no-op write is recognised and any
     // warning names the real current source.
-    if (FfiDeviceCapabilities* caps = aaronia_source_get_capabilities(_source)) {
+    if (FfiDeviceCapabilities* caps = spectran_source_get_capabilities(_source)) {
         if (caps->clock_source) _clockSource = caps->clock_source;
         if (caps->clock_sources) {
             _clockSources.clear();
@@ -497,13 +497,13 @@ void AaroniaSoapyDevice::setClockSource(const std::string &source) {
                 if (caps->clock_sources[i]) _clockSources.emplace_back(caps->clock_sources[i]);
             }
         }
-        aaronia_source_capabilities_free(caps);
+        spectran_source_capabilities_free(caps);
     }
     if (source == currentClockSourceLocked()) return;
 
     // `device/sclksource` is settable on both the native SDK and HTTP
     // backends; the crate reads the value back to confirm the write.
-    AaroniaFfiError err = aaronia_source_set_clock_source(_source, source.c_str());
+    SpectranFfiError err = spectran_source_set_clock_source(_source, source.c_str());
     if (err != Success) {
         SoapySDR::logf(SOAPY_SDR_ERROR, "setClockSource('%s') failed: %s",
                        source.c_str(), lastErrorOr("clock-source write failed").c_str());
@@ -514,7 +514,7 @@ void AaroniaSoapyDevice::setClockSource(const std::string &source) {
                    "setClockSource: stream clock source set to '%s'", source.c_str());
 }
 
-std::string AaroniaSoapyDevice::currentClockSourceLocked(void) const {
+std::string SpectranSoapyDevice::currentClockSourceLocked(void) const {
     // Always a member of listClockSources(). When the device gave a
     // list but no valid selection, the first entry keeps the contract
     // rather than "Internal", which would be in neither list.
@@ -523,14 +523,14 @@ std::string AaroniaSoapyDevice::currentClockSourceLocked(void) const {
     return "Internal";
 }
 
-std::string AaroniaSoapyDevice::getClockSource(void) const {
+std::string SpectranSoapyDevice::getClockSource(void) const {
     // setClockSource refreshes the cache after construction, so reads
     // take the lock too.
     std::lock_guard<std::mutex> lock(_mutex);
     return currentClockSourceLocked();
 }
 
-std::vector<std::string> AaroniaSoapyDevice::listAntennas(const int direction, const size_t channel) const {
+std::vector<std::string> SpectranSoapyDevice::listAntennas(const int direction, const size_t channel) const {
     std::vector<std::string> ant;
     if (channel != 0) return ant;
     if (direction == SOAPY_SDR_RX) {
@@ -544,14 +544,14 @@ std::vector<std::string> AaroniaSoapyDevice::listAntennas(const int direction, c
     return ant;
 }
 
-void AaroniaSoapyDevice::setAntenna(const int direction, const size_t channel, const std::string &name) {
+void SpectranSoapyDevice::setAntenna(const int direction, const size_t channel, const std::string &name) {
     (void)direction;
     (void)channel;
     (void)name;
     // Single antenna per direction.
 }
 
-std::string AaroniaSoapyDevice::getAntenna(const int direction, const size_t channel) const {
+std::string SpectranSoapyDevice::getAntenna(const int direction, const size_t channel) const {
     (void)channel;
     // Must be a member of listAntennas(): applications select the
     // combo entry matching this, and gr-soapy validates set_antenna
@@ -560,14 +560,14 @@ std::string AaroniaSoapyDevice::getAntenna(const int direction, const size_t cha
     return _rxAntenna.empty() ? std::string("RX1") : _rxAntenna;
 }
 
-void AaroniaSoapyDevice::setFrequency(const int direction, const size_t channel, const std::string &name, const double frequency, const SoapySDR::Kwargs &args) {
+void SpectranSoapyDevice::setFrequency(const int direction, const size_t channel, const std::string &name, const double frequency, const SoapySDR::Kwargs &args) {
     (void)channel;
     (void)name;
     (void)args;
     if (direction != SOAPY_SDR_RX) return;
     std::lock_guard<std::mutex> lock(_mutex);
 
-    AaroniaFfiError err = aaronia_source_set_center_frequency_hz(_source, frequency);
+    SpectranFfiError err = spectran_source_set_center_frequency_hz(_source, frequency);
     if (err == Success) {
         _centerFrequency = frequency;
     } else {
@@ -576,7 +576,7 @@ void AaroniaSoapyDevice::setFrequency(const int direction, const size_t channel,
     }
 }
 
-double AaroniaSoapyDevice::getFrequency(const int direction, const size_t channel, const std::string &name) const {
+double SpectranSoapyDevice::getFrequency(const int direction, const size_t channel, const std::string &name) const {
     (void)direction;
     (void)channel;
     (void)name;
@@ -584,7 +584,7 @@ double AaroniaSoapyDevice::getFrequency(const int direction, const size_t channe
     return _centerFrequency;
 }
 
-std::vector<std::string> AaroniaSoapyDevice::listFrequencies(const int direction, const size_t channel) const {
+std::vector<std::string> SpectranSoapyDevice::listFrequencies(const int direction, const size_t channel) const {
     (void)direction;
     (void)channel;
     std::vector<std::string> names;
@@ -592,7 +592,7 @@ std::vector<std::string> AaroniaSoapyDevice::listFrequencies(const int direction
     return names;
 }
 
-SoapySDR::RangeList AaroniaSoapyDevice::getFrequencyRange(const int direction, const size_t channel, const std::string &name) const {
+SoapySDR::RangeList SpectranSoapyDevice::getFrequencyRange(const int direction, const size_t channel, const std::string &name) const {
     (void)direction;
     (void)channel;
     (void)name;
@@ -609,7 +609,7 @@ SoapySDR::RangeList AaroniaSoapyDevice::getFrequencyRange(const int direction, c
     return ranges;
 }
 
-void AaroniaSoapyDevice::setSampleRate(const int direction, const size_t channel, const double rate) {
+void SpectranSoapyDevice::setSampleRate(const int direction, const size_t channel, const double rate) {
     (void)channel;
     std::lock_guard<std::mutex> lock(_mutex);
 
@@ -641,7 +641,7 @@ void AaroniaSoapyDevice::setSampleRate(const int direction, const size_t channel
                        wanted, snapped);
     }
 
-    AaroniaFfiError err = aaronia_source_set_sample_rate_hz(_source, snapped);
+    SpectranFfiError err = spectran_source_set_sample_rate_hz(_source, snapped);
     if (err == Success) {
         _sampleRate = snapped;
     } else {
@@ -650,7 +650,7 @@ void AaroniaSoapyDevice::setSampleRate(const int direction, const size_t channel
     }
 }
 
-double AaroniaSoapyDevice::getSampleRate(const int direction, const size_t channel) const {
+double SpectranSoapyDevice::getSampleRate(const int direction, const size_t channel) const {
     (void)channel;
     std::lock_guard<std::mutex> lock(_mutex);
     if (direction == SOAPY_SDR_TX) {
@@ -660,16 +660,16 @@ double AaroniaSoapyDevice::getSampleRate(const int direction, const size_t chann
     // its packet metadata, which is authoritative. Fall back to the
     // snapped request before the first packet arrives.
     if (_isStreaming && _source) {
-        if (FfiSourceInfo *info = aaronia_source_get_source_info(_source)) {
+        if (FfiSourceInfo *info = spectran_source_get_source_info(_source)) {
             const double actual = info->sample_rate_hz;
-            aaronia_source_info_free(info);
+            spectran_source_info_free(info);
             if (actual > 0.0) return actual;
         }
     }
     return _sampleRate;
 }
 
-SoapySDR::RangeList AaroniaSoapyDevice::getSampleRateRange(const int direction, const size_t channel) const {
+SoapySDR::RangeList SpectranSoapyDevice::getSampleRateRange(const int direction, const size_t channel) const {
     (void)direction;
     (void)channel;
     SoapySDR::RangeList ranges;
@@ -683,7 +683,7 @@ SoapySDR::RangeList AaroniaSoapyDevice::getSampleRateRange(const int direction, 
     return ranges;
 }
 
-std::vector<double> AaroniaSoapyDevice::listSampleRates(const int direction, const size_t channel) const {
+std::vector<double> SpectranSoapyDevice::listSampleRates(const int direction, const size_t channel) const {
     (void)direction;
     (void)channel;
     // Applications build their rate dropdowns from this list, so it has
@@ -715,14 +715,14 @@ std::vector<double> AaroniaSoapyDevice::listSampleRates(const int direction, con
     };
 }
 
-size_t AaroniaSoapyDevice::getStreamMTU(SoapySDR::Stream *stream) const {
+size_t SpectranSoapyDevice::getStreamMTU(SoapySDR::Stream *stream) const {
     (void)stream;
     // Matches the HTTP reader's chunking; larger requests are served
     // by looping internally.
     return 65536;
 }
 
-std::vector<std::string> AaroniaSoapyDevice::listGains(const int direction, const size_t channel) const {
+std::vector<std::string> SpectranSoapyDevice::listGains(const int direction, const size_t channel) const {
     (void)direction;
     (void)channel;
     std::vector<std::string> gains;
@@ -730,7 +730,7 @@ std::vector<std::string> AaroniaSoapyDevice::listGains(const int direction, cons
     return gains;
 }
 
-void AaroniaSoapyDevice::setGain(const int direction, const size_t channel, const std::string &name, const double value) {
+void SpectranSoapyDevice::setGain(const int direction, const size_t channel, const std::string &name, const double value) {
     (void)channel;
     (void)name;
     if (direction != SOAPY_SDR_RX) return;
@@ -740,7 +740,7 @@ void AaroniaSoapyDevice::setGain(const int direction, const size_t channel, cons
     // amplifier gain: RAISING it reduces sensitivity. Exposed under the
     // name "REF" so applications' generic gain sliders at least carry
     // the correct label.
-    AaroniaFfiError err = aaronia_source_set_reference_level_dbm(_source, value);
+    SpectranFfiError err = spectran_source_set_reference_level_dbm(_source, value);
     if (err == Success) {
         _referenceLevel = value;
     } else {
@@ -749,7 +749,7 @@ void AaroniaSoapyDevice::setGain(const int direction, const size_t channel, cons
     }
 }
 
-double AaroniaSoapyDevice::getGain(const int direction, const size_t channel, const std::string &name) const {
+double SpectranSoapyDevice::getGain(const int direction, const size_t channel, const std::string &name) const {
     (void)direction;
     (void)channel;
     (void)name;
@@ -757,7 +757,7 @@ double AaroniaSoapyDevice::getGain(const int direction, const size_t channel, co
     return _referenceLevel;
 }
 
-SoapySDR::Range AaroniaSoapyDevice::getGainRange(const int direction, const size_t channel, const std::string &name) const {
+SoapySDR::Range SpectranSoapyDevice::getGainRange(const int direction, const size_t channel, const std::string &name) const {
     (void)direction;
     (void)channel;
     (void)name;
@@ -780,24 +780,24 @@ SoapySDR::Range AaroniaSoapyDevice::getGainRange(const int direction, const size
 // already-verified `setSampleRate`, so no new device-write path appears.
 // ---------------------------------------------------------------------
 
-void AaroniaSoapyDevice::setBandwidth(const int direction, const size_t channel, const double bw) {
+void SpectranSoapyDevice::setBandwidth(const int direction, const size_t channel, const double bw) {
     if (bw <= 0.0) return;
-    setSampleRate(direction, channel, aaronia_iq_sample_rate_for_bandwidth(bw));
+    setSampleRate(direction, channel, spectran_iq_sample_rate_for_bandwidth(bw));
 }
 
-double AaroniaSoapyDevice::getBandwidth(const int direction, const size_t channel) const {
-    return aaronia_usable_bandwidth_hz(getSampleRate(direction, channel));
+double SpectranSoapyDevice::getBandwidth(const int direction, const size_t channel) const {
+    return spectran_usable_bandwidth_hz(getSampleRate(direction, channel));
 }
 
-std::vector<double> AaroniaSoapyDevice::listBandwidths(const int direction, const size_t channel) const {
+std::vector<double> SpectranSoapyDevice::listBandwidths(const int direction, const size_t channel) const {
     std::vector<double> bandwidths;
     for (const double rate : listSampleRates(direction, channel)) {
-        bandwidths.push_back(aaronia_usable_bandwidth_hz(rate));
+        bandwidths.push_back(spectran_usable_bandwidth_hz(rate));
     }
     return bandwidths;
 }
 
-SoapySDR::RangeList AaroniaSoapyDevice::getBandwidthRange(const int direction, const size_t channel) const {
+SoapySDR::RangeList SpectranSoapyDevice::getBandwidthRange(const int direction, const size_t channel) const {
     SoapySDR::RangeList ranges;
     for (const double bw : listBandwidths(direction, channel)) {
         ranges.push_back(SoapySDR::Range(bw, bw));
@@ -851,7 +851,7 @@ std::string formatSensorValue(double v) {
 
 } // namespace
 
-bool AaroniaSoapyDevice::refreshSensorsLocked(void) const {
+bool SpectranSoapyDevice::refreshSensorsLocked(void) const {
     // The rich sensors come from /healthstatus, which only the HTTP
     // backend serves — the raw native SDK's own health tree reads all
     // zeros. No client means no reading, and the caller then offers just
@@ -861,7 +861,7 @@ bool AaroniaSoapyDevice::refreshSensorsLocked(void) const {
         return false;
     }
     if (!_sensorClient) {
-        _sensorClient = aaronia_endpoints_client_new(_httpUrl.c_str());
+        _sensorClient = spectran_endpoints_client_new(_httpUrl.c_str());
         if (!_sensorClient) {
             return false;
         }
@@ -871,7 +871,7 @@ bool AaroniaSoapyDevice::refreshSensorsLocked(void) const {
     if (_sensorsCacheValid && now - _sensorsCacheTime < milliseconds(250)) {
         return true;
     }
-    if (aaronia_endpoints_client_get_sensors(_sensorClient, &_sensorsCache)) {
+    if (spectran_endpoints_client_get_sensors(_sensorClient, &_sensorsCache)) {
         _sensorsCacheTime = now;
         _sensorsCacheValid = true;
         return true;
@@ -879,7 +879,7 @@ bool AaroniaSoapyDevice::refreshSensorsLocked(void) const {
     return false;
 }
 
-std::vector<std::string> AaroniaSoapyDevice::listSensors(void) const {
+std::vector<std::string> SpectranSoapyDevice::listSensors(void) const {
     std::vector<std::string> sensors;
     // Always present: the client-side drop detector, which every backend
     // feeds and which needs no health fetch.
@@ -895,7 +895,7 @@ std::vector<std::string> AaroniaSoapyDevice::listSensors(void) const {
     return sensors;
 }
 
-SoapySDR::ArgInfo AaroniaSoapyDevice::getSensorInfo(const std::string &name) const {
+SoapySDR::ArgInfo SpectranSoapyDevice::getSensorInfo(const std::string &name) const {
     SoapySDR::ArgInfo info;
     if (name == "cumulative_drops") {
         info.key = "cumulative_drops";
@@ -915,12 +915,12 @@ SoapySDR::ArgInfo AaroniaSoapyDevice::getSensorInfo(const std::string &name) con
     return info;
 }
 
-std::string AaroniaSoapyDevice::readSensor(const std::string &name) const {
+std::string SpectranSoapyDevice::readSensor(const std::string &name) const {
     if (name == "cumulative_drops") {
         // A local counter read, not an HTTP fetch: brief enough to take
         // the streaming lock for.
         std::lock_guard<std::mutex> lock(_mutex);
-        return std::to_string(aaronia_source_get_cumulative_drops(_source));
+        return std::to_string(spectran_source_get_cumulative_drops(_source));
     }
     if (const SensorDef *def = findSensorDef(name)) {
         // The health fetch stays off `_mutex` — see the member comment.

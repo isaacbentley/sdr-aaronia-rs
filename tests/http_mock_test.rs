@@ -228,10 +228,7 @@ async fn test_get_remote_config_success() {
         .await;
 
     let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
-    let config = client
-        .get_config()
-        .await
-        .expect("Failed to get remote config");
+    let config = client.config().await.expect("Failed to get remote config");
     assert_eq!(config.request, 42);
     if let sdr_aaronia_rs::http_endpoints::ConfigItem::Group { name, items, .. } = config.config {
         assert_eq!(name, "root");

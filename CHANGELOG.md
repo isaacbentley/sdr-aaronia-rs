@@ -8,13 +8,12 @@ All notable changes to this project will be documented in this file.
 
 **One name per concept, with its unit.** A field, parameter or getter holding a
 bare number now carries its unit (`_hz`, `_dbm`, `_db`, `_s`); a type that
-already carries its unit, such as `Duration`, does not. `span_frequency` was the
-worst offender — it meant the IQ *sample rate*, while the same word meant
-alias-free *bandwidth* in the link budget and a mode-dependent device key on the
-wire. It is gone as a public name. Old builders were removed, not deprecated:
-an alias that silently kept working would have preserved exactly the ambiguity
-this release exists to remove. The `spanfreq` device key and the `frequencySpan`
-JSON field are unchanged — those are the vendor's vocabulary, not ours.
+already carries one, such as `Duration`, does not. `span_frequency` is gone: it
+meant the IQ *sample rate*, while the same word meant alias-free *bandwidth* in
+the link budget. Old names were removed rather than deprecated, since an alias
+that kept working would preserve the ambiguity this release exists to remove.
+The `spanfreq` device key and the `frequencySpan` JSON field are the vendor's
+vocabulary and are unchanged.
 
 | Old | New |
 | --- | --- |
@@ -36,41 +35,25 @@ JSON field are unchanged — those are the vendor's vocabulary, not ours.
 | `DeviceCapabilities::center_frequency`, `reference_level` | `center_frequency_hz`, `reference_level_dbm` |
 | `PacketMetadata::sample_rate()` | `sample_rate_hz()` |
 
-`frequency` became `center_frequency_hz` rather than `frequency_hz`: it was
-always the centre frequency — its own doc said so — and one concept gets one
-noun. `sample_rate_str` and the new `center_frequency_str` keep no unit suffix,
-because they take a string carrying its own units (`"146.52M"`), not a bare
-number. `DeviceCapabilities` is `#[non_exhaustive]`, so this is a field rename
-on a struct callers construct through the API rather than by literal.
+`frequency` became `center_frequency_hz`, not `frequency_hz`: it was always the
+centre frequency. The `_str` variants take a string carrying its own units
+(`"146.52M"`), so they keep no suffix. `DeviceCapabilities` is
+`#[non_exhaustive]`, so callers reach those fields through the API rather than
+by literal.
 
-**The Rust types are named for the device: `Aaronia*` becomes `Spectran*`.**
+**Rust types name the device: `Aaronia*` becomes `Spectran*`** —
 `SpectranConfig`, `SpectranSource`, `SpectranSourceBuilder`,
 `SpectranSinkBuilder`, `SpectranSeifyDevice`, `SpectranSeifyRxStreamer`,
-`SpectranBackend`, `SpectranSdrSource`. These are the objects a caller holds,
-and what they describe is a SPECTRAN, not a company.
+`SpectranBackend`, `SpectranSdrSource`.
 
-The vendor namespace stays wherever it is a frozen contract rather than a
-description: the `aaronia_*` C symbols and the `AaroniaSource` / `AaroniaFfiError`
-typedefs in `include/aaronia.h`, the crate name `sdr-aaronia-rs`, the PyPI
-package `python-aaronia`, the Python module `aaronia`, `AaroniaSoapyDevice`
-inside the plugin, and `driver=aaronia`. That last one is the load-bearing case:
-it is typed by hand into GQRX and SDR++ configuration files already in the
-world, and breaking it fails as "device not found" with nothing pointing at the
-cause. The C header also reads coherently as it stands —
-`AaroniaFfiError aaronia_source_...(AaroniaSource*)` — so there was nothing to
-gain by half-renaming it. Crates.io and PyPI names cannot be changed in place
-in any event.
+The vendor name stays wherever it is a frozen contract rather than a
+description: the `aaronia_*` C symbols and the `AaroniaSource` /
+`AaroniaFfiError` typedefs, the crate, the PyPI package, the Python module,
+`AaroniaSoapyDevice`, and `driver=aaronia`. That last is the load-bearing one —
+it is typed into GQRX and SDR++ configs already in the world, where breaking it
+reads as "device not found" with nothing pointing at the cause.
 
-The Python classes follow the same rule and are renamed alongside the rest of
-that surface: `aaronia.AaroniaConfig` becomes `aaronia.SpectranConfig`, module
-named for the vendor and class for the device, which is what Python convention
-wants anyway.
-
-**Python takes the same vocabulary.** The classes are `aaronia.SpectranConfig`
-and `aaronia.SpectranSource`, and the four exceptions follow —
-`SpectranConnectionError`, `SpectranHardwareError`, `SpectranTimeoutError`,
-`SpectranStreamClosed`. Leaving those as `Aaronia*` beside a `SpectranConfig` in
-one module would have been the same drift this release is removing.
+**Python takes the same vocabulary**, its four exceptions included.
 
 | Old Python | New |
 | --- | --- |
@@ -85,128 +68,125 @@ one module would have been the same drift this release is removing.
 | `src.set_center_frequency()` / `set_sample_rate()` / `set_reference_level()` | `set_center_frequency_hz()` / `set_sample_rate_hz()` / `set_reference_level_dbm()` |
 | `open(freq=, rate=, bandwidth=, ref_level=, read_timeout=)` | `open(center_frequency_hz=, sample_rate_hz=, bandwidth_hz=, reference_level_dbm=, read_timeout_s=)` |
 
-`open()`'s keywords were the one real trade here: it is the one-line front door,
-and the longer names cost the headline example a line wrap. They changed anyway,
-because `open(url, bandwidth=10e6)` gives no way to tell Hz from MHz, and the
-most-used entry point is where that ambiguity does the most damage. `sdk=`,
-`url=`, `file=`, `serial=`, `format=` and `scale=` carry no unit and are
-unchanged, and `sample_rate_for_bandwidth(bandwidth_hz)` already named its
-argument properly.
+`open()`'s keywords changed with them. It is the one-line front door and the
+longer names cost the headline example a wrap, but `open(url, bandwidth=10e6)`
+gives no way to tell Hz from MHz. `sdk=`, `url=`, `file=`, `serial=`, `format=`
+and `scale=` carry no unit and are unchanged.
 
-**The C ABI is renamed with no forwarders.** A C consumer gets an undefined
-symbol at link time rather than a deprecation warning, so this table is the
-migration guide. The `FfiSourceInfo` struct fields moved too — those are
-positional, so a stale header keeps reading the correct bytes under the old
-name forever, which is exactly why the header changed in the same commit.
+**The whole C ABI moves to `spectran_*`.** Every exported symbol, the header
+(`include/aaronia.h` is now `include/spectran.h`), the opaque typedefs
+(`AaroniaSource` / `AaroniaSourceBuilder` / `AaroniaSink` / `AaroniaSinkBuilder`
+/ `AaroniaFfiError` / `CAaroniaSourceType` become `Spectran*`), and the plugin
+class `AaroniaSoapyDevice` become `SpectranSoapyDevice`. The table below lists
+the symbols that also changed shape; the rest changed prefix only, so
+`aaronia_x` is `spectran_x`.
+
+What keeps the vendor name: `driver=aaronia`, because it is typed into GQRX and
+SDR++ configuration files already in the world and breaking it reads as "device
+not found"; the crate, the PyPI package and the Python module, which are
+published names; and `AARTSAAPI_*` / `AaroniaRTSAAPI.dll`, which are the
+vendor's own.
+
+**The C ABI is renamed with no forwarders**, so a consumer gets an undefined
+symbol at link time and this table is the migration guide. `FfiSourceInfo`'s
+fields moved with the header in the same commit: C reads them positionally, so
+a stale header would go on reading the right bytes under the wrong name.
 
 | Old C symbol | New |
 | --- | --- |
-| `aaronia_source_builder_center_frequency` | `aaronia_source_builder_center_frequency_hz` |
-| `aaronia_source_builder_span_frequency` | `aaronia_source_builder_sample_rate_hz` |
-| `aaronia_source_builder_reference_level` | `aaronia_source_builder_reference_level_dbm` |
-| `aaronia_source_set_center_frequency` | `aaronia_source_set_center_frequency_hz` |
-| `aaronia_source_set_span_frequency` | `aaronia_source_set_sample_rate_hz` |
-| `aaronia_source_set_reference_level` | `aaronia_source_set_reference_level_dbm` |
-| `aaronia_sink_builder_center_frequency` | `aaronia_sink_builder_center_frequency_hz` |
-| `aaronia_sink_builder_sample_rate` | `aaronia_sink_builder_sample_rate_hz` |
-| `aaronia_sink_builder_trans_gain` | `aaronia_sink_builder_trans_gain_db` |
-| `aaronia_source_read_sensors` | `aaronia_source_get_sensors` |
-| `aaronia_endpoints_client_read_sensors` | `aaronia_endpoints_client_get_sensors` |
+| `aaronia_source_builder_center_frequency` | `spectran_source_builder_center_frequency_hz` |
+| `aaronia_source_builder_span_frequency` | `spectran_source_builder_sample_rate_hz` |
+| `aaronia_source_builder_reference_level` | `spectran_source_builder_reference_level_dbm` |
+| `aaronia_source_set_center_frequency` | `spectran_source_set_center_frequency_hz` |
+| `aaronia_source_set_span_frequency` | `spectran_source_set_sample_rate_hz` |
+| `aaronia_source_set_reference_level` | `spectran_source_set_reference_level_dbm` |
+| `aaronia_sink_builder_center_frequency` | `spectran_sink_builder_center_frequency_hz` |
+| `aaronia_sink_builder_sample_rate` | `spectran_sink_builder_sample_rate_hz` |
+| `aaronia_sink_builder_trans_gain` | `spectran_sink_builder_trans_gain_db` |
+| `aaronia_source_read_sensors` | `spectran_source_get_sensors` |
+| `aaronia_endpoints_client_read_sensors` | `spectran_endpoints_client_get_sensors` |
 | `FfiSourceInfo::center_frequency` / `span_frequency` / `reference_level` | `center_frequency_hz` / `sample_rate_hz` / `reference_level_dbm` |
-| `aaronia_source_get_gps_time(.., double*)` | `aaronia_source_get_gps_time_ns(.., int64_t*)` |
+| `aaronia_source_get_gps_time(.., double*)` | `spectran_source_get_gps_time_ns(.., int64_t*)` |
 
-GPS time changes type as well as name. `AaroniaSource::get_gps_time() ->
-Option<f64>` of seconds is now `gps_time_ns() -> Option<i64>`, and the C
-function takes an `int64_t*`, matching `get_last_timestamp_ns` — one unit for
-one dimension. The conversion moved into the library because doing it right is
-not obvious: epoch nanoseconds land around `1.7e18`, where an `f64`'s step is
-256 ns, so a single `seconds * 1e9` multiply throws away tens of nanoseconds
-the reading still had. The SoapySDR plugin carried its own whole/fractional
-split to avoid that; it now just reads the `int64_t` and that code is deleted.
-`GpsState::time` becomes `time_s`, keeping the vendor's seconds under a name
-that says so. The C function also accepts a `NULL` out-parameter, meaning "just
-tell me whether a fix exists" — what a capability probe wants, and what the
-plugin previously had to declare a throwaway variable for.
+The two `read_sensors` are a verb change, not a unit one. `read_` advances a
+stream here (`aaronia_source_read_samples`); sensors are a snapshot, so they
+join `aaronia_source_get_capabilities`.
 
-To be clear about what this does not do: it does not make GPS time more
-precise. The device reports `gpstime` as an `f64`, whose resolution at
-present-day epoch values is about 240 ns, and nothing downstream can recover
-what was never there. `utils::gps_seconds_to_nanos` documents that bound, and
-a unit test pins the conversion against the naive multiply. For correlating
-captures across receivers, ~240 ns is ~70 m of ranging uncertainty, so build
-on the per-packet stream timestamps and use GPS time for disciplining and
-wall-clock labelling.
+**GPS time changes type as well as name.** `gps_time_ns() -> Option<i64>`, and
+`int64_t*` in C, matching `last_timestamp_ns`. The conversion moved into the
+library because epoch nanoseconds land near `1.7e18`, where an `f64`'s step is
+256 ns — a single `seconds * 1e9` discards tens of nanoseconds the reading
+still had. The SoapySDR plugin's own whole/fractional split is deleted.
+`GpsState::time` is now `time_s`, and the C function accepts a `NULL`
+out-parameter meaning "is there a fix?".
 
-The two `read_sensors` are not a unit change but a verb one: `read_` advances a
-stream in this ABI (`aaronia_source_read_samples`), while sensors are a
-snapshot, so they read as `get_` alongside `aaronia_source_get_capabilities`.
+It does **not** improve precision. The device reports `gpstime` as an `f64`,
+whose step at present-day epoch values is about 240 ns, and nothing downstream
+recovers what was never there. `utils::gps_seconds_to_nanos` documents that
+bound and a test pins it against the naive multiply. Across receivers ~240 ns
+is ~70 m of ranging uncertainty, so correlate on the per-packet stream
+timestamps and keep GPS for disciplining and wall-clock labelling.
 
-`CaptureControl`'s fields gained units too, but its JSON keys did not move: the
-struct now pins each one with an explicit `#[serde(rename)]` instead of deriving
-them from Rust field names, so a future rename cannot change the wire format by
-accident. `tests/wire_contract.rs` asserts the keys, and asserts the vendor
+`CaptureControl`'s fields gained units without moving its JSON keys: each is
+now pinned by an explicit `#[serde(rename)]` rather than derived from the Rust
+field name, so a later rename cannot change the wire format by accident.
+`tests/wire_contract.rs` asserts those keys, and asserts the vendor
 `AARTSAAPI_Packet` mirror still matches its C header field for field.
 
 ### Added
 - **The stream clock source can be set, not just read.** `device/sclksource`
-  selects what disciplines the receiver's clock — a V6 ECO offers `Consumer`,
+  selects what disciplines the receiver's clock; a V6 ECO offers `Consumer`,
   `Oscillator`, `GPS`, `PPS`, `10MHz` and three `... Provider` variants. It was
-  readable but read-only: SoapySDR's `setClockSource` logged a warning telling
-  the operator to go and change it in RTSA-Suite. `AaroniaSource::set_clock_source`,
-  `aaronia_source_set_clock_source` and the plugin's `setClockSource` now write
-  it on both backends — native SDK via `ConfigSetString`, HTTP via a
-  `simpleconfig` PUT that is read back to confirm, because a `/remoteconfig` PUT
-  naming a block outside the running mission answers 200 and changes nothing.
-  A confirmed mismatch is an **error** naming the sources the device does offer —
-  being told you are on a reference you are not is worse than a failed call. If
-  the read-back yields nothing at all the write is not failed, only reported as
-  unconfirmed.
+  readable but read-only, and SoapySDR's `setClockSource` merely logged a
+  warning telling the operator to change it in RTSA-Suite.
+  `SpectranSource::set_clock_source`, `aaronia_source_set_clock_source` and the
+  plugin's `setClockSource` now write it on both backends — native SDK via
+  `ConfigSetString`, HTTP via a `simpleconfig` PUT that is read back to confirm,
+  because a `/remoteconfig` PUT naming a block outside the running mission
+  answers 200 and changes nothing. A confirmed mismatch is an **error** naming
+  the sources the device does offer: being told you are on a reference you are
+  not is worse than a failed call. A read-back yielding nothing is reported as
+  unconfirmed rather than failed.
 
-  This is the enabling piece for correlating captures across receivers: lock a
-  fleet to one 10 MHz / PPS / GPS reference and their per-packet hardware
-  timestamps share a timebase. Note what is *not* possible — the SDK's C API has
-  no set-time and no arm-at-time entry point, so multi-device work is
-  shared-reference plus post-alignment on timestamps, never a commanded
-  synchronous start.
+  This is what makes cross-receiver correlation possible: lock a fleet to one
+  10 MHz / PPS / GPS reference and their per-packet timestamps share a timebase.
+  What is *not* possible is a commanded synchronous start — the SDK's C API has
+  no set-time and no arm-at-time entry point, so multi-device work is a shared
+  reference plus post-alignment on timestamps.
 
 ### Fixed
 - **A trailing slash in `device_type` no longer produces a malformed open
-  string.** The family/mode split asked whether the string contained a slash,
-  so `"spectranv6/"` counted as already mode-qualified and was passed to
+  string.** The family/mode split asked whether the string contained a slash, so
+  `"spectranv6/"` counted as already mode-qualified and went to
   `AARTSAAPI_OpenDevice` verbatim. The mode is now the text after the *first*
-  slash, and an empty one means no mode was given: `"spectranv6/"` is simply
-  `"spectranv6"`. The ECO was the sharp edge — `"spectranv6eco/"` also slipped
-  past the `spectranv6eco/raw` → `iqreceiver` remap, so the device was asked
-  for a pipeline it does not have, and answered with a vendor result code that
-  said nothing about the typo.
+  slash, and an empty one means none was given. The ECO was the sharp edge:
+  `"spectranv6eco/"` also slipped past the `spectranv6eco/raw` → `iqreceiver`
+  remap, so the device was asked for a pipeline it does not have and answered
+  with a result code that said nothing about the typo.
 
   A `device_type` naming no family (`""`, `"/"`, `"/raw"`) is no longer
   completed into a family-less `"/raw"`; it comes back untouched and is refused
-  with a configuration error at both points where a device type reaches the SDK,
-  `find_devices` and `open_device`. Both are needed: enumeration runs first, and
-  an empty family simply enumerates to nothing, so the old path reported "no
-  devices found" and never mentioned the typo. Which of the two fires depends on
-  the path: the config wrappers enumerate first, so that is the message they
-  surface. `device_family` and
-  `device_open_mode` stay infallible on both the source and sink config — a typo
-  in one field is not a reason to make four accessors return `Result`.
+  at both points where a device type reaches the SDK. Both guards are needed
+  because enumeration runs first, and an empty family simply enumerates to
+  nothing — the old path reported "no devices found" and never mentioned the
+  typo. `device_family` and `device_open_mode` stay infallible: a typo in one
+  field is not a reason to make four accessors return `Result`.
 - **An over-wide sample rate no longer reaches the hardware before it is
   refused.** `configure_iq_receiver` checked the IQ-mode constraint as its last
   act, so a rate the receiver clock cannot carry was written to
-  `main/centerfreq` and `main/spanfreq` first and rejected afterwards, leaving
-  the device holding exactly the misconfiguration the check exists to prevent —
-  and, per the SDK, silently emitting corrupted samples if anything started the
-  stream anyway. The check now runs before the first write.
+  `main/centerfreq` and `main/spanfreq` first and rejected afterwards — leaving
+  the device holding the misconfiguration the check exists to prevent, and per
+  the SDK quietly emitting corrupted samples if anything started the stream.
+  The check now runs before the first write.
 
-  It is checked against the clock the call *leaves in place*, which is not
-  always the one the device holds on entry. In raw mode the call writes the
-  clock itself, so that write is what counts: a V6 left on its 245.76 MHz clock
-  would otherwise pass a 150 MS/s request that stops being valid the moment
-  this same call drops the clock to 92.16 MHz. Every other open mode skips that
-  write, so there the live setting is the honest number — assuming 92.16 would
-  refuse rates a full V6 can genuinely reach. The read-back after the writes is
-  kept, and is what `receiver_clock_hz()` reports. Native SDK backend only; the
-  HTTP backend already validated at the API boundary.
+  It checks against the clock the call *leaves in place*, which is not always
+  the one the device holds on entry. Raw mode writes the clock itself, so that
+  write is what counts: a V6 left on its 245.76 MHz clock would otherwise pass a
+  150 MS/s request that stops being valid the moment this same call drops the
+  clock to 92.16 MHz. Every other mode skips that write, so there the live
+  setting is the honest number. The read-back after the writes is kept, and is
+  what `receiver_clock_hz()` reports. Native SDK only; the HTTP backend already
+  validated at the API boundary.
 
 ## [v0.9.0] - 2026-09-08
 

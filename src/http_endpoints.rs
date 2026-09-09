@@ -368,13 +368,13 @@ const REFLEVEL_CONFIRM_TOLERANCE_DB: f64 = 0.25;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CaptureConfig {
     /// `main/centerfreq0`, in Hz.
-    pub center_freq_hz: Option<f64>,
+    pub center_frequency_hz: Option<f64>,
     /// `main/decimation0`, the "Span" enum index (0 = Full, 9 = 1 / 512).
     /// Use [`crate::decimation_index_for_bandwidth`] to derive it from a
     /// requested span, or [`crate::decimation_index_for_rate`] from a rate.
     pub decimation_index: Option<usize>,
     /// `main/reflevel0`, in dBm.
-    pub reflevel_dbm: Option<f64>,
+    pub reference_level_dbm: Option<f64>,
 }
 
 /// The device values [`HttpEndpointsClient::apply_capture_config`] read
@@ -386,11 +386,11 @@ pub struct AppliedCaptureConfig {
     /// The `Block_*` receiver name the write targeted.
     pub receiver_name: String,
     /// `main/centerfreq0` as the device now reports it, in Hz.
-    pub center_freq_hz: Option<f64>,
+    pub center_frequency_hz: Option<f64>,
     /// `main/decimation0` index as the device now reports it.
     pub decimation_index: Option<usize>,
     /// `main/reflevel0` as the device now reports it, in dBm.
-    pub reflevel_dbm: Option<f64>,
+    pub reference_level_dbm: Option<f64>,
 }
 
 /// Defines the command for starting or stopping antenna rotation.
@@ -1595,7 +1595,7 @@ impl HttpEndpointsClient {
     /// that is not in the running mission returns HTTP 200 and changes
     /// nothing, so this returns `Ok(())` for a write that did not
     /// happen. The server offers nothing to check against, so resolve
-    /// the name once from [`Self::get_config`] (or
+    /// the name once from [`Self::config`] (or
     /// [`Self::find_iq_demodulator_block_name`]) when the session
     /// starts, rather than hard-coding a block name and trusting the
     /// status code. Read the value back afterwards when a write has to
@@ -1718,7 +1718,7 @@ impl HttpEndpointsClient {
 
     /// `GET /remoteconfig` as a raw `serde_json::Value`.
     ///
-    /// The typed [`Self::get_config`] deserialises into [`ConfigResponse`];
+    /// The typed [`Self::config`] deserialises into [`ConfigResponse`];
     /// this keeps the untyped tree so the block-discovery and read-back
     /// walkers can look up arbitrary leaves by name without every device's
     /// full schema being modelled.
@@ -1793,14 +1793,14 @@ impl HttpEndpointsClient {
         let block = self.find_block_name_with_field("centerfreq0").await?;
 
         let mut main = serde_json::Map::new();
-        if let Some(hz) = request.center_freq_hz {
+        if let Some(hz) = request.center_frequency_hz {
             main.insert("centerfreq0".to_string(), serde_json::json!(hz));
         }
         if let Some(idx) = request.decimation_index {
             // Enum fields take the index directly (see `simple_remote_config`).
             main.insert("decimation0".to_string(), serde_json::json!(idx));
         }
-        if let Some(dbm) = request.reflevel_dbm {
+        if let Some(dbm) = request.reference_level_dbm {
             main.insert("reflevel0".to_string(), serde_json::json!(dbm));
         }
 
@@ -1819,8 +1819,8 @@ impl HttpEndpointsClient {
         // Confirm each requested field against the read-back. Center is a
         // float snapped to the device's frequency step; decimation and
         // reflevel are exact (an enum index and a 0.5 dB grid).
-        if let Some(want) = request.center_freq_hz {
-            match applied.center_freq_hz {
+        if let Some(want) = request.center_frequency_hz {
+            match applied.center_frequency_hz {
                 Some(got) if (got - want).abs() <= CENTERFREQ_CONFIRM_TOLERANCE_HZ => {
                     info!("RTSA {block}: centerfreq0 = {got:.0} Hz (requested {want:.0})");
                 }
@@ -1843,8 +1843,8 @@ impl HttpEndpointsClient {
                 None => warn!("RTSA {block}: decimation0 missing from read-back"),
             }
         }
-        if let Some(want) = request.reflevel_dbm {
-            match applied.reflevel_dbm {
+        if let Some(want) = request.reference_level_dbm {
+            match applied.reference_level_dbm {
                 Some(got) if (got - want).abs() <= REFLEVEL_CONFIRM_TOLERANCE_DB => {
                     info!("RTSA {block}: reflevel0 = {got} dBm (requested {want})");
                 }
@@ -1875,10 +1875,10 @@ impl HttpEndpointsClient {
         })?;
         Ok(AppliedCaptureConfig {
             receiver_name: block.to_string(),
-            center_freq_hz: read_config_leaf_value(block_items, "centerfreq0"),
+            center_frequency_hz: read_config_leaf_value(block_items, "centerfreq0"),
             decimation_index: read_config_leaf_value(block_items, "decimation0")
                 .map(|v| v as usize),
-            reflevel_dbm: read_config_leaf_value(block_items, "reflevel0"),
+            reference_level_dbm: read_config_leaf_value(block_items, "reflevel0"),
         })
     }
 
@@ -1994,7 +1994,7 @@ impl HttpEndpointsClient {
         // Independent, so in flight together: serially, every SoapySDR
         // `Device::make` paid a second round trip, and a server that
         // answered `/info` then stalled hung it for two timeouts.
-        let (config, health) = tokio::join!(self.get_config(), self.get_health_status());
+        let (config, health) = tokio::join!(self.config(), self.get_health_status());
         let config = match config {
             Ok(config) => Some(config),
             Err(e) => {
@@ -2019,7 +2019,7 @@ impl HttpEndpointsClient {
     /// nothing about write capability.
     /// See: <https://aaronia.com/en/software-licence-remote-config>
     /// Documentation: <https://rtsa-manual.aaronia.com/en/Content/C_Operation/DDCommandCenter/RemoteConfig.htm>
-    pub async fn get_config(&self) -> Result<ConfigResponse> {
+    pub async fn config(&self) -> Result<ConfigResponse> {
         let url = format!("{}/remoteconfig", self.base_url);
         let request = self.control_request(self.client.get(&url));
         let response = Self::ensure_success("Config request", request.send().await?)?;
@@ -2091,7 +2091,7 @@ impl HttpEndpointsClient {
     pub async fn detect_remote_config_license(&self) -> RemoteConfigStatus {
         debug!("Checking Remote Config licensing status (read-only)");
 
-        match self.get_config().await {
+        match self.config().await {
             Ok(_) => RemoteConfigStatus::Unknown(
                 "read access confirmed, but reads work without a license; call \
                  probe_remote_config_write_license() to verify write capability"
@@ -2145,7 +2145,7 @@ impl HttpEndpointsClient {
         debug!("Probing Remote Config licensing status by testing write operations");
 
         // First check if we can read config (this works without license).
-        if let Err(e) = self.get_config().await {
+        if let Err(e) = self.config().await {
             return match e {
                 Error::Http {
                     status: reqwest::StatusCode::UNAUTHORIZED,
@@ -2225,7 +2225,7 @@ impl HttpEndpointsClient {
         );
 
         // Step 1: Read current configuration
-        let original_config = self.get_config().await?;
+        let original_config = self.config().await?;
         let original_value =
             self.extract_parameter_value(&original_config.config, test_parameter)?;
 
@@ -2249,7 +2249,7 @@ impl HttpEndpointsClient {
         // exactly when that promise matters most. Capture the outcome,
         // always restore, then surface the error.
         let readback = async {
-            let verification_config = self.get_config().await?;
+            let verification_config = self.config().await?;
             self.extract_parameter_value(&verification_config.config, test_parameter)
         }
         .await;
@@ -3541,7 +3541,7 @@ mod tests {
                 println!("      💡 This suggests we need better detection criteria");
 
                 // Get the config to analyze what we're actually getting
-                if let Ok(config) = client.get_config().await {
+                if let Ok(config) = client.config().await {
                     println!("      📊 Config Analysis:");
                     println!("         Request ID: {}", config.request);
                     analyze_config_structure(&config.config, 0);

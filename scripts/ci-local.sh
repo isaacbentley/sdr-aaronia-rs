@@ -78,6 +78,26 @@ if ! skipped clippy; then
     cargo clippy --workspace --all-features --all-targets -- -D warnings
 fi
 
+# ---- untagged markdown fences --------------------------------------
+# `src/lib.rs` pulls these three files in with `include_str!`, and
+# rustdoc compiles an untagged ``` fence as Rust. That is how an ASCII
+# architecture diagram once became a doctest failure on `main`: the
+# Linux CI leg runs `cargo llvm-cov`, which skips doctests, so only the
+# macOS and Windows legs caught it. Cheaper to catch here.
+if ! skipped fences; then
+    step "untagged code fences in the included markdown"
+    awk '
+        /^```/ {
+            n++
+            if (n % 2 == 1 && $0 == "```") {
+                printf "%s:%d: untagged fence — rustdoc will compile this as Rust\n", FILENAME, FNR
+                rc = 1
+            }
+        }
+        END { exit rc }
+    ' README.md docs/QUICKSTART.md docs/USAGE.md
+fi
+
 if ! skipped test; then
     # CI's Linux leg wraps this in cargo-llvm-cov for coverage; the
     # test outcome is identical, so plain `cargo test` suffices here.

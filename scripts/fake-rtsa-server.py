@@ -16,7 +16,7 @@ and 6x a WiFi 6E link, so the crate is not the bottleneck in any real
 configuration.
 
 Only `/stream` is served. Paths needing `/info`, `/inputs` or `/control`
-(`AaroniaSource`, the live smoke tests) will not work against it; drive
+(`SpectranSource`, the live smoke tests) will not work against it; drive
 `HttpEndpointsClient::start_stream` directly.
 
 One caveat, learned the hard way: loopback is not a small network. Over

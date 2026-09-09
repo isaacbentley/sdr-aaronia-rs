@@ -7,14 +7,14 @@ def main():
     results = SoapySDR.Device.enumerate()
     
     # Check if aaronia driver is present
-    aaronia_found = False
+    spectran_found = False
     for res in results:
         if res.get("driver") == "aaronia":
-            aaronia_found = True
+            spectran_found = True
             print("Found Aaronia device:", dict(res))
             break
             
-    if not aaronia_found:
+    if not spectran_found:
         print("Aaronia SoapySDR driver not found. Is the plugin installed?")
         print("Available drivers:")
         for res in results:

@@ -1,7 +1,7 @@
 //! Guards against the two hand-maintained mirrors of this crate's public
 //! surface drifting from the code they describe.
 //!
-//! `include/aaronia.h` is written by hand and nothing generates or diffs
+//! `include/spectran.h` is written by hand and nothing generates or diffs
 //! it, and `python-aaronia/aaronia.pyi` says in its own header that it is
 //! "kept in sync by hand". Both are exactly the kind of file a rename
 //! forgets, and neither failure is visible to a compiler: a C consumer of
@@ -71,7 +71,7 @@ fn arity(args: &str) -> usize {
     n
 }
 
-/// `aaronia_*` functions the Rust side actually exports, with their arity.
+/// `spectran_*` functions the Rust side actually exports, with their arity.
 fn rust_exports(src: &str) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
     let mut cursor = 0usize;
@@ -82,7 +82,7 @@ fn rust_exports(src: &str) -> BTreeMap<String, usize> {
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
-        if name.starts_with("aaronia_")
+        if name.starts_with("spectran_")
             && let Some(open) = src[at..].find('(')
             && let Some(args) = balanced_args(src, at + open)
         {
@@ -118,7 +118,7 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
-/// `aaronia_*` declarations in the C header, with their arity.
+/// `spectran_*` declarations in the C header, with their arity.
 ///
 /// Scans the whole comment-free text rather than line by line: several
 /// declarations wrap their argument list across lines, and a line-based
@@ -127,7 +127,7 @@ fn header_decls(src: &str) -> BTreeMap<String, usize> {
     let text = strip_comments(src);
     let mut out = BTreeMap::new();
     let mut cursor = 0usize;
-    while let Some(rel) = text[cursor..].find("aaronia_") {
+    while let Some(rel) = text[cursor..].find("spectran_") {
         let at = cursor + rel;
         let name: String = text[at..]
             .chars()
@@ -149,13 +149,13 @@ fn header_decls(src: &str) -> BTreeMap<String, usize> {
 /// same arity — in both directions.
 #[test]
 fn c_header_matches_the_exported_symbols() {
-    let header_path = repo("include/aaronia.h");
+    let header_path = repo("include/spectran.h");
     if !header_path.exists() {
-        eprintln!("include/aaronia.h not present (packaged build) — skipping");
+        eprintln!("include/spectran.h not present (packaged build) — skipping");
         return;
     }
     let rust = std::fs::read_to_string(repo("src/c_api.rs")).expect("src/c_api.rs");
-    let header = std::fs::read_to_string(&header_path).expect("include/aaronia.h");
+    let header = std::fs::read_to_string(&header_path).expect("include/spectran.h");
 
     let exports = rust_exports(&rust);
     let decls = header_decls(&header);
@@ -169,14 +169,14 @@ fn c_header_matches_the_exported_symbols() {
     let missing: Vec<_> = exports.keys().filter(|k| !decls.contains_key(*k)).collect();
     assert!(
         missing.is_empty(),
-        "exported from Rust but absent from include/aaronia.h: {missing:?}\n\
+        "exported from Rust but absent from include/spectran.h: {missing:?}\n\
          A C consumer cannot call these."
     );
 
     let extra: Vec<_> = decls.keys().filter(|k| !exports.contains_key(*k)).collect();
     assert!(
         extra.is_empty(),
-        "declared in include/aaronia.h but not exported by Rust: {extra:?}\n\
+        "declared in include/spectran.h but not exported by Rust: {extra:?}\n\
          A C consumer linking these gets an undefined symbol."
     );
 
@@ -238,7 +238,7 @@ fn pyo3_exposed(src: &str) -> Vec<String> {
                 .collect();
             if !name.is_empty() && !name.starts_with("__") && name != "new" {
                 // Only a #[getter]/#[setter] becomes a property; a plain
-                // `fn set_center_frequency` stays a method of that name.
+                // `fn set_center_frequency_hz` stays a method of that name.
                 // Stripping the prefix unconditionally invents a property
                 // that Python never exposes.
                 let preceding = &src[at.saturating_sub(64)..at];

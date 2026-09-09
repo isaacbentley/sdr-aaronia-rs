@@ -60,15 +60,20 @@ fn main() -> anyhow::Result<()> {
 
         // Configure for UHF amateur band (446 MHz, 10 MHz span, -30 dBm).
         // `configure_iq_receiver` validates the IQ Mode constraint
-        // (`span * 1.5 <= clock`) before returning.
-        let (center_freq, span_freq, ref_level) = (446.0e6, 10.0e6, -30.0);
+        // (`rate * 1.5 <= clock`) before it writes anything.
+        let (center_frequency_hz, sample_rate_hz, reference_level_dbm) = (446.0e6, 10.0e6, -30.0);
         info!(
-            "Configuring IQ receiver: {} Hz center, {} Hz span, {} dBm ref level",
-            center_freq, span_freq, ref_level
+            "Configuring IQ receiver: {} Hz center, {} S/s, {} dBm ref level",
+            center_frequency_hz, sample_rate_hz, reference_level_dbm
         );
         // `None` keeps the Rx1 default; pass Some(RxChannel::Rx2) or
         // Some(RxChannel::Rx1And2) on a full V6 to select inputs.
-        sdk_source.configure_iq_receiver(center_freq, span_freq, ref_level, None)?;
+        sdk_source.configure_iq_receiver(
+            center_frequency_hz,
+            sample_rate_hz,
+            reference_level_dbm,
+            None,
+        )?;
 
         // Optional: `set_decimation_factor` accepts powers of two in
         // [1, 512]; factor 1 (`Full`) keeps the native rate. The helper

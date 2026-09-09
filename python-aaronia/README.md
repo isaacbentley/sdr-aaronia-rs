@@ -82,7 +82,7 @@ print(src.cumulative_drops(), src.take_overrun(), src.last_timestamp_ns())
 src.stop_streaming()
 ```
 
-For full control, build an `SpectranConfig` and pass it to
+For full control, build a `SpectranConfig` and pass it to
 `SpectranSource.start_streaming()`; `open()` is a shorthand for the
 common fields.
 

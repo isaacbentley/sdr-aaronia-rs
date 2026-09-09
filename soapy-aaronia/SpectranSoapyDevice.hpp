@@ -4,17 +4,17 @@
 #include <SoapySDR/Device.hpp>
 #include <SoapySDR/Logger.hpp>
 #include <SoapySDR/Formats.hpp>
-#include "../include/aaronia.h"
+#include "../include/spectran.h"
 
 #include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
 
-class AaroniaSoapyDevice : public SoapySDR::Device {
+class SpectranSoapyDevice : public SoapySDR::Device {
 public:
-    AaroniaSoapyDevice(AaroniaSource* source, AaroniaSink* sink, const SoapySDR::Kwargs &args);
-    ~AaroniaSoapyDevice() override;
+    SpectranSoapyDevice(SpectranSource* source, SpectranSink* sink, const SoapySDR::Kwargs &args);
+    ~SpectranSoapyDevice() override;
 
     // Identification API
     std::string getDriverKey() const override;
@@ -115,8 +115,8 @@ public:
     std::string readSensor(const std::string &name) const override;
 
 private:
-    AaroniaSource *_source;
-    AaroniaSink *_sink;
+    SpectranSource *_source;
+    SpectranSink *_sink;
     // One mutex serializes every FFI call into the Rust objects: the C
     // ABI materializes `&mut` references, so concurrent calls from a
     // GUI thread (retune) and the streaming thread (readStream) would
@@ -162,7 +162,7 @@ private:
     // Which backend the source resolved to. Gates the capabilities
     // that only one backend has: timestamps come from the HTTP
     // packet headers and nowhere else.
-    CAaroniaSourceType _sourceType;
+    CSpectranSourceType _sourceType;
 
     // Live sensors (HTTP backend only), read through a dedicated
     // endpoints client and guarded by their own `_sensorMutex` — never

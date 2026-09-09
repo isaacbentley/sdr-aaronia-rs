@@ -22,7 +22,7 @@ full V6 are marked unverified.
 | SoapySDR plugin RX | HTTP | Verified manually: CF32 and CS16 both sustained 15.36 MS/s, the full requested rate, over an 8 s window after the connect backlog. No automated live test, as a `soapysdr` dev-dependency would make `cargo test` unbuildable without system SoapySDR |
 | SoapySDR device reporting (model, serial, ranges, rate ladder, clock source, antenna, timestamps, channel counts) | HTTP | Verified manually against a V6 ECO: every field the probe prints comes from the device, `getAntenna` is a member of `listAntennas`, and `getClockSource` a member of `listClockSources` |
 | Python bindings RX | HTTP | Verified manually: 15.58 MS/s of live IQ into NumPy, mean power matching the SoapySDR path on the same signal to within 3%. Also Arrow. No automated live test |
-| TX (`UnifiedSink`, `aaronia_sink_*`, SoapySDR TX) | Native SDK | **Hardware-unverified**. No TX-licensed device available |
+| TX (`UnifiedSink`, `spectran_sink_*`, SoapySDR TX) | Native SDK | **Hardware-unverified**. No TX-licensed device available |
 | Dual-channel RX (`Rx1And2`, `read_samples_dual`) | Native SDK | **Hardware-unverified**. Requires a full V6. Selects `Rx12`, the interleaved single-stream mode, matching how this crate reads |
 | Spectra reads (`read_spectra`) | Native SDK | **Hardware-unverified**. Packet layout and stream index follow Aaronia's `RawSpectrum` sample |
 | Device-family detection | Native SDK | **Live-verified** on a V6 ECO: `spectranv6` enumerates nothing, `spectranv6eco` finds it, and the source opens `spectranv6eco/iqreceiver` |

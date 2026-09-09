@@ -12,10 +12,10 @@ To use the Seify plugin, enable the `seify` feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sdr-aaronia-rs = { version = "0.8", features = ["seify"] }
+sdr-aaronia-rs = { version = "0.10", features = ["seify"] }
 ```
 
-Instantiate the device with `AaroniaSeifyDevice::from_args` and use it directly (or via `seify::dev::DynDeviceBackend`). The backend is **not** part of seify's built-in enumeration registry — `seify::enumerate()` will not discover it.
+Instantiate the device with `SpectranSeifyDevice::from_args` and use it directly (or via `seify::dev::DynDeviceBackend`). The backend is **not** part of seify's built-in enumeration registry — `seify::enumerate()` will not discover it.
 
 `url=` selects the HTTP backend and `file=` playback. `sdk=true` (or
 `serial=<device serial>`) selects the Aaronia native SDK; that needs the
@@ -23,13 +23,15 @@ crate built with both features — `features = ["seify", "native-sdk"]` —
 on Windows or Linux with RTSA-Suite PRO installed. Without the feature
 the request is a clean error, never a fallback to HTTP.
 
-`AaroniaSeifyDevice` owns a tokio runtime. Drop it from synchronous
+`SpectranSeifyDevice` owns a tokio runtime. Drop it from synchronous
 code: dropping it inside an `async` context (a `#[tokio::test]`, a task)
 is a tokio panic, "Cannot drop a runtime in a context where blocking is
 not allowed".
 
-```rust
-use sdr_aaronia_rs::seify_impl::AaroniaSeifyDevice;
+```rust,no_run
+# #[cfg(feature = "seify")]
+# fn demo() {
+use sdr_aaronia_rs::seify_impl::SpectranSeifyDevice;
 use seify::{Args, RxDevice, RxStreamer, DeviceInfo};
 use seify::dev::DynDeviceBackend;
 
@@ -38,7 +40,7 @@ let mut args = Args::new();
 args.set("url", "http://localhost:54664");
 
 // Open the device
-let dev = AaroniaSeifyDevice::from_args(&args).expect("Failed to open Aaronia device");
+let dev = SpectranSeifyDevice::from_args(&args).expect("Failed to open Aaronia device");
 
 // Start streaming (CF32 complex floats)
 let rx = dev.rx_device().expect("Failed to get RX device");
@@ -48,6 +50,8 @@ streamer.activate_at(None).expect("Failed to activate stream");
 let mut buffer = [num_complex::Complex32::new(0.0, 0.0); 1024];
 let read = streamer.read(&mut [&mut buffer], 1_000_000).expect("Read failed");
 println!("Read {} samples", read);
+# }
+# fn main() {}
 ```
 
 > **Note on Bandwidth:** Seify's `RxStreamer` trait natively expects `Complex32` (CF32) buffers, so data will be transferred as 32-bit floats.

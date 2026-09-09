@@ -132,9 +132,10 @@ Fields fall back independently, so a device that answers about frequency
 but not gain still gets its frequency range published. The file and
 native-SDK backends report the driver's defaults throughout.
 
-`setClockSource` only reads: it accepts the device's current source and
-warns for anything else. Change it in RTSA-Suite under Device > Stream
-Clock Source.
+`setClockSource` writes `device/sclksource` on both backends: the native
+SDK via `ConfigSetString`, HTTP via a `simpleconfig` PUT that is read back
+to confirm. A source the device does not adopt is an error naming the ones
+it does offer. `listClockSources` reports the device's own vocabulary.
 
 ## Streams
 

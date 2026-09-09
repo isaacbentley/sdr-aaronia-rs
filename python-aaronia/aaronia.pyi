@@ -44,7 +44,7 @@ WireFormat = Literal["F32", "F16", "I16"]
 ReceiverChannel = Literal["Rx1", "Rx2", "Rx1And2"]
 
 class SpectranConfig:
-    """Configuration for an :class:`SpectranSource`.
+    """Configuration for a :class:`SpectranSource`.
 
     Setting ``http_base_url`` selects the HTTP backend; setting
     ``file_path`` selects file playback. Every property is readable and

@@ -309,11 +309,11 @@ impl PySpectranConfig {
         // NaN/negative/overflowing input, which would abort the whole
         // interpreter over a bad assignment.
         let timeout = Duration::try_from_secs_f64(seconds).map_err(|e| {
-            PyValueError::new_err(format!("read_timeout is not a valid duration: {e}"))
+            PyValueError::new_err(format!("read_timeout_s is not a valid duration: {e}"))
         })?;
         if timeout.is_zero() {
             return Err(PyValueError::new_err(
-                "read_timeout must be greater than zero seconds",
+                "read_timeout_s must be greater than zero seconds",
             ));
         }
         self.inner.read_timeout = timeout;

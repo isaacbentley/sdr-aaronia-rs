@@ -102,7 +102,7 @@ async fn try_capture(sample_rate_hz: f64, samples_wanted: usize) -> Result<(usiz
     // A source that quietly came up on another backend would make every
     // downstream assertion meaningless.
     assert_eq!(
-        source.get_source_info().source_type,
+        source.source_info().source_type,
         SourceType::NativeSdk,
         "force_native_sdk must not fall back to another backend"
     );
@@ -169,7 +169,7 @@ async fn opens_device_and_reports_native_backend() {
         .await
         .expect("a Spectran V6 must be attached and free");
 
-    let info = source.get_source_info();
+    let info = source.source_info();
     println!(
         "source_type={:?} center={} Hz rate={} S/s serial={:?}",
         info.source_type, info.center_frequency_hz, info.sample_rate_hz, info.device_serial
@@ -285,7 +285,7 @@ async fn center_frequency_sweep() {
 
         match SpectranSource::new(cfg).await {
             Ok(source) => {
-                let seen = source.get_source_info().center_frequency_hz;
+                let seen = source.source_info().center_frequency_hz;
                 println!("{:>10.3} MHz -> reported {:>10.3} MHz", f / 1e6, seen / 1e6);
             }
             Err(e) => {
@@ -620,27 +620,27 @@ fn c_api_reaches_the_native_sdk_by_autodetection() {
     let _guard = device_lock_blocking();
 
     unsafe {
-        let builder = sdr_aaronia_rs::aaronia_source_builder_new();
+        let builder = sdr_aaronia_rs::spectran_source_builder_new();
         assert!(!builder.is_null(), "builder allocation");
 
-        sdr_aaronia_rs::aaronia_source_builder_center_frequency_hz(builder, center_hz());
-        sdr_aaronia_rs::aaronia_source_builder_sample_rate_hz(builder, 15.36e6);
+        sdr_aaronia_rs::spectran_source_builder_center_frequency_hz(builder, center_hz());
+        sdr_aaronia_rs::spectran_source_builder_sample_rate_hz(builder, 15.36e6);
         // Deliberately no http_source/file_source: that is what selects
         // auto-detection, and hence the SDK.
 
-        let source = sdr_aaronia_rs::aaronia_source_build(builder);
+        let source = sdr_aaronia_rs::spectran_source_build(builder);
         assert!(
             !source.is_null(),
             "native-SDK source must build over the C ABI when the SDK is installed"
         );
 
-        let info = sdr_aaronia_rs::aaronia_source_get_source_info(source);
+        let info = sdr_aaronia_rs::spectran_source_get_source_info(source);
         assert!(!info.is_null(), "source info must be returned");
-        // `CAaroniaSourceType` is a bare `#[repr(C)]` enum with no
+        // `CSpectranSourceType` is a bare `#[repr(C)]` enum with no
         // derives, so match on it rather than formatting it.
         let is_native = matches!(
             (*info).source_type,
-            sdr_aaronia_rs::CAaroniaSourceType::NativeSdk
+            sdr_aaronia_rs::CSpectranSourceType::NativeSdk
         );
         println!("C ABI reached the native SDK: {is_native}");
         assert!(
@@ -648,7 +648,7 @@ fn c_api_reaches_the_native_sdk_by_autodetection() {
             "auto-detection must land on the native SDK, not fall back to HTTP"
         );
 
-        sdr_aaronia_rs::aaronia_source_info_free(info);
-        sdr_aaronia_rs::aaronia_source_free(source);
+        sdr_aaronia_rs::spectran_source_info_free(info);
+        sdr_aaronia_rs::spectran_source_free(source);
     }
 }

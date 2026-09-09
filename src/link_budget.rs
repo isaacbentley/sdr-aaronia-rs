@@ -178,7 +178,7 @@ pub fn required_byte_rate(sample_rate_hz: f64) -> Option<f64> {
 }
 
 /// The fastest rung of the default-clock decimation ladder whose stream
-/// fits `measured_byte_rate_hz`, in samples a second.
+/// fits `measured_byte_rate_bps`, in samples a second.
 ///
 /// Inverts [`required_byte_rate_for_format`] through
 /// [`crate::utils::iq_sample_rates`] rather than solving for a rate and
@@ -195,26 +195,26 @@ pub fn required_byte_rate(sample_rate_hz: f64) -> Option<f64> {
 /// not fit — a link that narrow is the problem, not the span — or when
 /// the inputs admit no computation at all.
 pub fn max_sustainable_sample_rate_for_format(
-    measured_byte_rate_hz: f64,
+    measured_byte_rate_bps: f64,
     format: StreamFormat,
 ) -> Option<f64> {
-    if !measured_byte_rate_hz.is_finite() || measured_byte_rate_hz <= 0.0 {
+    if !measured_byte_rate_bps.is_finite() || measured_byte_rate_bps <= 0.0 {
         return None;
     }
     iq_sample_rates()
         .into_iter()
-        .filter(|rate| rung_fits(*rate, format, measured_byte_rate_hz))
+        .filter(|rate| rung_fits(*rate, format, measured_byte_rate_bps))
         // The ladder is ordered fastest-first, so the first match is the
         // answer; reducing over `max` rather than taking `next()` keeps
         // this correct if that order ever changes.
         .reduce(f64::max)
 }
 
-/// Whether the `rate_hz` rung's stream fits `measured_byte_rate_hz` in
+/// Whether the `rate_hz` rung's stream fits `measured_byte_rate_bps` in
 /// `format` — the one predicate behind every "widest rung" search here.
-fn rung_fits(rate_hz: f64, format: StreamFormat, measured_byte_rate_hz: f64) -> bool {
+fn rung_fits(rate_hz: f64, format: StreamFormat, measured_byte_rate_bps: f64) -> bool {
     required_byte_rate_for_format(rate_hz, format)
-        .is_some_and(|needed| needed <= measured_byte_rate_hz)
+        .is_some_and(|needed| needed <= measured_byte_rate_bps)
 }
 
 /// The decimation ladder whose top rung is `device_rate_hz` — the
@@ -224,7 +224,7 @@ pub(crate) fn device_ladder(device_rate_hz: f64) -> [f64; 10] {
 }
 
 /// The fastest rate at or below `device_rate_hz`, reachable by halving
-/// it, whose stream fits `measured_byte_rate_hz` in `format`.
+/// it, whose stream fits `measured_byte_rate_bps` in `format`.
 ///
 /// The ladder helpers above invert through the **default-clock** ladder,
 /// and a full V6 on a faster receiver clock has rungs that ladder does
@@ -240,19 +240,19 @@ pub(crate) fn device_ladder(device_rate_hz: f64) -> [f64; 10] {
 /// span.
 pub fn max_sustainable_sample_rate_below(
     device_rate_hz: f64,
-    measured_byte_rate_hz: f64,
+    measured_byte_rate_bps: f64,
     format: StreamFormat,
 ) -> Option<f64> {
     if !device_rate_hz.is_finite()
         || device_rate_hz <= 0.0
-        || !measured_byte_rate_hz.is_finite()
-        || measured_byte_rate_hz <= 0.0
+        || !measured_byte_rate_bps.is_finite()
+        || measured_byte_rate_bps <= 0.0
     {
         return None;
     }
     device_ladder(device_rate_hz)
         .into_iter()
-        .filter(|rate| rung_fits(*rate, format, measured_byte_rate_hz))
+        .filter(|rate| rung_fits(*rate, format, measured_byte_rate_bps))
         // As above: reduce over `max` rather than trusting the ladder's
         // fastest-first order.
         .reduce(f64::max)
@@ -260,7 +260,7 @@ pub fn max_sustainable_sample_rate_below(
 
 /// The widest usable bandwidth on the default-clock decimation ladder
 /// that fits
-/// `measured_byte_rate_hz`, in Hz, for the [`DEFAULT_LINK_FORMAT`].
+/// `measured_byte_rate_bps`, in Hz, for the [`DEFAULT_LINK_FORMAT`].
 ///
 /// This is the usable (alias-free) bandwidth the rung delivers — the
 /// same quantity the operator's `--span` selects, so the answer can be
@@ -269,19 +269,19 @@ pub fn max_sustainable_sample_rate_below(
 /// came from.
 ///
 /// Returns `None` when nothing on the ladder fits.
-pub fn max_sustainable_bandwidth(measured_byte_rate_hz: f64) -> Option<f64> {
-    max_sustainable_bandwidth_for_format(measured_byte_rate_hz, DEFAULT_LINK_FORMAT)
+pub fn max_sustainable_bandwidth(measured_byte_rate_bps: f64) -> Option<f64> {
+    max_sustainable_bandwidth_for_format(measured_byte_rate_bps, DEFAULT_LINK_FORMAT)
 }
 
 /// The widest usable bandwidth on the default-clock decimation ladder
 /// that fits
-/// `measured_byte_rate_hz`, in Hz, for `format`.
+/// `measured_byte_rate_bps`, in Hz, for `format`.
 pub fn max_sustainable_bandwidth_for_format(
-    measured_byte_rate_hz: f64,
+    measured_byte_rate_bps: f64,
     format: StreamFormat,
 ) -> Option<f64> {
     Some(usable_bandwidth_hz(max_sustainable_sample_rate_for_format(
-        measured_byte_rate_hz,
+        measured_byte_rate_bps,
         format,
     )?))
 }

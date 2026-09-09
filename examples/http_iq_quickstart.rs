@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         url, freq, rate
     );
     let mut source = SpectranSource::new(config).await?;
-    let info = source.get_source_info();
+    let info = source.source_info();
     eprintln!("Stream started successfully. Info: {:?}", info);
 
     let mut stdout = std::io::stdout().lock();
