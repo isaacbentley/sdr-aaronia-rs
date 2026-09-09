@@ -856,7 +856,7 @@ impl HttpSource {
         let verdict = finished
             .zip(self.link_device_rate)
             .and_then(|(mut measured, rate)| {
-                measured.stream_sample_rate = Some(rate);
+                measured.stream_sample_rate_hz = Some(rate);
                 crate::link_budget::LinkBudgetVerdict::judge(
                     rate,
                     self.stream_format,
@@ -882,7 +882,7 @@ impl HttpSource {
             self.link_check = LinkCheck::armed();
             return;
         };
-        let rate = verdict.sample_rate;
+        let rate = verdict.sample_rate_hz;
         let bytes_per_sample = verdict.bytes_per_sample;
         let required = verdict.required_byte_rate;
 
@@ -920,12 +920,12 @@ impl HttpSource {
             return;
         }
 
-        let remedy = match (verdict.fit_sample_rate_hz, verdict.fit_span_hz) {
-            (Some(fit_rate), Some(fit_span)) => format!(
+        let remedy = match (verdict.fit_sample_rate_hz, verdict.fit_bandwidth_hz) {
+            (Some(fit_rate), Some(fit_bandwidth)) => format!(
                 "The widest span this path sustains is {:.3} MHz ({:.2} MS/s, {:.1} MB/s) — \
                  a rung of this device's own ladder; narrow the span to that, or put the \
                  RTSA host on a faster link.{format_hint}",
-                fit_span / 1e6,
+                fit_bandwidth / 1e6,
                 fit_rate / 1e6,
                 fit_rate * bytes_per_sample as f64 / 1e6,
             ),
@@ -1203,11 +1203,11 @@ impl HttpSource {
                     // so it always describes the span currently streaming.
                     let predicted = match &self.link_check {
                         LinkCheck::Done(Some(v)) if v.short => {
-                            let fix = match v.fit_span_hz {
-                                Some(span) => {
+                            let fix = match v.fit_bandwidth_hz {
+                                Some(bandwidth) => {
                                     format!(
                                         " — narrowing to {:.3} MHz of span would fit",
-                                        span / 1e6
+                                        bandwidth / 1e6
                                     )
                                 }
                                 None => String::new(),
@@ -1219,7 +1219,7 @@ impl HttpSource {
                                  arriving as lost signal.",
                                 v.measured.byte_rate / 1e6,
                                 v.required_byte_rate / 1e6,
-                                v.sample_rate / 1e6,
+                                v.sample_rate_hz / 1e6,
                             )
                         }
                         _ => String::new(),
@@ -2680,8 +2680,8 @@ mod tests {
         // The remedy is halved down from the device's own rate: 55 MB/s
         // carries the 7.68 MS/s rung, 6.144 MHz of span.
         assert_eq!(verdict.fit_sample_rate_hz, Some(7_680_000.0));
-        assert_eq!(verdict.fit_span_hz, Some(6_144_000.0));
-        assert_eq!(verdict.sample_rate, 15_360_000.0);
+        assert_eq!(verdict.fit_bandwidth_hz, Some(6_144_000.0));
+        assert_eq!(verdict.sample_rate_hz, 15_360_000.0);
         assert_eq!(verdict.required_byte_rate, 61_440_000.0);
 
         // Idempotent: a second call cannot produce a second warning, and
@@ -2736,7 +2736,10 @@ mod tests {
             !verdict.short,
             "a stream delivered at exactly the rate it needs is not a link problem",
         );
-        assert_eq!(verdict.fit_span_hz, None, "no remedy when nothing is wrong");
+        assert_eq!(
+            verdict.fit_bandwidth_hz, None,
+            "no remedy when nothing is wrong"
+        );
     }
 
     /// The stale-rate regression: the builder's default 1 MS/s request is
@@ -2769,7 +2772,7 @@ mod tests {
              (measured {} B/s, required {} B/s)",
             verdict.measured.byte_rate, verdict.required_byte_rate,
         );
-        assert_eq!(verdict.sample_rate, 960_000.0);
+        assert_eq!(verdict.sample_rate_hz, 960_000.0);
     }
 
     /// An external retune (RTSA GUI/API — nothing restarts this stream)
@@ -3167,7 +3170,7 @@ mod tests {
             .link_budget
             .expect("the verdict must be published on StreamStats");
         assert!(verdict.short);
-        assert_eq!(verdict.fit_span_hz, Some(6_144_000.0));
+        assert_eq!(verdict.fit_bandwidth_hz, Some(6_144_000.0));
 
         // What the restart_pending path does before reconnecting.
         block.link_check = LinkCheck::Unmeasured;

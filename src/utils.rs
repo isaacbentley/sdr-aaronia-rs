@@ -557,15 +557,15 @@ pub fn decimation_index_for_bandwidth(bandwidth_hz: f64) -> usize {
     decimation_index_for_rate(iq_sample_rate_for_bandwidth(bandwidth_hz))
 }
 
-/// Hardware constraint for IQ Mode: the configured span frequency
-/// must satisfy `span_freq * IQ_RATE_CLOCK_RATIO ≤ receiver_clock`.
+/// Hardware constraint for IQ Mode: the configured sample rate must
+/// satisfy `sample_rate_hz * IQ_RATE_CLOCK_RATIO ≤ receiver_clock`.
 /// Misconfigurations cause the SDK to silently emit corrupted samples;
 /// reject them at the API boundary instead.
-pub fn validate_iq_mode(span_freq_hz: f64, receiver_clock_hz: f64) -> Result<()> {
-    if !span_freq_hz.is_finite() || span_freq_hz <= 0.0 {
+pub fn validate_iq_mode(sample_rate_hz: f64, receiver_clock_hz: f64) -> Result<()> {
+    if !sample_rate_hz.is_finite() || sample_rate_hz <= 0.0 {
         return Err(Error::Config(format!(
-            "span_frequency must be a finite positive number (got {})",
-            span_freq_hz
+            "sample rate must be a finite positive number (got {})",
+            sample_rate_hz
         )));
     }
     if !receiver_clock_hz.is_finite() || receiver_clock_hz <= 0.0 {
@@ -574,14 +574,14 @@ pub fn validate_iq_mode(span_freq_hz: f64, receiver_clock_hz: f64) -> Result<()>
             receiver_clock_hz
         )));
     }
-    let max_span = receiver_clock_hz / IQ_RATE_CLOCK_RATIO;
-    if span_freq_hz > max_span {
+    let max_sample_rate_hz = receiver_clock_hz / IQ_RATE_CLOCK_RATIO;
+    if sample_rate_hz > max_sample_rate_hz {
         return Err(Error::Config(format!(
-            "IQ Mode constraint violated: span_frequency {:.3} MHz exceeds \
-             receiver_clock / {IQ_RATE_CLOCK_RATIO} = {:.3} MHz. Lower the span \
+            "IQ Mode constraint violated: sample rate {:.3} MHz exceeds \
+             receiver_clock / {IQ_RATE_CLOCK_RATIO} = {:.3} MHz. Lower the sample rate \
              or raise the receiver clock.",
-            span_freq_hz / 1e6,
-            max_span / 1e6
+            sample_rate_hz / 1e6,
+            max_sample_rate_hz / 1e6
         )));
     }
     Ok(())

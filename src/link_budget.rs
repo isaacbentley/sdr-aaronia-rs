@@ -60,14 +60,14 @@
 //! `0.0` that a comparison would silently wave through.
 //!
 //! ```
-//! use sdr_aaronia_rs::link_budget::{max_sustainable_span, required_byte_rate};
+//! use sdr_aaronia_rs::link_budget::{max_sustainable_bandwidth, required_byte_rate};
 //!
 //! // 15.36 MS/s at 4 bytes a sample.
 //! assert_eq!(required_byte_rate(15_360_000.0), Some(61_440_000.0));
 //!
 //! // A path measured at 75 MB/s (WiFi 7, station to station) carries the
 //! // 15.36 MS/s rung and nothing above it: 12.288 MHz of usable span.
-//! assert_eq!(max_sustainable_span(75_000_000.0), Some(12_288_000.0));
+//! assert_eq!(max_sustainable_bandwidth(75_000_000.0), Some(12_288_000.0));
 //! ```
 //!
 //! The end-to-end probe is [`measure_link_throughput`]. Deliberately
@@ -258,23 +258,25 @@ pub fn max_sustainable_sample_rate_below(
         .reduce(f64::max)
 }
 
-/// The widest span on the default-clock decimation ladder that fits
+/// The widest usable bandwidth on the default-clock decimation ladder
+/// that fits
 /// `measured_byte_rate_hz`, in Hz, for the [`DEFAULT_LINK_FORMAT`].
 ///
-/// "Span" here is the usable (alias-free) bandwidth the rung delivers —
-/// the same quantity `--span` selects, so the answer can be handed
-/// straight back to the operator. Round-trips: feeding it to
+/// This is the usable (alias-free) bandwidth the rung delivers — the
+/// same quantity the operator's `--span` selects, so the answer can be
+/// handed straight back. Round-trips: feeding it to
 /// [`crate::utils::iq_sample_rate_for_bandwidth`] returns the rung it
 /// came from.
 ///
 /// Returns `None` when nothing on the ladder fits.
-pub fn max_sustainable_span(measured_byte_rate_hz: f64) -> Option<f64> {
-    max_sustainable_span_for_format(measured_byte_rate_hz, DEFAULT_LINK_FORMAT)
+pub fn max_sustainable_bandwidth(measured_byte_rate_hz: f64) -> Option<f64> {
+    max_sustainable_bandwidth_for_format(measured_byte_rate_hz, DEFAULT_LINK_FORMAT)
 }
 
-/// The widest span on the default-clock decimation ladder that fits
+/// The widest usable bandwidth on the default-clock decimation ladder
+/// that fits
 /// `measured_byte_rate_hz`, in Hz, for `format`.
-pub fn max_sustainable_span_for_format(
+pub fn max_sustainable_bandwidth_for_format(
     measured_byte_rate_hz: f64,
     format: StreamFormat,
 ) -> Option<f64> {
@@ -320,7 +322,7 @@ pub struct ThroughputMeasurement {
     /// measurement of 4 MB/s taken while the device streamed 1 MS/s says
     /// nothing about a gigabit link; the same 4 MB/s while the device
     /// streamed 15.36 MS/s says the path is failing badly.
-    pub stream_sample_rate: Option<f64>,
+    pub stream_sample_rate_hz: Option<f64>,
 }
 
 impl ThroughputMeasurement {
@@ -329,8 +331,8 @@ impl ThroughputMeasurement {
         self.byte_rate / 1e6
     }
 
-    /// The widest span this measurement proves the path can carry, in Hz,
-    /// for a capture in `format` — see [`max_sustainable_span_for_format`],
+    /// The widest usable bandwidth this measurement proves the path can carry, in Hz,
+    /// for a capture in `format` — see [`max_sustainable_bandwidth_for_format`],
     /// and note "proves": if the device was streaming narrower than the
     /// link could carry, this is a floor on the answer rather than the
     /// answer. `None` when nothing on the ladder fits.
@@ -341,8 +343,8 @@ impl ThroughputMeasurement {
     /// but only 7.68 MS/s in `float32`. Pass the format the capture will
     /// use — normally the same one handed to
     /// [`measure_link_throughput_with`].
-    pub fn max_sustainable_span_hz(&self, format: StreamFormat) -> Option<f64> {
-        max_sustainable_span_for_format(self.byte_rate, format)
+    pub fn max_sustainable_bandwidth(&self, format: StreamFormat) -> Option<f64> {
+        max_sustainable_bandwidth_for_format(self.byte_rate, format)
     }
 }
 
@@ -372,7 +374,7 @@ impl std::fmt::Display for ThroughputMeasurement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkBudgetVerdict {
     /// Device-reported sample rate the check compared against, in Hz.
-    pub sample_rate: f64,
+    pub sample_rate_hz: f64,
     /// Wire format the requirement was computed for.
     pub format: StreamFormat,
     /// Bytes one IQ sample occupies in [`Self::format`] — denormalized
@@ -393,8 +395,8 @@ pub struct LinkBudgetVerdict {
     /// on its ladder. `None` when the path is not short, or when nothing
     /// fits.
     pub fit_sample_rate_hz: Option<f64>,
-    /// The usable span [`Self::fit_sample_rate_hz`] delivers, in Hz.
-    pub fit_span_hz: Option<f64>,
+    /// The usable bandwidth [`Self::fit_sample_rate_hz`] delivers, in Hz.
+    pub fit_bandwidth_hz: Option<f64>,
 }
 
 impl LinkBudgetVerdict {
@@ -429,14 +431,14 @@ impl LinkBudgetVerdict {
             None
         };
         Some(Self {
-            sample_rate: sample_rate_hz,
+            sample_rate_hz,
             format,
             bytes_per_sample,
             required_byte_rate: required,
             measured,
             short,
             fit_sample_rate_hz,
-            fit_span_hz: fit_sample_rate_hz.map(usable_bandwidth_hz),
+            fit_bandwidth_hz: fit_sample_rate_hz.map(usable_bandwidth_hz),
         })
     }
 }
@@ -572,7 +574,7 @@ impl ThroughputMeter {
             window,
             settle: mark.saturating_duration_since(self.opened),
             settle_bytes: self.discarded_bytes,
-            stream_sample_rate: None,
+            stream_sample_rate_hz: None,
         })
     }
 }
@@ -661,7 +663,7 @@ impl RateSniffer {
 /// can deliver.** If the device is tuned to 1 MS/s the answer is 4 MB/s
 /// and says nothing about a gigabit link. To measure a ceiling, set the
 /// device at or above the span being planned first, then read
-/// [`ThroughputMeasurement::stream_sample_rate`] to confirm the path was
+/// [`ThroughputMeasurement::stream_sample_rate_hz`] to confirm the path was
 /// actually loaded.
 ///
 /// Read-only: it opens `/stream` and nothing else. It does not start the
@@ -755,7 +757,7 @@ pub async fn measure_link_throughput_with(
     // is dropped. `None` once the rate is known or the scan budget is
     // spent, so the steady-state loop does nothing but count.
     let mut sniffer: Option<RateSniffer> = Some(RateSniffer::new());
-    let mut stream_sample_rate = None;
+    let mut stream_sample_rate_hz = None;
     let mut stream_ended = false;
 
     loop {
@@ -780,13 +782,13 @@ pub async fn measure_link_throughput_with(
             let found = s.feed(&chunk);
             let budget_spent = s.budget_spent();
             if found.is_some() {
-                stream_sample_rate = found;
+                stream_sample_rate_hz = found;
                 sniffer = None;
             } else if budget_spent {
                 debug!(
                     "No RTSA packet header with a positive sample rate in the first \
                      {PROBE_HEADER_SCAN_BYTES} bytes from {url}; measuring bytes only \
-                     (stream_sample_rate will be None)"
+                     (stream_sample_rate_hz will be None)"
                 );
                 sniffer = None;
             }
@@ -800,7 +802,7 @@ pub async fn measure_link_throughput_with(
     match meter.finish() {
         Some(m) => {
             let m = ThroughputMeasurement {
-                stream_sample_rate,
+                stream_sample_rate_hz,
                 ..m
             };
             debug!("Link throughput probe of {url}: {m}");
@@ -895,7 +897,7 @@ mod tests {
         // measured working and does not cover the --span 20M that was
         // measured failing.
         let measured = 0.95 * 122_880_000.0;
-        let advice = max_sustainable_span(measured).expect("some rung fits");
+        let advice = max_sustainable_bandwidth(measured).expect("some rung fits");
         assert_eq!(advice, 12_288_000.0);
         assert!(advice >= 10e6, "--span 10M must still be offered");
         assert!(advice < 20e6, "--span 20M must not be offered");
@@ -911,7 +913,7 @@ mod tests {
             max_sustainable_sample_rate_for_format(75e6, DEFAULT_LINK_FORMAT),
             Some(15_360_000.0)
         );
-        assert_eq!(max_sustainable_span(75e6), Some(12_288_000.0));
+        assert_eq!(max_sustainable_bandwidth(75e6), Some(12_288_000.0));
 
         // The original link, ~57 MB/s: not enough for 15.36 MS/s, so the
         // honest answer is a rung lower.
@@ -919,26 +921,26 @@ mod tests {
             max_sustainable_sample_rate_for_format(57e6, DEFAULT_LINK_FORMAT),
             Some(7_680_000.0)
         );
-        assert_eq!(max_sustainable_span(57e6), Some(6_144_000.0));
+        assert_eq!(max_sustainable_bandwidth(57e6), Some(6_144_000.0));
     }
 
     /// The inversion has to land on the ladder, not near it: every span
     /// it names must round-trip to a rung that genuinely fits, and the
     /// next rung up must genuinely not.
     #[test]
-    fn max_sustainable_span_round_trips_through_the_ladder() {
+    fn max_sustainable_bandwidth_round_trips_through_the_ladder() {
         for measured in [
             0.5e6, 1e6, 5e6, 12e6, 30e6, 57e6, 61.44e6, 75e6, 122e6, 125e6, 250e6, 1e9,
         ] {
-            let span = max_sustainable_span(measured)
+            let bandwidth = max_sustainable_bandwidth(measured)
                 .unwrap_or_else(|| panic!("{measured} B/s should fit some rung"));
 
-            // The span names a rung, and that rung fits the measurement.
-            let rate = iq_sample_rate_for_bandwidth(span);
+            // The bandwidth names a rung, and that rung fits the measurement.
+            let rate = iq_sample_rate_for_bandwidth(bandwidth);
             assert_eq!(
                 Some(rate),
                 max_sustainable_sample_rate_for_format(measured, DEFAULT_LINK_FORMAT),
-                "span {span} must round-trip to the rung it came from",
+                "bandwidth {bandwidth} must round-trip to the rung it came from",
             );
             assert!(
                 required_byte_rate(rate).unwrap() <= measured,
@@ -963,17 +965,17 @@ mod tests {
     /// A link too narrow for the slowest rung gets no recommendation at
     /// all, rather than a span of zero dressed up as advice.
     #[test]
-    fn max_sustainable_span_reports_nothing_when_no_rung_fits() {
+    fn max_sustainable_bandwidth_reports_nothing_when_no_rung_fits() {
         // The slowest rung is 120 kS/s = 480 kB/s.
-        assert_eq!(max_sustainable_span(479_999.0), None);
-        assert_eq!(max_sustainable_span(480_000.0), Some(96_000.0));
-        assert_eq!(max_sustainable_span(0.0), None);
-        assert_eq!(max_sustainable_span(-1.0), None);
-        assert_eq!(max_sustainable_span(f64::NAN), None);
+        assert_eq!(max_sustainable_bandwidth(479_999.0), None);
+        assert_eq!(max_sustainable_bandwidth(480_000.0), Some(96_000.0));
+        assert_eq!(max_sustainable_bandwidth(0.0), None);
+        assert_eq!(max_sustainable_bandwidth(-1.0), None);
+        assert_eq!(max_sustainable_bandwidth(f64::NAN), None);
         // JSON has no computable per-sample size, so no rung can be
         // shown to fit.
         assert_eq!(
-            max_sustainable_span_for_format(1e9, StreamFormat::Json),
+            max_sustainable_bandwidth_for_format(1e9, StreamFormat::Json),
             None
         );
     }
@@ -1080,7 +1082,7 @@ mod tests {
         // The reported settle is the interval actually discarded — up to
         // the mark at t=600 ms, not the configured 500 ms.
         assert_eq!(m.settle, Duration::from_millis(600));
-        assert_eq!(m.stream_sample_rate, None, "no packet header was parsed");
+        assert_eq!(m.stream_sample_rate_hz, None, "no packet header was parsed");
     }
 
     /// The same trace with no settle window, to show the defect is real
@@ -1235,7 +1237,7 @@ mod tests {
             window: Duration::from_secs(2),
             settle: Duration::from_millis(500),
             settle_bytes: 21_400_000,
-            stream_sample_rate: Some(15_360_000.0),
+            stream_sample_rate_hz: Some(15_360_000.0),
         };
         let s = m.to_string();
         assert!(s.contains("57.3 MB/s"), "{s}");
@@ -1246,7 +1248,7 @@ mod tests {
         // 57.3 MB/s is short of the 61.44 the stream needed, and the
         // advice reflects it.
         assert_eq!(
-            m.max_sustainable_span_hz(DEFAULT_LINK_FORMAT),
+            m.max_sustainable_bandwidth(DEFAULT_LINK_FORMAT),
             Some(6_144_000.0)
         );
     }
@@ -1451,7 +1453,7 @@ mod tests {
         assert!(m.window >= Duration::from_millis(200), "{:?}", m.window);
         // Nothing in that stream is an RTSA packet, so no rate is
         // claimed — and the byte measurement stands regardless.
-        assert_eq!(m.stream_sample_rate, None);
+        assert_eq!(m.stream_sample_rate_hz, None);
     }
 
     /// A server that hangs up before the window closes is an error, not

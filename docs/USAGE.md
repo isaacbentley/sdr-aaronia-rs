@@ -124,7 +124,7 @@ breaks digital symbol timing.
 `link_budget` answers the question before the capture rather than after:
 
 ```rust
-use sdr_aaronia_rs::link_budget::{max_sustainable_span, required_byte_rate};
+use sdr_aaronia_rs::link_budget::{max_sustainable_bandwidth, required_byte_rate};
 
 // What a span costs, via the ladder.
 let rate = sdr_aaronia_rs::iq_sample_rate_for_bandwidth(10e6);       // 15.36 MS/s
@@ -133,7 +133,7 @@ assert_eq!(required_byte_rate(rate), Some(61_440_000.0));            // 61.4 MB/
 // What a measured path affords, as a span you can pass to --span.
 // `None` would mean no rung fits (or no budget can be computed at all,
 // e.g. for the JSON format) — never a 0.0 a comparison could wave through.
-assert_eq!(max_sustainable_span(75_000_000.0), Some(12_288_000.0));  // 12.288 MHz
+assert_eq!(max_sustainable_bandwidth(75_000_000.0), Some(12_288_000.0));  // 12.288 MHz
 ```
 
 To measure the path rather than assume it, stream from the server and
@@ -152,7 +152,7 @@ let m = measure_link_throughput("http://localhost:54664", Duration::from_secs(3)
 println!("{m}");                                   // rate, window, settle discarded
 println!(
     "widest span: {:?} Hz",
-    m.max_sustainable_span_hz(DEFAULT_LINK_FORMAT)
+    m.max_sustainable_bandwidth(DEFAULT_LINK_FORMAT)
 );
 # Ok(())
 # }
@@ -165,7 +165,7 @@ settle window, for servers whose connect backlog outlasts the default.
 
 It measures what the path *delivered*, which is a floor on what it can
 deliver: point the device at or above the span being planned first, and
-check `ThroughputMeasurement::stream_sample_rate` to confirm the path was
+check `ThroughputMeasurement::stream_sample_rate_hz` to confirm the path was
 actually loaded. An unreachable server or an idle mission is an error,
 never a rate — "0 MB/s" would condemn every span on the ladder.
 
