@@ -109,8 +109,8 @@ a stale header would go on reading the right bytes under the wrong name.
 | `aaronia_source_get_gps_time(.., double*)` | `spectran_source_get_gps_time_ns(.., int64_t*)` |
 
 The two `read_sensors` are a verb change, not a unit one. `read_` advances a
-stream here (`aaronia_source_read_samples`); sensors are a snapshot, so they
-join `aaronia_source_get_capabilities`.
+stream here (`spectran_source_read_samples`); sensors are a snapshot, so they
+join `spectran_source_get_capabilities`.
 
 **GPS time changes type as well as name.** `gps_time_ns() -> Option<i64>`, and
 `int64_t*` in C, matching `last_timestamp_ns`. The conversion moved into the
@@ -139,7 +139,7 @@ field name, so a later rename cannot change the wire format by accident.
   `Oscillator`, `GPS`, `PPS`, `10MHz` and three `... Provider` variants. It was
   readable but read-only, and SoapySDR's `setClockSource` merely logged a
   warning telling the operator to change it in RTSA-Suite.
-  `SpectranSource::set_clock_source`, `aaronia_source_set_clock_source` and the
+  `SpectranSource::set_clock_source`, `spectran_source_set_clock_source` and the
   plugin's `setClockSource` now write it on both backends — native SDK via
   `ConfigSetString`, HTTP via a `simpleconfig` PUT that is read back to confirm,
   because a `/remoteconfig` PUT naming a block outside the running mission

@@ -1,5 +1,5 @@
-#ifndef AARONIA_H
-#define AARONIA_H
+#ifndef SPECTRAN_H
+#define SPECTRAN_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -237,11 +237,11 @@ typedef struct SpectranSink SpectranSink; // Opaque UnifiedSink
 // TX packet-boundary flags for spectran_sink_write_samples. Pass
 // START|END|PUSH for a self-contained burst; continuous multi-packet
 // streams mark only the first/last packet.
-#define AARONIA_TX_STREAM_START  ((uint64_t)0x00000001)
-#define AARONIA_TX_STREAM_END    ((uint64_t)0x00000002)
-#define AARONIA_TX_SEGMENT_START ((uint64_t)0x00000004)
-#define AARONIA_TX_SEGMENT_END   ((uint64_t)0x00000008)
-#define AARONIA_TX_PUSH          ((uint64_t)0x00008000)
+#define SPECTRAN_TX_STREAM_START  ((uint64_t)0x00000001)
+#define SPECTRAN_TX_STREAM_END    ((uint64_t)0x00000002)
+#define SPECTRAN_TX_SEGMENT_START ((uint64_t)0x00000004)
+#define SPECTRAN_TX_SEGMENT_END   ((uint64_t)0x00000008)
+#define SPECTRAN_TX_PUSH          ((uint64_t)0x00008000)
 
 // True when this build carries the native-SDK transmit path. Ask before
 // advertising a TX capability: spectran_sink_build succeeds everywhere,
@@ -306,4 +306,4 @@ char* spectran_last_error(void);
 }
 #endif
 
-#endif // AARONIA_H
+#endif // SPECTRAN_H

@@ -2230,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aaronia_config_default() {
+    fn test_spectran_config_default() {
         // Test default configuration values
         let config = SpectranConfig::default();
 
@@ -2247,7 +2247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aaronia_config_receiver_channel_builder() {
+    fn test_spectran_config_receiver_channel_builder() {
         let config = SpectranConfig::default()
             .force_native_sdk()
             .receiver_channel(RxChannel::Rx1And2);
@@ -2258,7 +2258,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aaronia_config_from_file() {
+    fn test_spectran_config_from_file() {
         // Test file configuration creation
         let file_path = "/path/to/test.rtsa";
         let config = SpectranConfig::from_file(file_path);
@@ -2269,7 +2269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aaronia_config_from_http() {
+    fn test_spectran_config_from_http() {
         // Test HTTP configuration creation
         let base_url = "http://rtsa-device:54664";
         let config = SpectranConfig::from_http(base_url);
@@ -2280,7 +2280,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aaronia_config_builder_methods() {
+    fn test_spectran_config_builder_methods() {
         // Test configuration builder pattern methods
         let config = SpectranConfig::default()
             .center_frequency_hz(915e6)
@@ -2297,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aaronia_source_builder_creation() {
+    fn test_spectran_source_builder_creation() {
         // Test builder creation and default values
         let builder = SpectranSourceBuilder::new();
         assert_eq!(builder.config.center_frequency_hz, 2.44e9);
@@ -2308,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aaronia_source_builder_configuration() {
+    fn test_spectran_source_builder_configuration() {
         // Test builder configuration methods
         let mut builder = SpectranSourceBuilder::new();
         builder
@@ -2331,7 +2331,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aaronia_source_builder_file_source() {
+    fn test_spectran_source_builder_file_source() {
         // Test file source configuration
         let test_path = "/tmp/test_recording.rtsa";
         let mut builder = SpectranSourceBuilder::new();

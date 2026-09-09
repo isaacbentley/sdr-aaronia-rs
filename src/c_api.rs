@@ -187,7 +187,7 @@ pub struct FfiSourceInfo {
 
 // --- SpectranSourceBuilder FFI --- //
 
-/// Aaronia source builder new.
+/// Create a Spectran source builder.
 #[unsafe(no_mangle)]
 pub extern "C" fn spectran_source_builder_new() -> *mut SpectranSourceBuilder {
     Box::into_raw(Box::new(SpectranSourceBuilder::new()))
@@ -1672,8 +1672,8 @@ pub unsafe extern "C" fn spectran_get_error_message(
         x if x == SpectranFfiError::NullPointer as i32 => "Null pointer provided",
         x if x == SpectranFfiError::InvalidString as i32 => "Invalid UTF-8 string provided",
         x if x == SpectranFfiError::InternalError as i32 => "Internal Rust error",
-        x if x == SpectranFfiError::BuildFailed as i32 => "Failed to build Aaronia source",
-        x if x == SpectranFfiError::ReadError as i32 => "Failed to read from Aaronia source",
+        x if x == SpectranFfiError::BuildFailed as i32 => "Failed to build Spectran source",
+        x if x == SpectranFfiError::ReadError as i32 => "Failed to read from Spectran source",
         x if x == SpectranFfiError::RuntimeContext as i32 => {
             "Called from a thread context that cannot block (current-thread tokio runtime)"
         }
@@ -1887,7 +1887,7 @@ pub unsafe extern "C" fn spectran_sink_stop_streaming(ptr: *mut c_void) -> Spect
 ///
 /// `start_time_s`/`end_time_s` are in device **master stream time**
 /// seconds; `flags` are `tx_flags` packet-boundary bits (pass
-/// `AARONIA_TX_SEGMENT_START | AARONIA_TX_SEGMENT_END | AARONIA_TX_PUSH`
+/// `SPECTRAN_TX_SEGMENT_START | SPECTRAN_TX_SEGMENT_END | SPECTRAN_TX_PUSH`
 /// for a self-contained burst). Samples use the same
 /// [`FfiComplex`] layout as the read path — the header no longer uses
 /// C99 `_Complex`, which MSVC rejects in C++.
@@ -2239,7 +2239,7 @@ mod tests {
     /// confirm the message mentions the right function. Then call a
     /// successful no-op (a null free), confirm the slot was cleared.
     #[test]
-    fn test_aaronia_last_error_roundtrip() {
+    fn test_spectran_last_error_roundtrip() {
         unsafe {
             // Trigger a null-pointer failure from a fallible FFI entry
             // point. `spectran_source_start_streaming` is convenient

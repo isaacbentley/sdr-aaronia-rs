@@ -74,7 +74,7 @@ fn control_put_tuning_to(freq: f64) -> impl Fn(&wiremock::Request) -> bool {
 }
 
 #[test]
-fn test_aaronia_sdr_source_creation() {
+fn test_spectran_sdr_source_creation() {
     let backend = SpectranBackend::Http("http://example.com".to_string());
 
     let source = SpectranSdrSource {

@@ -61,7 +61,7 @@ fn test_c_api_endpoints_client_lifecycle() {
 }
 
 #[test]
-fn test_aaronia_get_error_message() {
+fn test_spectran_get_error_message() {
     unsafe {
         let msg_ptr = spectran_get_error_message(SpectranFfiError::NullPointer as i32);
         assert!(!msg_ptr.is_null());

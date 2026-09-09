@@ -389,7 +389,7 @@ int SpectranSoapyDevice::writeStream(
     // immediate transmission (times relative to "now" in the device
     // clock are handled by the PUSH flag path in the SDK).
     const uint64_t burstFlags =
-        AARONIA_TX_SEGMENT_START | AARONIA_TX_SEGMENT_END | AARONIA_TX_PUSH;
+        SPECTRAN_TX_SEGMENT_START | SPECTRAN_TX_SEGMENT_END | SPECTRAN_TX_PUSH;
 
     SpectranFfiError err = spectran_sink_write_samples(
         _sink,
