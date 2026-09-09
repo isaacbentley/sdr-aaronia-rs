@@ -34,7 +34,7 @@ pub struct UnifiedSinkConfig {
     pub device_type: String,
     /// TX center frequency in Hz.
     pub center_frequency_hz: f64,
-    /// IQ sample rate (span) in Hz.
+    /// IQ sample rate (Fs) in Hz.
     pub sample_rate_hz: f64,
     /// Transmission gain in dB (typically 0.0 to -120.0).
     pub trans_gain_db: f64,
@@ -299,7 +299,7 @@ impl AaroniaSinkBuilder {
         self
     }
 
-    /// Set the IQ sample rate (span) in Hz.
+    /// Set the IQ sample rate (Fs) in Hz.
     #[must_use]
     pub fn sample_rate_hz(mut self, hz: f64) -> Self {
         self.config.sample_rate_hz = hz;

@@ -389,7 +389,7 @@ pub struct LinkBudgetVerdict {
     /// Whether delivery fell short of the requirement beyond measurement
     /// tolerance.
     pub short: bool,
-    /// On a shortfall, the fastest rate at or below [`Self::sample_rate`]
+    /// On a shortfall, the fastest rate at or below [`Self::sample_rate_hz`]
     /// whose stream fits the measurement — halved down from the device's
     /// own rate via [`max_sustainable_sample_rate_below`], so it exists
     /// on its ladder. `None` when the path is not short, or when nothing

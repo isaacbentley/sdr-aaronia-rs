@@ -18,9 +18,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or("http://localhost:54664");
 
     let config = AaroniaConfig::from_http(url)
-        .center_frequency(freq)
+        .center_frequency_hz(freq)
         .sample_rate_hz(rate)
-        .reference_level(-20.0);
+        .reference_level_dbm(-20.0);
 
     eprintln!(
         "Connecting to HTTP stream at {} (freq={} rate={})...",

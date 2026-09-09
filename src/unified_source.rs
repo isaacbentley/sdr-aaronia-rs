@@ -129,9 +129,9 @@ fn should_reconnect(auto_reconnect: bool, attempts: &mut u32) -> bool {
 /// configured at startup.
 #[derive(Debug, Clone, Copy)]
 struct CaptureTuning {
-    center: f64,
-    span: f64,
-    reference_level: f64,
+    center_frequency_hz: f64,
+    sample_rate_hz: f64,
+    reference_level_dbm: f64,
 }
 
 /// Hard ceiling on the total time spent retrying, measured from the
@@ -210,23 +210,25 @@ where
 /// Configuration for the unified Aaronia source
 #[derive(Debug, Clone)]
 pub struct AaroniaConfig {
-    /// Center frequency in Hz
-    pub center_frequency: f64,
-    /// IQ **sample rate** (Fs) in Hz. Named "span" for historical
-    /// Aaronia-API reasons, but in IQ mode this is the sample rate, not
-    /// the occupied RF bandwidth — the alias-free RX bandwidth is
-    /// strictly smaller (see [`bandwidth_hz`](Self::bandwidth_hz)).
-    pub span_frequency: f64,
+    /// Centre frequency in Hz
+    pub center_frequency_hz: f64,
+    /// IQ **sample rate** (Fs) in Hz. The device key behind it is
+    /// `spanfreq`, but in IQ mode that key selects a rate off the
+    /// decimation ladder rather than an occupied RF bandwidth — the
+    /// alias-free RX bandwidth is strictly smaller (see
+    /// [`bandwidth_hz`](field@Self::bandwidth_hz)).
+    pub sample_rate_hz: f64,
     /// Usable **RX / real-time bandwidth** in Hz: the alias-free RF span
-    /// actually captured. Strictly less than the sample rate
-    /// `span_frequency` — the anti-alias filter rolls off the remaining
-    /// fraction, measured at 0.8 of the rate on a V6 ECO (49.152 MHz
-    /// usable inside a 61.44 MHz Fs capture).
+    /// actually captured. Strictly less than
+    /// [`sample_rate_hz`](field@Self::sample_rate_hz) — the anti-alias
+    /// filter rolls off the remaining fraction, measured at 0.8 of the
+    /// rate on a V6 ECO (49.152 MHz usable inside a 61.44 MHz Fs
+    /// capture).
     /// `0.0` means "unknown" (a live backend that hasn't reported it);
     /// file sources populate it from the RTSA sub-stream span.
     pub bandwidth_hz: f64,
     /// Reference level in dBm
-    pub reference_level: f64,
+    pub reference_level_dbm: f64,
     /// Device serial number (optional, uses first available if None)
     pub device_serial: Option<String>,
     /// HTTP base URL (for HTTP sources)
@@ -273,10 +275,10 @@ pub struct AaroniaConfig {
 impl Default for AaroniaConfig {
     fn default() -> Self {
         Self {
-            center_frequency: 2.44e9, // 2.44 GHz (ISM band)
-            span_frequency: 15.36e6,  // 15.36 MHz sample rate
-            bandwidth_hz: 0.0,        // unknown until a source reports it
-            reference_level: -20.0,   // -20 dBm
+            center_frequency_hz: 2.44e9, // 2.44 GHz (ISM band)
+            sample_rate_hz: 15.36e6,     // 15.36 MHz sample rate
+            bandwidth_hz: 0.0,           // unknown until a source reports it
+            reference_level_dbm: -20.0,  // -20 dBm
             device_serial: None,
             http_base_url: None,
             file_path: None,
@@ -316,30 +318,29 @@ impl AaroniaConfig {
         self
     }
 
-    /// Set the center frequency
+    /// Set the centre frequency in Hz.
     #[must_use]
-    pub fn center_frequency(mut self, freq: f64) -> Self {
-        self.center_frequency = freq;
+    pub fn center_frequency_hz(mut self, hz: f64) -> Self {
+        self.center_frequency_hz = hz;
         self
     }
 
-    /// Set the span frequency
+    /// Set the IQ sample rate in Hz.
+    ///
+    /// Before 0.10 this knob was also spelled `span_frequency`, which
+    /// named the same quantity: the request selects a rate off the
+    /// device's decimation ladder, and the HTTP backend delivers exactly
+    /// it. One name now.
     #[must_use]
-    pub fn span_frequency(mut self, freq: f64) -> Self {
-        self.span_frequency = freq;
+    pub fn sample_rate_hz(mut self, hz: f64) -> Self {
+        self.sample_rate_hz = hz;
         self
     }
 
-    /// Set the sample rate (alias for `span_frequency`)
+    /// Set the reference level in dBm.
     #[must_use]
-    pub fn sample_rate_hz(self, freq: f64) -> Self {
-        self.span_frequency(freq)
-    }
-
-    /// Set the reference level
-    #[must_use]
-    pub fn reference_level(mut self, level: f64) -> Self {
-        self.reference_level = level;
+    pub fn reference_level_dbm(mut self, dbm: f64) -> Self {
+        self.reference_level_dbm = dbm;
         self
     }
 
@@ -550,7 +551,7 @@ impl AaroniaSource {
         // subject to it.
         match source_type {
             SourceType::Http => {
-                validate_iq_mode(config.span_frequency, DEFAULT_RECEIVER_CLOCK_HZ)?;
+                validate_iq_mode(config.sample_rate_hz, DEFAULT_RECEIVER_CLOCK_HZ)?;
             }
             SourceType::NativeSdk | SourceType::File => {}
         }
@@ -741,9 +742,9 @@ impl AaroniaSource {
             // re-applies it automatically.
             source.open_device(&open_mode, &serial_wide)?;
             source.configure_iq_receiver(
-                self.config.center_frequency,
-                self.config.span_frequency,
-                self.config.reference_level,
+                self.config.center_frequency_hz,
+                self.config.sample_rate_hz,
+                self.config.reference_level_dbm,
                 self.config.receiver_channel,
             )?;
 
@@ -777,18 +778,18 @@ impl AaroniaSource {
         // Tune the hardware to the requested frequency *before* opening the
         // stream.  Without this the `/stream` endpoint returns whatever the
         // RTSA Suite is already configured to, completely ignoring the
-        // caller's `center_frequency` / `span_frequency`.
+        // caller's `center_frequency_hz` / `sample_rate_hz`.
         info!(
-            "Tuning HTTP source to center={:.3} MHz, span={:.3} MHz, ref_level={} dBm",
-            self.config.center_frequency / 1e6,
-            self.config.span_frequency / 1e6,
-            self.config.reference_level,
+            "Tuning HTTP source to center={:.3} MHz, rate={:.3} MS/s, ref_level={} dBm",
+            self.config.center_frequency_hz / 1e6,
+            self.config.sample_rate_hz / 1e6,
+            self.config.reference_level_dbm,
         );
         retry_connect("Initial tuning", || {
             client.configure_capture(crate::http_endpoints::CaptureControl {
-                frequency_center_hz: Some(self.config.center_frequency),
-                frequency_span_hz: Some(self.config.span_frequency),
-                reference_level_dbm: Some(self.config.reference_level as f32),
+                frequency_center_hz: Some(self.config.center_frequency_hz),
+                frequency_span_hz: Some(self.config.sample_rate_hz),
+                reference_level_dbm: Some(self.config.reference_level_dbm as f32),
                 control_type: crate::http_endpoints::ControlType::Capture,
                 ..Default::default()
             })
@@ -822,9 +823,9 @@ impl AaroniaSource {
         // Tuning shared with the retune setters so a reconnect restores
         // what the caller most recently asked for.
         let tuning = Arc::new(Mutex::new(CaptureTuning {
-            center: self.config.center_frequency,
-            span: self.config.span_frequency,
-            reference_level: self.config.reference_level,
+            center_frequency_hz: self.config.center_frequency_hz,
+            sample_rate_hz: self.config.sample_rate_hz,
+            reference_level_dbm: self.config.reference_level_dbm,
         }));
         let tuning_for_task = tuning.clone();
         let observed = Arc::new(Mutex::new(ObservedStream::default()));
@@ -983,9 +984,9 @@ impl AaroniaSource {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Err(e) = client_for_task
                     .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center_hz: Some(desired.center),
-                        frequency_span_hz: Some(desired.span),
-                        reference_level_dbm: Some(desired.reference_level as f32),
+                        frequency_center_hz: Some(desired.center_frequency_hz),
+                        frequency_span_hz: Some(desired.sample_rate_hz),
+                        reference_level_dbm: Some(desired.reference_level_dbm as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
@@ -1038,7 +1039,7 @@ impl AaroniaSource {
         // so any absolute frequency a downstream consumer derives — e.g.
         // a DJI OcuSync detection — is meaningless.
         let meta = source.metadata();
-        self.config.span_frequency = meta.sample_rate_hz;
+        self.config.sample_rate_hz = meta.sample_rate_hz;
         // The RTSA sub-stream span is the usable RX bandwidth, distinct
         // from (and smaller than) the sample rate above. Surface it so
         // consumers don't mistake the sample rate for the captured RF
@@ -1049,7 +1050,7 @@ impl AaroniaSource {
         if let Some(center) = meta.center_frequency_hz
             && center > 0.0
         {
-            self.config.center_frequency = center;
+            self.config.center_frequency_hz = center;
         }
         self.file_source = Some(source);
 
@@ -1563,7 +1564,7 @@ impl AaroniaSource {
     ///
     /// - **HTTP**: wraps `HttpEndpointsClient::configure_capture`, a `PUT`
     ///   to the license-free `/control` endpoint, always sending the
-    ///   complete capture tuple (centre, span, reference level) with the
+    ///   complete capture tuple (centre, rate, reference level) with the
     ///   unchanged values taken from the cached config. The full tuple is
     ///   load-bearing: RTSA servers return `{"success":true}` for a
     ///   capture `PUT` that carries only one of the two frequency fields
@@ -1576,14 +1577,14 @@ impl AaroniaSource {
     ///   a `/remoteconfig` write-license check should call
     ///   [`Self::probe_remote_config_license`] separately.
     /// - **Native SDK**: re-issues `configure_iq_receiver` with the new
-    ///   centre frequency, the existing span, and the existing reference
+    ///   centre frequency, the existing sample rate, and the existing reference
     ///   level. The SDK config system applies the change to the open device
     ///   handle without a stream restart.
     /// - **File**: logs a warning and returns `Ok(())`. RTSA capture files
     ///   carry their own frequency in metadata; mid-stream retune is
     ///   meaningless. Hopping orchestrators shouldn't drive a file backend,
     ///   but the no-op keeps the abstraction tidy.
-    pub async fn set_center_frequency(&mut self, freq: f64) -> Result<()> {
+    pub async fn set_center_frequency_hz(&mut self, hz: f64) -> Result<()> {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
@@ -1593,9 +1594,9 @@ impl AaroniaSource {
                 if let Some(ref mut source) = self.native_source {
                     unsafe {
                         source.configure_iq_receiver(
-                            freq,
-                            self.config.span_frequency,
-                            self.config.reference_level,
+                            hz,
+                            self.config.sample_rate_hz,
+                            self.config.reference_level_dbm,
                             self.config.receiver_channel,
                         )?
                     };
@@ -1620,15 +1621,15 @@ impl AaroniaSource {
                 // Publish the intent *before* the PUT so a reconnect
                 // racing this call restores the frequency the caller
                 // asked for rather than the one it is replacing.
-                Self::publish_tuning(&self.http_tuning, |t| t.center = freq);
+                Self::publish_tuning(&self.http_tuning, |t| t.center_frequency_hz = hz);
                 // Full tuple, not just the changed field: the server
                 // ignores capture PUTs that lack frequencySpan (see the
                 // doc comment above).
                 client
                     .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center_hz: Some(freq),
-                        frequency_span_hz: Some(self.config.span_frequency),
-                        reference_level_dbm: Some(self.config.reference_level as f32),
+                        frequency_center_hz: Some(hz),
+                        frequency_span_hz: Some(self.config.sample_rate_hz),
+                        reference_level_dbm: Some(self.config.reference_level_dbm as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
@@ -1640,18 +1641,18 @@ impl AaroniaSource {
                 );
             }
         }
-        self.config.center_frequency = freq;
+        self.config.center_frequency_hz = hz;
         Ok(())
     }
 
-    /// Update the span frequency (sample rate) of the running source.
-    pub async fn set_span_frequency(&mut self, span: f64) -> Result<()> {
+    /// Update the IQ sample rate of the running source.
+    pub async fn set_sample_rate_hz(&mut self, hz: f64) -> Result<()> {
         // Enforce the IQ-mode constraint at runtime exactly as the
         // builder does at construction: without this, an out-of-range
         // runtime rate was shipped to the server unchecked, the request
         // was silently clamped device-side, and the cached value made
         // the plugin report a rate the hardware wasn't producing.
-        validate_iq_mode(span, DEFAULT_RECEIVER_CLOCK_HZ)?;
+        validate_iq_mode(hz, DEFAULT_RECEIVER_CLOCK_HZ)?;
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
@@ -1661,9 +1662,9 @@ impl AaroniaSource {
                 if let Some(ref mut source) = self.native_source {
                     unsafe {
                         source.configure_iq_receiver(
-                            self.config.center_frequency,
-                            span,
-                            self.config.reference_level,
+                            self.config.center_frequency_hz,
+                            hz,
+                            self.config.reference_level_dbm,
                             self.config.receiver_channel,
                         )?
                     };
@@ -1685,14 +1686,14 @@ impl AaroniaSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
-                Self::publish_tuning(&self.http_tuning, |t| t.span = span);
+                Self::publish_tuning(&self.http_tuning, |t| t.sample_rate_hz = hz);
                 // Full tuple: partial capture PUTs are silently ignored
-                // by the server (see `set_center_frequency`).
+                // by the server (see `set_center_frequency_hz`).
                 client
                     .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center_hz: Some(self.config.center_frequency),
-                        frequency_span_hz: Some(span),
-                        reference_level_dbm: Some(self.config.reference_level as f32),
+                        frequency_center_hz: Some(self.config.center_frequency_hz),
+                        frequency_span_hz: Some(hz),
+                        reference_level_dbm: Some(self.config.reference_level_dbm as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
@@ -1700,16 +1701,16 @@ impl AaroniaSource {
             }
             SourceType::File => {
                 warn!(
-                    "set_span_frequency called on file source (no-op); RTSA files carry their own span"
+                    "set_sample_rate_hz called on file source (no-op); RTSA files carry their own rate"
                 );
             }
         }
-        self.config.span_frequency = span;
+        self.config.sample_rate_hz = hz;
         Ok(())
     }
 
     /// Update the reference level (in dBm) of the running source.
-    pub async fn set_reference_level(&mut self, ref_level: f64) -> Result<()> {
+    pub async fn set_reference_level_dbm(&mut self, dbm: f64) -> Result<()> {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
@@ -1719,9 +1720,9 @@ impl AaroniaSource {
                 if let Some(ref mut source) = self.native_source {
                     unsafe {
                         source.configure_iq_receiver(
-                            self.config.center_frequency,
-                            self.config.span_frequency,
-                            ref_level,
+                            self.config.center_frequency_hz,
+                            self.config.sample_rate_hz,
+                            dbm,
                             self.config.receiver_channel,
                         )?
                     };
@@ -1743,24 +1744,24 @@ impl AaroniaSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
-                Self::publish_tuning(&self.http_tuning, |t| t.reference_level = ref_level);
+                Self::publish_tuning(&self.http_tuning, |t| t.reference_level_dbm = dbm);
                 // Full tuple: partial capture PUTs are silently ignored
-                // by the server (see `set_center_frequency`).
+                // by the server (see `set_center_frequency_hz`).
                 client
                     .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center_hz: Some(self.config.center_frequency),
-                        frequency_span_hz: Some(self.config.span_frequency),
-                        reference_level_dbm: Some(ref_level as f32),
+                        frequency_center_hz: Some(self.config.center_frequency_hz),
+                        frequency_span_hz: Some(self.config.sample_rate_hz),
+                        reference_level_dbm: Some(dbm as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
                     .await?;
             }
             SourceType::File => {
-                warn!("set_reference_level called on file source (no-op)");
+                warn!("set_reference_level_dbm called on file source (no-op)");
             }
         }
-        self.config.reference_level = ref_level;
+        self.config.reference_level_dbm = dbm;
         Ok(())
     }
 
@@ -1808,7 +1809,7 @@ impl AaroniaSource {
     /// Probe the RTSA-Suite Remote Config license status, returning
     /// [`crate::http_endpoints::RemoteConfigStatus::Active`] for non-HTTP
     /// sources (they don't need it). This concerns **`/remoteconfig`
-    /// writes only** — mid-stream retuning via [`Self::set_center_frequency`]
+    /// writes only** — mid-stream retuning via [`Self::set_center_frequency_hz`]
     /// goes through the license-free `/control` endpoint and does not
     /// need this probe. (An earlier revision claimed unlicensed
     /// `configure_capture` calls were silently ignored; live testing
@@ -1872,7 +1873,7 @@ impl AaroniaSource {
             if native > 0.0 {
                 native
             } else {
-                self.config.span_frequency
+                self.config.sample_rate_hz
             }
         }
     }
@@ -1921,17 +1922,20 @@ impl AaroniaSource {
         let pick = |seen: f64, configured: f64| if seen > 0.0 { seen } else { configured };
         SourceInfo {
             source_type: self.source_type.clone(),
-            center_frequency: pick(observed.center_frequency_hz, self.config.center_frequency),
-            span_frequency: pick(
+            center_frequency_hz: pick(
+                observed.center_frequency_hz,
+                self.config.center_frequency_hz,
+            ),
+            sample_rate_hz: pick(
                 if observed.sample_rate_hz > 0.0 {
                     observed.sample_rate_hz
                 } else {
                     self.native_observed_rate_hz()
                 },
-                self.config.span_frequency,
+                self.config.sample_rate_hz,
             ),
             bandwidth_hz: pick(observed.bandwidth_hz, self.config.bandwidth_hz),
-            reference_level: self.config.reference_level,
+            reference_level_dbm: self.config.reference_level_dbm,
             device_serial: self.config.device_serial.clone(),
         }
     }
@@ -2054,38 +2058,31 @@ impl Drop for AaroniaSource {
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
     pub source_type: SourceType,
-    pub center_frequency: f64,
-    /// IQ sample rate (Fs) in Hz — see [`AaroniaConfig::span_frequency`].
-    pub span_frequency: f64,
+    pub center_frequency_hz: f64,
+    /// IQ sample rate (Fs) in Hz — see [`AaroniaConfig::sample_rate_hz`].
+    pub sample_rate_hz: f64,
     /// Usable RX/real-time bandwidth in Hz (`0.0` = unknown) — see
-    /// [`AaroniaConfig::bandwidth_hz`]. Always `<= span_frequency`.
+    /// [`AaroniaConfig::bandwidth_hz`]. Always `<= sample_rate_hz`.
     pub bandwidth_hz: f64,
-    pub reference_level: f64,
+    pub reference_level_dbm: f64,
     pub device_serial: Option<String>,
 }
 
 impl std::fmt::Display for SourceInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `span_frequency` is the sample rate (Fs); the RX bandwidth is a
-        // separate, smaller number, only shown when the source reported it.
+        // The RX bandwidth is a separate, smaller number than the sample
+        // rate, and is only shown when the source reported it.
         write!(
             f,
             "Aaronia Source ({:?}): {:.1} MHz center, {:.1} MHz sample-rate",
             self.source_type,
-            self.center_frequency / 1e6,
-            self.span_frequency / 1e6,
+            self.center_frequency_hz / 1e6,
+            self.sample_rate_hz / 1e6,
         )?;
         if self.bandwidth_hz > 0.0 {
             write!(f, ", {:.3} MHz RX-BW", self.bandwidth_hz / 1e6)?;
         }
-        write!(f, ", {:.1} dBm ref", self.reference_level)
-    }
-}
-
-impl SourceInfo {
-    /// Get the sample rate (alias for `span_frequency`)
-    pub fn sample_rate_hz(&self) -> f64 {
-        self.span_frequency
+        write!(f, ", {:.1} dBm ref", self.reference_level_dbm)
     }
 }
 
@@ -2102,26 +2099,21 @@ impl AaroniaSourceBuilder {
         }
     }
 
-    /// Set the center frequency
-    pub fn center_frequency(&mut self, freq: f64) -> &mut Self {
-        self.config.center_frequency = freq;
+    /// Set the centre frequency in Hz.
+    pub fn center_frequency_hz(&mut self, hz: f64) -> &mut Self {
+        self.config.center_frequency_hz = hz;
         self
     }
 
-    /// Set the span frequency
-    pub fn span_frequency(&mut self, freq: f64) -> &mut Self {
-        self.config.span_frequency = freq;
+    /// Set the IQ sample rate in Hz.
+    pub fn sample_rate_hz(&mut self, hz: f64) -> &mut Self {
+        self.config.sample_rate_hz = hz;
         self
     }
 
-    /// Set the sample rate (alias for `span_frequency`)
-    pub fn sample_rate_hz(&mut self, freq: f64) -> &mut Self {
-        self.span_frequency(freq)
-    }
-
-    /// Set the reference level
-    pub fn reference_level(&mut self, level: f64) -> &mut Self {
-        self.config.reference_level = level;
+    /// Set the reference level in dBm.
+    pub fn reference_level_dbm(&mut self, dbm: f64) -> &mut Self {
+        self.config.reference_level_dbm = dbm;
         self
     }
 
@@ -2226,9 +2218,9 @@ mod tests {
         // Test default configuration values
         let config = AaroniaConfig::default();
 
-        assert_eq!(config.center_frequency, 2.44e9);
-        assert_eq!(config.span_frequency, 15.36e6);
-        assert_eq!(config.reference_level, -20.0);
+        assert_eq!(config.center_frequency_hz, 2.44e9);
+        assert_eq!(config.sample_rate_hz, 15.36e6);
+        assert_eq!(config.reference_level_dbm, -20.0);
         assert!(config.device_serial.is_none());
         assert!(config.http_base_url.is_none());
         assert!(config.file_path.is_none());
@@ -2257,7 +2249,7 @@ mod tests {
 
         assert_eq!(config.file_path, Some(file_path.to_string()));
         assert_eq!(config.force_source_type, Some(SourceType::File));
-        assert_eq!(config.center_frequency, 2.44e9); // Should inherit defaults
+        assert_eq!(config.center_frequency_hz, 2.44e9); // Should inherit defaults
     }
 
     #[test]
@@ -2268,22 +2260,22 @@ mod tests {
 
         assert_eq!(config.http_base_url, Some(base_url.to_string()));
         assert_eq!(config.force_source_type, Some(SourceType::Http));
-        assert_eq!(config.span_frequency, 15.36e6); // Should inherit defaults
+        assert_eq!(config.sample_rate_hz, 15.36e6); // Should inherit defaults
     }
 
     #[test]
     fn test_aaronia_config_builder_methods() {
         // Test configuration builder pattern methods
         let config = AaroniaConfig::default()
-            .center_frequency(915e6)
-            .span_frequency(10e6)
-            .reference_level(-30.0)
+            .center_frequency_hz(915e6)
+            .sample_rate_hz(10e6)
+            .reference_level_dbm(-30.0)
             .device_serial("TEST123".to_string())
             .force_native_sdk();
 
-        assert_eq!(config.center_frequency, 915e6);
-        assert_eq!(config.span_frequency, 10e6);
-        assert_eq!(config.reference_level, -30.0);
+        assert_eq!(config.center_frequency_hz, 915e6);
+        assert_eq!(config.sample_rate_hz, 10e6);
+        assert_eq!(config.reference_level_dbm, -30.0);
         assert_eq!(config.device_serial, Some("TEST123".to_string()));
         assert_eq!(config.force_source_type, Some(SourceType::NativeSdk));
     }
@@ -2292,11 +2284,11 @@ mod tests {
     fn test_aaronia_source_builder_creation() {
         // Test builder creation and default values
         let builder = AaroniaSourceBuilder::new();
-        assert_eq!(builder.config.center_frequency, 2.44e9);
-        assert_eq!(builder.config.span_frequency, 15.36e6);
+        assert_eq!(builder.config.center_frequency_hz, 2.44e9);
+        assert_eq!(builder.config.sample_rate_hz, 15.36e6);
 
         let default_builder = AaroniaSourceBuilder::default();
-        assert_eq!(default_builder.config.center_frequency, 2.44e9);
+        assert_eq!(default_builder.config.center_frequency_hz, 2.44e9);
     }
 
     #[test]
@@ -2304,16 +2296,16 @@ mod tests {
         // Test builder configuration methods
         let mut builder = AaroniaSourceBuilder::new();
         builder
-            .center_frequency(2.4e9)
-            .span_frequency(25e6)
-            .reference_level(-25.0)
+            .center_frequency_hz(2.4e9)
+            .sample_rate_hz(25e6)
+            .reference_level_dbm(-25.0)
             .device_serial("DEV456".to_string())
             .http_source("http://localhost:8080".to_string())
             .force_source_type(SourceType::Http);
 
-        assert_eq!(builder.config.center_frequency, 2.4e9);
-        assert_eq!(builder.config.span_frequency, 25e6);
-        assert_eq!(builder.config.reference_level, -25.0);
+        assert_eq!(builder.config.center_frequency_hz, 2.4e9);
+        assert_eq!(builder.config.sample_rate_hz, 25e6);
+        assert_eq!(builder.config.reference_level_dbm, -25.0);
         assert_eq!(builder.config.device_serial, Some("DEV456".to_string()));
         assert_eq!(
             builder.config.http_base_url,
@@ -2337,19 +2329,19 @@ mod tests {
         // Test SourceInfo structure
         let info = SourceInfo {
             source_type: SourceType::Http,
-            center_frequency: 2.45e9,
-            span_frequency: 20e6,
+            center_frequency_hz: 2.45e9,
+            sample_rate_hz: 20e6,
             bandwidth_hz: 16e6,
-            reference_level: -20.0,
+            reference_level_dbm: -20.0,
             device_serial: Some("SERIAL123".to_string()),
         };
 
         assert_eq!(info.source_type, SourceType::Http);
-        assert_eq!(info.center_frequency, 2.45e9);
-        assert_eq!(info.span_frequency, 20e6);
+        assert_eq!(info.center_frequency_hz, 2.45e9);
+        assert_eq!(info.sample_rate_hz, 20e6);
         assert_eq!(info.bandwidth_hz, 16e6);
-        assert!(info.bandwidth_hz <= info.span_frequency);
-        assert_eq!(info.reference_level, -20.0);
+        assert!(info.bandwidth_hz <= info.sample_rate_hz);
+        assert_eq!(info.reference_level_dbm, -20.0);
         assert_eq!(info.device_serial, Some("SERIAL123".to_string()));
     }
 
@@ -2358,10 +2350,10 @@ mod tests {
         // Test SourceInfo display formatting
         let info = SourceInfo {
             source_type: SourceType::File,
-            center_frequency: 915e6,
-            span_frequency: 10e6,
+            center_frequency_hz: 915e6,
+            sample_rate_hz: 10e6,
             bandwidth_hz: 8e6,
-            reference_level: -30.0,
+            reference_level_dbm: -30.0,
             device_serial: None,
         };
 
@@ -2421,7 +2413,7 @@ mod tests {
         // Regression test for the center-frequency wiring: the file
         // source must surface the RTSA metadata's tuning through
         // `get_source_info()`, overriding the builder's placeholder
-        // defaults (2.44 GHz center / 15.36 MHz span). The CW fixture is
+        // defaults (2.44 GHz center / 15.36 MS/s). The CW fixture is
         // tuned to 2410 MHz at 1 MSPS — *both* differ from the defaults,
         // so passing assertions prove the file values win rather than a
         // coincidental match. Before the fix, `init_file_source` only
@@ -2451,14 +2443,14 @@ mod tests {
         let info = source.get_source_info();
         assert_eq!(info.source_type, SourceType::File);
         assert!(
-            (info.center_frequency - 2_410_000_000.0).abs() < 1_000.0,
+            (info.center_frequency_hz - 2_410_000_000.0).abs() < 1_000.0,
             "expected ~2410 MHz center from file metadata, got {} Hz (default is 2.44 GHz)",
-            info.center_frequency
+            info.center_frequency_hz
         );
         assert!(
-            (info.span_frequency - 1_000_000.0).abs() < 1_000.0,
-            "expected ~1 MHz span from file metadata, got {} Hz (default is 15.36 MHz)",
-            info.span_frequency
+            (info.sample_rate_hz - 1_000_000.0).abs() < 1_000.0,
+            "expected ~1 MS/s from file metadata, got {} Hz (default is 15.36 MS/s)",
+            info.sample_rate_hz
         );
     }
 
@@ -2586,20 +2578,20 @@ mod tests {
     fn test_complex_configuration_scenarios() {
         // Test various configuration scenarios
         let config1 = AaroniaConfig::default()
-            .center_frequency(2.4e9)
-            .span_frequency(40e6)
-            .reference_level(-10.0);
+            .center_frequency_hz(2.4e9)
+            .sample_rate_hz(40e6)
+            .reference_level_dbm(-10.0);
 
-        assert_eq!(config1.center_frequency, 2.4e9);
-        assert_eq!(config1.span_frequency, 40e6);
-        assert_eq!(config1.reference_level, -10.0);
+        assert_eq!(config1.center_frequency_hz, 2.4e9);
+        assert_eq!(config1.sample_rate_hz, 40e6);
+        assert_eq!(config1.reference_level_dbm, -10.0);
 
         // Test overriding default values
         let config2 = AaroniaConfig::from_http("http://localhost:8080")
-            .center_frequency(915e6)
+            .center_frequency_hz(915e6)
             .device_serial("OVERRIDE123".to_string());
 
-        assert_eq!(config2.center_frequency, 915e6);
+        assert_eq!(config2.center_frequency_hz, 915e6);
         assert_eq!(config2.device_serial, Some("OVERRIDE123".to_string()));
         assert_eq!(config2.force_source_type, Some(SourceType::Http));
     }
@@ -2608,13 +2600,13 @@ mod tests {
     fn test_edge_case_configurations() {
         // Test edge cases and boundary conditions
         let config = AaroniaConfig::default()
-            .center_frequency(0.0)
-            .span_frequency(-1.0)
-            .reference_level(100.0);
+            .center_frequency_hz(0.0)
+            .sample_rate_hz(-1.0)
+            .reference_level_dbm(100.0);
 
-        assert_eq!(config.center_frequency, 0.0);
-        assert_eq!(config.span_frequency, -1.0);
-        assert_eq!(config.reference_level, 100.0);
+        assert_eq!(config.center_frequency_hz, 0.0);
+        assert_eq!(config.sample_rate_hz, -1.0);
+        assert_eq!(config.reference_level_dbm, 100.0);
 
         // Test empty strings
         let config_empty = AaroniaConfig::from_http("").device_serial("".to_string());
@@ -2627,15 +2619,15 @@ mod tests {
     fn test_configuration_chaining() {
         // Test method chaining for configuration
         let config = AaroniaConfig::default()
-            .center_frequency(1e9)
-            .span_frequency(10e6)
-            .reference_level(-40.0)
+            .center_frequency_hz(1e9)
+            .sample_rate_hz(10e6)
+            .reference_level_dbm(-40.0)
             .device_serial("CHAIN123".to_string())
             .force_native_sdk();
 
-        assert_eq!(config.center_frequency, 1e9);
-        assert_eq!(config.span_frequency, 10e6);
-        assert_eq!(config.reference_level, -40.0);
+        assert_eq!(config.center_frequency_hz, 1e9);
+        assert_eq!(config.sample_rate_hz, 10e6);
+        assert_eq!(config.reference_level_dbm, -40.0);
         assert_eq!(config.device_serial, Some("CHAIN123".to_string()));
         assert_eq!(config.force_source_type, Some(SourceType::NativeSdk));
     }
@@ -2644,16 +2636,16 @@ mod tests {
     fn test_builder_immutable_vs_mutable() {
         // Test builder pattern both mutable and return-based approaches
         let mut builder = AaroniaSourceBuilder::new();
-        builder.center_frequency(2.4e9);
-        builder.span_frequency(20e6);
+        builder.center_frequency_hz(2.4e9);
+        builder.sample_rate_hz(20e6);
 
-        assert_eq!(builder.config.center_frequency, 2.4e9);
-        assert_eq!(builder.config.span_frequency, 20e6);
+        assert_eq!(builder.config.center_frequency_hz, 2.4e9);
+        assert_eq!(builder.config.sample_rate_hz, 20e6);
 
         // Test chaining
         let mut builder2 = AaroniaSourceBuilder::new();
-        builder2.center_frequency(915e6);
-        assert_eq!(builder2.config.center_frequency, 915e6);
+        builder2.center_frequency_hz(915e6);
+        assert_eq!(builder2.config.center_frequency_hz, 915e6);
     }
 
     #[test]
@@ -2691,31 +2683,31 @@ mod tests {
     fn test_configuration_validation_boundaries() {
         // Test various frequency and power level boundaries
         let extreme_config = AaroniaConfig::default()
-            .center_frequency(f64::MAX)
-            .span_frequency(f64::MIN)
-            .reference_level(f64::INFINITY);
+            .center_frequency_hz(f64::MAX)
+            .sample_rate_hz(f64::MIN)
+            .reference_level_dbm(f64::INFINITY);
 
-        assert_eq!(extreme_config.center_frequency, f64::MAX);
-        assert_eq!(extreme_config.span_frequency, f64::MIN);
-        assert!(extreme_config.reference_level.is_infinite());
+        assert_eq!(extreme_config.center_frequency_hz, f64::MAX);
+        assert_eq!(extreme_config.sample_rate_hz, f64::MIN);
+        assert!(extreme_config.reference_level_dbm.is_infinite());
 
         // Test NaN values
-        let nan_config = AaroniaConfig::default().center_frequency(f64::NAN);
-        assert!(nan_config.center_frequency.is_nan());
+        let nan_config = AaroniaConfig::default().center_frequency_hz(f64::NAN);
+        assert!(nan_config.center_frequency_hz.is_nan());
     }
 
     #[test]
     fn test_clone_and_debug_traits() {
         // Test Clone and Debug trait implementations
         let original_config = AaroniaConfig::from_http("http://test.com")
-            .center_frequency(2.4e9)
+            .center_frequency_hz(2.4e9)
             .device_serial("TEST123".to_string());
 
         let cloned_config = original_config.clone();
         assert_eq!(original_config.http_base_url, cloned_config.http_base_url);
         assert_eq!(
-            original_config.center_frequency,
-            cloned_config.center_frequency
+            original_config.center_frequency_hz,
+            cloned_config.center_frequency_hz
         );
         assert_eq!(original_config.device_serial, cloned_config.device_serial);
 

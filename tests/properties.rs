@@ -172,7 +172,7 @@ proptest! {
 // Pins A3: IQ-mode `spanfreq * 1.5 <= receiverclock`.
 //
 // Hardware constraint for the Spectran V6 IQ-Mode receiver:
-// `span_frequency * 1.5 ≤ receiver_clock`.
+// `sample_rate_hz * 1.5 ≤ receiver_clock`.
 // Misconfigurations cause the SDK to silently emit corrupted samples,
 // so we reject them at the API boundary. This property generates a
 // `(clock, span_factor)` pair where `span = clock * span_factor`, then

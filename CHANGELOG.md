@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking changes
+
+**One name per concept, with its unit.** A field, parameter or getter holding a
+bare number now carries its unit (`_hz`, `_dbm`, `_db`, `_s`); a type that
+already carries its unit, such as `Duration`, does not. `span_frequency` was the
+worst offender — it meant the IQ *sample rate*, while the same word meant
+alias-free *bandwidth* in the link budget and a mode-dependent device key on the
+wire. It is gone as a public name. Old builders were removed, not deprecated:
+an alias that silently kept working would have preserved exactly the ambiguity
+this release exists to remove. The `spanfreq` device key and the `frequencySpan`
+JSON field are unchanged — those are the vendor's vocabulary, not ours.
+
+| Old | New |
+| --- | --- |
+| `AaroniaConfig::center_frequency` (field + builder) | `center_frequency_hz` |
+| `AaroniaConfig::span_frequency` (field + builder) | `sample_rate_hz` |
+| `AaroniaConfig::reference_level` (field + builder) | `reference_level_dbm` |
+| `AaroniaSourceBuilder::center_frequency` / `span_frequency` / `reference_level` | `center_frequency_hz` / `sample_rate_hz` / `reference_level_dbm` |
+| `AaroniaSource::set_center_frequency` / `set_span_frequency` / `set_reference_level` | `set_center_frequency_hz` / `set_sample_rate_hz` / `set_reference_level_dbm` |
+| `SourceInfo::center_frequency` / `span_frequency` / `reference_level` | `center_frequency_hz` / `sample_rate_hz` / `reference_level_dbm` |
+| `SourceInfo::sample_rate_hz()` (method) | removed — read the field of the same name |
+| `UnifiedSinkConfig::span_frequency`, `trans_gain` | `sample_rate_hz`, `trans_gain_db` |
+| `ThroughputMeasurement::max_sustainable_span_hz` | `max_sustainable_bandwidth` |
+| `ThroughputMeasurement::stream_sample_rate` | `stream_sample_rate_hz` |
+| `LinkBudgetVerdict::sample_rate`, `fit_span_hz` | `sample_rate_hz`, `fit_bandwidth_hz` |
+| `RtsaMetadata` / `StreamingSdrConfig` bare quantities | unit-suffixed (`_hz`, `_s`) |
+
+`CaptureControl`'s fields gained units too, but its JSON keys did not move: the
+struct now pins each one with an explicit `#[serde(rename)]` instead of deriving
+them from Rust field names, so a future rename cannot change the wire format by
+accident. `tests/wire_contract.rs` asserts the keys, and asserts the vendor
+`AARTSAAPI_Packet` mirror still matches its C header field for field.
+
 ### Added
 - **The stream clock source can be set, not just read.** `device/sclksource`
   selects what disciplines the receiver's clock — a V6 ECO offers `Consumer`,

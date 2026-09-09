@@ -59,9 +59,9 @@ use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = AaroniaConfig::from_http("http://localhost:54664")
-        .center_frequency(2.44e9)
-        .span_frequency(15.36e6)    // sample rate (Fs), not RF bandwidth
-        .reference_level(-20.0);
+        .center_frequency_hz(2.44e9)
+        .sample_rate_hz(15.36e6)  // Fs, not RF bandwidth — see the table below
+        .reference_level_dbm(-20.0);
 
     let mut source = AaroniaSource::new(config).await?;
     source.start_streaming().await?;
@@ -134,13 +134,13 @@ not wired to the HTTP Server block. `curl /sample` shows whether data is
 present.
 
 **Span, sample rate and the "1 / 4" in the GUI.**
-`span_frequency` is the IQ sample rate (Fs). The name comes from the
-Aaronia API. Three numbers describe the same capture and they are all
-different:
+`sample_rate_hz` is the IQ sample rate (Fs). The device key behind it is
+`spanfreq`, which is where the older `span_frequency` name came from.
+Three numbers describe the same capture and they are all different:
 
 | Where you see it | Example | Meaning |
 | --- | --- | --- |
-| `span_frequency`, and `sampleFrequency` in packet metadata | 15.36 MHz | The sample rate, Fs |
+| `sample_rate_hz`, and `sampleFrequency` in packet metadata | 15.36 MHz | The sample rate, Fs |
 | `startFrequency`..`endFrequency` in packet metadata | 12.288 MHz | Usable RF bandwidth: exactly 0.8 x Fs, at every rate |
 | The Span control in the RTSA GUI | `1 / 4` | Decimation of the top rate, so Fs = 61.44 / 4 on an ECO |
 
@@ -222,8 +222,8 @@ use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
 # async fn run() -> anyhow::Result<()> {
 let config = AaroniaConfig::default()
     .force_native_sdk()
-    .center_frequency(2.44e9)
-    .span_frequency(15.36e6);
+    .center_frequency_hz(2.44e9)
+    .sample_rate_hz(15.36e6);
 let mut source = AaroniaSource::new(config).await?;
 # Ok(())
 # }

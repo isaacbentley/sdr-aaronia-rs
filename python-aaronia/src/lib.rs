@@ -149,23 +149,23 @@ impl PyAaroniaConfig {
 
     #[setter]
     fn set_center_freq(&mut self, freq: f64) {
-        self.inner.center_frequency = freq;
+        self.inner.center_frequency_hz = freq;
     }
 
     #[getter]
     fn get_center_freq(&self) -> f64 {
-        self.inner.center_frequency
+        self.inner.center_frequency_hz
     }
 
     /// IQ sample rate in Hz (the Aaronia "span" frequency).
     #[setter]
     fn set_sample_rate(&mut self, rate: f64) {
-        self.inner.span_frequency = rate;
+        self.inner.sample_rate_hz = rate;
     }
 
     #[getter]
     fn get_sample_rate(&self) -> f64 {
-        self.inner.span_frequency
+        self.inner.sample_rate_hz
     }
 
     /// Integer encode multiplier for the `I16` wire format
@@ -198,12 +198,12 @@ impl PyAaroniaConfig {
 
     #[setter]
     fn set_reference_level(&mut self, dbm: f64) {
-        self.inner.reference_level = dbm;
+        self.inner.reference_level_dbm = dbm;
     }
 
     #[getter]
     fn get_reference_level(&self) -> f64 {
-        self.inner.reference_level
+        self.inner.reference_level_dbm
     }
 
     /// Base URL of an RTSA-Suite HTTP server block
@@ -470,7 +470,7 @@ impl PyAaroniaSource {
             .as_mut()
             .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
-        py.detach(|| rt.block_on(source.set_center_frequency(freq_hz)))
+        py.detach(|| rt.block_on(source.set_center_frequency_hz(freq_hz)))
             .map_err(map_aaronia_err)
     }
 
@@ -482,7 +482,7 @@ impl PyAaroniaSource {
             .as_mut()
             .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
-        py.detach(|| rt.block_on(source.set_span_frequency(rate_hz)))
+        py.detach(|| rt.block_on(source.set_sample_rate_hz(rate_hz)))
             .map_err(map_aaronia_err)
     }
 
@@ -494,7 +494,7 @@ impl PyAaroniaSource {
             .as_mut()
             .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
-        py.detach(|| rt.block_on(source.set_reference_level(dbm)))
+        py.detach(|| rt.block_on(source.set_reference_level_dbm(dbm)))
             .map_err(map_aaronia_err)
     }
 

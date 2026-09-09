@@ -456,13 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn test_span_frequency_validation() {
-        // Test span frequency ranges
-        let valid_spans = vec![1e3, 1e6, 10e6, 100e6, 1e9];
+    fn test_sample_rate_validation() {
+        // Test sample rate ranges
+        let valid_rates = vec![1e3, 1e6, 10e6, 100e6, 1e9];
 
-        for span in valid_spans {
-            assert!(span > 0.0, "Span {} should be positive", span);
-            assert!(span <= 10e9, "Span {} should be within device limits", span);
+        for rate in valid_rates {
+            assert!(rate > 0.0, "Rate {} should be positive", rate);
+            assert!(rate <= 10e9, "Rate {} should be within device limits", rate);
         }
     }
 

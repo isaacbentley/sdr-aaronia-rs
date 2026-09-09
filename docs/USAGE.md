@@ -19,9 +19,9 @@ use anyhow::Result;
 async fn main() -> Result<()> {
     // Specify RF parameters; the library auto-detects the best backend
     let config = AaroniaConfig::default()
-        .center_frequency(446.0e6)     // 446 MHz UHF amateur
-        .span_frequency(10.0e6)        // 10 MHz span
-        .reference_level(-30.0);       // -30 dBm
+        .center_frequency_hz(446.0e6)  // 446 MHz UHF amateur
+        .sample_rate_hz(10.0e6)        // 10 MS/s (Fs)
+        .reference_level_dbm(-30.0);   // -30 dBm
 
     let mut source = AaroniaSource::new(config).await?;
     println!("Selected Source: {:?}", source.get_source_info());
@@ -47,9 +47,9 @@ use anyhow::Result;
 async fn main() -> Result<()> {
     let mut builder = AaroniaSourceBuilder::new();
     builder
-        .center_frequency(2.44e9)     // 2.4 GHz ISM band
-        .span_frequency(20.0e6)       // 20 MHz span
-        .reference_level(-25.0);      // -25 dBm
+        .center_frequency_hz(2.44e9)  // 2.4 GHz ISM band
+        .sample_rate_hz(20.0e6)       // 20 MS/s (Fs)
+        .reference_level_dbm(-25.0);  // -25 dBm
 
     let mut source = builder.build().await?;
 
@@ -73,9 +73,9 @@ use anyhow::Result;
 async fn main() -> Result<()> {
     // Force Native SDK
     let sdk_config = AaroniaConfig::default()
-        .center_frequency(2.44e9)
-        .span_frequency(20.0e6)
-        .reference_level(-20.0)
+        .center_frequency_hz(2.44e9)
+        .sample_rate_hz(20.0e6)
+        .reference_level_dbm(-20.0)
         .force_native_sdk();
     let _sdk_source = AaroniaSource::new(sdk_config).await?;
 
@@ -101,13 +101,13 @@ use sdr_aaronia_rs::AaroniaConfig;
 // Default (Float32): 8 bytes/sample on the wire. Lossless, zero-copy decode.
 // At the 61.44 MS/s top rate that is ~490 MB/s (best for localhost).
 let _high_fidelity = AaroniaConfig::default()
-    .center_frequency(2.4e9);
+    .center_frequency_hz(2.4e9);
 
 // Low Bandwidth (Int16): 4 bytes/sample. Halves network traffic.
 // Requires setting both the format and the encode scale factor.
 // At 61.44 MS/s, ~246 MB/s.
 let _low_bandwidth = AaroniaConfig::default()
-    .center_frequency(2.4e9)
+    .center_frequency_hz(2.4e9)
     .low_bandwidth_mode(); // Sets StreamFormat::Int16 and scale=32767.0
 ```
 
@@ -253,15 +253,15 @@ use sdr_aaronia_rs::AaroniaConfig;
 
 // UHF amateur band
 let _config = AaroniaConfig::default()
-    .center_frequency(446.0e6)    // 446 MHz
-    .span_frequency(10.0e6)       // 10 MHz span
-    .reference_level(-30.0);      // -30 dBm
+    .center_frequency_hz(446.0e6)  // 446 MHz
+    .sample_rate_hz(10.0e6)        // 10 MS/s (Fs)
+    .reference_level_dbm(-30.0);   // -30 dBm
 
 // 2m amateur band
 let _config = AaroniaConfig::default()
-    .center_frequency(146.52e6)   // 2m amateur
-    .span_frequency(25e3)         // 25 kHz
-    .reference_level(-30.0);      // -30 dBm
+    .center_frequency_hz(146.52e6)  // 2m amateur
+    .sample_rate_hz(25e3)           // 25 kS/s (Fs)
+    .reference_level_dbm(-30.0);    // -30 dBm
 ```
 
 ## Device control and monitoring

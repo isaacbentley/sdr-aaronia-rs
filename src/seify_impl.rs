@@ -79,9 +79,9 @@ impl AaroniaSeifyDevice {
             reference_level = ref_level;
         }
 
-        builder.center_frequency(center_frequency);
-        builder.span_frequency(sample_rate);
-        builder.reference_level(reference_level);
+        builder.center_frequency_hz(center_frequency);
+        builder.sample_rate_hz(sample_rate);
+        builder.reference_level_dbm(reference_level);
 
         let source = runtime
             .block_on(builder.build())
@@ -199,7 +199,7 @@ impl FrequencyControl for AaroniaSeifyDevice {
         }
         let mut source = self.source.lock().unwrap();
         self.runtime
-            .block_on(source.set_center_frequency(frequency))
+            .block_on(source.set_center_frequency_hz(frequency))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
         self.tuning.lock().unwrap().center_frequency = frequency;
         Ok(())
@@ -249,7 +249,7 @@ impl SampleRateControl for AaroniaSeifyDevice {
         }
         let mut source = self.source.lock().unwrap();
         self.runtime
-            .block_on(source.set_span_frequency(rate))
+            .block_on(source.set_sample_rate_hz(rate))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
         self.tuning.lock().unwrap().sample_rate = rate;
         Ok(())
@@ -327,7 +327,7 @@ impl GainControl for AaroniaSeifyDevice {
         }
         let mut source = self.source.lock().unwrap();
         self.runtime
-            .block_on(source.set_reference_level(gain))
+            .block_on(source.set_reference_level_dbm(gain))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
         self.tuning.lock().unwrap().reference_level = gain;
         Ok(())

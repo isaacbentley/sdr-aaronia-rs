@@ -351,8 +351,8 @@ pipeline delivers samples at exactly 1.5× it, continuously rather than on
 a `/2ⁿ` ladder: a 10 MHz request streams at 15.0 MS/s, 15.36 at 23.04,
 24.576 at 36.864, capped at 59.214 MS/s (474 MB/s — the USB 3 link).
 Every rung of a request→delivered sweep was ×1.5 to the third decimal.
-This crate's `span_frequency` is the sample rate (the HTTP backend
-delivers exactly it), so `configure_iq_receiver` writes `span / 1.5` on
+This crate's `sample_rate_hz` is the sample rate (the HTTP backend
+delivers exactly it), so `configure_iq_receiver` writes `rate / 1.5` on
 this mode and the caller gets the rate it named on every backend; a
 15.36 MS/s request now measures 15.360 MS/s, and `sample_rate_hz` reports
 what the packets carry. Two more measured facts: the pipeline delivers

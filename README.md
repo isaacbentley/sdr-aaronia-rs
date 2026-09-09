@@ -104,9 +104,9 @@ use anyhow::Result;
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = AaroniaConfig::default()
-        .center_frequency(446.0e6)     // 446 MHz
-        .span_frequency(10.0e6)        // 10 MHz span
-        .reference_level(-30.0);       // -30 dBm
+        .center_frequency_hz(446.0e6)  // 446 MHz
+        .sample_rate_hz(10.0e6)        // 10 MS/s (Fs), not RF bandwidth
+        .reference_level_dbm(-30.0);   // -30 dBm
 
     let mut source = AaroniaSource::new(config).await?;
 

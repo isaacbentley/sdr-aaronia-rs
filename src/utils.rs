@@ -348,10 +348,10 @@ pub fn snap_to_ladder_top(measured_hz: f64) -> Option<f64> {
 
 /// Receiver clock cycles per IQ sample at the fastest rate: the top of
 /// the decimation ladder is `receiver_clock / IQ_RATE_CLOCK_RATIO`, and
-/// [`validate_iq_mode`] refuses a span wider than that.
+/// [`validate_iq_mode`] refuses a sample rate above that.
 ///
 /// One definition, because the same 1.5 governs the ladder's top rung,
-/// the IQ-mode span check, and the link budget's device-anchored remedy
+/// the IQ-mode rate check, and the link budget's device-anchored remedy
 /// — and because it is a hardware rule that may yet need revising for a
 /// full V6 (see [`iq_sample_rates_for_clock`]).
 pub const IQ_RATE_CLOCK_RATIO: f64 = 1.5;

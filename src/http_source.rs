@@ -357,7 +357,7 @@ pub struct HttpSource {
     drop_detector: DropDetector,
 
     /// Whether the one-shot device retune in [`Self::configure_rtsa_device`]
-    /// has already run. The tune applies the builder's centre / span /
+    /// has already run. The tune applies the builder's centre / rate /
     /// reference level on the **first** stream start; subsequent restarts
     /// (triggered via `shared_stats.restart_pending` after an external
     /// retune) must only reconnect the `/stream`, never re-push this
@@ -1499,7 +1499,7 @@ impl HttpSource {
         }
     }
 
-    /// Push this source's centre / span / reference level to the device and
+    /// Push this source's centre / rate / reference level to the device and
     /// report what the device actually adopted.
     ///
     /// This replaced a `configure_capture` call on the `/control` endpoint,

@@ -80,12 +80,12 @@ fn center_hz() -> f64 {
 /// Base configuration pinned to the native SDK. `force_native_sdk`
 /// means a missing SDK is a hard error here rather than a silent
 /// fallback to HTTP — which is exactly what these tests must assert.
-fn sdk_config(span_hz: f64) -> AaroniaConfig {
+fn sdk_config(sample_rate_hz: f64) -> AaroniaConfig {
     let mut cfg = AaroniaConfig::default()
         .force_native_sdk()
-        .center_frequency(center_hz())
-        .span_frequency(span_hz)
-        .reference_level(-20.0)
+        .center_frequency_hz(center_hz())
+        .sample_rate_hz(sample_rate_hz)
+        .reference_level_dbm(-20.0)
         .read_timeout(Duration::from_secs(10));
     cfg.device_serial = std::env::var("AARONIA_SDK_SERIAL").ok();
     cfg
@@ -94,8 +94,8 @@ fn sdk_config(span_hz: f64) -> AaroniaConfig {
 /// Open, stream briefly, and report how many samples arrived. Returns
 /// the error rather than panicking so callers can characterise
 /// failures instead of aborting the run on the first one.
-async fn try_capture(span_hz: f64, samples_wanted: usize) -> Result<(usize, f64), String> {
-    let mut source = AaroniaSource::new(sdk_config(span_hz))
+async fn try_capture(sample_rate_hz: f64, samples_wanted: usize) -> Result<(usize, f64), String> {
+    let mut source = AaroniaSource::new(sdk_config(sample_rate_hz))
         .await
         .map_err(|e| format!("open: {e}"))?;
 
@@ -171,8 +171,8 @@ async fn opens_device_and_reports_native_backend() {
 
     let info = source.get_source_info();
     println!(
-        "source_type={:?} center={} Hz span={} Hz serial={:?}",
-        info.source_type, info.center_frequency, info.span_frequency, info.device_serial
+        "source_type={:?} center={} Hz rate={} S/s serial={:?}",
+        info.source_type, info.center_frequency_hz, info.sample_rate_hz, info.device_serial
     );
     assert_eq!(info.source_type, SourceType::NativeSdk);
 }
@@ -281,11 +281,11 @@ async fn center_frequency_sweep() {
 
     for f in freqs {
         let mut cfg = sdk_config(15.36e6);
-        cfg.center_frequency = f;
+        cfg.center_frequency_hz = f;
 
         match AaroniaSource::new(cfg).await {
             Ok(source) => {
-                let seen = source.get_source_info().center_frequency;
+                let seen = source.get_source_info().center_frequency_hz;
                 println!("{:>10.3} MHz -> reported {:>10.3} MHz", f / 1e6, seen / 1e6);
             }
             Err(e) => {
@@ -327,7 +327,7 @@ async fn mid_stream_retune_keeps_samples_flowing() {
     );
 
     source
-        .set_center_frequency(1.09e9)
+        .set_center_frequency_hz(1.09e9)
         .await
         .expect("mid-stream retune");
 
@@ -350,14 +350,14 @@ async fn mid_stream_retune_keeps_samples_flowing() {
 /// Records, rather than asserts, how far up the decimation ladder this
 /// device is actually reliable.
 ///
-/// `validate_iq_mode` permits any span up to `receiver_clock / 1.5`,
+/// `validate_iq_mode` permits any sample rate up to `receiver_clock / 1.5`,
 /// which for the hardcoded 92.16 MHz clock is 61.44 MHz. Field testing
 /// on a V6 ECO found that ceiling is optimistic: the USB link, not the
 /// clock, runs out first. This test turns that into a table so the
 /// honest limit can be documented and enforced instead of guessed at.
 #[tokio::test]
 #[ignore = "requires an attached Spectran V6; several minutes"]
-async fn span_ladder_characterisation() {
+async fn sample_rate_ladder_characterisation() {
     let _guard = device_lock().await;
 
     let trials = env_usize("AARONIA_SDK_TRIALS", 5);
@@ -373,13 +373,13 @@ async fn span_ladder_characterisation() {
 
     let mut table = Vec::new();
 
-    for span in rungs {
+    for rate in rungs {
         let mut ok = 0usize;
         let mut first_err: Option<String> = None;
         let mut reported = 0.0f64;
 
         for _ in 0..trials {
-            match try_capture(span, 262_144).await {
+            match try_capture(rate, 262_144).await {
                 Ok((_, rate)) => {
                     ok += 1;
                     reported = rate;
@@ -398,57 +398,61 @@ async fn span_ladder_characterisation() {
         let failed = trials - ok;
         println!(
             "  {:>15.3}   {:>21.3}   {:>6}   {:>2}   {:>6}   {}",
-            span / 1e6,
+            rate / 1e6,
             reported / 1e6,
             trials,
             ok,
             failed,
             first_err.as_deref().unwrap_or("-")
         );
-        table.push((span, ok, trials));
+        table.push((rate, ok, trials));
     }
 
     println!();
     let highest_reliable = table
         .iter()
         .filter(|(_, ok, trials)| ok == trials)
-        .map(|(span, _, _)| *span)
+        .map(|(rate, _, _)| *rate)
         .fold(0.0f64, f64::max);
     println!(
-        "  highest fully-reliable requested span on this unit: {:.3} MHz",
+        "  highest fully-reliable requested sample rate on this unit: {:.3} MHz",
         highest_reliable / 1e6
     );
 
     assert!(
         highest_reliable > 0.0,
-        "no span succeeded on every trial — the device is not usable at any rung"
+        "no sample rate succeeded on every trial — the device is not usable at any rung"
     );
 }
 
-/// A span past what the receiver clock permits must be refused up front,
+/// A sample rate past what the receiver clock permits must be refused up front,
 /// with a message that says so. The failure this guards against is the
 /// SDK reporting an over-wide request as "No Spectran V6 devices found",
 /// which sends the user hunting for a cabling fault that isn't there.
 #[tokio::test]
 #[ignore = "requires an attached Spectran V6"]
-async fn oversized_span_is_refused_with_an_honest_message() {
+async fn oversized_sample_rate_is_refused_with_an_honest_message() {
     let _guard = device_lock().await;
 
     // 92.16 MHz / 1.5 = 61.44 MHz is the ceiling; ask for well past it.
     let err = AaroniaSource::new(sdk_config(120e6))
         .await
         .err()
-        .expect("a span above the clock ceiling must be refused");
+        .expect("a rate above the clock ceiling must be refused");
     let msg = err.to_string().to_lowercase();
     println!("error: {msg}");
 
     assert!(
         !msg.contains("no spectran v6 devices found"),
-        "an over-wide span must not be reported as a missing device: {msg}"
+        "an over-wide rate must not be reported as a missing device: {msg}"
     );
     assert!(
-        msg.contains("span") || msg.contains("bandwidth") || msg.contains("rate"),
-        "the error should name the span as the problem, got: {msg}"
+        // Broad on purpose: the refusal may come from this crate's own
+        // `validate_iq_mode` ("sample rate ... exceeds ...") or, if a
+        // vendor config write fails first, from the SDK, which still
+        // speaks of "span". Either must name the quantity, not the device.
+        msg.contains("rate") || msg.contains("span") || msg.contains("bandwidth"),
+        "the error should name the sample rate as the problem, got: {msg}"
     );
 }
 
@@ -461,8 +465,8 @@ async fn oversized_span_is_refused_with_an_honest_message() {
 async fn observed_sample_rate_matches_the_request() {
     let _guard = device_lock().await;
 
-    let span = 15.36e6;
-    let mut source = AaroniaSource::new(sdk_config(span))
+    let rate = 15.36e6;
+    let mut source = AaroniaSource::new(sdk_config(rate))
         .await
         .expect("device must open");
     source.start_streaming().await.expect("start");
@@ -495,11 +499,11 @@ async fn observed_sample_rate_matches_the_request() {
     println!(
         "requested {:.3} MS/s, device reports {:.3} MS/s, measured {:.3} MS/s over {} samples \
          (reported/requested = {:.3})",
-        span / 1e6,
+        rate / 1e6,
         reported / 1e6,
         measured / 1e6,
         total,
-        reported / span
+        reported / rate
     );
     assert!(
         (measured - reported).abs() / reported < 0.05,

@@ -72,13 +72,13 @@ const NOAA_CHANNELS: [NoaaChannel; 7] = [
 /// Scanner configuration
 struct ScannerConfig {
     /// Wideband sample rate covering entire NOAA band
-    wideband_rate: f64,
+    wideband_rate_hz: f64,
     /// Center frequency for wideband capture
-    center_frequency: f64,
+    center_frequency_hz: f64,
     /// Audio output sample rate
-    audio_rate: f64,
+    audio_rate_hz: f64,
     /// Minimum power threshold for active stations
-    min_power_threshold: f64,
+    min_power_threshold_dbm: f64,
     /// Device URL (configurable via environment)
     device_url: String,
 }
@@ -86,10 +86,10 @@ struct ScannerConfig {
 impl ScannerConfig {
     fn new() -> Self {
         Self {
-            wideband_rate: 1.5e6,        // 1.5 MS/s covers full NOAA band with margin
-            center_frequency: 162.475e6, // WX4 - perfect center point
-            audio_rate: 48_000.0,        // Standard audio rate
-            min_power_threshold: -100.0, // Conservative threshold for weak signals
+            wideband_rate_hz: 1.5e6,         // 1.5 MS/s covers full NOAA band with margin
+            center_frequency_hz: 162.475e6,  // WX4 - perfect center point
+            audio_rate_hz: 48_000.0,         // Standard audio rate
+            min_power_threshold_dbm: -100.0, // Conservative threshold for weak signals
             device_url: env::var("NOAA_DEVICE")
                 .unwrap_or_else(|_| "http://atc.local:54664".to_string()),
         }
@@ -120,16 +120,16 @@ impl NoaaScanner {
         Self { config }
     }
 
-    /// Create an optimized AaroniaSource for the given frequency and span
+    /// Create an optimized AaroniaSource for the given frequency and rate
     async fn create_source(
         &self,
-        frequency: f64,
-        span: f64,
+        center_frequency_hz: f64,
+        sample_rate_hz: f64,
     ) -> Result<sdr_aaronia_rs::AaroniaSource> {
         AaroniaSourceBuilder::new()
             .http_source(self.config.device_url.clone())
-            .center_frequency(frequency)
-            .span_frequency(span)
+            .center_frequency_hz(center_frequency_hz)
+            .sample_rate_hz(sample_rate_hz)
             .build()
             .await
             .with_context(|| {
@@ -146,22 +146,25 @@ impl NoaaScanner {
     async fn scan_and_find_strongest(&self) -> Result<NoaaChannel> {
         println!("\nScanning all 7 NOAA channels simultaneously...");
         println!(
-            "   Wideband capture: {:.1} MHz span at {:.3} MHz",
-            self.config.wideband_rate / 1e6,
-            self.config.center_frequency / 1e6
+            "   Wideband capture: {:.1} MS/s at {:.3} MHz",
+            self.config.wideband_rate_hz / 1e6,
+            self.config.center_frequency_hz / 1e6
         );
 
         // One line creates a SDR source
         let mut source = self
-            .create_source(self.config.center_frequency, self.config.wideband_rate)
+            .create_source(
+                self.config.center_frequency_hz,
+                self.config.wideband_rate_hz,
+            )
             .await?;
 
         tokio::time::sleep(Duration::from_millis(500)).await; // Hardware settling time
 
         // Capture all NOAA frequencies in one shot
-        let mut samples = Vec::with_capacity(self.config.wideband_rate as usize);
+        let mut samples = Vec::with_capacity(self.config.wideband_rate_hz as usize);
         source
-            .read_samples(&mut samples, self.config.wideband_rate as usize)
+            .read_samples(&mut samples, self.config.wideband_rate_hz as usize)
             .await?;
 
         // functional programming for signal analysis
@@ -178,10 +181,10 @@ impl NoaaScanner {
         // Display results
         self.print_survey_results(&channel_powers);
 
-        if strongest.1 < self.config.min_power_threshold {
+        if strongest.1 < self.config.min_power_threshold_dbm {
             anyhow::bail!(
                 "No NOAA stations found above {:.1} dBm threshold. Check your antenna!",
-                self.config.min_power_threshold
+                self.config.min_power_threshold_dbm
             );
         }
 
@@ -217,7 +220,7 @@ impl NoaaScanner {
 
         let active_count = powers
             .iter()
-            .filter(|&&p| p > self.config.min_power_threshold)
+            .filter(|&&p| p > self.config.min_power_threshold_dbm)
             .count();
         println!("   Found {} active weather stations", active_count);
     }
@@ -227,8 +230,8 @@ impl NoaaScanner {
     /// In a production system, you'd use proper FFT analysis here.
     /// This simplified version demonstrates the concept clearly.
     fn estimate_channel_power(&self, samples: &[Complex32], frequency: f64) -> f64 {
-        let distance_from_center = (frequency - self.config.center_frequency).abs();
-        let max_distance = self.config.wideband_rate / 2.0;
+        let distance_from_center = (frequency - self.config.center_frequency_hz).abs();
+        let max_distance = self.config.wideband_rate_hz / 2.0;
 
         if distance_from_center > max_distance {
             return -120.0; // Outside capture bandwidth
@@ -260,13 +263,15 @@ impl NoaaScanner {
         println!("   Press Ctrl+C to stop\n");
 
         // Create optimized audio source - narrow bandwidth for FM reception
-        let audio_span = self.config.audio_rate * 5.0; // 240 kHz for high-quality FM
-        let mut audio_source = self.create_source(channel.frequency, audio_span).await?;
+        let audio_capture_rate_hz = self.config.audio_rate_hz * 5.0; // 240 kHz for high-quality FM
+        let mut audio_source = self
+            .create_source(channel.frequency, audio_capture_rate_hz)
+            .await?;
 
         // Capture IQ samples for processing
-        let mut iq_samples = Vec::with_capacity((self.config.audio_rate * 5.0) as usize);
+        let mut iq_samples = Vec::with_capacity((self.config.audio_rate_hz * 5.0) as usize);
         audio_source
-            .read_samples(&mut iq_samples, (self.config.audio_rate * 5.0) as usize)
+            .read_samples(&mut iq_samples, (self.config.audio_rate_hz * 5.0) as usize)
             .await
             .context("Failed to read IQ samples for audio processing")?;
 
@@ -303,7 +308,7 @@ impl NoaaScanner {
         let resampler = FirBuilder::resampling::<f32, f32>(1, resample_ratio);
 
         // Audio output
-        let audio_sink = AudioSink::new(self.config.audio_rate as u32, 1);
+        let audio_sink = AudioSink::new(self.config.audio_rate_hz as u32, 1);
 
         // Connect the pipeline with clean, readable calls
         let source_id = flowgraph.add_block(iq_source);

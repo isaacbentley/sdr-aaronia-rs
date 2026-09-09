@@ -227,7 +227,7 @@ pub unsafe extern "C" fn aaronia_source_builder_center_frequency(
 ) {
     unsafe {
         if let Some(builder) = builder.as_mut() {
-            builder.center_frequency(freq);
+            builder.center_frequency_hz(freq);
         }
     }
 }
@@ -246,7 +246,7 @@ pub unsafe extern "C" fn aaronia_source_builder_span_frequency(
 ) {
     unsafe {
         if let Some(builder) = builder.as_mut() {
-            builder.span_frequency(freq);
+            builder.sample_rate_hz(freq);
         }
     }
 }
@@ -265,7 +265,7 @@ pub unsafe extern "C" fn aaronia_source_builder_reference_level(
 ) {
     unsafe {
         if let Some(builder) = builder.as_mut() {
-            builder.reference_level(level);
+            builder.reference_level_dbm(level);
         }
     }
 }
@@ -876,7 +876,7 @@ pub unsafe extern "C" fn aaronia_source_set_center_frequency(
 
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    match ffi_block_on(source.set_center_frequency(freq_hz)) {
+    match ffi_block_on(source.set_center_frequency_hz(freq_hz)) {
         Ok(Ok(())) => AaroniaFfiError::Success,
         Ok(Err(e)) => {
             set_last_error(format!("aaronia_source_set_center_frequency failed: {}", e));
@@ -906,7 +906,7 @@ pub unsafe extern "C" fn aaronia_source_set_span_frequency(
 
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    match ffi_block_on(source.set_span_frequency(span_hz)) {
+    match ffi_block_on(source.set_sample_rate_hz(span_hz)) {
         Ok(Ok(())) => AaroniaFfiError::Success,
         Ok(Err(e)) => {
             set_last_error(format!("aaronia_source_set_span_frequency failed: {}", e));
@@ -936,7 +936,7 @@ pub unsafe extern "C" fn aaronia_source_set_reference_level(
 
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
 
-    match ffi_block_on(source.set_reference_level(ref_level_dbm)) {
+    match ffi_block_on(source.set_reference_level_dbm(ref_level_dbm)) {
         Ok(Ok(())) => AaroniaFfiError::Success,
         Ok(Err(e)) => {
             set_last_error(format!("aaronia_source_set_reference_level failed: {}", e));
@@ -1024,10 +1024,10 @@ pub unsafe extern "C" fn aaronia_source_get_source_info(ptr: *mut c_void) -> *mu
 
     let ffi_info = Box::new(FfiSourceInfo {
         source_type: info.source_type.into(),
-        center_frequency: info.center_frequency,
-        span_frequency: info.span_frequency,
+        center_frequency: info.center_frequency_hz,
+        span_frequency: info.sample_rate_hz,
         bandwidth_hz: info.bandwidth_hz,
-        reference_level: info.reference_level,
+        reference_level: info.reference_level_dbm,
         device_serial,
     });
 

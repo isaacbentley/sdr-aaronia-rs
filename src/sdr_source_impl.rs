@@ -114,7 +114,7 @@ impl SdrSource for AaroniaSdrSource {
             stream_format,
         } = *self;
         let block_size = block_size.max(1024);
-        let span_hz = config.sample_rate_hz;
+        let sample_rate_hz = config.sample_rate_hz;
         let channels_hz = config.channels_hz.clone();
         let dwell_ctrl = DwellController {
             min: config.dwell_min,
@@ -135,9 +135,9 @@ impl SdrSource for AaroniaSdrSource {
                             runtime.block_on(async move {
                     let mut builder = AaroniaSourceBuilder::new();
                     builder
-                        .center_frequency(center_frequency_hz)
-                        .span_frequency(span_hz)
-                        .reference_level(reference_level_dbm);
+                        .center_frequency_hz(center_frequency_hz)
+                        .sample_rate_hz(sample_rate_hz)
+                        .reference_level_dbm(reference_level_dbm);
 
                     match &backend {
                         AaroniaBackend::Http(url) => {
@@ -175,8 +175,8 @@ impl SdrSource for AaroniaSdrSource {
                     // front. `build()` resolves it into the config, so prefer
                     // the value from `source_info`; fall back to the caller's
                     // value for live backends where the two already agree.
-                    let effective_center_hz = if source_info.center_frequency > 0.0 {
-                        source_info.center_frequency
+                    let effective_center_hz = if source_info.center_frequency_hz > 0.0 {
+                        source_info.center_frequency_hz
                     } else {
                         center_frequency_hz
                     };
@@ -310,7 +310,7 @@ async fn single_channel_pump(
     while !stop_thread.load(Ordering::SeqCst) {
         let target = advice.channel_override().unwrap_or(center_frequency_hz);
         if (target - current_freq).abs() > 1.0 {
-            if let Err(e) = source.set_center_frequency(target).await {
+            if let Err(e) = source.set_center_frequency_hz(target).await {
                 warn!("Aaronia retune to {:.3} MHz failed: {e}", target / 1e6);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -409,7 +409,7 @@ async fn hop_pump(
         // the current channel — otherwise a one-channel hop list
         // would burn ~75 ms per dwell cycle on a no-op tune.
         if channel != current_channel {
-            if let Err(e) = source.set_center_frequency(channel).await {
+            if let Err(e) = source.set_center_frequency_hz(channel).await {
                 warn!("Aaronia retune to {:.3} MHz failed: {e}", channel / 1e6);
                 consecutive_retune_failures += 1;
                 if consecutive_retune_failures >= READ_ERROR_BAILOUT {

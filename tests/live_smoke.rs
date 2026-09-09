@@ -858,8 +858,8 @@ async fn live_auto_reconnect_stream_is_continuous() {
     use sdr_aaronia_rs::unified_source::{AaroniaConfig, AaroniaSource};
 
     let config = AaroniaConfig::from_http(&live_url())
-        .center_frequency(2.44e9)
-        .span_frequency(12.288e6)
+        .center_frequency_hz(2.44e9)
+        .sample_rate_hz(12.288e6)
         .read_timeout(Duration::from_secs(20));
     assert!(config.auto_reconnect, "reconnect must default to on");
 

@@ -2176,7 +2176,7 @@ impl NativeSdkSource {
             // the pipeline delivers samples at 1.5x it — measured on a
             // V6 ECO: a 15.36 MHz request streamed at 23.04 MS/s, 10 MHz
             // at 15.0, every rung exactly x1.5 up to a 59.2 MS/s USB
-            // ceiling. This crate's `span_frequency` *is* the sample
+            // ceiling. This crate's `sample_rate_hz` *is* the sample
             // rate (the HTTP backend delivers exactly it), so ask the
             // ECO for rate / 1.5 and the caller gets the rate it named
             // on every backend. `spectranv6/raw` is left as-is: not
@@ -2301,9 +2301,9 @@ impl NativeSdkSource {
                 // fixed. It is 92.16 MHz, not the 61.44 MHz this used to
                 // assume. A V6 ECO streams at 61.44 MHz sampling, measured
                 // over HTTP against real hardware, and the constraint
-                // checked below is `span * 1.5 <= clock`, so the clock
+                // checked below is `rate * 1.5 <= clock`, so the clock
                 // cannot be lower than 92.16 MHz. With the old value this
-                // rejected every span above 40.96 MHz, including the
+                // rejected every rate above 40.96 MHz, including the
                 // device's own maximum.
                 crate::utils::DEFAULT_RECEIVER_CLOCK_HZ
             };
