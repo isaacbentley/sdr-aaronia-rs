@@ -344,6 +344,40 @@ read from it arrives at ~0.4 MS/s whatever rate was asked. `AaroniaSource`
 does this since 0.8.2; before that it enumerated `spectranv6` only and
 could not open an ECO, and 0.8.1's ECO path opened `rtsa`.
 
+`split_device_type` performs the split for both `SdkConfig` and
+`SdkSinkConfig`, and it reads the mode as the text after the **first**
+slash. A trailing slash therefore supplies no mode: `"spectranv6/"` means
+`"spectranv6"`, and picks up the caller's default (`raw` for a source,
+`iqtransmitter` for a sink). This is worth stating because the earlier
+rule — "contains a slash, so it is already qualified" — sent
+`"spectranv6/"` to `AARTSAAPI_OpenDevice` verbatim, and on the ECO the
+same empty mode segment slipped past the `spectranv6eco/raw` remap in
+`device_open_mode`, asking the device for a pipeline it does not have.
+The vendor answer to either is a result code that says nothing about the
+typo.
+
+A device type naming no family at all (`""`, `"/"`, `"/raw"`) is passed
+back verbatim rather than completed — no default mode is appended to a
+string that names no device — and it is refused at both points where a
+device type crosses into the SDK. `names_a_device_family` is the shared
+rule; `find_devices` and `open_device` each apply it and return an
+`Error::Config`. Two guards rather than one because enumeration runs
+*first*: an empty family simply enumerates to nothing, so without that
+guard the caller reports "no devices found" and the typo never surfaces.
+Which refusal a caller sees depends on the path: the config wrappers
+enumerate before they open, and enumeration takes the *family*, so a
+`device_type` of `"/raw"` trips the `find_devices` guard on an empty
+family — that message therefore has to stand on its own rather than quote
+the string it never saw. `open_device` does quote it, which matters for
+callers that open directly, `open_device` being public.
+
+`device_family` and `device_open_mode` stay infallible: a typo in one
+config field is not a reason to make four accessors return `Result`.
+`open_detected_device` is unaffected either way — it builds its open
+string from an enumerated family and a mode, never from
+`split_device_type` — though it reaches the SDK through the same guarded
+`open_device`.
+
 ### ECO `iqreceiver`: span is bandwidth, rate is 1.5× it
 
 On `spectranv6eco/iqreceiver`, `main/spanfreq` is a *bandwidth* and the

@@ -373,3 +373,32 @@ pub mod futuresdr_sink {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sink's half of the family/mode split. It shares
+    /// `split_device_type` with `SdkConfig` but supplies a different
+    /// default mode, so the trailing-slash fix has to hold here too — and
+    /// `iqtransmitter` is exactly the mode a malformed `"spectranv6/"`
+    /// used to drop on the floor.
+    #[test]
+    fn a_trailing_slash_still_gets_the_transmit_mode() {
+        let mut config = SdkSinkConfig {
+            device_type: "spectranv6".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.device_family(), "spectranv6");
+        assert_eq!(config.device_open_mode(), "spectranv6/iqtransmitter");
+
+        config.device_type = "spectranv6/".to_string();
+        assert_eq!(config.device_family(), "spectranv6");
+        assert_eq!(config.device_open_mode(), "spectranv6/iqtransmitter");
+
+        // An explicit mode is still passed through untouched. The sink has
+        // no eco remap of its own — `iqtransmitter` is the only default.
+        config.device_type = "spectranv6/iqtransceiver".to_string();
+        assert_eq!(config.device_open_mode(), "spectranv6/iqtransceiver");
+    }
+}

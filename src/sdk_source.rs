@@ -457,6 +457,14 @@ mod tests {
         // Any other explicit mode is passed through untouched.
         config.device_type = "spectranv6eco/iqreceiver".to_string();
         assert_eq!(config.device_open_mode(), "spectranv6eco/iqreceiver");
+        // A trailing slash names no mode, so it is the bare family again.
+        // This used to yield `"spectranv6eco/"`: the empty mode segment
+        // counted as "already qualified" and so never met the remap above.
+        config.device_type = "spectranv6eco/".to_string();
+        assert_eq!(config.device_family(), "spectranv6eco");
+        assert_eq!(config.device_open_mode(), "spectranv6eco/iqreceiver");
+        config.device_type = "spectranv6/".to_string();
+        assert_eq!(config.device_open_mode(), "spectranv6/raw");
     }
 
     /// `raw_mode_for_family` is a two-way branch: everything that is not

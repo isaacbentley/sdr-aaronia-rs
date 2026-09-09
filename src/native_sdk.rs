@@ -1400,6 +1400,17 @@ fn wide_to_string(wide: &[WideChar]) -> String {
     wstr.to_string_lossy()
 }
 
+/// Whether `s` names a device family at all.
+///
+/// The rule behind the guards in [`NativeSdkSource::find_devices`] and
+/// [`NativeSdkSource::open_device`], factored out because neither can be
+/// unit-tested directly: constructing a `NativeSdkSource` needs a
+/// `NativeSdkClient` full of non-nullable vendor fn pointers, which cannot
+/// be faked without a test-double trait this crate does not have.
+pub(crate) fn names_a_device_family(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('/')
+}
+
 /// Splits a possibly mode-qualified device-type string (e.g. `"spectranv6"`
 /// or `"spectranv6/raw"`) into its bare family — for `AARTSAAPI_EnumDevice`,
 /// which only accepts the family, not a mode-qualified string — and its
@@ -1408,12 +1419,39 @@ fn wide_to_string(wide: &[WideChar]) -> String {
 /// string (`SdkConfig` defaults to `"raw"`, `SdkSinkConfig` to
 /// `"iqtransmitter"` — the two other high-level SDK config wrappers that
 /// otherwise duplicated this exact split).
+///
+/// A **trailing slash supplies no mode**: `"spectranv6/"` is the same
+/// request as `"spectranv6"`, not a mode of `""`. Testing for a `/`
+/// anywhere in the string got this wrong and passed the malformed
+/// `"spectranv6/"` straight to `AARTSAAPI_OpenDevice`. On the ECO it was
+/// worse than malformed — `"spectranv6eco/"` also slipped past the
+/// `"spectranv6eco/raw"` remap in [`crate::sdk_source::SdkConfig::device_open_mode`],
+/// so the device was asked for a pipeline it does not have.
+///
+/// A device type that names **no family** (`""`, `"/"`, `"/raw"`) is handed
+/// back verbatim rather than completed: there is nothing to qualify, and
+/// turning `"/"` into `"/raw"` would only manufacture a string that reads
+/// as valid on the way to the SDK. [`NativeSdkSource::find_devices`] and
+/// [`NativeSdkSource::open_device`] are what refuse it — see
+/// [`names_a_device_family`]. The family is returned as-is, empty in and
+/// empty out, so the accessors built on this stay infallible.
+///
+/// Note which refusal a caller actually sees: the config wrappers
+/// enumerate before they open, and enumeration is handed the *family*, so
+/// a `device_type` of `"/raw"` trips the `find_devices` guard on an empty
+/// family. `open_device` quoting the string back is for callers that open
+/// directly, `open_device` being public.
 pub(crate) fn split_device_type<'a>(device_type: &'a str, default_mode: &str) -> (&'a str, String) {
-    let family = device_type.split('/').next().unwrap_or(device_type);
-    let open_mode = if device_type.contains('/') {
+    let (family, mode) = match device_type.split_once('/') {
+        Some((family, mode)) => (family, mode),
+        None => (device_type, ""),
+    };
+    let open_mode = if family.is_empty() {
         device_type.to_string()
-    } else {
+    } else if mode.is_empty() {
         format!("{family}/{default_mode}")
+    } else {
+        format!("{family}/{mode}")
     };
     (family, open_mode)
 }
@@ -1862,6 +1900,20 @@ impl NativeSdkSource {
 
     pub unsafe fn find_devices(&mut self, device_type: &str) -> Result<Vec<AARTSAAPI_DeviceInfo>> {
         unsafe {
+            // The sibling of the guard in `Self::open_device`, and needed
+            // separately because enumeration runs *first*: a `device_type`
+            // naming no family yields an empty family, and enumerating on
+            // it merely finds nothing, so the caller reports "no devices
+            // found" and the typo never surfaces.
+            if !names_a_device_family(device_type) {
+                return Err(Error::Config(
+                    "device family is empty: the configured device type names no \
+                     family, being empty or starting with `/`. Expected something \
+                     like \"spectranv6\" or \"spectranv6eco\""
+                        .to_string(),
+                ));
+            }
+
             let handle = self
                 .handle
                 .as_mut()
@@ -1896,6 +1948,19 @@ impl NativeSdkSource {
         serial_number: &[WideChar],
     ) -> Result<()> {
         unsafe {
+            // A family-less open string reaches `AARTSAAPI_OpenDevice` as
+            // garbage and comes back as a vendor result code, pointing
+            // nowhere near the actual mistake. `split_device_type` yields
+            // an empty string for a device type naming no family (`""`,
+            // `"/"`, `"/raw"`), so catch it here — one guard for every
+            // open path — and name the field to fix.
+            if !names_a_device_family(device_type) {
+                return Err(Error::Config(format!(
+                    "device type {device_type:?} names no device family; expected \
+                     something like \"spectranv6\" or \"spectranv6eco/iqreceiver\""
+                )));
+            }
+
             // Opening over a live device would leave it opened and
             // streaming with nothing left to stop or close it.
             if self.device.is_some() {
@@ -3567,6 +3632,80 @@ mod tests {
         assert_eq!(
             split_device_type("spectranv6eco/sweepsa", "raw"),
             ("spectranv6eco", "spectranv6eco/sweepsa".to_string())
+        );
+    }
+
+    /// A trailing slash supplies no mode, so it must behave exactly like
+    /// the bare family. Testing for a `/` anywhere in the string treated
+    /// `"spectranv6/"` as already mode-qualified and handed that on
+    /// verbatim, which `AARTSAAPI_OpenDevice` can only reject.
+    #[test]
+    fn split_device_type_treats_a_trailing_slash_as_no_mode() {
+        for default_mode in ["raw", "iqtransmitter"] {
+            assert_eq!(
+                split_device_type("spectranv6/", default_mode),
+                split_device_type("spectranv6", default_mode),
+                "a trailing slash must mean the same as no slash"
+            );
+            assert_eq!(
+                split_device_type("spectranv6/", default_mode),
+                ("spectranv6", format!("spectranv6/{default_mode}"))
+            );
+        }
+        // The eco is where this bit hardest: `device_open_mode` remaps
+        // `spectranv6eco/raw`, and `spectranv6eco/` used to slip past it.
+        assert_eq!(
+            split_device_type("spectranv6eco/", "iqreceiver"),
+            ("spectranv6eco", "spectranv6eco/iqreceiver".to_string())
+        );
+    }
+
+    /// Nothing to qualify, so nothing is invented: the split neither
+    /// appends a default mode nor erases what the caller wrote, and
+    /// `names_a_device_family` is what rejects the result. Returning the
+    /// family as-is rather than erroring is what keeps `device_family`
+    /// infallible.
+    #[test]
+    fn split_device_type_completes_nothing_without_a_family() {
+        for device_type in ["", "/", "/raw"] {
+            let (family, open_mode) = split_device_type(device_type, "raw");
+            assert!(family.is_empty(), "{device_type:?} names no family");
+            assert_eq!(
+                open_mode, device_type,
+                "{device_type:?} must come back verbatim so the refusal can quote it"
+            );
+            assert!(
+                !names_a_device_family(&open_mode),
+                "{device_type:?} must not survive the guard"
+            );
+        }
+    }
+
+    /// The rule both SDK-boundary guards apply. Tested here because
+    /// neither `find_devices` nor `open_device` can be called without a
+    /// live `NativeSdkClient`.
+    #[test]
+    fn names_a_device_family_accepts_only_a_leading_family() {
+        for good in [
+            "spectranv6",
+            "spectranv6eco",
+            "spectranv6/raw",
+            "spectranv6eco/iqreceiver",
+        ] {
+            assert!(names_a_device_family(good), "{good:?} names a family");
+        }
+        for bad in ["", "/", "/raw", "/spectranv6/raw"] {
+            assert!(!names_a_device_family(bad), "{bad:?} names no family");
+        }
+    }
+
+    /// A multi-segment string keeps every segment; only the first `/`
+    /// separates family from mode.
+    #[test]
+    fn split_device_type_keeps_later_slashes_in_the_mode() {
+        assert_eq!(
+            split_device_type("spectranv6/a/b", "raw"),
+            ("spectranv6", "spectranv6/a/b".to_string())
         );
     }
 

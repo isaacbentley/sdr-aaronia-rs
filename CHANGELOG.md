@@ -60,6 +60,26 @@ accident. `tests/wire_contract.rs` asserts the keys, and asserts the vendor
   synchronous start.
 
 ### Fixed
+- **A trailing slash in `device_type` no longer produces a malformed open
+  string.** The family/mode split asked whether the string contained a slash,
+  so `"spectranv6/"` counted as already mode-qualified and was passed to
+  `AARTSAAPI_OpenDevice` verbatim. The mode is now the text after the *first*
+  slash, and an empty one means no mode was given: `"spectranv6/"` is simply
+  `"spectranv6"`. The ECO was the sharp edge — `"spectranv6eco/"` also slipped
+  past the `spectranv6eco/raw` → `iqreceiver` remap, so the device was asked
+  for a pipeline it does not have, and answered with a vendor result code that
+  said nothing about the typo.
+
+  A `device_type` naming no family (`""`, `"/"`, `"/raw"`) is no longer
+  completed into a family-less `"/raw"`; it comes back untouched and is refused
+  with a configuration error at both points where a device type reaches the SDK,
+  `find_devices` and `open_device`. Both are needed: enumeration runs first, and
+  an empty family simply enumerates to nothing, so the old path reported "no
+  devices found" and never mentioned the typo. Which of the two fires depends on
+  the path: the config wrappers enumerate first, so that is the message they
+  surface. `device_family` and
+  `device_open_mode` stay infallible on both the source and sink config — a typo
+  in one field is not a reason to make four accessors return `Result`.
 - **An over-wide sample rate no longer reaches the hardware before it is
   refused.** `configure_iq_receiver` checked the IQ-mode constraint as its last
   act, so a rate the receiver clock cannot carry was written to
