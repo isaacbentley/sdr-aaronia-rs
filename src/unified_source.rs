@@ -548,7 +548,13 @@ impl AaroniaSource {
 
         // Hardware-bound source types must respect the IQ Mode
         // constraint. File sources read pre-recorded samples and aren't
-        // subject to it.
+        // subject to it. The native SDK is not exempt either — it applies
+        // the check inside `configure_iq_receiver`, before writing
+        // anything to the device, so an over-wide rate is refused there
+        // without the hardware ever seeing it. It is checked against the
+        // clock that call leaves in place rather than this default: the
+        // default in raw mode, where the call installs it, and the
+        // device's live clock in the modes that leave it alone.
         match source_type {
             SourceType::Http => {
                 validate_iq_mode(config.sample_rate_hz, DEFAULT_RECEIVER_CLOCK_HZ)?;

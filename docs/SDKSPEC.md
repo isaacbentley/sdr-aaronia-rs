@@ -365,11 +365,41 @@ a full V6 has not been measured and is left untranslated.
 ### IQ-mode receiver clock constraint
 
 `NativeSdkSource::configure_iq_receiver` calls
-`utils::validate_iq_mode(span, clock)` after applying the config,
-where `clock` is read live from `device/receiverclock` via
-`AARTSAAPI_ConfigGetString` (or `DEFAULT_RECEIVER_CLOCK_HZ`, 92.16 MHz,
-on eco devices, which expose no such key and run at a fixed clock). The check enforces
-`span * 1.5 <= clock` and returns a typed error before the device starts.
+`utils::validate_iq_mode(rate, clock)` twice, and the order matters.
+
+The gate runs **before the first config write**, against the clock the
+call *leaves in place* — which is not always the one the device holds on
+entry:
+
+- On `spectranv6/raw`, the function writes `device/receiverclock` itself
+  (`DEFAULT_RECEIVER_CLOCK_LABEL`, `"92MHz"`, = 92.16 MHz), so that write
+  decides the clock and the check uses it. Checking the *current* setting
+  here would pass a rate the incoming clock cannot carry: a V6 left on
+  245.76 MHz would accept 150 MS/s and then have the clock pulled down to
+  92.16 MHz underneath it.
+- On every other open mode the clock write is skipped
+  (`DeviceOpenMode::supports_raw_only_keys` is true only for `Raw`), so
+  the device keeps what it has and the check reads it live. An eco
+  exposes no such key and falls back to the 92.16 MHz default; a full V6
+  in a non-raw IQ mode may sit on a faster clock, and assuming 92.16
+  there would refuse rates it can genuinely reach.
+
+The second call runs after the writes, against the clock read back from
+`device/receiverclock` via `AARTSAAPI_ConfigGetString`. Its real job is
+to make `receiver_clock_hz()` report the device's own number rather than
+the requested one. As a check it is deliberately weak in one direction:
+the rate already fits the intended clock, so a device sitting on a
+*faster* clock than intended still passes — an ignored clock write is
+invisible here, and harmless, because a rate that fits 92.16 MHz also
+fits 245.76. What it catches is a device on a clock too slow for the
+rate, which the pre-write check had no way to know about. That error
+says the device is already configured, since unlike the pre-write refusal
+there is no prior state to restore.
+
+Both enforce `rate * 1.5 <= clock`; the pre-write one returns
+`Error::Config` from `validate_iq_mode`, the post-write one wraps it in
+an `Error::Sdk`. `utils::the_92mhz_label_is_the_default_receiver_clock`
+pins the label↔rate equality the raw-mode arm depends on.
 
 The ConfigItem labels the SDK exposes are *rounded* — `"92MHz"` is
 actually 92.16 MHz, etc. Use `receiver_clock_for_label` to convert.

@@ -59,6 +59,25 @@ accident. `tests/wire_contract.rs` asserts the keys, and asserts the vendor
   shared-reference plus post-alignment on timestamps, never a commanded
   synchronous start.
 
+### Fixed
+- **An over-wide sample rate no longer reaches the hardware before it is
+  refused.** `configure_iq_receiver` checked the IQ-mode constraint as its last
+  act, so a rate the receiver clock cannot carry was written to
+  `main/centerfreq` and `main/spanfreq` first and rejected afterwards, leaving
+  the device holding exactly the misconfiguration the check exists to prevent —
+  and, per the SDK, silently emitting corrupted samples if anything started the
+  stream anyway. The check now runs before the first write.
+
+  It is checked against the clock the call *leaves in place*, which is not
+  always the one the device holds on entry. In raw mode the call writes the
+  clock itself, so that write is what counts: a V6 left on its 245.76 MHz clock
+  would otherwise pass a 150 MS/s request that stops being valid the moment
+  this same call drops the clock to 92.16 MHz. Every other open mode skips that
+  write, so there the live setting is the honest number — assuming 92.16 would
+  refuse rates a full V6 can genuinely reach. The read-back after the writes is
+  kept, and is what `receiver_clock_hz()` reports. Native SDK backend only; the
+  HTTP backend already validated at the API boundary.
+
 ## [v0.9.0] - 2026-09-08
 
 ### Added

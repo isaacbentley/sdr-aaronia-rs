@@ -2130,6 +2130,39 @@ impl NativeSdkSource {
         }
     }
 
+    /// Resolve `device/receiverclock` to a real rate in Hz.
+    ///
+    /// The ConfigItem labels the SDK exposes are *rounded* — `"92MHz"` is
+    /// actually 92.16 MHz — so this goes through the documented label→rate
+    /// table rather than parsing the leading integer.
+    ///
+    /// An absent or unreadable key yields [`crate::utils::DEFAULT_RECEIVER_CLOCK_HZ`].
+    /// Eco devices are the reason: they expose no such key and run at a
+    /// fixed clock, which is 92.16 MHz, not the 61.44 MHz this crate once
+    /// assumed. A V6 ECO streams at 61.44 MS/s and the constraint is
+    /// `rate * 1.5 <= clock`, so the clock cannot be lower than 92.16 MHz;
+    /// the old value rejected every rate above 40.96 MS/s, including the
+    /// device's own maximum.
+    ///
+    /// Takes `client` explicitly rather than through `&self`: callers
+    /// already hold `device` borrowed out of `self.device`, so a `&self`
+    /// receiver would conflict with it.
+    unsafe fn read_receiver_clock_hz(
+        client: &NativeSdkClient,
+        device: &mut AARTSAAPI_Device,
+        root: &mut AARTSAAPI_Config,
+    ) -> f64 {
+        unsafe {
+            if let Ok(mut config) = client.find_config(device, root, "device/receiverclock")
+                && let Ok(label) = client.get_config_string(device, &mut config)
+            {
+                crate::utils::receiver_clock_for_label(&label)
+            } else {
+                crate::utils::DEFAULT_RECEIVER_CLOCK_HZ
+            }
+        }
+    }
+
     /// Configure the IQ receiver pipeline: tuning, level, and — on raw
     /// mode — the receiver channel.
     ///
@@ -2157,6 +2190,46 @@ impl NativeSdkSource {
 
             // Get config root
             let mut root = self.client.get_config_root(device)?;
+
+            // The next four config keys are only present on `spectranv6/raw`.
+            // On `spectranv6eco/iqreceiver` (per IQReceiverEco.cpp) the SDK
+            // owns the channel/format/clock/decimation pipeline and the keys
+            // either don't exist or are read-only — touching them produces a
+            // misleading warning. Skip them when we know the mode is eco.
+            //
+            // Hoisted above the writes because it also decides which clock
+            // the rate is checked against, immediately below.
+            let writes_raw_only_keys = self
+                .open_mode
+                .as_ref()
+                .map(|m| m.supports_raw_only_keys())
+                .unwrap_or(true); // Unknown mode: try anyway.
+
+            // Check the IQ-mode constraint *before* the first write. This
+            // used to run at the end of the function, which meant an
+            // over-wide request was already sitting on the hardware by the
+            // time it was refused — precisely the misconfiguration
+            // `validate_iq_mode` exists to prevent.
+            //
+            // Check against the clock this call *leaves in place*, which is
+            // not always the one the device is on now:
+            //
+            // - When we write `device/receiverclock` below, that write is
+            //   what decides it. Checking the current setting instead would
+            //   pass a rate the incoming clock cannot carry — a V6 left on
+            //   245.76 MHz would accept 150 MS/s, then have the clock pulled
+            //   down to 92.16 MHz underneath it.
+            // - When we don't write it (every non-raw mode), the device keeps
+            //   whatever it has, so that is the honest number. An eco exposes
+            //   no such key and falls back to the same default; a full V6 in
+            //   a non-raw IQ mode may legitimately be on a faster clock, and
+            //   assuming 92.16 there would refuse rates it can really reach.
+            let intended_clock_hz = if writes_raw_only_keys {
+                crate::utils::receiver_clock_for_label(crate::utils::DEFAULT_RECEIVER_CLOCK_LABEL)
+            } else {
+                Self::read_receiver_clock_hz(&self.client, device, &mut root)
+            };
+            crate::utils::validate_iq_mode(sample_rate_hz, intended_clock_hz)?;
 
             // Configure center frequency
             if let Ok(mut config) = self
@@ -2211,17 +2284,6 @@ impl NativeSdkSource {
                 warn!("Could not find main/reflevel config");
             }
 
-            // The next four config keys are only present on `spectranv6/raw`.
-            // On `spectranv6eco/iqreceiver` (per IQReceiverEco.cpp) the SDK
-            // owns the channel/format/clock/decimation pipeline and the keys
-            // either don't exist or are read-only — touching them produces a
-            // misleading warning. Skip them when we know the mode is eco.
-            let writes_raw_only_keys = self
-                .open_mode
-                .as_ref()
-                .map(|m| m.supports_raw_only_keys())
-                .unwrap_or(true); // Unknown mode: try anyway.
-
             if writes_raw_only_keys {
                 // Configure receiver channel (caller's selection, Rx1
                 // default — see the doc comment on this function).
@@ -2262,9 +2324,15 @@ impl NativeSdkSource {
                     self.client
                         .find_config(device, &mut root, "device/receiverclock")
                 {
-                    self.client
-                        .set_config_string(device, &mut config, "92MHz")?;
-                    info!("Set receiver clock to 92MHz");
+                    self.client.set_config_string(
+                        device,
+                        &mut config,
+                        crate::utils::DEFAULT_RECEIVER_CLOCK_LABEL,
+                    )?;
+                    info!(
+                        "Set receiver clock to {}",
+                        crate::utils::DEFAULT_RECEIVER_CLOCK_LABEL
+                    );
                 } else {
                     debug!("device/receiverclock not found (may be V6 ECO with fixed clock)");
                 }
@@ -2283,33 +2351,29 @@ impl NativeSdkSource {
                 );
             }
 
-            // Validate the IQ Mode Constraint dynamically after applying
-            // config. The `"92MHz"`-style ConfigItem labels are *rounded* — for
-            // example `"92MHz"` is actually 92.16 MHz — so resolve via the
-            // documented label→rate table rather than parsing the integer.
-            let actual_clock_hz = if let Ok(mut config) =
-                self.client
-                    .find_config(device, &mut root, "device/receiverclock")
-            {
-                if let Ok(clock_str) = self.client.get_config_string(device, &mut config) {
-                    crate::utils::receiver_clock_for_label(&clock_str)
-                } else {
-                    crate::utils::DEFAULT_RECEIVER_CLOCK_HZ
-                }
-            } else {
-                // Eco devices report no receiverclock key: the clock is
-                // fixed. It is 92.16 MHz, not the 61.44 MHz this used to
-                // assume. A V6 ECO streams at 61.44 MHz sampling, measured
-                // over HTTP against real hardware, and the constraint
-                // checked below is `rate * 1.5 <= clock`, so the clock
-                // cannot be lower than 92.16 MHz. With the old value this
-                // rejected every rate above 40.96 MHz, including the
-                // device's own maximum.
-                crate::utils::DEFAULT_RECEIVER_CLOCK_HZ
-            };
-
+            // Read back what the device settled on, so `receiver_clock_hz()`
+            // reports the real clock rather than the one this call asked
+            // for — they differ if the write above did not take.
+            let actual_clock_hz = Self::read_receiver_clock_hz(&self.client, device, &mut root);
             self.receiver_clock_hz = Some(actual_clock_hz);
-            crate::utils::validate_iq_mode(sample_rate_hz, actual_clock_hz)?;
+
+            // Re-check against that number. Note what this can and cannot
+            // catch: the rate already fits `intended_clock_hz`, so a device
+            // sitting on a *faster* clock than intended still passes — an
+            // ignored clock write is invisible here, and harmless, since a
+            // rate that fits 92.16 MHz also fits 245.76. What it catches is
+            // a device on a clock too slow for the rate, which the pre-write
+            // check could not have known about.
+            crate::utils::validate_iq_mode(sample_rate_hz, actual_clock_hz).map_err(|e| {
+                Error::Sdk(format!(
+                    "device reports a {:.2} MHz receiver clock, too slow for the \
+                     requested rate: {e}. The device is already configured at this \
+                     point, with no prior state to restore; re-configure it at \
+                     {:.3} MS/s or less.",
+                    actual_clock_hz / 1e6,
+                    actual_clock_hz / crate::utils::IQ_RATE_CLOCK_RATIO / 1e6,
+                ))
+            })?;
 
             info!("IQ Receiver configuration completed");
             Ok(())

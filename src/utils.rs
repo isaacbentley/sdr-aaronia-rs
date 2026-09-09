@@ -266,6 +266,12 @@ pub fn format_sample_rate(rate_hz: f64) -> String {
 /// to resolve any of the documented labels to its physical rate.
 pub const DEFAULT_RECEIVER_CLOCK_HZ: f64 = 92_160_000.0;
 
+/// The `device/receiverclock` ConfigItem label that selects
+/// [`DEFAULT_RECEIVER_CLOCK_HZ`]. `configure_iq_receiver` writes this on
+/// `spectranv6/raw`, and its pre-write rate check assumes the two agree;
+/// `the_92mhz_label_is_the_default_receiver_clock` pins that.
+pub const DEFAULT_RECEIVER_CLOCK_LABEL: &str = "92MHz";
+
 /// Resolve a `device/receiverclock` ConfigItem label (e.g. `"92MHz"`) to
 /// its actual physical rate in Hz. The mapping comes from the official
 /// RTSA-API-Samples README. Unknown labels fall back to the integer-MHz
@@ -916,6 +922,23 @@ mod tests {
         // Empty env var falls back to default (not the empty string).
         unsafe { std::env::set_var("AARONIA_USER_AGENT", "   ") };
         assert!(user_agent().starts_with("sdr-aaronia-rs/"));
+    }
+
+    /// `configure_iq_receiver` refuses an over-wide rate *before* it
+    /// writes anything to the device, which it can only do by checking
+    /// against the clock the call is about to install rather than the one
+    /// currently set. On `spectranv6/raw` it writes the `"92MHz"` label;
+    /// on an eco there is no clock key and the fixed clock is the same
+    /// rate. Both arms therefore assume this equality — if the label
+    /// table and the default ever drift apart, that check would silently
+    /// validate against a clock the device does not end up on.
+    #[test]
+    fn the_92mhz_label_is_the_default_receiver_clock() {
+        assert_eq!(
+            receiver_clock_for_label(DEFAULT_RECEIVER_CLOCK_LABEL),
+            DEFAULT_RECEIVER_CLOCK_HZ,
+            "configure_iq_receiver's pre-write check depends on these agreeing"
+        );
     }
 
     #[test]
