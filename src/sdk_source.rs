@@ -440,58 +440,6 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
-    #[test]
-    fn test_frequency_validation() {
-        // Test typical frequency ranges
-        let valid_frequencies = vec![100e6, 1e9, 2.4e9, 5.8e9, 10e9];
-
-        for freq in valid_frequencies {
-            assert!(freq > 0.0, "Frequency {} should be positive", freq);
-            assert!(
-                freq <= 20e9,
-                "Frequency {} should be within device limits",
-                freq
-            );
-        }
-    }
-
-    #[test]
-    fn test_sample_rate_validation() {
-        // Test sample rate ranges
-        let valid_rates = vec![1e3, 1e6, 10e6, 100e6, 1e9];
-
-        for rate in valid_rates {
-            assert!(rate > 0.0, "Rate {} should be positive", rate);
-            assert!(rate <= 10e9, "Rate {} should be within device limits", rate);
-        }
-    }
-
-    #[test]
-    fn test_reference_level_validation() {
-        // Test reference level ranges (typical for RF)
-        let valid_levels = vec![-100.0, -50.0, -20.0, 0.0, 30.0];
-
-        for level in valid_levels {
-            assert!(level >= -140.0, "Reference level {} too low", level);
-            assert!(level <= 40.0, "Reference level {} too high", level);
-        }
-    }
-
-    #[test]
-    fn test_timeout_validation() {
-        let timeouts = vec![
-            Duration::from_secs(1),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            Duration::from_secs(300),
-        ];
-
-        for timeout in timeouts {
-            assert!(!timeout.is_zero(), "Timeout should not be zero");
-            assert!(timeout.as_secs() <= 600, "Timeout should be reasonable");
-        }
-    }
-
     /// The ECO has no `/raw`; its raw pipeline is `rtsa`.
     #[test]
     fn bare_family_opens_in_its_raw_mode() {
@@ -511,84 +459,27 @@ mod tests {
         assert_eq!(config.device_open_mode(), "spectranv6eco/iqreceiver");
     }
 
+    /// `raw_mode_for_family` is a two-way branch: everything that is not
+    /// the ECO gets `/raw`, including a family this build has never heard
+    /// of. Worth pinning because the fallback is what a future device
+    /// family will hit before anyone teaches the crate about it.
+    ///
+    /// The family name here is deliberately one Aaronia will never ship.
+    /// A plausible-looking `spectranv6mk2` would quietly stop testing the
+    /// fallback the day someone added support for it.
     #[test]
-    fn test_device_type_validation() {
-        let valid_device_types = vec![
-            "spectranv6",
-            "spectranv6/raw",
-            "spectranv6eco",
-            "spectranv6eco/iqreceiver",
-        ];
-
-        for device_type in valid_device_types {
-            assert!(!device_type.is_empty(), "Device type should not be empty");
-            assert!(
-                device_type.len() <= 50,
-                "Device type should be reasonable length"
-            );
-        }
-    }
-
-    #[test]
-    fn test_config_frequency_relationships() {
-        let config = SdkConfig {
-            device_type: "Test".to_string(),
-            center_frequency_hz: 1e9,
-            sample_rate_hz: 10e6,
-            reference_level_dbm: -20.0,
-            timeout: Duration::from_secs(30),
-            receiver_channel: None,
+    fn unknown_family_falls_back_to_raw() {
+        let mut config = SdkConfig {
+            device_type: "not_a_real_family".to_string(),
+            ..Default::default()
         };
+        assert_eq!(config.device_family(), "not_a_real_family");
+        assert_eq!(config.device_open_mode(), "not_a_real_family/raw");
 
-        // Span should be much smaller than center frequency for typical use
-        assert!(config.sample_rate_hz < config.center_frequency_hz);
-
-        // Calculate frequency ranges
-        let start_frequency_hz = config.center_frequency_hz - config.sample_rate_hz / 2.0;
-        let end_frequency_hz = config.center_frequency_hz + config.sample_rate_hz / 2.0;
-
-        assert!(
-            start_frequency_hz > 0.0,
-            "Start frequency should be positive"
-        );
-        assert!(
-            end_frequency_hz > start_frequency_hz,
-            "End frequency should be greater than start"
-        );
-    }
-
-    #[test]
-    fn test_sample_rate_calculation() {
-        let config = SdkConfig::default();
-
-        // For IQ mode, sample rate typically equals span frequency
-        let expected_sample_rate = config.sample_rate_hz;
-
-        // Calculate expected samples per second
-        let samples_per_second = expected_sample_rate as usize;
-        assert!(samples_per_second > 0);
-
-        // Calculate buffer size for 1 second of data
-        let buffer_size_1sec = samples_per_second;
-        assert!(buffer_size_1sec > 1000); // Should be reasonable size
-    }
-
-    #[test]
-    fn test_memory_requirements() {
-        let config = SdkConfig::default();
-
-        // Calculate memory requirements for different buffer sizes
-        let complex_size = std::mem::size_of::<num_complex::Complex32>();
-        let samples_per_second = config.sample_rate_hz as usize;
-
-        let memory_1sec = samples_per_second * complex_size;
-        let memory_10sec = memory_1sec * 10;
-
-        assert!(complex_size == 8, "Complex32 should be 8 bytes");
-        assert!(memory_1sec > 0, "Memory calculation should be positive");
-        assert!(
-            memory_10sec == memory_1sec * 10,
-            "Memory scaling should be linear"
-        );
+        // An explicit mode on an unknown family is passed through rather
+        // than rewritten — only `spectranv6eco/raw` is remapped.
+        config.device_type = "not_a_real_family/sweepsa".to_string();
+        assert_eq!(config.device_family(), "not_a_real_family");
+        assert_eq!(config.device_open_mode(), "not_a_real_family/sweepsa");
     }
 }
