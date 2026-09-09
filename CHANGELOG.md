@@ -30,6 +30,18 @@ JSON field are unchanged — those are the vendor's vocabulary, not ours.
 | `ThroughputMeasurement::stream_sample_rate` | `stream_sample_rate_hz` |
 | `LinkBudgetVerdict::sample_rate`, `fit_span_hz` | `sample_rate_hz`, `fit_bandwidth_hz` |
 | `RtsaMetadata` / `StreamingSdrConfig` bare quantities | unit-suffixed (`_hz`, `_s`) |
+| `HttpSourceBuilder::frequency` / `frequency_str` / `sample_rate` / `reference_level` | `center_frequency_hz` / `center_frequency_str` / `sample_rate_hz` / `reference_level_dbm` |
+| `HttpSinkBuilder::frequency`, `sample_rate` | `center_frequency_hz`, `sample_rate_hz` |
+| `HttpSource::new` / `with_advanced_options`, `HttpSink::new` parameters | `center_frequency_hz` / `sample_rate_hz` / `reference_level_dbm` |
+| `DeviceCapabilities::center_frequency`, `reference_level` | `center_frequency_hz`, `reference_level_dbm` |
+| `PacketMetadata::sample_rate()` | `sample_rate_hz()` |
+
+`frequency` became `center_frequency_hz` rather than `frequency_hz`: it was
+always the centre frequency — its own doc said so — and one concept gets one
+noun. `sample_rate_str` and the new `center_frequency_str` keep no unit suffix,
+because they take a string carrying its own units (`"146.52M"`), not a bare
+number. `DeviceCapabilities` is `#[non_exhaustive]`, so this is a field rename
+on a struct callers construct through the API rather than by literal.
 
 `CaptureControl`'s fields gained units too, but its JSON keys did not move: the
 struct now pins each one with an explicit `#[serde(rename)]` instead of deriving

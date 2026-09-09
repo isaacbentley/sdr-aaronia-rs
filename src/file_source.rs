@@ -4254,8 +4254,8 @@ mod tests {
 
         // Test that we can create the HTTP source block successfully
         let http_block = HttpSourceBuilder::new(base_url)
-            .frequency(100_000_000.0) // 100 MHz
-            .sample_rate(2_000_000.0) // 2 MSPS
+            .center_frequency_hz(100_000_000.0) // 100 MHz
+            .sample_rate_hz(2_000_000.0) // 2 MSPS
             .timeout_ms(10000) // 10 second timeout
             .buffer_size(1024 * 1024) // 1MB buffer
             .format(crate::http_streaming::StreamFormat::Float32)
@@ -4328,8 +4328,8 @@ mod tests {
 
         for (frequency, description) in frequency_tests {
             let result = HttpSourceBuilder::new(base_url)
-                .frequency(frequency)
-                .sample_rate(2_000_000.0)
+                .center_frequency_hz(frequency)
+                .sample_rate_hz(2_000_000.0)
                 .timeout_ms(5000)
                 .build();
 
@@ -4351,8 +4351,8 @@ mod tests {
         println!("\n📊 Sample Rate Configuration Tests:");
         for (sample_rate, description) in sample_rate_tests {
             let result = HttpSourceBuilder::new(base_url)
-                .frequency(915_000_000.0) // Fixed at 915 MHz
-                .sample_rate(sample_rate)
+                .center_frequency_hz(915_000_000.0) // Fixed at 915 MHz
+                .sample_rate_hz(sample_rate)
                 .timeout_ms(5000)
                 .build();
 
@@ -4371,8 +4371,8 @@ mod tests {
         println!("\n🎯 Stream Format Configuration Tests:");
         for (format, description) in format_tests {
             let result = HttpSourceBuilder::new(base_url)
-                .frequency(915_000_000.0)
-                .sample_rate(2_000_000.0)
+                .center_frequency_hz(915_000_000.0)
+                .sample_rate_hz(2_000_000.0)
                 .format(format)
                 .timeout_ms(5000)
                 .build();
@@ -4392,8 +4392,8 @@ mod tests {
         println!("\n🔐 Authentication Configuration Tests:");
         for (auth_method, description) in auth_tests {
             let result = HttpSourceBuilder::new(base_url)
-                .frequency(915_000_000.0)
-                .sample_rate(2_000_000.0)
+                .center_frequency_hz(915_000_000.0)
+                .sample_rate_hz(2_000_000.0)
                 .auth(auth_method)
                 .timeout_ms(5000)
                 .build();

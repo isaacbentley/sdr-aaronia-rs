@@ -348,7 +348,7 @@ impl PacketMetadata {
     /// consumer wanting the device's IQ rate must check `payload` first.
     /// The zero-duration guard keeps a degenerate status header (equal
     /// start and end times) from producing Inf/NaN.
-    pub fn sample_rate(&self) -> f64 {
+    pub fn sample_rate_hz(&self) -> f64 {
         let duration = self.end_time - self.start_time;
         self.sample_frequency.unwrap_or(if duration > 0.0 {
             self.samples as f64 / duration
@@ -365,7 +365,7 @@ impl StreamingSdrConfig {
         let bandwidth_hz = metadata.end_frequency - metadata.start_frequency;
         let duration = metadata.end_time - metadata.start_time;
         let duration_ms = duration * 1000.0;
-        let sample_rate_hz = metadata.sample_rate();
+        let sample_rate_hz = metadata.sample_rate_hz();
         let antenna_name = metadata
             .antenna
             .as_ref()

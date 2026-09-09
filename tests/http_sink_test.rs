@@ -34,8 +34,8 @@ async fn run_flowgraph_with_deadline(fg: Flowgraph) {
 #[tokio::test]
 async fn test_http_sink_builder() {
     let builder = HttpSinkBuilder::new("http://example.com:8080")
-        .frequency(2.4e9)
-        .sample_rate(20e6)
+        .center_frequency_hz(2.4e9)
+        .sample_rate_hz(20e6)
         .buffer_size(1024)
         .streaming_delay(0.5)
         .auth(AuthMethod::None);

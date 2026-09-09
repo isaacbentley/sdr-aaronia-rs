@@ -631,7 +631,7 @@ impl RateSniffer {
                     if metadata.payload != PayloadType::Iq {
                         continue;
                     }
-                    let rate = metadata.sample_rate();
+                    let rate = metadata.sample_rate_hz();
                     if rate > 0.0 {
                         return Some(rate);
                     }

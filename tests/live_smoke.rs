@@ -94,12 +94,14 @@ async fn live_control_plane() {
     println!("sample rates: {:?}", caps.sample_rates());
     assert!(caps.model.is_some(), "device must name a model");
     assert!(caps.serial.is_some(), "device must report a serial");
-    let freq = caps.center_frequency.expect("centerfreq0 declares bounds");
+    let freq = caps
+        .center_frequency_hz
+        .expect("centerfreq0 declares bounds");
     assert!(
         freq.min > 0.0 && freq.max > freq.min,
         "centre-frequency bounds must be a usable pair: {freq:?}"
     );
-    let refl = caps.reference_level.expect("reflevel0 declares bounds");
+    let refl = caps.reference_level_dbm.expect("reflevel0 declares bounds");
     assert!(
         refl.max > refl.min,
         "reference-level bounds must be a usable pair: {refl:?}"

@@ -702,9 +702,9 @@ pub struct DeviceCapabilities {
     /// `/healthstatus` `info/version` — firmware/FPGA revisions.
     pub version: Option<String>,
     /// Bounds on `centerfreq0`, in Hz.
-    pub center_frequency: Option<ValueRange>,
+    pub center_frequency_hz: Option<ValueRange>,
     /// Bounds on `reflevel0`, in dBm.
-    pub reference_level: Option<ValueRange>,
+    pub reference_level_dbm: Option<ValueRange>,
     /// How many rungs `decimation0` offers — `"Full,1 / 2,…"` counted,
     /// so a device with a shorter ladder is not advertised ten.
     pub decimation_steps: Option<usize>,
@@ -740,8 +740,8 @@ impl DeviceCapabilities {
         let mut caps = Self::default();
 
         if let Some(config) = config {
-            caps.center_frequency = range_of(config, "centerfreq0");
-            caps.reference_level = range_of(config, "reflevel0");
+            caps.center_frequency_hz = range_of(config, "centerfreq0");
+            caps.reference_level_dbm = range_of(config, "reflevel0");
             caps.decimation_steps = match enum_options(config, "decimation0").0.len() {
                 0 => None,
                 n => Some(n),
@@ -2629,7 +2629,7 @@ mod tests {
 
         assert_eq!(caps.model.as_deref(), Some("SPECTRAN V6 ECO"));
         assert_eq!(
-            caps.center_frequency,
+            caps.center_frequency_hz,
             Some(ValueRange {
                 min: 5_500_000.0,
                 max: 8_000_000_000.0,
@@ -2638,7 +2638,7 @@ mod tests {
             "the plugin's constant said 10 Hz - 6 GHz",
         );
         assert_eq!(
-            caps.reference_level,
+            caps.reference_level_dbm,
             Some(ValueRange {
                 min: -55.0,
                 max: 23.0,
@@ -2699,8 +2699,8 @@ mod tests {
         let caps = DeviceCapabilities::from_trees(None, None);
         assert_eq!(caps, DeviceCapabilities::default());
         assert!(caps.model.is_none());
-        assert!(caps.center_frequency.is_none());
-        assert!(caps.reference_level.is_none());
+        assert!(caps.center_frequency_hz.is_none());
+        assert!(caps.reference_level_dbm.is_none());
         assert!(
             caps.sample_rates().is_none(),
             "no ladder without both a rate and a rung count"
@@ -2714,8 +2714,8 @@ mod tests {
         let config: ConfigItem = serde_json::from_value(live_shaped_config()).unwrap();
         let caps = DeviceCapabilities::from_trees(Some(&config), None);
 
-        assert!(caps.center_frequency.is_some());
-        assert!(caps.reference_level.is_some());
+        assert!(caps.center_frequency_hz.is_some());
+        assert!(caps.reference_level_dbm.is_some());
         assert_eq!(caps.decimation_steps, Some(10));
         // Identity and the native rate live in the other tree.
         assert_eq!(caps.model.as_deref(), Some("SPECTRAN V6 ECO"));
@@ -2822,9 +2822,9 @@ mod tests {
 
         let config: ConfigItem = serde_json::from_value(value).unwrap();
         let caps = DeviceCapabilities::from_trees(Some(&config), None);
-        assert!(caps.center_frequency.is_none());
+        assert!(caps.center_frequency_hz.is_none());
         assert!(
-            caps.reference_level.is_some(),
+            caps.reference_level_dbm.is_some(),
             "one unusable item must not discard the others"
         );
     }
@@ -2858,10 +2858,10 @@ mod tests {
         let config: ConfigItem = serde_json::from_value(value).unwrap();
         let caps = DeviceCapabilities::from_trees(Some(&config), None);
         assert!(
-            caps.center_frequency.is_none(),
+            caps.center_frequency_hz.is_none(),
             "0..0 is not a usable interval"
         );
-        assert!(caps.reference_level.is_some(), "the other range stands");
+        assert!(caps.reference_level_dbm.is_some(), "the other range stands");
     }
 
     /// A trailing comma is not an option, and the selected index still

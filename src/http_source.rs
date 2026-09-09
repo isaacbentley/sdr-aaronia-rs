@@ -346,7 +346,7 @@ pub struct HttpSource {
     /// had set — with the caller's default, not a value they had chosen.
     /// `None` is what "the user did not ask for a reference level" looks like,
     /// and `CaptureConfig` leaves `None` fields untouched.
-    reference_level: Option<f64>,
+    reference_level_dbm: Option<f64>,
 
     // Authentication
     auth_method: AuthMethod,
@@ -372,17 +372,17 @@ impl HttpSource {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(
         base_url: String,
-        frequency: f64,
-        sample_rate: f64,
-        reference_level: Option<f64>,
+        center_frequency_hz: f64,
+        sample_rate_hz: f64,
+        reference_level_dbm: Option<f64>,
         buffer_size: usize,
         timeout_ms: u64,
     ) -> Result<Self> {
         Self::with_advanced_options(
             base_url,
-            frequency,
-            sample_rate,
-            reference_level,
+            center_frequency_hz,
+            sample_rate_hz,
+            reference_level_dbm,
             buffer_size,
             timeout_ms,
             StreamFormat::Float32, // Default to float32 for compatibility
@@ -397,9 +397,9 @@ impl HttpSource {
     #[allow(clippy::too_many_arguments)]
     pub fn with_advanced_options(
         base_url: String,
-        frequency: f64,
-        sample_rate: f64,
-        reference_level: Option<f64>,
+        center_frequency_hz: f64,
+        sample_rate_hz: f64,
+        reference_level_dbm: Option<f64>,
         buffer_size: usize,
         timeout_ms: u64,
         stream_format: StreamFormat,
@@ -462,8 +462,8 @@ impl HttpSource {
             rate_reduction,
             scale,
             stream_active: false,
-            current_frequency: frequency,
-            current_sample_rate: sample_rate,
+            current_frequency: center_frequency_hz,
+            current_sample_rate: sample_rate_hz,
             overflow_samples: 0,
             next_overflow_report: 1,
             stream_gap_seconds: 0.0,
@@ -473,7 +473,7 @@ impl HttpSource {
             chunk_rx: None,
             reader_task: None,
             buffer_size,
-            reference_level,
+            reference_level_dbm,
             auth_method,
             tokio_handle,
             shared_stats: None,
@@ -1528,13 +1528,13 @@ impl HttpSource {
             self.current_frequency / 1e6,
             self.current_sample_rate / 1e6,
             decimation_index,
-            self.reference_level,
+            self.reference_level_dbm,
         );
 
         let request = crate::http_endpoints::CaptureConfig {
             center_freq_hz: (self.current_frequency > 0.0).then_some(self.current_frequency),
             decimation_index,
-            reflevel_dbm: self.reference_level,
+            reflevel_dbm: self.reference_level_dbm,
         };
 
         match self.endpoints_client.apply_capture_config(&request).await {
@@ -1587,7 +1587,7 @@ impl HttpSource {
                     .configure_capture(crate::http_endpoints::CaptureControl {
                         frequency_center_hz: Some(self.current_frequency),
                         frequency_span_hz: Some(self.current_sample_rate),
-                        reference_level_dbm: self.reference_level.map(|dbm| dbm as f32),
+                        reference_level_dbm: self.reference_level_dbm.map(|dbm| dbm as f32),
                         control_type: crate::http_endpoints::ControlType::Capture,
                         ..Default::default()
                     })
@@ -1835,9 +1835,9 @@ impl Kernel for HttpSource {
 /// See: <https://aaronia.com/en/software-licence-remote-config>
 pub struct HttpSourceBuilder {
     base_url: String,
-    frequency: f64,
-    sample_rate: f64,
-    reference_level: Option<f64>,
+    center_frequency_hz: f64,
+    sample_rate_hz: f64,
+    reference_level_dbm: Option<f64>,
     buffer_size: usize,
     timeout_ms: u64,
     stream_format: StreamFormat,
@@ -1859,11 +1859,11 @@ impl HttpSourceBuilder {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
-            frequency: 100e6, // 100 MHz default
-            sample_rate: 1e6, // 1 MS/s default
+            center_frequency_hz: 100e6, // 100 MHz default
+            sample_rate_hz: 1e6,        // 1 MS/s default
             // `None`, not a number: pushing a default reference level on
             // every start silently overwrites the operator's gain.
-            reference_level: None,
+            reference_level_dbm: None,
             buffer_size: 4096, // 4k samples default
             timeout_ms: 15000, // 15s timeout default
             // The one shared definition of the capture default — see
@@ -1879,34 +1879,34 @@ impl HttpSourceBuilder {
 
     /// Set the initial center frequency, in Hz.
     #[must_use]
-    pub fn frequency(mut self, freq: f64) -> Self {
-        self.frequency = freq;
+    pub fn center_frequency_hz(mut self, hz: f64) -> Self {
+        self.center_frequency_hz = hz;
         self
     }
 
     /// Set frequency from string with units (e.g., "146.52M", "2.4G", "162.5k")
-    pub fn frequency_str(mut self, freq_str: &str) -> Result<Self> {
-        self.frequency = crate::utils::parse_frequency(freq_str)?;
+    pub fn center_frequency_str(mut self, freq_str: &str) -> Result<Self> {
+        self.center_frequency_hz = crate::utils::parse_frequency(freq_str)?;
         Ok(self)
     }
 
     /// Set the initial sample rate, in Hz.
     #[must_use]
-    pub fn sample_rate(mut self, rate: f64) -> Self {
-        self.sample_rate = rate;
+    pub fn sample_rate_hz(mut self, hz: f64) -> Self {
+        self.sample_rate_hz = hz;
         self
     }
 
     /// Set sample rate from string with units (e.g., "25M", "10k", "2.5M")
     pub fn sample_rate_str(mut self, rate_str: &str) -> Result<Self> {
-        self.sample_rate = crate::utils::parse_sample_rate(rate_str)?;
+        self.sample_rate_hz = crate::utils::parse_sample_rate(rate_str)?;
         Ok(self)
     }
 
     /// Set the initial reference level, in dBm.
     #[must_use]
-    pub fn reference_level(mut self, level: f64) -> Self {
-        self.reference_level = Some(level);
+    pub fn reference_level_dbm(mut self, dbm: f64) -> Self {
+        self.reference_level_dbm = Some(dbm);
         self
     }
 
@@ -1995,9 +1995,9 @@ impl HttpSourceBuilder {
     pub fn build(self) -> Result<HttpSource> {
         let mut source = HttpSource::with_advanced_options(
             self.base_url,
-            self.frequency,
-            self.sample_rate,
-            self.reference_level,
+            self.center_frequency_hz,
+            self.sample_rate_hz,
+            self.reference_level_dbm,
             self.buffer_size,
             self.timeout_ms,
             self.stream_format,
@@ -2022,8 +2022,8 @@ mod tests {
     async fn test_http_source_creation() {
         // Basic source creation should work
         let source = HttpSourceBuilder::new("http://localhost:54664")
-            .frequency(146.52e6)
-            .sample_rate(2.048e6)
+            .center_frequency_hz(146.52e6)
+            .sample_rate_hz(2.048e6)
             .format(StreamFormat::Float32)
             .buffer_size(4096)
             .timeout_ms(5000);
@@ -2049,9 +2049,9 @@ mod tests {
     #[tokio::test]
     async fn test_http_source_builder_configuration() {
         let source = HttpSourceBuilder::new("http://localhost:54664")
-            .frequency(915e6)
-            .sample_rate(10e6)
-            .reference_level(-20.0)
+            .center_frequency_hz(915e6)
+            .sample_rate_hz(10e6)
+            .reference_level_dbm(-20.0)
             .buffer_size(8192)
             .timeout_ms(30000)
             .format(StreamFormat::Int16)
@@ -2070,22 +2070,23 @@ mod tests {
     async fn test_frequency_string_parsing() {
         // Test frequency parsing with units
         let source = HttpSourceBuilder::new("http://localhost:54664")
-            .frequency_str("146.52M")
+            .center_frequency_str("146.52M")
             .expect("Should parse MHz");
         assert!(source.build().is_ok());
 
         let source = HttpSourceBuilder::new("http://localhost:54664")
-            .frequency_str("2.4G")
+            .center_frequency_str("2.4G")
             .expect("Should parse GHz");
         assert!(source.build().is_ok());
 
         let source = HttpSourceBuilder::new("http://localhost:54664")
-            .frequency_str("162.5k")
+            .center_frequency_str("162.5k")
             .expect("Should parse kHz");
         assert!(source.build().is_ok());
 
         // Invalid frequency strings should fail
-        let result = HttpSourceBuilder::new("http://localhost:54664").frequency_str("invalid");
+        let result =
+            HttpSourceBuilder::new("http://localhost:54664").center_frequency_str("invalid");
         assert!(result.is_err());
     }
 
@@ -2155,8 +2156,8 @@ mod tests {
         let _guard = rt.enter();
 
         let block = HttpSourceBuilder::new("http://localhost:54664")
-            .frequency(915e6)
-            .sample_rate(2.048e6)
+            .center_frequency_hz(915e6)
+            .sample_rate_hz(2.048e6)
             .format(StreamFormat::Float32)
             .input("main")
             .rate_reduction(2)
@@ -2327,10 +2328,10 @@ mod tests {
         let _guard = rt.enter();
 
         let built = HttpSourceBuilder::new("http://localhost:54664")
-            .reference_level(-18.0)
+            .reference_level_dbm(-18.0)
             .build()
             .expect("Should build");
-        assert_eq!(built.reference_level, Some(-18.0));
+        assert_eq!(built.reference_level_dbm, Some(-18.0));
     }
 
     #[tokio::test]
@@ -3198,7 +3199,7 @@ mod tests {
         // gain with a figure they had never chosen. Absent means "leave the
         // device's gain alone".
         assert_eq!(
-            built.reference_level, None,
+            built.reference_level_dbm, None,
             "no reference level unless the caller asks for one"
         );
         assert_eq!(built.buffer_size, 4096);
@@ -3214,11 +3215,11 @@ mod tests {
     async fn test_complex_configuration_combinations() {
         // Test complex combinations of settings
         let source = HttpSourceBuilder::new("https://rtsa-device.local:8443")
-            .frequency_str("2.4G")
+            .center_frequency_str("2.4G")
             .expect("Should parse frequency")
             .sample_rate_str("10M")
             .expect("Should parse sample rate")
-            .reference_level(-30.0)
+            .reference_level_dbm(-30.0)
             .buffer_size(16384)
             .timeout_ms(45000)
             .format(StreamFormat::Int16)
@@ -3234,8 +3235,8 @@ mod tests {
     #[test]
     fn test_error_handling_invalid_configurations() {
         // Test that invalid frequency strings are handled
-        let result =
-            HttpSourceBuilder::new("http://localhost:54664").frequency_str("not-a-frequency");
+        let result = HttpSourceBuilder::new("http://localhost:54664")
+            .center_frequency_str("not-a-frequency");
         assert!(result.is_err());
 
         // Test that invalid sample rate strings are handled
@@ -3256,8 +3257,8 @@ mod tests {
         let _guard = rt.enter();
 
         let block = HttpSourceBuilder::new("http://localhost:54664")
-            .frequency(146.52e6)
-            .sample_rate(2.048e6)
+            .center_frequency_hz(146.52e6)
+            .sample_rate_hz(2.048e6)
             .format(StreamFormat::Int16)
             .buffer_size(4096)
             .input("test_input")
@@ -3299,15 +3300,15 @@ mod tests {
     async fn test_edge_case_configurations() {
         // Test minimum valid configuration
         let source = HttpSourceBuilder::new("http://localhost:54664")
-            .frequency(1.0) // 1 Hz (extreme low)
-            .sample_rate(1.0) // 1 S/s (extreme low)
+            .center_frequency_hz(1.0) // 1 Hz (extreme low)
+            .sample_rate_hz(1.0) // 1 S/s (extreme low)
             .buffer_size(1); // Minimal buffer
         assert!(source.build().is_ok());
 
         // Test maximum practical configuration
         let source = HttpSourceBuilder::new("http://localhost:54664")
-            .frequency(6e9) // 6 GHz (high end)
-            .sample_rate(250e6) // 250 MS/s (high end)
+            .center_frequency_hz(6e9) // 6 GHz (high end)
+            .sample_rate_hz(250e6) // 250 MS/s (high end)
             .buffer_size(1_000_000); // Large buffer
         assert!(source.build().is_ok());
     }
@@ -3321,8 +3322,8 @@ mod tests {
         let sources: Vec<_> = (0..5)
             .map(|i| {
                 HttpSourceBuilder::new(&format!("http://localhost:{}", 54664 + i))
-                    .frequency(100e6 + i as f64 * 10e6)
-                    .sample_rate(1e6 + i as f64 * 1e6)
+                    .center_frequency_hz(100e6 + i as f64 * 10e6)
+                    .sample_rate_hz(1e6 + i as f64 * 1e6)
                     .build()
             })
             .collect();

@@ -9,8 +9,8 @@ use crate::http_endpoints::{AuthMethod, HttpEndpointsClient, TxSampleRequest};
 /// Builder for the `FutureSDR` [`HttpSink`] block.
 pub struct HttpSinkBuilder {
     base_url: String,
-    frequency: f64,
-    sample_rate: f64,
+    center_frequency_hz: f64,
+    sample_rate_hz: f64,
     buffer_size: usize,
     timeout_ms: u64,
     auth_method: AuthMethod,
@@ -28,8 +28,8 @@ impl HttpSinkBuilder {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
-            frequency: 100e6,
-            sample_rate: 1e6,
+            center_frequency_hz: 100e6,
+            sample_rate_hz: 1e6,
             buffer_size: 65536,
             timeout_ms: 15000,
             auth_method: AuthMethod::None,
@@ -39,15 +39,15 @@ impl HttpSinkBuilder {
 
     /// Set the target transmission center frequency in Hz.
     #[must_use]
-    pub fn frequency(mut self, freq: f64) -> Self {
-        self.frequency = freq;
+    pub fn center_frequency_hz(mut self, hz: f64) -> Self {
+        self.center_frequency_hz = hz;
         self
     }
 
     /// Set the target transmission sample rate in Hz.
     #[must_use]
-    pub fn sample_rate(mut self, rate: f64) -> Self {
-        self.sample_rate = rate;
+    pub fn sample_rate_hz(mut self, hz: f64) -> Self {
+        self.sample_rate_hz = hz;
         self
     }
 
@@ -88,8 +88,8 @@ impl HttpSinkBuilder {
     pub fn build(self) -> Result<HttpSink> {
         HttpSink::new(
             self.base_url,
-            self.frequency,
-            self.sample_rate,
+            self.center_frequency_hz,
+            self.sample_rate_hz,
             self.buffer_size,
             self.timeout_ms,
             self.auth_method,
@@ -101,7 +101,7 @@ impl HttpSinkBuilder {
 /// `FutureSDR` block for transmitting IQ samples to an Aaronia RTSA via HTTP.
 #[derive(Block)]
 pub struct HttpSink {
-    sample_rate: f64,
+    sample_rate_hz: f64,
     buffer_size: usize,
     sample_buffer: Vec<Complex32>,
     last_transmission_end_time: f64,
@@ -120,8 +120,8 @@ impl HttpSink {
     #[allow(clippy::too_many_arguments, clippy::new_ret_no_self)]
     pub fn new(
         base_url: String,
-        frequency: f64,
-        sample_rate: f64,
+        center_frequency_hz: f64,
+        sample_rate_hz: f64,
         buffer_size: usize,
         timeout_ms: u64,
         auth_method: AuthMethod,
@@ -152,8 +152,8 @@ impl HttpSink {
                 let req = TxSampleRequest {
                     start_time,
                     end_time,
-                    start_frequency: frequency - sample_rate / 2.0,
-                    end_frequency: frequency + sample_rate / 2.0,
+                    start_frequency: center_frequency_hz - sample_rate_hz / 2.0,
+                    end_frequency: center_frequency_hz + sample_rate_hz / 2.0,
                     step_frequency: None,
                     min_power: -2.0,
                     max_power: 2.0,
@@ -189,7 +189,7 @@ impl HttpSink {
         });
 
         Ok(Self {
-            sample_rate,
+            sample_rate_hz,
             buffer_size,
             sample_buffer: Vec::with_capacity(buffer_size * 2),
             last_transmission_end_time: now,
@@ -232,10 +232,10 @@ impl HttpSink {
         let desired_start = now + self.streaming_delay;
 
         let start_time = desired_start.max(self.last_transmission_end_time);
-        let duration = num_complex as f64 / self.sample_rate;
+        let duration = num_complex as f64 / self.sample_rate_hz;
         let end_time = start_time + duration;
 
-        self.last_transmission_end_time = end_time + (1.0 / self.sample_rate);
+        self.last_transmission_end_time = end_time + (1.0 / self.sample_rate_hz);
 
         if self
             .tx

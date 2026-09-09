@@ -25,9 +25,9 @@ use tokio::runtime::Runtime;
 /// device made every getter permanently stale after the first retune).
 #[derive(Debug, Clone, Copy)]
 struct Tuning {
-    center_frequency: f64,
-    sample_rate: f64,
-    reference_level: f64,
+    center_frequency_hz: f64,
+    sample_rate_hz: f64,
+    reference_level_dbm: f64,
 }
 
 /// Seify device wrapper around [`AaroniaSource`]. `Clone` shares the
@@ -65,23 +65,23 @@ impl AaroniaSeifyDevice {
             builder.force_source_type(SourceType::NativeSdk);
         }
 
-        let mut center_frequency = 100e6;
-        let mut sample_rate = 1e6;
-        let mut reference_level = -20.0;
+        let mut center_frequency_hz = 100e6;
+        let mut sample_rate_hz = 1e6;
+        let mut reference_level_dbm = -20.0;
 
         if let Ok(freq) = args.get::<f64>("freq") {
-            center_frequency = freq;
+            center_frequency_hz = freq;
         }
         if let Ok(rate) = args.get::<f64>("rate") {
-            sample_rate = rate;
+            sample_rate_hz = rate;
         }
         if let Ok(ref_level) = args.get::<f64>("ref_level") {
-            reference_level = ref_level;
+            reference_level_dbm = ref_level;
         }
 
-        builder.center_frequency_hz(center_frequency);
-        builder.sample_rate_hz(sample_rate);
-        builder.reference_level_dbm(reference_level);
+        builder.center_frequency_hz(center_frequency_hz);
+        builder.sample_rate_hz(sample_rate_hz);
+        builder.reference_level_dbm(reference_level_dbm);
 
         let source = runtime
             .block_on(builder.build())
@@ -91,9 +91,9 @@ impl AaroniaSeifyDevice {
             source: Arc::new(Mutex::new(source)),
             runtime,
             tuning: Arc::new(Mutex::new(Tuning {
-                center_frequency,
-                sample_rate,
-                reference_level,
+                center_frequency_hz,
+                sample_rate_hz,
+                reference_level_dbm,
             })),
         })
     }
@@ -136,7 +136,7 @@ impl FrequencyControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(self.tuning.lock().unwrap().center_frequency)
+        Ok(self.tuning.lock().unwrap().center_frequency_hz)
     }
 
     fn frequency_range(
@@ -201,7 +201,7 @@ impl FrequencyControl for AaroniaSeifyDevice {
         self.runtime
             .block_on(source.set_center_frequency_hz(frequency))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
-        self.tuning.lock().unwrap().center_frequency = frequency;
+        self.tuning.lock().unwrap().center_frequency_hz = frequency;
         Ok(())
     }
 }
@@ -251,7 +251,7 @@ impl SampleRateControl for AaroniaSeifyDevice {
         self.runtime
             .block_on(source.set_sample_rate_hz(rate))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
-        self.tuning.lock().unwrap().sample_rate = rate;
+        self.tuning.lock().unwrap().sample_rate_hz = rate;
         Ok(())
     }
 }
@@ -265,7 +265,7 @@ impl GainControl for AaroniaSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(Some(self.tuning.lock().unwrap().reference_level))
+        Ok(Some(self.tuning.lock().unwrap().reference_level_dbm))
     }
 
     fn gain_elements(
@@ -329,7 +329,7 @@ impl GainControl for AaroniaSeifyDevice {
         self.runtime
             .block_on(source.set_reference_level_dbm(gain))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
-        self.tuning.lock().unwrap().reference_level = gain;
+        self.tuning.lock().unwrap().reference_level_dbm = gain;
         Ok(())
     }
 }

@@ -218,7 +218,7 @@ use sdr_aaronia_rs::http_endpoints::{AuthMethod, HttpEndpointsClient};
 let client = HttpEndpointsClient::new("http://localhost:54664".into(), AuthMethod::None)?;
 let caps = client.get_device_capabilities().await;
 println!("{:?} serial {:?}", caps.model, caps.serial);
-if let Some(range) = caps.center_frequency {
+if let Some(range) = caps.center_frequency_hz {
     println!("tunes {:.3}-{:.3} MHz", range.min / 1e6, range.max / 1e6);
 }
 // Highest first, and every rung one the device can actually be set to:
@@ -313,13 +313,13 @@ use anyhow::Result;
 fn main() -> Result<()> {
     // Low-level FutureSDR blocks
     let source = HttpSourceBuilder::new("http://127.0.0.1:54664")
-        .frequency(146.52e6)
-        .sample_rate(25e3)
+        .center_frequency_hz(146.52e6)
+        .sample_rate_hz(25e3)
         .build()?;
 
     let sink = HttpSinkBuilder::new("http://127.0.0.1:54664")
-        .frequency(433.0e6)
-        .sample_rate(1e6)
+        .center_frequency_hz(433.0e6)
+        .sample_rate_hz(1e6)
         .build()?;
 
     // Use in FutureSDR flowgraph
@@ -342,9 +342,9 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     let _advanced_source = HttpSourceBuilder::new("http://127.0.0.1:54664")
-        .frequency(446.125e6)           // UHF band
-        .sample_rate(12.5e3)            // Narrow bandwidth
-        .format(StreamFormat::Int16)    // High-performance format
+        .center_frequency_hz(446.125e6)  // UHF band
+        .sample_rate_hz(12.5e3)          // 12.5 kS/s
+        .format(StreamFormat::Int16)     // High-performance format
         .auth(AuthMethod::Basic {
             username: "admin".to_string(),
             password: "secure_pass".to_string(),
