@@ -1540,9 +1540,12 @@ pub enum DeviceOpenMode {
     /// `spectranv6eco/iqreceiver` — IQ receiver on the ECO platform.
     EcoIqReceiver,
     /// `spectranv6eco/rtsa` — the ECO's spectrum pipeline, which is what
-    /// its `RawSpectrumEco` sample opens. IQ can be read from it, but
-    /// arrives at ~0.4 MS/s regardless of the requested rate; use
-    /// [`Self::EcoIqReceiver`] for IQ.
+    /// its `RawSpectrumEco` sample opens. It carries **no IQ**: an
+    /// earlier note here claimed IQ could be read from it at ~0.4 MS/s,
+    /// but measurement showed that was spectra bins reinterpreted as
+    /// samples — 200k of them spanning -130 to -59 with a mean of -77
+    /// and not one value near zero, which is a dBm distribution, not a
+    /// voltage one. Use [`Self::EcoIqReceiver`] for IQ.
     EcoRtsa,
     /// `spectranv6/sweepsa` — sweep spectrum analyzer on the V6 platform.
     Sweepsa,
@@ -1574,6 +1577,37 @@ impl DeviceOpenMode {
     /// exposes them; eco's `iqreceiver` drives a fixed pipeline.
     pub fn supports_raw_only_keys(&self) -> bool {
         matches!(self, Self::Raw)
+    }
+
+    /// Whether this mode delivers IQ samples at all.
+    ///
+    /// `raw` carries IQ on stream 0 and spectra on stream 2, so it does
+    /// both. The spectrum pipelines carry only spectra: reading them as
+    /// IQ returns dBm bins reinterpreted as voltages, which is plausible
+    /// enough to be mistaken for a working capture — measured on a V6
+    /// ECO's `rtsa`, 200k "samples" with a mean of -77 and none near
+    /// zero. An unrecognised mode is allowed through: we cannot know.
+    pub fn carries_iq(&self) -> bool {
+        // Exhaustive on purpose: a new variant should not inherit
+        // "carries everything" by falling through a negative match.
+        match self {
+            Self::Raw | Self::EcoIqReceiver => true,
+            Self::EcoRtsa | Self::Sweepsa | Self::EcoSweepsa => false,
+            Self::Other(_) => true,
+        }
+    }
+
+    /// Whether this mode delivers spectra at all.
+    ///
+    /// The mirror of [`Self::carries_iq`]: `iqreceiver` carries only IQ,
+    /// and reading it as spectra reports each complex pair as a
+    /// two-bin frame whose bin spacing is the whole span.
+    pub fn carries_spectra(&self) -> bool {
+        match self {
+            Self::Raw | Self::EcoRtsa | Self::Sweepsa | Self::EcoSweepsa => true,
+            Self::EcoIqReceiver => false,
+            Self::Other(_) => true,
+        }
     }
 
     /// Which stream index carries spectra in this mode.
@@ -2224,6 +2258,28 @@ impl NativeSdkSource {
         }
     }
 
+    /// Refuse a read the open mode cannot serve.
+    ///
+    /// Neither the SDK nor the packet says what a stream carries, so
+    /// asking a spectrum pipeline for IQ returns dBm bins reinterpreted
+    /// as voltages, and asking an IQ pipeline for spectra returns
+    /// complex pairs reinterpreted as two-bin frames. Both look like
+    /// data. The open mode is the only thing that knows, so it decides.
+    fn require_mode(
+        mode: Option<&DeviceOpenMode>,
+        allows: fn(&DeviceOpenMode) -> bool,
+        wanted: &str,
+    ) -> Result<()> {
+        match mode {
+            Some(m) if !allows(m) => Err(Error::Sdk(format!(
+                "this device is open in {m:?}, which carries no {wanted}. Reading it anyway \
+                 would return the other payload reinterpreted, which looks like data and is \
+                 not. Re-open in a mode that carries {wanted}."
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Resolve `device/receiverclock` to a real rate in Hz.
     ///
     /// The ConfigItem labels the SDK exposes are *rounded* — `"92MHz"` is
@@ -2611,6 +2667,11 @@ impl NativeSdkSource {
             if !self.stream_active {
                 return Err(Error::Sdk("Streaming not active".to_string()));
             }
+            Self::require_mode(
+                self.open_mode.as_ref(),
+                DeviceOpenMode::carries_spectra,
+                "spectra",
+            )?;
             let stream = self
                 .open_mode
                 .as_ref()
@@ -2768,6 +2829,7 @@ impl NativeSdkSource {
             if !self.stream_active {
                 return Err(Error::Sdk("Streaming not active".to_string()));
             }
+            Self::require_mode(self.open_mode.as_ref(), DeviceOpenMode::carries_iq, "IQ")?;
 
             // Serve from the carry-over buffer first. The SDK hands back
             // whole packets whose size it chooses; when one is larger than
@@ -3044,6 +3106,7 @@ impl NativeSdkSource {
             if !self.stream_active {
                 return Err(Error::Sdk("Streaming not active".to_string()));
             }
+            Self::require_mode(self.open_mode.as_ref(), DeviceOpenMode::carries_iq, "IQ")?;
 
             match self.read_mode {
                 None => self.read_mode = Some(ReadMode::Dual),
@@ -3736,6 +3799,91 @@ mod tests {
             split_device_type("spectranv6/a/b", "raw"),
             ("spectranv6", "spectranv6/a/b".to_string())
         );
+    }
+
+    /// Which payload each mode actually carries. `raw` is the only one
+    /// that does both — IQ on stream 0, spectra on stream 2 — and the
+    /// spectrum pipelines carry no IQ at all, measured rather than
+    /// assumed: an ECO's `rtsa` returns dBm bins that a naive read
+    /// reports as voltages.
+    #[test]
+    fn open_modes_know_which_payload_they_carry() {
+        assert!(DeviceOpenMode::Raw.carries_iq());
+        assert!(DeviceOpenMode::Raw.carries_spectra());
+
+        assert!(DeviceOpenMode::EcoIqReceiver.carries_iq());
+        assert!(!DeviceOpenMode::EcoIqReceiver.carries_spectra());
+
+        for spectra_only in [
+            DeviceOpenMode::EcoRtsa,
+            DeviceOpenMode::Sweepsa,
+            DeviceOpenMode::EcoSweepsa,
+        ] {
+            assert!(!spectra_only.carries_iq(), "{spectra_only:?} carries no IQ");
+            assert!(
+                spectra_only.carries_spectra(),
+                "{spectra_only:?} carries spectra"
+            );
+        }
+
+        // An unrecognised mode is allowed through both ways: we do not
+        // know what it carries, and refusing would break a mode this
+        // build has simply never heard of.
+        let unknown = DeviceOpenMode::Other("spectranv6/somethingnew".to_string());
+        assert!(unknown.carries_iq());
+        assert!(unknown.carries_spectra());
+    }
+
+    /// The guard refuses only the combinations that would return the
+    /// other payload reinterpreted, and says which mode it is in.
+    #[test]
+    fn require_mode_refuses_the_wrong_payload() {
+        let err = NativeSdkSource::require_mode(
+            Some(&DeviceOpenMode::EcoRtsa),
+            DeviceOpenMode::carries_iq,
+            "IQ",
+        )
+        .expect_err("rtsa carries no IQ");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("EcoRtsa"),
+            "the error should name the mode: {msg}"
+        );
+        assert!(msg.contains("no IQ"), "and what it lacks: {msg}");
+
+        let err = NativeSdkSource::require_mode(
+            Some(&DeviceOpenMode::EcoIqReceiver),
+            DeviceOpenMode::carries_spectra,
+            "spectra",
+        )
+        .expect_err("iqreceiver carries no spectra");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("EcoIqReceiver"),
+            "the error should name the mode: {msg}"
+        );
+        assert!(msg.contains("no spectra"), "and what it lacks: {msg}");
+
+        assert!(
+            NativeSdkSource::require_mode(
+                Some(&DeviceOpenMode::EcoRtsa),
+                DeviceOpenMode::carries_spectra,
+                "spectra",
+            )
+            .is_ok(),
+            "rtsa is exactly what spectra reads want"
+        );
+        assert!(
+            NativeSdkSource::require_mode(
+                Some(&DeviceOpenMode::Raw),
+                DeviceOpenMode::carries_iq,
+                "IQ",
+            )
+            .is_ok(),
+            "raw segregates the two by stream index and serves both"
+        );
+        // Nothing open yet is not this guard's business.
+        assert!(NativeSdkSource::require_mode(None, DeviceOpenMode::carries_iq, "IQ").is_ok());
     }
 
     #[test]

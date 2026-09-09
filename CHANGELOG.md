@@ -17,6 +17,20 @@ All notable changes to this project will be documented in this file.
   backends.
 
 ### Fixed
+- **Reading the wrong payload for the open mode is refused instead of answered.**
+  Neither the SDK nor the packet says what a stream carries, so asking a
+  spectrum pipeline for IQ returned dBm bins reinterpreted as voltages, and
+  asking an IQ pipeline for spectra returned complex pairs reinterpreted as
+  two-bin frames whose bin spacing was the whole span. Both look like data.
+  Measured on a V6 ECO's `rtsa`: 200k "samples" spanning -130 to -59 with a
+  mean of -77 and not one value near zero — a dBm distribution, not a voltage
+  one. `read_samples`, `read_samples_dual` and `read_spectra` now check the
+  open mode and say which payload it carries.
+
+  This also corrects a doc claim: `spectranv6eco/rtsa` was documented as
+  yielding IQ at "~0.4 MS/s regardless of the requested rate". It yields no IQ
+  at all; that figure was the spectra misread. `spectranv6/raw` genuinely does
+  both, IQ on stream 0 and spectra on stream 2, and is unaffected.
 - **Capability lists no longer advertise options the device will refuse.** The
   config tree carries a bitmask of enum entries the device is currently
   rejecting, and it was ignored: a V6 ECO with no GPS antenna offered `GPS` and
