@@ -266,7 +266,7 @@ impl Drop for HttpSink {
     fn drop(&mut self) {
         // Explicit abort rather than relying on `tx`'s drop to close the
         // channel and have the task notice on its next `recv()` — mirrors
-        // `AaroniaSource`'s `http_task` handling for the same reason: a
+        // `SpectranSource`'s `http_task` handling for the same reason: a
         // background task should not linger past its owner's lifetime.
         self.sender_task.abort();
     }

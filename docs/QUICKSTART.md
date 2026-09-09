@@ -13,7 +13,7 @@ In RTSA-Suite PRO:
 
 1. Add your device block (for example **SPECTRAN V6**) to the mission
    and start it. A live spectrum should appear.
-2. Set the device to **IQ mode**. `AaroniaSource` reads IQ data. Spectra
+2. Set the device to **IQ mode**. `SpectranSource` reads IQ data. Spectra
    streams are available through the lower-level `HttpEndpointsClient`,
    but the sample APIs expect IQ.
 3. Add an **HTTP Server** block.
@@ -54,16 +54,16 @@ traffic on port 54664 through the RTSA host's firewall.
 ### Rust
 
 ```rust,no_run
-use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
+use sdr_aaronia_rs::{SpectranConfig, SpectranSource};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = AaroniaConfig::from_http("http://localhost:54664")
+    let config = SpectranConfig::from_http("http://localhost:54664")
         .center_frequency_hz(2.44e9)
         .sample_rate_hz(15.36e6)  // Fs, not RF bandwidth — see the table below
         .reference_level_dbm(-20.0);
 
-    let mut source = AaroniaSource::new(config).await?;
+    let mut source = SpectranSource::new(config).await?;
     source.start_streaming().await?;
 
     let mut buffer = Vec::new();
@@ -179,7 +179,7 @@ whose usable span is closest. Asking for 2.5 MHz gives Fs = 3.84 MHz,
 whose usable span is 3.07 MHz, rather than the numerically closer
 1.92 MHz. Verified across nine requests on a V6 ECO.
 
-`AaroniaSource::get_source_info()` reports the rate the server is
+`SpectranSource::get_source_info()` reports the rate the server is
 actually sending once packets are flowing, so read it back rather than
 assuming.
 
@@ -197,7 +197,7 @@ crate tunes through `/control`, which needs none.
 **Network saturation at high sample rates.**
 Float32 needs roughly 490 MB/s at the 61.44 MS/s top rate. On anything other than
 localhost, use the `I16` wire format via
-`AaroniaConfig::low_bandwidth_mode()` or the `format=I16` SoapySDR
+`SpectranConfig::low_bandwidth_mode()` or the `format=I16` SoapySDR
 device argument to halve that. This changes the wire format itself,
 unlike a client-side `CS16` conversion.
 
@@ -217,14 +217,14 @@ and the HTTP backend is silently used instead; the list is in
 [SDKSPEC](SDKSPEC.md#native-sdk-pulls-in-massive-qt--ffmpeg-dependencies).
 
 ```rust,no_run
-use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
+use sdr_aaronia_rs::{SpectranConfig, SpectranSource};
 
 # async fn run() -> anyhow::Result<()> {
-let config = AaroniaConfig::default()
+let config = SpectranConfig::default()
     .force_native_sdk()
     .center_frequency_hz(2.44e9)
     .sample_rate_hz(15.36e6);
-let mut source = AaroniaSource::new(config).await?;
+let mut source = SpectranSource::new(config).await?;
 # Ok(())
 # }
 ```

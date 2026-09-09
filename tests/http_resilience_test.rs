@@ -1,14 +1,14 @@
 //! Resilience of the HTTP backend: connect retry, stream
 //! auto-reconnect, and the configurable blocking-read timeout.
 //!
-//! These drive `AaroniaSource` against a `wiremock` server rather than
+//! These drive `SpectranSource` against a `wiremock` server rather than
 //! `HttpEndpointsClient` directly, because the behaviour under test
 //! lives in the source's setup and reader-task paths, not in the
 //! endpoint client.
 
 use sdr_aaronia_rs::Error;
 use sdr_aaronia_rs::http_streaming::StreamFormat;
-use sdr_aaronia_rs::unified_source::{AaroniaConfig, AaroniaSource};
+use sdr_aaronia_rs::unified_source::{SpectranConfig, SpectranSource};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -137,8 +137,8 @@ async fn connect_retries_transient_failures() {
         .await;
     mount_control_and_idle_stream(&server).await;
 
-    let config = AaroniaConfig::from_http(&server.uri());
-    AaroniaSource::new(config)
+    let config = SpectranConfig::from_http(&server.uri());
+    SpectranSource::new(config)
         .await
         .expect("source must survive two 503s on /info");
 
@@ -169,9 +169,9 @@ async fn connect_does_not_retry_client_errors() {
         .mount(&server)
         .await;
 
-    let config = AaroniaConfig::from_http(&server.uri());
-    // `AaroniaSource` is not `Debug`, so match instead of `expect_err`.
-    match AaroniaSource::new(config).await {
+    let config = SpectranConfig::from_http(&server.uri());
+    // `SpectranSource` is not `Debug`, so match instead of `expect_err`.
+    match SpectranSource::new(config).await {
         Ok(_) => panic!("404 must not be retried into success"),
         Err(Error::Protocol(_)) => {}
         Err(other) => panic!("unexpected error variant: {other:?}"),
@@ -197,8 +197,8 @@ async fn read_honours_configured_timeout() {
         .await;
     mount_control_and_idle_stream(&server).await;
 
-    let config = AaroniaConfig::from_http(&server.uri()).read_timeout(Duration::from_millis(300));
-    let mut source = AaroniaSource::new(config).await.expect("source");
+    let config = SpectranConfig::from_http(&server.uri()).read_timeout(Duration::from_millis(300));
+    let mut source = SpectranSource::new(config).await.expect("source");
     source.start_streaming().await.expect("start_streaming");
 
     let mut buffer = Vec::new();
@@ -263,10 +263,10 @@ async fn stream_reconnects_and_reapplies_tuning() {
         .mount(&server)
         .await;
 
-    let config = AaroniaConfig::from_http(&server.uri())
+    let config = SpectranConfig::from_http(&server.uri())
         .stream_format(StreamFormat::Json)
         .read_timeout(Duration::from_secs(20));
-    let mut source = AaroniaSource::new(config).await.expect("source");
+    let mut source = SpectranSource::new(config).await.expect("source");
     source.start_streaming().await.expect("start_streaming");
 
     let puts_after_start = full_tuple_control_puts(&server).await;
@@ -331,10 +331,10 @@ async fn flapping_server_exhausts_reconnect_budget() {
         .mount(&server)
         .await;
 
-    let config = AaroniaConfig::from_http(&server.uri())
+    let config = SpectranConfig::from_http(&server.uri())
         .stream_format(StreamFormat::Json)
         .read_timeout(Duration::from_secs(30));
-    let mut source = AaroniaSource::new(config).await.expect("source");
+    let mut source = SpectranSource::new(config).await.expect("source");
     source.start_streaming().await.expect("start_streaming");
 
     // Far more samples than the flapping server will ever deliver.
@@ -398,11 +398,11 @@ async fn auto_reconnect_disabled_keeps_fail_fast() {
         .mount(&server)
         .await;
 
-    let config = AaroniaConfig::from_http(&server.uri())
+    let config = SpectranConfig::from_http(&server.uri())
         .stream_format(StreamFormat::Json)
         .auto_reconnect(false)
         .read_timeout(Duration::from_secs(20));
-    let mut source = AaroniaSource::new(config).await.expect("source");
+    let mut source = SpectranSource::new(config).await.expect("source");
     source.start_streaming().await.expect("start_streaming");
 
     // More samples than one connection can deliver: without reconnect

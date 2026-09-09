@@ -1,4 +1,4 @@
-use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
+use sdr_aaronia_rs::{SpectranConfig, SpectranSource};
 use std::io::Write;
 
 #[tokio::main]
@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(String::as_str)
         .unwrap_or("http://localhost:54664");
 
-    let config = AaroniaConfig::from_http(url)
+    let config = SpectranConfig::from_http(url)
         .center_frequency_hz(freq)
         .sample_rate_hz(rate)
         .reference_level_dbm(-20.0);
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Connecting to HTTP stream at {} (freq={} rate={})...",
         url, freq, rate
     );
-    let mut source = AaroniaSource::new(config).await?;
+    let mut source = SpectranSource::new(config).await?;
     let info = source.get_source_info();
     eprintln!("Stream started successfully. Info: {:?}", info);
 

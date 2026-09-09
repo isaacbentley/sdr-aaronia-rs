@@ -340,7 +340,7 @@ with the unit sitting on the USB bus. `NativeSdkClient::DEVICE_FAMILIES`
 lists both; try each, or let `open_detected_device` do it. Take the mode
 from whichever answered: the ECO's IQ mode is `iqreceiver`
 (`raw_mode_for_family`) — its `rtsa` is the spectrum pipeline, and IQ
-read from it arrives at ~0.4 MS/s whatever rate was asked. `AaroniaSource`
+read from it arrives at ~0.4 MS/s whatever rate was asked. `SpectranSource`
 does this since 0.8.2; before that it enumerated `spectranv6` only and
 could not open an ECO, and 0.8.1's ECO path opened `rtsa`.
 
@@ -513,7 +513,7 @@ threads it through every configuration surface:
 *   `NativeSdkSource::configure_iq_receiver(center, span, ref,
     channel)` — the channel is a *parameter* of every (re)configuration
     rather than a follow-up call, so a mid-stream retune (e.g.
-    `AaroniaSource::set_center_frequency`) re-applies the selection
+    `SpectranSource::set_center_frequency_hz`) re-applies the selection
     instead of silently reverting the device to `Rx1`. `None` keeps the
     `Rx1` default; an explicit selection on a non-raw open mode (or a
     device without the key) is a hard error.
@@ -521,14 +521,14 @@ threads it through every configuration surface:
     raw-mode-only runtime setter (errors on other open modes).
 *   `SdkConfig::receiver_channel: Option<RxChannel>` — passed through
     by `SdkSource::start_streaming`.
-*   `AaroniaConfig::receiver_channel(RxChannel)` — unified-source
+*   `SpectranConfig::receiver_channel(RxChannel)` — unified-source
     builder equivalent, passed through by `init_native_sdk` and every
     retune.
 
 In `Rx1+Rx2` mode the SDK interleaves both receivers into one packet:
 each sample occupies `stride` floats laid out `[I1, Q1, I2, Q2, ...pad]`.
 `NativeSdkSource::read_samples_dual(rx1, rx2, max)` (wrapped by
-`SdkSource::read_samples_dual` and `AaroniaSource::read_samples_dual`)
+`SdkSource::read_samples_dual` and `SpectranSource::read_samples_dual`)
 demuxes that layout into two time-aligned `Complex32` streams with the
 same whole-packet carry-over rule as `read_samples`; the demux itself
 is the pure `utils::deinterleave_dual_iq`, unit- and Miri-tested. A

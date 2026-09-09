@@ -172,7 +172,7 @@ async fn live_device_sensors() {
 #[tokio::test]
 #[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
 async fn live_bandwidth_tracks_sample_rate() {
-    use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource, usable_bandwidth_hz};
+    use sdr_aaronia_rs::{SpectranConfig, SpectranSource, usable_bandwidth_hz};
 
     // The Bandwidth API the plugin exposes is a reparametrization of the
     // sample rate: usable bandwidth is narrower than the rate, and every
@@ -180,7 +180,7 @@ async fn live_bandwidth_tracks_sample_rate() {
     // minimal mission may not expose the decimation config — fall back to
     // the crate's compiled ladder, which is what the plugin's
     // `listBandwidths` uses in that case anyway.
-    let source = AaroniaSource::new(AaroniaConfig::from_http(&live_url()))
+    let source = SpectranSource::new(SpectranConfig::from_http(&live_url()))
         .await
         .expect("unified source over HTTP");
     let caps = source.device_capabilities().await;
@@ -633,7 +633,7 @@ async fn live_create_input_failure_is_typed() {
 #[tokio::test]
 #[ignore = "requires live RTSA-Suite PRO with an IQ input at AARONIA_LIVE_URL"]
 async fn live_unified_source() {
-    use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
+    use sdr_aaronia_rs::{SpectranConfig, SpectranSource};
 
     // The unified source consumes IQ; skip when the mission only
     // exposes spectra.
@@ -645,8 +645,8 @@ async fn live_unified_source() {
         return;
     }
 
-    let config = AaroniaConfig::from_http(&live_url());
-    let mut source = AaroniaSource::new(config).await.expect("unified source");
+    let config = SpectranConfig::from_http(&live_url());
+    let mut source = SpectranSource::new(config).await.expect("unified source");
     source.start_streaming().await.expect("start_streaming");
 
     let mut buffer = Vec::with_capacity(65_536);
@@ -725,7 +725,7 @@ async fn live_tx_push_sample() {
 #[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL"]
 #[cfg(feature = "seify")]
 fn live_stream_seify() {
-    use sdr_aaronia_rs::seify_impl::AaroniaSeifyDevice;
+    use sdr_aaronia_rs::seify_impl::SpectranSeifyDevice;
     use seify::dev::DynDeviceBackend;
     use seify::{Args, DeviceInfo, RxStreamer};
 
@@ -733,7 +733,7 @@ fn live_stream_seify() {
     let mut args = Args::new();
     args.set("url", url);
 
-    let dev = AaroniaSeifyDevice::from_args(&args).expect("seify open");
+    let dev = SpectranSeifyDevice::from_args(&args).expect("seify open");
 
     let info = dev.info().expect("info");
     println!("seify info: {:?}", info);
@@ -857,15 +857,15 @@ async fn live_retune_full_tuple_applies() {
 #[tokio::test]
 #[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
 async fn live_auto_reconnect_stream_is_continuous() {
-    use sdr_aaronia_rs::unified_source::{AaroniaConfig, AaroniaSource};
+    use sdr_aaronia_rs::unified_source::{SpectranConfig, SpectranSource};
 
-    let config = AaroniaConfig::from_http(&live_url())
+    let config = SpectranConfig::from_http(&live_url())
         .center_frequency_hz(2.44e9)
         .sample_rate_hz(12.288e6)
         .read_timeout(Duration::from_secs(20));
     assert!(config.auto_reconnect, "reconnect must default to on");
 
-    let mut source = AaroniaSource::new(config).await.expect("source");
+    let mut source = SpectranSource::new(config).await.expect("source");
     source.start_streaming().await.expect("start_streaming");
 
     let mut total = 0usize;

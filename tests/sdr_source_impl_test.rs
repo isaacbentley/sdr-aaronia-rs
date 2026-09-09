@@ -1,6 +1,6 @@
 use sdr_aaronia_rs::http_streaming::StreamFormat;
 use sdr_aaronia_rs::sdr_source::{DwellAdvice, SdrSource, SourceConfig};
-use sdr_aaronia_rs::sdr_source_impl::{AaroniaBackend, AaroniaSdrSource};
+use sdr_aaronia_rs::sdr_source_impl::{SpectranBackend, SpectranSdrSource};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,9 +75,9 @@ fn control_put_tuning_to(freq: f64) -> impl Fn(&wiremock::Request) -> bool {
 
 #[test]
 fn test_aaronia_sdr_source_creation() {
-    let backend = AaroniaBackend::Http("http://example.com".to_string());
+    let backend = SpectranBackend::Http("http://example.com".to_string());
 
-    let source = AaroniaSdrSource {
+    let source = SpectranSdrSource {
         backend,
         center_frequency_hz: 1e9,
         reference_level_dbm: 0.0,
@@ -120,9 +120,9 @@ async fn test_sdr_source_start_single_channel() {
         .mount(&mock_server)
         .await;
 
-    let backend = AaroniaBackend::Http(mock_server.uri());
+    let backend = SpectranBackend::Http(mock_server.uri());
 
-    let source = AaroniaSdrSource {
+    let source = SpectranSdrSource {
         backend,
         center_frequency_hz: 1e9,
         reference_level_dbm: 0.0,
@@ -176,9 +176,9 @@ async fn test_sdr_source_start_hopping() {
         .mount(&mock_server)
         .await;
 
-    let backend = AaroniaBackend::Http(mock_server.uri());
+    let backend = SpectranBackend::Http(mock_server.uri());
 
-    let source = AaroniaSdrSource {
+    let source = SpectranSdrSource {
         backend,
         center_frequency_hz: 1e9,
         reference_level_dbm: 0.0,
@@ -231,8 +231,8 @@ async fn test_hop_mode_never_touches_remoteconfig() {
         .mount(&mock_server)
         .await;
 
-    let source = AaroniaSdrSource {
-        backend: AaroniaBackend::Http(mock_server.uri()),
+    let source = SpectranSdrSource {
+        backend: SpectranBackend::Http(mock_server.uri()),
         center_frequency_hz: 1e9,
         reference_level_dbm: 0.0,
         block_size: 1024,
@@ -303,8 +303,8 @@ async fn test_single_channel_honors_channel_override_via_control() {
         .await;
 
     let override_freq = 5.8e9;
-    let source = AaroniaSdrSource {
-        backend: AaroniaBackend::Http(mock_server.uri()),
+    let source = SpectranSdrSource {
+        backend: SpectranBackend::Http(mock_server.uri()),
         center_frequency_hz: 1e9, // base frequency, distinct from the override
         reference_level_dbm: 0.0,
         block_size: 1024,
@@ -373,8 +373,8 @@ async fn test_hop_mode_honors_channel_override_via_control() {
     // A channel that is *not* in the hop list — proves the override wins
     // over the hop list rather than just happening to match a hop target.
     let override_freq = 5.8e9;
-    let source = AaroniaSdrSource {
-        backend: AaroniaBackend::Http(mock_server.uri()),
+    let source = SpectranSdrSource {
+        backend: SpectranBackend::Http(mock_server.uri()),
         center_frequency_hz: 1e9,
         reference_level_dbm: 0.0,
         block_size: 1024,

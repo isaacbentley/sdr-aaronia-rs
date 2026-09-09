@@ -140,12 +140,12 @@ pub use link_budget::{
 /// orchestrator can dispatch through `Box<dyn SdrSource>` uniformly.
 #[cfg(feature = "sdr-source")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sdr-source")))]
-pub use sdr_source_impl::{AaroniaBackend, AaroniaSdrSource};
+pub use sdr_source_impl::{SpectranBackend, SpectranSdrSource};
 /// Unified SDR Source abstraction
 #[cfg(all(feature = "http", feature = "file"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "http", feature = "file"))))]
 pub use unified_source::{
-    AaroniaConfig, AaroniaSource, AaroniaSourceBuilder, SourceInfo, SourceType,
+    SourceInfo, SourceType, SpectranConfig, SpectranSource, SpectranSourceBuilder,
 };
 /// Utilities for DB/linear conversions and string parsing
 pub use utils::{

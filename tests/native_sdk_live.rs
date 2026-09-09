@@ -24,7 +24,7 @@
 ))]
 
 use sdr_aaronia_rs::Complex32;
-use sdr_aaronia_rs::unified_source::{AaroniaConfig, AaroniaSource, SourceType};
+use sdr_aaronia_rs::unified_source::{SourceType, SpectranConfig, SpectranSource};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, MutexGuard};
@@ -80,8 +80,8 @@ fn center_hz() -> f64 {
 /// Base configuration pinned to the native SDK. `force_native_sdk`
 /// means a missing SDK is a hard error here rather than a silent
 /// fallback to HTTP — which is exactly what these tests must assert.
-fn sdk_config(sample_rate_hz: f64) -> AaroniaConfig {
-    let mut cfg = AaroniaConfig::default()
+fn sdk_config(sample_rate_hz: f64) -> SpectranConfig {
+    let mut cfg = SpectranConfig::default()
         .force_native_sdk()
         .center_frequency_hz(center_hz())
         .sample_rate_hz(sample_rate_hz)
@@ -95,7 +95,7 @@ fn sdk_config(sample_rate_hz: f64) -> AaroniaConfig {
 /// the error rather than panicking so callers can characterise
 /// failures instead of aborting the run on the first one.
 async fn try_capture(sample_rate_hz: f64, samples_wanted: usize) -> Result<(usize, f64), String> {
-    let mut source = AaroniaSource::new(sdk_config(sample_rate_hz))
+    let mut source = SpectranSource::new(sdk_config(sample_rate_hz))
         .await
         .map_err(|e| format!("open: {e}"))?;
 
@@ -165,7 +165,7 @@ fn sdk_is_detected_on_this_machine() {
 async fn opens_device_and_reports_native_backend() {
     let _guard = device_lock().await;
 
-    let source = AaroniaSource::new(sdk_config(15.36e6))
+    let source = SpectranSource::new(sdk_config(15.36e6))
         .await
         .expect("a Spectran V6 must be attached and free");
 
@@ -185,7 +185,7 @@ async fn unknown_serial_fails_with_an_actionable_message() {
     let mut cfg = sdk_config(15.36e6);
     cfg.device_serial = Some("NO-SUCH-SERIAL-0000".to_string());
 
-    let err = AaroniaSource::new(cfg)
+    let err = SpectranSource::new(cfg)
         .await
         .err()
         .expect("a bogus serial must not open a device");
@@ -236,7 +236,7 @@ async fn repeated_open_close_cycles_do_not_degrade() {
 async fn read_before_start_streaming_errors_rather_than_hanging() {
     let _guard = device_lock().await;
 
-    let mut source = AaroniaSource::new(sdk_config(15.36e6))
+    let mut source = SpectranSource::new(sdk_config(15.36e6))
         .await
         .expect("device must open");
 
@@ -256,7 +256,7 @@ async fn read_before_start_streaming_errors_rather_than_hanging() {
 async fn stop_without_start_is_harmless() {
     let _guard = device_lock().await;
 
-    let mut source = AaroniaSource::new(sdk_config(15.36e6))
+    let mut source = SpectranSource::new(sdk_config(15.36e6))
         .await
         .expect("device must open");
 
@@ -283,7 +283,7 @@ async fn center_frequency_sweep() {
         let mut cfg = sdk_config(15.36e6);
         cfg.center_frequency_hz = f;
 
-        match AaroniaSource::new(cfg).await {
+        match SpectranSource::new(cfg).await {
             Ok(source) => {
                 let seen = source.get_source_info().center_frequency_hz;
                 println!("{:>10.3} MHz -> reported {:>10.3} MHz", f / 1e6, seen / 1e6);
@@ -306,7 +306,7 @@ async fn center_frequency_sweep() {
 async fn mid_stream_retune_keeps_samples_flowing() {
     let _guard = device_lock().await;
 
-    let mut source = AaroniaSource::new(sdk_config(15.36e6))
+    let mut source = SpectranSource::new(sdk_config(15.36e6))
         .await
         .expect("device must open");
     source.start_streaming().await.expect("start");
@@ -435,7 +435,7 @@ async fn oversized_sample_rate_is_refused_with_an_honest_message() {
     let _guard = device_lock().await;
 
     // 92.16 MHz / 1.5 = 61.44 MHz is the ceiling; ask for well past it.
-    let err = AaroniaSource::new(sdk_config(120e6))
+    let err = SpectranSource::new(sdk_config(120e6))
         .await
         .err()
         .expect("a rate above the clock ceiling must be refused");
@@ -466,7 +466,7 @@ async fn observed_sample_rate_matches_the_request() {
     let _guard = device_lock().await;
 
     let rate = 15.36e6;
-    let mut source = AaroniaSource::new(sdk_config(rate))
+    let mut source = SpectranSource::new(sdk_config(rate))
         .await
         .expect("device must open");
     source.start_streaming().await.expect("start");
@@ -518,7 +518,7 @@ async fn long_run_is_stable_and_reports_its_drops() {
     let _guard = device_lock().await;
 
     let secs = env_f64("AARONIA_SDK_SOAK_SECS", 60.0);
-    let mut source = AaroniaSource::new(sdk_config(15.36e6))
+    let mut source = SpectranSource::new(sdk_config(15.36e6))
         .await
         .expect("device must open");
     source.start_streaming().await.expect("start");
@@ -581,7 +581,7 @@ async fn long_run_is_stable_and_reports_its_drops() {
 /// The Seify backend had no tests of any kind. `sdk=true` must reach the
 /// native SDK, not fall through to HTTP.
 ///
-/// A plain `#[test]`, deliberately: `AaroniaSeifyDevice` owns a tokio
+/// A plain `#[test]`, deliberately: `SpectranSeifyDevice` owns a tokio
 /// runtime, and dropping one inside an async context is a tokio panic
 /// ("Cannot drop a runtime in a context where blocking is not
 /// allowed"). The first run of this test on hardware opened the device
@@ -598,7 +598,7 @@ fn seify_backend_reaches_the_native_sdk() {
     args.set("freq", center_hz().to_string());
     args.set("rate", "15360000");
 
-    let dev = sdr_aaronia_rs::seify_impl::AaroniaSeifyDevice::from_args(&args)
+    let dev = sdr_aaronia_rs::seify_impl::SpectranSeifyDevice::from_args(&args)
         .expect("seify device must open through the native SDK");
 
     println!("seify device id = {:?}", dev.id());

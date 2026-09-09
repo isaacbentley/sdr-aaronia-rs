@@ -1,7 +1,10 @@
 //! Python bindings for `sdr-aaronia-rs`.
 //!
-//! Exposes [`AaroniaConfig`]/[`AaroniaSource`] as the `aaronia` Python
-//! module. Sample reads come back as NumPy arrays or PyArrow
+//! Wraps [`SpectranConfig`]/[`SpectranSource`] and exposes them as the
+//! `aaronia` Python module. The Python-side class names are their own
+//! surface, set by the `#[pyclass(name = ...)]` attributes below.
+//!
+//! Sample reads come back as NumPy arrays or PyArrow
 //! `FixedSizeListArray`s of `[re, im]` float32 pairs; both paths copy
 //! the samples out of the Rust receive buffer exactly once (an earlier
 //! revision advertised "zero-copy", which was never true — and worse,
@@ -22,7 +25,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use sdr_aaronia_rs::http_streaming::StreamFormat;
-use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource, Error as AaroniaError};
+use sdr_aaronia_rs::{Error as AaroniaError, SpectranConfig, SpectranSource};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -101,7 +104,7 @@ fn map_any_err<E: std::fmt::Display>(e: E) -> PyErr {
     AaroniaHardwareError::new_err(e.to_string())
 }
 
-/// Configuration for an [`AaroniaSource`].
+/// Configuration for a [`SpectranSource`].
 ///
 /// Every field is settable *and* readable (the earlier revision was
 /// write-only, and offered no way to reach a non-localhost device or a
@@ -109,7 +112,7 @@ fn map_any_err<E: std::fmt::Display>(e: E) -> PyErr {
 #[pyclass(name = "AaroniaConfig", skip_from_py_object)]
 #[derive(Clone)]
 struct PyAaroniaConfig {
-    inner: AaroniaConfig,
+    inner: SpectranConfig,
 }
 
 #[pymethods]
@@ -117,7 +120,7 @@ impl PyAaroniaConfig {
     #[new]
     fn new() -> Self {
         Self {
-            inner: AaroniaConfig::default(),
+            inner: SpectranConfig::default(),
         }
     }
 
@@ -350,7 +353,7 @@ type DualArrays<'py> = (
 struct PyAaroniaSource {
     // Field order matters: `source` must drop before `rt` so the
     // source's background tasks shut down while the runtime is alive.
-    source: Option<AaroniaSource>,
+    source: Option<SpectranSource>,
     rt: Arc<Runtime>,
     /// Scratch buffer reused across reads. `read_samples` *appends* to
     /// the Vec it is given, so every read starts with `clear()` —
@@ -400,7 +403,7 @@ impl PyAaroniaSource {
         let source = py
             .detach(|| {
                 rt.block_on(async {
-                    let mut source = AaroniaSource::new(config_inner).await?;
+                    let mut source = SpectranSource::new(config_inner).await?;
                     source.start_streaming().await?;
                     Ok::<_, AaroniaError>(source)
                 })
@@ -601,7 +604,7 @@ impl PyAaroniaSource {
 }
 
 /// Iterator over fixed-size sample blocks, returned by
-/// [`AaroniaSource.blocks`].
+/// `AaroniaSource.blocks` on the Python side.
 #[pyclass(name = "BlockIterator")]
 struct BlockIterator {
     source: Py<PyAaroniaSource>,

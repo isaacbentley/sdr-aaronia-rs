@@ -12,18 +12,18 @@ For first-time setup of the RTSA-Suite HTTP Server block, see
 Specify the RF parameters and let the library select the backend.
 
 ```rust,no_run
-use sdr_aaronia_rs::{AaroniaSource, AaroniaConfig};
+use sdr_aaronia_rs::{SpectranSource, SpectranConfig};
 use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Specify RF parameters; the library auto-detects the best backend
-    let config = AaroniaConfig::default()
+    let config = SpectranConfig::default()
         .center_frequency_hz(446.0e6)  // 446 MHz UHF amateur
         .sample_rate_hz(10.0e6)        // 10 MS/s (Fs)
         .reference_level_dbm(-30.0);   // -30 dBm
 
-    let mut source = AaroniaSource::new(config).await?;
+    let mut source = SpectranSource::new(config).await?;
     println!("Selected Source: {:?}", source.get_source_info());
 
     // Read IQ samples using the unified interface
@@ -37,15 +37,15 @@ async fn main() -> Result<()> {
 
 ## Builder pattern
 
-`AaroniaSourceBuilder` is the high-level unified builder. By default the backend is auto-detected, but it can be pinned explicitly with `http_source(url)`, `file_source(path)`, or `force_source_type(...)`; additional knobs include `device_serial(...)`, `stream_format(...)`, `stream_scale(...)`, and `receiver_channel(...)` (native-SDK RX selection, incl. dual-channel `Rx1And2`).
+`SpectranSourceBuilder` is the high-level unified builder. By default the backend is auto-detected, but it can be pinned explicitly with `http_source(url)`, `file_source(path)`, or `force_source_type(...)`; additional knobs include `device_serial(...)`, `stream_format(...)`, `stream_scale(...)`, and `receiver_channel(...)` (native-SDK RX selection, incl. dual-channel `Rx1And2`).
 
 ```rust,no_run
-use sdr_aaronia_rs::AaroniaSourceBuilder;
+use sdr_aaronia_rs::SpectranSourceBuilder;
 use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut builder = AaroniaSourceBuilder::new();
+    let mut builder = SpectranSourceBuilder::new();
     builder
         .center_frequency_hz(2.44e9)  // 2.4 GHz ISM band
         .sample_rate_hz(20.0e6)       // 20 MS/s (Fs)
@@ -66,26 +66,26 @@ async fn main() -> Result<()> {
 You can force a specific backend if auto-detection is not desired:
 
 ```rust,no_run
-use sdr_aaronia_rs::{AaroniaSource, AaroniaConfig};
+use sdr_aaronia_rs::{SpectranSource, SpectranConfig};
 use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Force Native SDK
-    let sdk_config = AaroniaConfig::default()
+    let sdk_config = SpectranConfig::default()
         .center_frequency_hz(2.44e9)
         .sample_rate_hz(20.0e6)
         .reference_level_dbm(-20.0)
         .force_native_sdk();
-    let _sdk_source = AaroniaSource::new(sdk_config).await?;
+    let _sdk_source = SpectranSource::new(sdk_config).await?;
 
     // Force HTTP Streaming
-    let http_config = AaroniaConfig::from_http("http://192.168.1.100");
-    let _http_source = AaroniaSource::new(http_config).await?;
+    let http_config = SpectranConfig::from_http("http://192.168.1.100");
+    let _http_source = SpectranSource::new(http_config).await?;
 
     // Force RTSA File Source
-    let file_config = AaroniaConfig::from_file("capture.rtsa");
-    let _file_source = AaroniaSource::new(file_config).await?;
+    let file_config = SpectranConfig::from_file("capture.rtsa");
+    let _file_source = SpectranSource::new(file_config).await?;
 
     Ok(())
 }
@@ -96,17 +96,17 @@ async fn main() -> Result<()> {
 When using the HTTP backend over a network link, the wire format heavily impacts bandwidth. `sdr-aaronia-rs` defaults to lossless Float32 for maximum precision, but you can opt into a low-bandwidth integer mode if network throughput is a bottleneck.
 
 ```rust,no_run
-use sdr_aaronia_rs::AaroniaConfig;
+use sdr_aaronia_rs::SpectranConfig;
 
 // Default (Float32): 8 bytes/sample on the wire. Lossless, zero-copy decode.
 // At the 61.44 MS/s top rate that is ~490 MB/s (best for localhost).
-let _high_fidelity = AaroniaConfig::default()
+let _high_fidelity = SpectranConfig::default()
     .center_frequency_hz(2.4e9);
 
 // Low Bandwidth (Int16): 4 bytes/sample. Halves network traffic.
 // Requires setting both the format and the encode scale factor.
 // At 61.44 MS/s, ~246 MB/s.
-let _low_bandwidth = AaroniaConfig::default()
+let _low_bandwidth = SpectranConfig::default()
     .center_frequency_hz(2.4e9)
     .low_bandwidth_mode(); // Sets StreamFormat::Int16 and scale=32767.0
 ```
@@ -249,16 +249,16 @@ a definitive count, look at the RTSA host. See `docs/HTTPSPEC.md`,
 Build your own configuration for specific bands:
 
 ```rust,no_run
-use sdr_aaronia_rs::AaroniaConfig;
+use sdr_aaronia_rs::SpectranConfig;
 
 // UHF amateur band
-let _config = AaroniaConfig::default()
+let _config = SpectranConfig::default()
     .center_frequency_hz(446.0e6)  // 446 MHz
     .sample_rate_hz(10.0e6)        // 10 MS/s (Fs)
     .reference_level_dbm(-30.0);   // -30 dBm
 
 // 2m amateur band
-let _config = AaroniaConfig::default()
+let _config = SpectranConfig::default()
     .center_frequency_hz(146.52e6)  // 2m amateur
     .sample_rate_hz(25e3)           // 25 kS/s (Fs)
     .reference_level_dbm(-30.0);    // -30 dBm

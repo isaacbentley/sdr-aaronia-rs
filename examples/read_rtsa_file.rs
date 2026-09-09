@@ -1,7 +1,7 @@
 //! Open a local RTSA capture, print metadata, and read samples efficiently.
 //! Run with: `cargo run --example read_rtsa_file --features file`
 
-use sdr_aaronia_rs::{AaroniaConfig, AaroniaSource};
+use sdr_aaronia_rs::{SpectranConfig, SpectranSource};
 use std::env;
 
 #[tokio::main]
@@ -15,8 +15,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("Opening RTSA file: {}", file_path);
-    let config = AaroniaConfig::from_file(file_path);
-    let mut source = AaroniaSource::new(config).await?;
+    let config = SpectranConfig::from_file(file_path);
+    let mut source = SpectranSource::new(config).await?;
 
     let mut read_samples = 0;
     let mut buffer = Vec::with_capacity(1024 * 64);

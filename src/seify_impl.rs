@@ -1,6 +1,6 @@
 //! Native [`seify`] driver implementation for `sdr-aaronia-rs`.
 //!
-//! Integration status: construct via [`AaroniaSeifyDevice::from_args`]
+//! Integration status: construct via [`SpectranSeifyDevice::from_args`]
 //! and use the trait objects directly (or through
 //! `seify::dev::DynDeviceBackend`). The device is `Clone` (all state is
 //! behind `Arc`s) as seify's `Device::from_impl` requires. It is *not*
@@ -10,7 +10,7 @@
 //! Blocking: every control call and `read` uses `Runtime::block_on`
 //! internally and must not be called from within an async runtime.
 
-use crate::unified_source::{AaroniaSource, AaroniaSourceBuilder, SourceType};
+use crate::unified_source::{SourceType, SpectranSource, SpectranSourceBuilder};
 use num_complex::Complex32;
 use seify::dev::DynDeviceBackend;
 use seify::{
@@ -30,17 +30,17 @@ struct Tuning {
     reference_level_dbm: f64,
 }
 
-/// Seify device wrapper around [`AaroniaSource`]. `Clone` shares the
+/// Seify device wrapper around [`SpectranSource`]. `Clone` shares the
 /// underlying source/runtime/tuning (required by seify's
 /// `Device::from_impl`).
 #[derive(Clone)]
-pub struct AaroniaSeifyDevice {
-    source: Arc<Mutex<AaroniaSource>>,
+pub struct SpectranSeifyDevice {
+    source: Arc<Mutex<SpectranSource>>,
     runtime: Arc<Runtime>,
     tuning: Arc<Mutex<Tuning>>,
 }
 
-impl AaroniaSeifyDevice {
+impl SpectranSeifyDevice {
     /// Create a new Seify device from arguments string.
     pub fn from_args(args: &Args) -> std::result::Result<Self, seify::Error> {
         let runtime = Arc::new(
@@ -50,7 +50,7 @@ impl AaroniaSeifyDevice {
                 .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?,
         );
 
-        let mut builder = AaroniaSourceBuilder::new();
+        let mut builder = SpectranSourceBuilder::new();
 
         if let Ok(url) = args.get::<String>("url") {
             builder.http_source(url);
@@ -99,7 +99,7 @@ impl AaroniaSeifyDevice {
     }
 }
 
-impl DeviceInfo for AaroniaSeifyDevice {
+impl DeviceInfo for SpectranSeifyDevice {
     fn driver(&self) -> seify::Driver {
         seify::Driver::AaroniaHttp
     }
@@ -127,7 +127,7 @@ impl DeviceInfo for AaroniaSeifyDevice {
     }
 }
 
-impl FrequencyControl for AaroniaSeifyDevice {
+impl FrequencyControl for SpectranSeifyDevice {
     fn frequency(
         &self,
         direction: Direction,
@@ -206,7 +206,7 @@ impl FrequencyControl for AaroniaSeifyDevice {
     }
 }
 
-impl SampleRateControl for AaroniaSeifyDevice {
+impl SampleRateControl for SpectranSeifyDevice {
     fn sample_rate(
         &self,
         direction: Direction,
@@ -256,7 +256,7 @@ impl SampleRateControl for AaroniaSeifyDevice {
     }
 }
 
-impl GainControl for AaroniaSeifyDevice {
+impl GainControl for SpectranSeifyDevice {
     fn gain(
         &self,
         direction: Direction,
@@ -334,8 +334,8 @@ impl GainControl for AaroniaSeifyDevice {
     }
 }
 
-impl RxDevice for AaroniaSeifyDevice {
-    type RxStreamer = AaroniaSeifyRxStreamer;
+impl RxDevice for SpectranSeifyDevice {
+    type RxStreamer = SpectranSeifyRxStreamer;
 
     fn rx_streamer(
         &self,
@@ -351,7 +351,7 @@ impl RxDevice for AaroniaSeifyDevice {
                 1,
             ));
         }
-        Ok(AaroniaSeifyRxStreamer {
+        Ok(SpectranSeifyRxStreamer {
             source: self.source.clone(),
             runtime: self.runtime.clone(),
             deferred_overrun: false,
@@ -359,19 +359,19 @@ impl RxDevice for AaroniaSeifyDevice {
     }
 }
 
-impl DynDeviceBackend for AaroniaSeifyDevice {
+impl DynDeviceBackend for SpectranSeifyDevice {
     fn rx_device(&self) -> Option<&dyn seify::dev::DynRxDevice> {
         Some(self)
     }
 }
 
-pub struct AaroniaSeifyRxStreamer {
-    source: Arc<Mutex<AaroniaSource>>,
+pub struct SpectranSeifyRxStreamer {
+    source: Arc<Mutex<SpectranSource>>,
     runtime: Arc<Runtime>,
     deferred_overrun: bool,
 }
 
-impl RxStreamer for AaroniaSeifyRxStreamer {
+impl RxStreamer for SpectranSeifyRxStreamer {
     fn mtu(&self) -> std::result::Result<usize, seify::Error> {
         Ok(65536)
     }

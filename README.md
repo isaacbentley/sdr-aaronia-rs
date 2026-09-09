@@ -12,7 +12,7 @@ Python bindings and a SoapySDR plugin come from the same engine.
 *Disclaimer: This project is not affiliated with Aaronia AG. Aaronia, SPECTRAN, and RTSA-Suite PRO are trademarks of Aaronia AG.*
 
 Working with a SPECTRAN usually means choosing a transport first and
-then writing against whatever API that transport exposes. `AaroniaSource`
+then writing against whatever API that transport exposes. `SpectranSource`
 removes the choice: point it at a file, a URL, or nothing at all, and it
 selects a backend and presents the same interface either way.
 
@@ -48,7 +48,7 @@ Backends:      ├── HTTP Streaming (REST + binary chunked)
                └── Offline .rtsa Files (binary parser)
                        │
                        ▼
-Engine:        [ AaroniaSource / Unified Source ]
+Engine:        [ SpectranSource / Unified Source ]
                        │
                        ▼
 Consumers:     ├── Native Rust API
@@ -98,17 +98,17 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 Set the RF parameters and read:
 
 ```rust,no_run
-use sdr_aaronia_rs::{AaroniaSource, AaroniaConfig};
+use sdr_aaronia_rs::{SpectranSource, SpectranConfig};
 use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = AaroniaConfig::default()
+    let config = SpectranConfig::default()
         .center_frequency_hz(446.0e6)  // 446 MHz
         .sample_rate_hz(10.0e6)        // 10 MS/s (Fs), not RF bandwidth
         .reference_level_dbm(-30.0);   // -30 dBm
 
-    let mut source = AaroniaSource::new(config).await?;
+    let mut source = SpectranSource::new(config).await?;
 
     let mut buffer = Vec::with_capacity(1024);
     let n = source.read_samples(&mut buffer, 1024).await?;
@@ -175,7 +175,7 @@ which is a real wire-format change rather than a client-side conversion.
 ### seify (Rust-native)
 
 Enable the `seify` feature and construct the device with
-`AaroniaSeifyDevice::from_args`. It is not part of seify's built-in
+`SpectranSeifyDevice::from_args`. It is not part of seify's built-in
 enumeration, so it will not appear in `seify::enumerate()`. See
 [PLUGINS.md](PLUGINS.md).
 
@@ -195,12 +195,12 @@ responses are retried; 4xx and configuration errors fail on the first
 attempt. This matters for `*.local` hostnames, which refuse the first
 connection from a cold process while mDNS resolves.
 
-`AaroniaConfig::read_timeout` (default 30 s) bounds `read_samples`.
+`SpectranConfig::read_timeout` (default 30 s) bounds `read_samples`.
 `read_samples_deadline`, and therefore the SoapySDR and seify paths, uses
 its caller's per-call deadline instead.
 
 A dropped HTTP stream, from an RTSA restart or a network interruption,
-reconnects automatically. This is `AaroniaConfig::auto_reconnect`,
+reconnects automatically. This is `SpectranConfig::auto_reconnect`,
 enabled by default. The reader reopens the stream, re-applies the
 current tuning (a restarted server returns to its mission's frequency),
 and flags the first packet after the gap as an overrun so callers know
@@ -218,7 +218,7 @@ Functionality is grouped behind Cargo features so unused dependencies stay out o
 | `file` | Buffered RTSA file parsing. | **Yes** |
 | `native-sdk` | Links the proprietary Aaronia C++ SDK. Windows/Linux only. | No |
 | `futuresdr` | Enables the FutureSDR block API: `HttpSource`, `HttpSink`, and their builders. Implies `http`. | No |
-| `sdr-source` | Integrates `AaroniaSdrSource` implementing the native `SdrSource` traits. | **Yes** |
+| `sdr-source` | Integrates `SpectranSdrSource` implementing the native `SdrSource` traits. | **Yes** |
 | `ffi` | Builds the C-API export layer. | **Yes** |
 
 ## Testing & Contributing

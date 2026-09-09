@@ -48,7 +48,7 @@ pub enum SourceType {
 
 pub use crate::utils::RxChannel;
 
-/// Default blocking-read timeout — see [`AaroniaConfig::read_timeout`].
+/// Default blocking-read timeout — see [`SpectranConfig::read_timeout`].
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Attempts made when first reaching the RTSA server, including the
@@ -209,7 +209,7 @@ where
 
 /// Configuration for the unified Aaronia source
 #[derive(Debug, Clone)]
-pub struct AaroniaConfig {
+pub struct SpectranConfig {
     /// Centre frequency in Hz
     pub center_frequency_hz: f64,
     /// IQ **sample rate** (Fs) in Hz. The device key behind it is
@@ -248,8 +248,8 @@ pub struct AaroniaConfig {
     pub receiver_channel: Option<RxChannel>,
     /// How long a blocking read waits for samples before returning
     /// [`Error::Io`] with [`std::io::ErrorKind::TimedOut`]. Applies to
-    /// [`AaroniaSource::read_samples`] on HTTP sources; the
-    /// deadline-taking reads ([`AaroniaSource::read_samples_deadline`],
+    /// [`SpectranSource::read_samples`] on HTTP sources; the
+    /// deadline-taking reads ([`SpectranSource::read_samples_deadline`],
     /// and therefore the SoapySDR/seify paths) use their caller's
     /// timeout instead.
     ///
@@ -272,7 +272,7 @@ pub struct AaroniaConfig {
     pub auto_reconnect: bool,
 }
 
-impl Default for AaroniaConfig {
+impl Default for SpectranConfig {
     fn default() -> Self {
         Self {
             center_frequency_hz: 2.44e9, // 2.44 GHz (ISM band)
@@ -292,7 +292,7 @@ impl Default for AaroniaConfig {
     }
 }
 
-impl AaroniaConfig {
+impl SpectranConfig {
     /// Create a new configuration for file source
     pub fn from_file<P: AsRef<Path>>(file_path: P) -> Self {
         Self {
@@ -386,8 +386,8 @@ impl AaroniaConfig {
 
     /// Select the receiver channel(s) for native-SDK captures
     /// (`spectranv6/raw` only). With [`RxChannel::Rx1And2`], read both
-    /// channels via [`AaroniaSource::read_samples_dual`]; the mono
-    /// [`AaroniaSource::read_samples`] on a dual stream is rejected by
+    /// channels via [`SpectranSource::read_samples_dual`]; the mono
+    /// [`SpectranSource::read_samples`] on a dual stream is rejected by
     /// the stream's read-mode latch rather than silently returning one
     /// channel.
     #[must_use]
@@ -397,7 +397,7 @@ impl AaroniaConfig {
     }
 
     /// Set how long a blocking read waits before timing out
-    /// (default 30 s) — see [`AaroniaConfig::read_timeout`].
+    /// (default 30 s) — see [`SpectranConfig::read_timeout`].
     #[must_use]
     pub fn read_timeout(mut self, timeout: Duration) -> Self {
         self.read_timeout = timeout;
@@ -405,7 +405,7 @@ impl AaroniaConfig {
     }
 
     /// Enable or disable automatic stream reconnection (default: on) —
-    /// see [`AaroniaConfig::auto_reconnect`].
+    /// see [`SpectranConfig::auto_reconnect`].
     #[must_use]
     pub fn auto_reconnect(mut self, enabled: bool) -> Self {
         self.auto_reconnect = enabled;
@@ -414,8 +414,8 @@ impl AaroniaConfig {
 }
 
 /// Unified Aaronia source that automatically selects the best available connection method
-pub struct AaroniaSource {
-    config: AaroniaConfig,
+pub struct SpectranSource {
+    config: SpectranConfig,
     source_type: SourceType,
     sample_buffer: VecDeque<Complex32>,
 
@@ -475,7 +475,7 @@ pub struct AaroniaSource {
     read_scratch: Vec<Complex32>,
 }
 
-impl AaroniaSource {
+impl SpectranSource {
     /// The latest GPS time in nanoseconds since the Unix epoch, if valid
     /// and available.
     ///
@@ -521,7 +521,7 @@ impl AaroniaSource {
     }
 
     /// Create a new unified Aaronia source with automatic detection
-    pub async fn new(config: AaroniaConfig) -> Result<Self> {
+    pub async fn new(config: SpectranConfig) -> Result<Self> {
         let mut source = Self {
             config: config.clone(),
             source_type: SourceType::Http, // Will be updated during detection
@@ -611,7 +611,7 @@ impl AaroniaSource {
             }
         }
 
-        info!("AaroniaSource initialized with {:?} backend", source_type);
+        info!("SpectranSource initialized with {:?} backend", source_type);
         Ok(source)
     }
 
@@ -813,7 +813,7 @@ impl AaroniaSource {
         .await?;
 
         // Create a channel for sending samples from the async task to
-        // AaroniaSource. Each item also carries whether the reader
+        // SpectranSource. Each item also carries whether the reader
         // task's DropDetector flagged a gap ending at this packet, so
         // `read_samples` can surface it as `IqPacket::overrun`.
         let (sender, receiver) = tokio::sync::mpsc::channel(100); // Buffer up to 100 chunks
@@ -1128,7 +1128,7 @@ impl AaroniaSource {
     /// dual-channel native-SDK stream — the unified-level counterpart
     /// of `NativeSdkSource::read_samples_dual`. Requires the source to
     /// have been built with
-    /// [`receiver_channel(RxChannel::Rx1And2)`](AaroniaConfig::receiver_channel)
+    /// [`receiver_channel(RxChannel::Rx1And2)`](SpectranConfig::receiver_channel)
     /// on the native SDK backend; every other backend returns a
     /// configuration error, since HTTP and file sources carry one
     /// channel per stream.
@@ -2028,7 +2028,7 @@ impl AaroniaSource {
     }
 
     /// Get the current configuration
-    pub fn get_config(&self) -> &AaroniaConfig {
+    pub fn get_config(&self) -> &SpectranConfig {
         &self.config
     }
 
@@ -2058,7 +2058,7 @@ impl AaroniaSource {
     }
 }
 
-impl Drop for AaroniaSource {
+impl Drop for SpectranSource {
     fn drop(&mut self) {
         // Abort the background HTTP reader (if any) so a dropped source
         // doesn't leave a task parked on `next().await` holding the open
@@ -2075,10 +2075,10 @@ impl Drop for AaroniaSource {
 pub struct SourceInfo {
     pub source_type: SourceType,
     pub center_frequency_hz: f64,
-    /// IQ sample rate (Fs) in Hz — see [`AaroniaConfig::sample_rate_hz`].
+    /// IQ sample rate (Fs) in Hz — see [`SpectranConfig::sample_rate_hz`].
     pub sample_rate_hz: f64,
     /// Usable RX/real-time bandwidth in Hz (`0.0` = unknown) — see
-    /// [`AaroniaConfig::bandwidth_hz`]. Always `<= sample_rate_hz`.
+    /// [`SpectranConfig::bandwidth_hz`]. Always `<= sample_rate_hz`.
     pub bandwidth_hz: f64,
     pub reference_level_dbm: f64,
     pub device_serial: Option<String>,
@@ -2102,16 +2102,16 @@ impl std::fmt::Display for SourceInfo {
     }
 }
 
-/// Builder pattern for easy AaroniaSource configuration
-pub struct AaroniaSourceBuilder {
-    config: AaroniaConfig,
+/// Builder pattern for easy SpectranSource configuration
+pub struct SpectranSourceBuilder {
+    config: SpectranConfig,
 }
 
-impl AaroniaSourceBuilder {
+impl SpectranSourceBuilder {
     /// Create a new builder with default configuration
     pub fn new() -> Self {
         Self {
-            config: AaroniaConfig::default(),
+            config: SpectranConfig::default(),
         }
     }
 
@@ -2136,7 +2136,7 @@ impl AaroniaSourceBuilder {
     /// Set the device serial number
     /// Select the receiver channel(s) for native-SDK captures
     /// (`spectranv6/raw` only) — see
-    /// [`AaroniaConfig::receiver_channel`].
+    /// [`SpectranConfig::receiver_channel`].
     pub fn receiver_channel(&mut self, channel: RxChannel) -> &mut Self {
         self.config.receiver_channel = Some(channel);
         self
@@ -2181,26 +2181,26 @@ impl AaroniaSourceBuilder {
     }
 
     /// Set how long a blocking read waits before timing out
-    /// (default 30 s) — see [`AaroniaConfig::read_timeout`].
+    /// (default 30 s) — see [`SpectranConfig::read_timeout`].
     pub fn read_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.config.read_timeout = timeout;
         self
     }
 
     /// Enable or disable automatic stream reconnection (default: on) —
-    /// see [`AaroniaConfig::auto_reconnect`].
+    /// see [`SpectranConfig::auto_reconnect`].
     pub fn auto_reconnect(&mut self, enabled: bool) -> &mut Self {
         self.config.auto_reconnect = enabled;
         self
     }
 
-    /// Build the AaroniaSource
-    pub async fn build(&self) -> Result<AaroniaSource> {
-        AaroniaSource::new(self.config.clone()).await
+    /// Build the SpectranSource
+    pub async fn build(&self) -> Result<SpectranSource> {
+        SpectranSource::new(self.config.clone()).await
     }
 }
 
-impl Default for AaroniaSourceBuilder {
+impl Default for SpectranSourceBuilder {
     fn default() -> Self {
         Self::new()
     }
@@ -2232,7 +2232,7 @@ mod tests {
     #[test]
     fn test_aaronia_config_default() {
         // Test default configuration values
-        let config = AaroniaConfig::default();
+        let config = SpectranConfig::default();
 
         assert_eq!(config.center_frequency_hz, 2.44e9);
         assert_eq!(config.sample_rate_hz, 15.36e6);
@@ -2248,12 +2248,12 @@ mod tests {
 
     #[test]
     fn test_aaronia_config_receiver_channel_builder() {
-        let config = AaroniaConfig::default()
+        let config = SpectranConfig::default()
             .force_native_sdk()
             .receiver_channel(RxChannel::Rx1And2);
         assert_eq!(config.receiver_channel, Some(RxChannel::Rx1And2));
 
-        let config = AaroniaConfig::default().receiver_channel(RxChannel::Rx2);
+        let config = SpectranConfig::default().receiver_channel(RxChannel::Rx2);
         assert_eq!(config.receiver_channel, Some(RxChannel::Rx2));
     }
 
@@ -2261,7 +2261,7 @@ mod tests {
     fn test_aaronia_config_from_file() {
         // Test file configuration creation
         let file_path = "/path/to/test.rtsa";
-        let config = AaroniaConfig::from_file(file_path);
+        let config = SpectranConfig::from_file(file_path);
 
         assert_eq!(config.file_path, Some(file_path.to_string()));
         assert_eq!(config.force_source_type, Some(SourceType::File));
@@ -2272,7 +2272,7 @@ mod tests {
     fn test_aaronia_config_from_http() {
         // Test HTTP configuration creation
         let base_url = "http://rtsa-device:54664";
-        let config = AaroniaConfig::from_http(base_url);
+        let config = SpectranConfig::from_http(base_url);
 
         assert_eq!(config.http_base_url, Some(base_url.to_string()));
         assert_eq!(config.force_source_type, Some(SourceType::Http));
@@ -2282,7 +2282,7 @@ mod tests {
     #[test]
     fn test_aaronia_config_builder_methods() {
         // Test configuration builder pattern methods
-        let config = AaroniaConfig::default()
+        let config = SpectranConfig::default()
             .center_frequency_hz(915e6)
             .sample_rate_hz(10e6)
             .reference_level_dbm(-30.0)
@@ -2299,18 +2299,18 @@ mod tests {
     #[test]
     fn test_aaronia_source_builder_creation() {
         // Test builder creation and default values
-        let builder = AaroniaSourceBuilder::new();
+        let builder = SpectranSourceBuilder::new();
         assert_eq!(builder.config.center_frequency_hz, 2.44e9);
         assert_eq!(builder.config.sample_rate_hz, 15.36e6);
 
-        let default_builder = AaroniaSourceBuilder::default();
+        let default_builder = SpectranSourceBuilder::default();
         assert_eq!(default_builder.config.center_frequency_hz, 2.44e9);
     }
 
     #[test]
     fn test_aaronia_source_builder_configuration() {
         // Test builder configuration methods
-        let mut builder = AaroniaSourceBuilder::new();
+        let mut builder = SpectranSourceBuilder::new();
         builder
             .center_frequency_hz(2.4e9)
             .sample_rate_hz(25e6)
@@ -2334,7 +2334,7 @@ mod tests {
     fn test_aaronia_source_builder_file_source() {
         // Test file source configuration
         let test_path = "/tmp/test_recording.rtsa";
-        let mut builder = AaroniaSourceBuilder::new();
+        let mut builder = SpectranSourceBuilder::new();
         builder.file_source(test_path);
 
         assert_eq!(builder.config.file_path, Some(test_path.to_string()));
@@ -2392,10 +2392,10 @@ mod tests {
     async fn test_detect_best_source_type_file_exists() {
         // Test file detection when file exists
         let temp_file = NamedTempFile::new().expect("Should create temp file");
-        let config = AaroniaConfig::from_file(temp_file.path());
+        let config = SpectranConfig::from_file(temp_file.path());
 
-        // Create a minimal AaroniaSource for testing detect_best_source_type
-        let source = AaroniaSource {
+        // Create a minimal SpectranSource for testing detect_best_source_type
+        let source = SpectranSource {
             config,
             source_type: SourceType::Http, // Will be updated
             sample_buffer: VecDeque::new(),
@@ -2444,7 +2444,7 @@ mod tests {
             println!("Skipping test: LFS fixture missing");
             return;
         }
-        let mut builder = AaroniaSourceBuilder::new();
+        let mut builder = SpectranSourceBuilder::new();
         builder.file_source(fixture);
 
         let source = match builder.build().await {
@@ -2473,9 +2473,9 @@ mod tests {
     #[tokio::test]
     async fn test_detect_best_source_type_file_not_found() {
         // Test file detection when file doesn't exist
-        let config = AaroniaConfig::from_file("/nonexistent/path/test.rtsa");
+        let config = SpectranConfig::from_file("/nonexistent/path/test.rtsa");
 
-        let source = AaroniaSource {
+        let source = SpectranSource {
             config,
             source_type: SourceType::Http,
             sample_buffer: VecDeque::new(),
@@ -2505,9 +2505,9 @@ mod tests {
     #[tokio::test]
     async fn test_detect_best_source_type_http() {
         // Test HTTP detection when URL provided
-        let config = AaroniaConfig::from_http("http://rtsa-device:54664");
+        let config = SpectranConfig::from_http("http://rtsa-device:54664");
 
-        let source = AaroniaSource {
+        let source = SpectranSource {
             config,
             source_type: SourceType::File,
             sample_buffer: VecDeque::new(),
@@ -2539,9 +2539,9 @@ mod tests {
     #[tokio::test]
     async fn test_detect_best_source_type_localhost_fallback() {
         // Test localhost HTTP fallback when no specific source provided
-        let config = AaroniaConfig::default();
+        let config = SpectranConfig::default();
 
-        let source = AaroniaSource {
+        let source = SpectranSource {
             config,
             source_type: SourceType::NativeSdk,
             sample_buffer: VecDeque::new(),
@@ -2593,7 +2593,7 @@ mod tests {
     #[test]
     fn test_complex_configuration_scenarios() {
         // Test various configuration scenarios
-        let config1 = AaroniaConfig::default()
+        let config1 = SpectranConfig::default()
             .center_frequency_hz(2.4e9)
             .sample_rate_hz(40e6)
             .reference_level_dbm(-10.0);
@@ -2603,7 +2603,7 @@ mod tests {
         assert_eq!(config1.reference_level_dbm, -10.0);
 
         // Test overriding default values
-        let config2 = AaroniaConfig::from_http("http://localhost:8080")
+        let config2 = SpectranConfig::from_http("http://localhost:8080")
             .center_frequency_hz(915e6)
             .device_serial("OVERRIDE123".to_string());
 
@@ -2615,7 +2615,7 @@ mod tests {
     #[test]
     fn test_edge_case_configurations() {
         // Test edge cases and boundary conditions
-        let config = AaroniaConfig::default()
+        let config = SpectranConfig::default()
             .center_frequency_hz(0.0)
             .sample_rate_hz(-1.0)
             .reference_level_dbm(100.0);
@@ -2625,7 +2625,7 @@ mod tests {
         assert_eq!(config.reference_level_dbm, 100.0);
 
         // Test empty strings
-        let config_empty = AaroniaConfig::from_http("").device_serial("".to_string());
+        let config_empty = SpectranConfig::from_http("").device_serial("".to_string());
 
         assert_eq!(config_empty.http_base_url, Some("".to_string()));
         assert_eq!(config_empty.device_serial, Some("".to_string()));
@@ -2634,7 +2634,7 @@ mod tests {
     #[test]
     fn test_configuration_chaining() {
         // Test method chaining for configuration
-        let config = AaroniaConfig::default()
+        let config = SpectranConfig::default()
             .center_frequency_hz(1e9)
             .sample_rate_hz(10e6)
             .reference_level_dbm(-40.0)
@@ -2651,7 +2651,7 @@ mod tests {
     #[test]
     fn test_builder_immutable_vs_mutable() {
         // Test builder pattern both mutable and return-based approaches
-        let mut builder = AaroniaSourceBuilder::new();
+        let mut builder = SpectranSourceBuilder::new();
         builder.center_frequency_hz(2.4e9);
         builder.sample_rate_hz(20e6);
 
@@ -2659,7 +2659,7 @@ mod tests {
         assert_eq!(builder.config.sample_rate_hz, 20e6);
 
         // Test chaining
-        let mut builder2 = AaroniaSourceBuilder::new();
+        let mut builder2 = SpectranSourceBuilder::new();
         builder2.center_frequency_hz(915e6);
         assert_eq!(builder2.config.center_frequency_hz, 915e6);
     }
@@ -2668,13 +2668,13 @@ mod tests {
     fn test_pathbuf_file_source() {
         // Test PathBuf compatibility for file sources
         let path = PathBuf::from("/tmp/test.rtsa");
-        let mut builder = AaroniaSourceBuilder::new();
+        let mut builder = SpectranSourceBuilder::new();
         builder.file_source(&path);
 
         assert_eq!(builder.config.file_path, Some("/tmp/test.rtsa".to_string()));
 
-        // Test with AaroniaConfig::from_file
-        let config = AaroniaConfig::from_file(&path);
+        // Test with SpectranConfig::from_file
+        let config = SpectranConfig::from_file(&path);
         assert_eq!(config.file_path, Some("/tmp/test.rtsa".to_string()));
     }
 
@@ -2683,22 +2683,22 @@ mod tests {
         // Test the documented priority logic in configuration
 
         // Priority 1: File source
-        let file_config = AaroniaConfig::from_file("/test.rtsa");
+        let file_config = SpectranConfig::from_file("/test.rtsa");
         assert_eq!(file_config.force_source_type, Some(SourceType::File));
 
         // Priority 2: HTTP source
-        let http_config = AaroniaConfig::from_http("http://localhost:54664");
+        let http_config = SpectranConfig::from_http("http://localhost:54664");
         assert_eq!(http_config.force_source_type, Some(SourceType::Http));
 
         // Priority 3: Native SDK (manual force)
-        let sdk_config = AaroniaConfig::default().force_native_sdk();
+        let sdk_config = SpectranConfig::default().force_native_sdk();
         assert_eq!(sdk_config.force_source_type, Some(SourceType::NativeSdk));
     }
 
     #[test]
     fn test_configuration_validation_boundaries() {
         // Test various frequency and power level boundaries
-        let extreme_config = AaroniaConfig::default()
+        let extreme_config = SpectranConfig::default()
             .center_frequency_hz(f64::MAX)
             .sample_rate_hz(f64::MIN)
             .reference_level_dbm(f64::INFINITY);
@@ -2708,14 +2708,14 @@ mod tests {
         assert!(extreme_config.reference_level_dbm.is_infinite());
 
         // Test NaN values
-        let nan_config = AaroniaConfig::default().center_frequency_hz(f64::NAN);
+        let nan_config = SpectranConfig::default().center_frequency_hz(f64::NAN);
         assert!(nan_config.center_frequency_hz.is_nan());
     }
 
     #[test]
     fn test_clone_and_debug_traits() {
         // Test Clone and Debug trait implementations
-        let original_config = AaroniaConfig::from_http("http://test.com")
+        let original_config = SpectranConfig::from_http("http://test.com")
             .center_frequency_hz(2.4e9)
             .device_serial("TEST123".to_string());
 
@@ -2739,8 +2739,8 @@ mod tests {
         // HTTP reader task flagged as dropped must surface via
         // `take_overrun()` on the next call, and clear after being read.
         let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
-        let mut source = AaroniaSource {
-            config: AaroniaConfig::default(),
+        let mut source = SpectranSource {
+            config: SpectranConfig::default(),
             source_type: SourceType::Http,
             sample_buffer: VecDeque::new(),
             #[cfg(all(

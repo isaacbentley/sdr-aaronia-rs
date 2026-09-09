@@ -283,11 +283,11 @@ impl Default for UnifiedSink {
 /// whether the built sink can transmit is decided at
 /// [`UnifiedSink::initialize`] time.
 #[derive(Debug, Clone, Default)]
-pub struct AaroniaSinkBuilder {
+pub struct SpectranSinkBuilder {
     config: UnifiedSinkConfig,
 }
 
-impl AaroniaSinkBuilder {
+impl SpectranSinkBuilder {
     pub fn new() -> Self {
         Self::default()
     }

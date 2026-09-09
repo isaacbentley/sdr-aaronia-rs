@@ -10,7 +10,7 @@
 //! ## Code flow
 //!
 //! ```text
-//! AaroniaSource::build()   creates a wideband SDR source
+//! SpectranSource::build()   creates a wideband SDR source
 //! .read_samples()          captures all NOAA frequencies at once
 //! .find_strongest()        picks the strongest station from the spectrum
 //! FutureSDR pipeline       real-time FM demodulation to audio
@@ -27,7 +27,7 @@
 use anyhow::{Context, Result};
 use futuresdr::blocks::{Apply, FirBuilder, VectorSource, audio::AudioSink};
 use futuresdr::runtime::{Flowgraph, Runtime};
-use sdr_aaronia_rs::{AaroniaSourceBuilder, Complex32};
+use sdr_aaronia_rs::{Complex32, SpectranSourceBuilder};
 use std::{env, time::Duration};
 
 /// NOAA Weather Radio Channel Definition
@@ -120,13 +120,13 @@ impl NoaaScanner {
         Self { config }
     }
 
-    /// Create an optimized AaroniaSource for the given frequency and rate
+    /// Create an optimized SpectranSource for the given frequency and rate
     async fn create_source(
         &self,
         center_frequency_hz: f64,
         sample_rate_hz: f64,
-    ) -> Result<sdr_aaronia_rs::AaroniaSource> {
-        AaroniaSourceBuilder::new()
+    ) -> Result<sdr_aaronia_rs::SpectranSource> {
+        SpectranSourceBuilder::new()
             .http_source(self.config.device_url.clone())
             .center_frequency_hz(center_frequency_hz)
             .sample_rate_hz(sample_rate_hz)
@@ -251,7 +251,7 @@ impl NoaaScanner {
     /// Listen to weather radio audio - showcasing aaronia-rs + FutureSDR integration
     ///
     /// Creates an real-time FM demodulation pipeline:
-    /// AaroniaSource FM Demod Audio Output
+    /// SpectranSource FM Demod Audio Output
     async fn listen_to_audio(&self, channel: &NoaaChannel) -> Result<()> {
         println!(
             "\nTuning to {} weather station: {:.3} MHz",

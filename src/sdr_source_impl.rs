@@ -1,6 +1,6 @@
 //! [`SdrSource`] implementation for the Aaronia source family.
 //!
-//! Wraps the existing async [`AaroniaSourceBuilder`] in a synchronous
+//! Wraps the existing async [`SpectranSourceBuilder`] in a synchronous
 //! [`SdrSource::start`] entry point: spawns a dedicated thread with
 //! its own tokio runtime, drives the builder + read-samples loop
 //! inside that runtime, and bridges async-yielded samples to a sync
@@ -8,12 +8,12 @@
 //! caring that the underlying transport (HTTP, file, native SDK) is
 //! async.
 //!
-//! Naming: the existing [`crate::AaroniaSource`] is the unified
-//! async-API source. The new [`AaroniaSdrSource`] here is the
+//! Naming: the existing [`crate::SpectranSource`] is the unified
+//! async-API source. The new [`SpectranSdrSource`] here is the
 //! `SdrSource`-trait facade that constructs and drives one. They
 //! live in the same crate but serve different layers.
 
-use crate::AaroniaSourceBuilder;
+use crate::SpectranSourceBuilder;
 use crate::sdr_source::{
     DwellAdvice, DwellController, IqPacket, SdrError, SdrHandle, SdrSource, SourceConfig,
     freq_key_khz,
@@ -33,7 +33,7 @@ use tracing::{info, warn};
 /// orchestrator's `aaronia http` / `aaronia file` / `aaronia sdk`
 /// subcommands one-to-one.
 #[derive(Debug, Clone)]
-pub enum AaroniaBackend {
+pub enum SpectranBackend {
     /// HTTP server-block endpoint of a running RTSA-Suite.
     Http(String),
     /// `.rtsa` capture file replayed through the unified source.
@@ -44,7 +44,7 @@ pub enum AaroniaBackend {
 }
 
 /// `SdrSource`-trait facade for Aaronia. Pair with an
-/// [`AaroniaBackend`], a centre frequency, and a reference level; the
+/// [`SpectranBackend`], a centre frequency, and a reference level; the
 /// trait machinery handles the rest.
 ///
 /// **Hopping**: when [`SourceConfig::channels_hz`] is non-empty, the
@@ -52,9 +52,9 @@ pub enum AaroniaBackend {
 /// [`DwellController`] for per-hop pacing (same logic as the USRP
 /// backend). File backends ignore hopping — RTSA capture files carry
 /// a single centre frequency in their metadata.
-pub struct AaroniaSdrSource {
+pub struct SpectranSdrSource {
     /// Transport selection: HTTP endpoint, capture file, or native SDK.
-    pub backend: AaroniaBackend,
+    pub backend: SpectranBackend,
     /// Initial center frequency, in Hz.
     pub center_frequency_hz: f64,
     /// Reference level, in dBm.
@@ -64,7 +64,7 @@ pub struct AaroniaSdrSource {
     /// latency. The orchestrator's default is 65 536.
     pub block_size: usize,
     /// HTTP `/stream` wire format passthrough for the
-    /// [`AaroniaBackend::Http`] backend; `None` uses the library default
+    /// [`SpectranBackend::Http`] backend; `None` uses the library default
     /// (binary Float32). Ignored by the file and native-SDK backends.
     /// Exists so orchestrators can select e.g. Int16 (half the network
     /// bandwidth of Float32) without reaching into the unified source
@@ -96,7 +96,7 @@ const EMPTY_READ_BAILOUT: u32 = 16;
 /// should see EOF rather than be silently fed an empty channel.
 const READ_ERROR_BAILOUT: u32 = 5;
 
-impl SdrSource for AaroniaSdrSource {
+impl SdrSource for SpectranSdrSource {
     fn start(
         self: Box<Self>,
         config: SourceConfig,
@@ -106,7 +106,7 @@ impl SdrSource for AaroniaSdrSource {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_thread = stop_flag.clone();
 
-        let AaroniaSdrSource {
+        let SpectranSdrSource {
             backend,
             center_frequency_hz,
             reference_level_dbm,
@@ -133,14 +133,14 @@ impl SdrSource for AaroniaSdrSource {
                                 .build()?;
 
                             runtime.block_on(async move {
-                    let mut builder = AaroniaSourceBuilder::new();
+                    let mut builder = SpectranSourceBuilder::new();
                     builder
                         .center_frequency_hz(center_frequency_hz)
                         .sample_rate_hz(sample_rate_hz)
                         .reference_level_dbm(reference_level_dbm);
 
                     match &backend {
-                        AaroniaBackend::Http(url) => {
+                        SpectranBackend::Http(url) => {
                             builder.http_source(url.clone());
                             if let Some(format) = stream_format {
                                 builder.stream_format(format);
@@ -149,11 +149,11 @@ impl SdrSource for AaroniaSdrSource {
                                 info!("Aaronia HTTP source: {}", url);
                             }
                         }
-                        AaroniaBackend::File(path) => {
+                        SpectranBackend::File(path) => {
                             builder.file_source(path.to_string_lossy().as_ref());
                             info!("Aaronia file source: {}", path.display());
                         }
-                        AaroniaBackend::Sdk { serial } => {
+                        SpectranBackend::Sdk { serial } => {
                             builder.force_source_type(SourceType::NativeSdk);
                             if let Some(s) = serial {
                                 builder.device_serial(s.clone());
@@ -165,7 +165,7 @@ impl SdrSource for AaroniaSdrSource {
                     }
 
                     let mut source = builder.build().await.map_err(|e| {
-                        Error::Config(format!("AaroniaSourceBuilder::build failed: {e}"))
+                        Error::Config(format!("SpectranSourceBuilder::build failed: {e}"))
                     })?;
                     let source_info = source.get_source_info();
                     info!("Aaronia source: {:?}", source_info);
@@ -204,11 +204,11 @@ impl SdrSource for AaroniaSdrSource {
                     // hopping on it meant a server the probe couldn't
                     // positively confirm fell back to single-channel even
                     // though `/control` retunes work. `probe_remote_config_license`
-                    // is still available on `AaroniaSource` for callers who
+                    // is still available on `SpectranSource` for callers who
                     // want it for their own purposes; this orchestrator no
                     // longer calls it.
                     let hopping =
-                        !channels_hz.is_empty() && !matches!(backend, AaroniaBackend::File(_));
+                        !channels_hz.is_empty() && !matches!(backend, SpectranBackend::File(_));
 
                     let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(256);
                     for _ in 0..256 {
@@ -280,7 +280,7 @@ impl SdrSource for AaroniaSdrSource {
 }
 
 /// Pump samples on a single centre frequency. Pre-A37 behaviour — used
-/// for file replay and for direct callers of `AaroniaSdrSource` that
+/// for file replay and for direct callers of `SpectranSdrSource` that
 /// build with an empty `channels_hz` list (including hop configs that
 /// fell back here after `probe_remote_config_license` failed).
 ///
@@ -296,7 +296,7 @@ impl SdrSource for AaroniaSdrSource {
 /// there.
 #[allow(clippy::too_many_arguments)]
 async fn single_channel_pump(
-    source: &mut crate::AaroniaSource,
+    source: &mut crate::SpectranSource,
     center_frequency_hz: f64,
     advice: &dyn DwellAdvice,
     tx: &channel::Sender<IqPacket>,
@@ -369,7 +369,7 @@ async fn single_channel_pump(
 /// EOF to the orchestrator, not as a tight retune retry loop.
 #[allow(clippy::too_many_arguments)]
 async fn hop_pump(
-    source: &mut crate::AaroniaSource,
+    source: &mut crate::SpectranSource,
     channels_hz: &[f64],
     dwell_ctrl: &DwellController,
     advice: &dyn DwellAdvice,
@@ -536,7 +536,7 @@ async fn hop_pump(
 /// window elapses or `read_samples` errors out (in which case the
 /// caller's main loop surfaces the error on the next read).
 async fn drain_during_settle(
-    source: &mut crate::AaroniaSource,
+    source: &mut crate::SpectranSource,
     block_size: usize,
     settle: Duration,
 ) {

@@ -43,6 +43,29 @@ because they take a string carrying its own units (`"146.52M"`), not a bare
 number. `DeviceCapabilities` is `#[non_exhaustive]`, so this is a field rename
 on a struct callers construct through the API rather than by literal.
 
+**The Rust types are named for the device: `Aaronia*` becomes `Spectran*`.**
+`SpectranConfig`, `SpectranSource`, `SpectranSourceBuilder`,
+`SpectranSinkBuilder`, `SpectranSeifyDevice`, `SpectranSeifyRxStreamer`,
+`SpectranBackend`, `SpectranSdrSource`. These are the objects a caller holds,
+and what they describe is a SPECTRAN, not a company.
+
+The vendor namespace stays wherever it is a frozen contract rather than a
+description: the `aaronia_*` C symbols and the `AaroniaSource` / `AaroniaFfiError`
+typedefs in `include/aaronia.h`, the crate name `sdr-aaronia-rs`, the PyPI
+package `python-aaronia`, the Python module `aaronia`, `AaroniaSoapyDevice`
+inside the plugin, and `driver=aaronia`. That last one is the load-bearing case:
+it is typed by hand into GQRX and SDR++ configuration files already in the
+world, and breaking it fails as "device not found" with nothing pointing at the
+cause. The C header also reads coherently as it stands —
+`AaroniaFfiError aaronia_source_...(AaroniaSource*)` — so there was nothing to
+gain by half-renaming it. Crates.io and PyPI names cannot be changed in place
+in any event.
+
+The Python classes follow the same rule and are renamed alongside the rest of
+that surface: `aaronia.AaroniaConfig` becomes `aaronia.SpectranConfig`, module
+named for the vendor and class for the device, which is what Python convention
+wants anyway.
+
 **The C ABI is renamed with no forwarders.** A C consumer gets an undefined
 symbol at link time rather than a deprecation warning, so this table is the
 migration guide. The `FfiSourceInfo` struct fields moved too — those are

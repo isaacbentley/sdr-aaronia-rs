@@ -1,6 +1,6 @@
 //! Channel hopping using the native `sdr-source` traits.
 //!
-//! This example shows how to configure `AaroniaSdrSource` with a dwell advice
+//! This example shows how to configure `SpectranSdrSource` with a dwell advice
 //! controller and multiple frequency channels, automatically hopping frequencies
 //! while receiving unified IQ data.
 //!
@@ -9,7 +9,7 @@
 #[cfg(feature = "sdr-source")]
 fn main() -> anyhow::Result<()> {
     use sdr_aaronia_rs::sdr_source::{DwellAdvice, SdrSource, SourceConfig};
-    use sdr_aaronia_rs::sdr_source_impl::{AaroniaBackend, AaroniaSdrSource};
+    use sdr_aaronia_rs::sdr_source_impl::{SpectranBackend, SpectranSdrSource};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -32,9 +32,9 @@ fn main() -> anyhow::Result<()> {
     };
 
     println!("Initializing Aaronia SDR Source with 3 channels...");
-    // AaroniaSdrSource implements `SdrSource` providing a synchronized, hopping stream
-    let source = Box::new(AaroniaSdrSource {
-        backend: AaroniaBackend::Http("http://localhost:54664".to_string()),
+    // SpectranSdrSource implements `SdrSource` providing a synchronized, hopping stream
+    let source = Box::new(SpectranSdrSource {
+        backend: SpectranBackend::Http("http://localhost:54664".to_string()),
         center_frequency_hz: 446.0e6,
         reference_level_dbm: -20.0,
         block_size: 8192,

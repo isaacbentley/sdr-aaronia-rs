@@ -16,7 +16,7 @@
 //! exists in this crate).
 //!
 //! For HTTP-based streaming from an Aaronia RTSA Suite Pro instance, use
-//! [`crate::AaroniaSource`] (in [`crate::unified_source`]) instead.
+//! [`crate::SpectranSource`] (in [`crate::unified_source`]) instead.
 
 use crate::Result;
 use crate::utils::RxChannel;
