@@ -63,6 +63,29 @@ name forever, which is exactly why the header changed in the same commit.
 | `aaronia_source_read_sensors` | `aaronia_source_get_sensors` |
 | `aaronia_endpoints_client_read_sensors` | `aaronia_endpoints_client_get_sensors` |
 | `FfiSourceInfo::center_frequency` / `span_frequency` / `reference_level` | `center_frequency_hz` / `sample_rate_hz` / `reference_level_dbm` |
+| `aaronia_source_get_gps_time(.., double*)` | `aaronia_source_get_gps_time_ns(.., int64_t*)` |
+
+GPS time changes type as well as name. `AaroniaSource::get_gps_time() ->
+Option<f64>` of seconds is now `gps_time_ns() -> Option<i64>`, and the C
+function takes an `int64_t*`, matching `get_last_timestamp_ns` — one unit for
+one dimension. The conversion moved into the library because doing it right is
+not obvious: epoch nanoseconds land around `1.7e18`, where an `f64`'s step is
+256 ns, so a single `seconds * 1e9` multiply throws away tens of nanoseconds
+the reading still had. The SoapySDR plugin carried its own whole/fractional
+split to avoid that; it now just reads the `int64_t` and that code is deleted.
+`GpsState::time` becomes `time_s`, keeping the vendor's seconds under a name
+that says so. The C function also accepts a `NULL` out-parameter, meaning "just
+tell me whether a fix exists" — what a capability probe wants, and what the
+plugin previously had to declare a throwaway variable for.
+
+To be clear about what this does not do: it does not make GPS time more
+precise. The device reports `gpstime` as an `f64`, whose resolution at
+present-day epoch values is about 240 ns, and nothing downstream can recover
+what was never there. `utils::gps_seconds_to_nanos` documents that bound, and
+a unit test pins the conversion against the naive multiply. For correlating
+captures across receivers, ~240 ns is ~70 m of ranging uncertainty, so build
+on the per-packet stream timestamps and use GPS time for disciplining and
+wall-clock labelling.
 
 The two `read_sensors` are not a unit change but a verb one: `read_` advances a
 stream in this ABI (`aaronia_source_read_samples`), while sensors are a

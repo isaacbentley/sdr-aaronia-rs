@@ -563,6 +563,43 @@ pub fn decimation_index_for_bandwidth(bandwidth_hz: f64) -> usize {
     decimation_index_for_rate(iq_sample_rate_for_bandwidth(bandwidth_hz))
 }
 
+/// Convert the vendor's GPS time — `float64` seconds since the Unix epoch,
+/// as `gpstime` in the health tree — to integer nanoseconds.
+///
+/// Done as whole seconds plus fraction rather than one `s * 1e9` multiply.
+/// The product is around `1.7e18`, past the point where an `f64` step is
+/// one nanosecond: its ULP there is 256 ns, so the multiply alone throws
+/// away tens of nanoseconds the input still had.
+///
+/// It does **not** make the reading more precise than the vendor's own
+/// number. An `f64` holding present-day epoch seconds has a ULP of about
+/// 238 ns, so GPS time from this device is quantised at roughly that
+/// regardless of what it is converted to. Worth knowing before designing
+/// around it: for TDOA across receivers, ~240 ns of timing uncertainty is
+/// ~70 m of ranging uncertainty. The per-packet stream timestamps, not
+/// this, are what a correlation should be built on; GPS time is for
+/// disciplining and for wall-clock labelling.
+///
+/// `None` for a value that is not finite, is negative (there is no
+/// pre-epoch GPS fix), or would overflow `i64` nanoseconds, which runs
+/// out around the year 2262.
+#[must_use]
+pub fn gps_seconds_to_nanos(seconds: f64) -> Option<i64> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let whole = seconds.floor();
+    // Checked all the way out rather than range-guarding first. Comparing
+    // `whole` against `i64::MAX / 1_000_000_000` looks like it covers this
+    // and does not: the last representable second still has a fraction to
+    // add, so 9_223_372_036.9 passes the guard and then overflows. A
+    // float-to-int cast saturates in Rust, so an absurd input arrives as
+    // `i64::MAX` and the multiply refuses it here.
+    (whole as i64)
+        .checked_mul(1_000_000_000)?
+        .checked_add(((seconds - whole) * 1e9).round() as i64)
+}
+
 /// Hardware constraint for IQ Mode: the configured sample rate must
 /// satisfy `sample_rate_hz * IQ_RATE_CLOCK_RATIO ≤ receiver_clock`.
 /// Misconfigurations cause the SDK to silently emit corrupted samples;
@@ -939,6 +976,117 @@ mod tests {
             DEFAULT_RECEIVER_CLOCK_HZ,
             "configure_iq_receiver's pre-write check depends on these agreeing"
         );
+    }
+
+    /// Exactly what an `f64` is worth in nanoseconds, from its bit
+    /// pattern in `i128`.
+    ///
+    /// Deliberately shares no arithmetic with `gps_seconds_to_nanos`: a
+    /// ground truth computed the same whole-plus-fraction way would only
+    /// prove the function equals itself. An `f64` is `mantissa * 2^exp`
+    /// exactly, so scaling by `1e9` in integers is exact too, and the
+    /// only rounding is the final divide.
+    fn exact_nanos(seconds: f64) -> i128 {
+        let bits = seconds.to_bits();
+        let raw_exponent = ((bits >> 52) & 0x7ff) as i32;
+        assert!(
+            raw_exponent > 0,
+            "subnormals are not among the values tested"
+        );
+        let mantissa = i128::from(bits & 0x000f_ffff_ffff_ffff) | (1i128 << 52);
+        let exponent = raw_exponent - 1075;
+        let scaled = mantissa * 1_000_000_000;
+        if exponent >= 0 {
+            scaled << exponent
+        } else {
+            let divisor = 1i128 << (-exponent);
+            // Round half away from zero, as `f64::round` does; every value
+            // here is positive.
+            (scaled + divisor / 2) / divisor
+        }
+    }
+
+    /// The split conversion must beat a single `s * 1e9` multiply, which
+    /// is the whole reason it exists. At epoch scale the product's ULP is
+    /// 256 ns, so the naive form discards tens of nanoseconds the input
+    /// still carried.
+    #[test]
+    fn gps_nanos_beat_a_naive_multiply() {
+        // Written as the f64 actually stores it: a longer literal is
+        // rounded to this anyway, which is the same lossiness the
+        // function exists to handle.
+        let seconds = 1_757_376_000.123_456_7_f64;
+        let split = i128::from(gps_seconds_to_nanos(seconds).expect("a present-day fix converts"));
+        let naive = (seconds * 1e9) as i128;
+        let exact = exact_nanos(seconds);
+
+        // One nanosecond of slack: the split rounds once when scaling the
+        // fraction, so it is allowed to sit on either side of exact, but
+        // nowhere further.
+        assert!(
+            (split - exact).abs() <= 1,
+            "split {split} should be within 1 ns of the exact {exact}"
+        );
+        assert!(
+            (naive - exact).abs() > 1,
+            "if the naive multiply were this accurate the split would be pointless; \
+             naive {naive} vs exact {exact}"
+        );
+        assert!(
+            (split - exact).abs() < (naive - exact).abs(),
+            "split {split} should sit closer to {exact} than naive {naive}"
+        );
+    }
+
+    /// A value an `f64` holds exactly, whose nanoseconds can therefore be
+    /// written down as an integer literal with no arithmetic at all. The
+    /// clearest possible ground truth, and it still separates the two
+    /// conversions.
+    #[test]
+    fn gps_nanos_are_exact_for_a_binary_fraction() {
+        // 0.125 == 2^-3, exact in binary.
+        let seconds = 1_757_376_000.125_f64;
+        assert_eq!(
+            gps_seconds_to_nanos(seconds),
+            Some(1_757_376_000_125_000_000)
+        );
+        assert_ne!(
+            (seconds * 1e9) as i64,
+            1_757_376_000_125_000_000,
+            "the naive multiply should miss even an exactly-held input"
+        );
+    }
+
+    /// `i64` nanoseconds run out mid-second in 2262, and the last second
+    /// is where a range check that only looks at whole seconds lets an
+    /// overflow through.
+    #[test]
+    fn gps_nanos_refuse_the_final_partial_second() {
+        let last_whole = (i64::MAX / 1_000_000_000) as f64; // 9_223_372_036
+        assert!(gps_seconds_to_nanos(last_whole).is_some());
+        // Same whole second, but the fraction pushes it past i64::MAX.
+        assert_eq!(gps_seconds_to_nanos(last_whole + 0.9), None);
+    }
+
+    #[test]
+    fn gps_nanos_round_trip_whole_seconds() {
+        assert_eq!(gps_seconds_to_nanos(0.0), Some(0));
+        assert_eq!(gps_seconds_to_nanos(1.0), Some(1_000_000_000));
+        assert_eq!(
+            gps_seconds_to_nanos(1_757_376_000.0),
+            Some(1_757_376_000_000_000_000)
+        );
+    }
+
+    /// Garbage in the health tree must not become a plausible timestamp.
+    #[test]
+    fn gps_nanos_reject_the_unrepresentable() {
+        assert_eq!(gps_seconds_to_nanos(f64::NAN), None);
+        assert_eq!(gps_seconds_to_nanos(f64::INFINITY), None);
+        assert_eq!(gps_seconds_to_nanos(-1.0), None);
+        // i64 nanoseconds run out in 2262; past that there is no answer
+        // to give rather than a wrapped one.
+        assert_eq!(gps_seconds_to_nanos(1e19), None);
     }
 
     #[test]

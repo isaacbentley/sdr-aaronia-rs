@@ -476,10 +476,20 @@ pub struct AaroniaSource {
 }
 
 impl AaroniaSource {
-    /// Get the latest GPS time (seconds since unix epoch), if valid and
-    /// available.
+    /// The latest GPS time in nanoseconds since the Unix epoch, if valid
+    /// and available.
     ///
     /// Native SDK only; returns `None` on the HTTP and file backends.
+    ///
+    /// Nanoseconds to match [`Self::last_timestamp_ns`], one unit for one
+    /// dimension, and to keep the conversion in one place: the device
+    /// reports `gpstime` as `float64` seconds, and turning that into
+    /// nanoseconds correctly is fiddly enough that the SoapySDR plugin
+    /// used to carry its own copy of the arithmetic. **It is not more
+    /// precise than the vendor's own reading** — see
+    /// [`crate::utils::gps_seconds_to_nanos`], which puts the floor at
+    /// roughly 240 ns and explains why a cross-receiver correlation wants
+    /// the per-packet stream timestamps instead.
     ///
     /// **GPS has to be switched on first, and this crate does not do it.**
     /// The device ships with `device/gpsmode` set to `Disabled`, in which
@@ -492,7 +502,7 @@ impl AaroniaSource {
     ///
     /// Hardware-unverified: no GPS-equipped device has been available to
     /// test against.
-    pub fn get_gps_time(&mut self) -> Option<f64> {
+    pub fn gps_time_ns(&mut self) -> Option<i64> {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
@@ -502,7 +512,7 @@ impl AaroniaSource {
                 if let Some(sdk) = &mut self.native_source
                     && let Ok((_health, gps)) = unsafe { sdk.get_health_and_gps() }
                 {
-                    return gps.time;
+                    return gps.time_s.and_then(crate::utils::gps_seconds_to_nanos);
                 }
                 None
             }

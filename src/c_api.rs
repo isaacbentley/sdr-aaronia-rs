@@ -779,27 +779,45 @@ pub unsafe extern "C" fn aaronia_source_get_last_timestamp_ns(ptr: *mut c_void) 
     source.last_timestamp_ns()
 }
 
-/// Get the current GPS time (in seconds since epoch) if available and valid.
-/// Returns `true` if GPS time was populated into `out_gps_time`, otherwise `false`.
+/// Get the current GPS time in nanoseconds since the Unix epoch, if
+/// available and valid. Returns `true` when `out_gps_time_ns` was written,
+/// otherwise `false`.
+///
+/// Nanoseconds, matching [`aaronia_source_get_last_timestamp_ns`]. The
+/// device reports seconds as a `double`; converting that to epoch
+/// nanoseconds correctly needs the whole and fractional parts handled
+/// separately, because the product lands where a `double`'s step is
+/// 256 ns. Every caller of the old `double` form had to know that. Now
+/// none of them do — but note the reading is still only good to about
+/// 240 ns, which is the vendor `double`'s own resolution and not
+/// something this can improve on.
+///
+/// Pass `NULL` for `out_gps_time_ns` to ask only whether a valid fix
+/// exists, without wanting the value. That is what a capability probe
+/// needs, and the alternative is every such caller declaring a throwaway
+/// variable to point at.
 ///
 /// # Safety
 /// - `ptr` must be a valid pointer returned by [`aaronia_source_build`]
 ///   and not yet freed; null returns `false`.
-/// - `out_gps_time` must be a valid pointer to a `f64`.
+/// - `out_gps_time_ns`, when not null, must be a valid pointer to an `i64`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn aaronia_source_get_gps_time(
+pub unsafe extern "C" fn aaronia_source_get_gps_time_ns(
     ptr: *mut c_void,
-    out_gps_time: *mut f64,
+    out_gps_time_ns: *mut i64,
 ) -> bool {
-    if ptr.is_null() || out_gps_time.is_null() {
+    if ptr.is_null() {
         return false;
     }
     let source = unsafe { &mut *(ptr as *mut AaroniaSource) };
-    if let Some(time) = source.get_gps_time() {
-        unsafe { *out_gps_time = time };
-        true
-    } else {
-        false
+    match source.gps_time_ns() {
+        Some(nanos) => {
+            if !out_gps_time_ns.is_null() {
+                unsafe { *out_gps_time_ns = nanos };
+            }
+            true
+        }
+        None => false,
     }
 }
 

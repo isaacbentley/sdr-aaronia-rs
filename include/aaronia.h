@@ -190,7 +190,12 @@ intptr_t aaronia_source_read_samples_dual(AaroniaSource* source, FfiComplex* rx1
 bool aaronia_source_take_overrun(AaroniaSource* source);
 uint64_t aaronia_source_get_cumulative_drops(AaroniaSource* source);
 int64_t aaronia_source_get_last_timestamp_ns(AaroniaSource* source);
-bool aaronia_source_get_gps_time(AaroniaSource* source, double* out_gps_time);
+// Nanoseconds since the Unix epoch, matching get_last_timestamp_ns.
+// out_gps_time_ns may be NULL to probe only whether a fix exists.
+// The device reports seconds as a double; the conversion lives in the
+// library now, so callers no longer split whole/fractional seconds
+// themselves. Resolution is ~240 ns, set by the vendor's own double.
+bool aaronia_source_get_gps_time_ns(AaroniaSource* source, int64_t* out_gps_time_ns);
 AaroniaFfiError aaronia_source_start_streaming(AaroniaSource* source);
 AaroniaFfiError aaronia_source_stop_streaming(AaroniaSource* source);
 AaroniaFfiError aaronia_source_set_center_frequency_hz(AaroniaSource* source, double hz);

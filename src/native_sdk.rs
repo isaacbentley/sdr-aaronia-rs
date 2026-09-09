@@ -1702,9 +1702,12 @@ pub struct GpsState {
     pub altitude: Option<f64>,
     /// Whether `time` holds a valid GPS time (`gpstimevalid`).
     pub time_valid: bool,
-    /// GPS time (`gpstime`), seconds since the Unix epoch. `None` unless
-    /// `time_valid`.
-    pub time: Option<f64>,
+    /// GPS time (`gpstime`), seconds since the Unix epoch, as the vendor
+    /// reports it. `None` unless `time_valid`. Seconds rather than
+    /// nanoseconds because that is the health tree's own type; use
+    /// [`crate::utils::gps_seconds_to_nanos`] to convert, and read its
+    /// note on how precise this actually is.
+    pub time_s: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1830,7 +1833,7 @@ impl NativeSdkSource {
                                 .is_some_and(|v| v != 0.0);
                         }
                         "gpstime" => {
-                            gps.time = self.read_health_value(device, &mut current);
+                            gps.time_s = self.read_health_value(device, &mut current);
                         }
                         _ => {}
                     }
@@ -1869,7 +1872,7 @@ impl NativeSdkSource {
                 gps.altitude = None;
             }
             if !gps.time_valid {
-                gps.time = None;
+                gps.time_s = None;
             }
 
             Ok((health, gps))

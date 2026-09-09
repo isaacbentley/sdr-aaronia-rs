@@ -418,8 +418,7 @@ bool AaroniaSoapyDevice::hasHardwareTime(const std::string &what) const {
         // backend with a valid fix. Answering "true" unconditionally
         // (the old behaviour) made apps timestamp data to 1970.
         std::lock_guard<std::mutex> lock(_mutex);
-        double unused = 0.0;
-        return aaronia_source_get_gps_time(_source, &unused);
+        return aaronia_source_get_gps_time_ns(_source, nullptr);
     }
     if (what.empty()) {
         // A capability, not a current value. Every RTSA packet header
@@ -449,16 +448,18 @@ bool AaroniaSoapyDevice::hasHardwareTime(const std::string &what) const {
 long long AaroniaSoapyDevice::getHardwareTime(const std::string &what) const {
     std::lock_guard<std::mutex> lock(_mutex);
     if (what == "GPS") {
-        double gps_time_s = 0.0;
-        if (aaronia_source_get_gps_time(_source, &gps_time_s)) {
-            // Split integer/fractional seconds before scaling: a single
-            // (s * 1e9) double multiply cannot represent epoch-scale
-            // nanoseconds (53-bit mantissa vs ~61 bits needed) and
-            // quantized GPS time to ~256 ns steps.
-            const double whole_s = std::floor(gps_time_s);
-            const double frac_s = gps_time_s - whole_s;
-            return static_cast<long long>(whole_s) * 1000000000LL
-                 + static_cast<long long>(std::lrint(frac_s * 1e9));
+        // Nanoseconds straight from the ABI. This used to receive
+        // seconds as a double and split whole from fractional before
+        // scaling, because (s * 1e9) lands where a double's step is
+        // 256 ns. That arithmetic now lives in the library, where every
+        // caller gets it rather than only this one.
+        // int64_t, not long long: on LP64 Linux int64_t is `long`, and
+        // `long long*` will not convert to `int64_t*` in C++. macOS makes
+        // them the same type, so the mismatch only shows up on the Linux
+        // build.
+        int64_t gps_time_ns = 0;
+        if (aaronia_source_get_gps_time_ns(_source, &gps_time_ns)) {
+            return gps_time_ns;
         }
         return 0;
     }
