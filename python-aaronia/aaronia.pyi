@@ -10,41 +10,41 @@ import numpy as np
 import numpy.typing as npt
 
 __all__ = [
-    "AaroniaConfig",
-    "AaroniaSource",
+    "SpectranConfig",
+    "SpectranSource",
     "BlockIterator",
-    "AaroniaConnectionError",
-    "AaroniaHardwareError",
-    "AaroniaTimeoutError",
-    "AaroniaStreamClosed",
+    "SpectranConnectionError",
+    "SpectranHardwareError",
+    "SpectranTimeoutError",
+    "SpectranStreamClosed",
     "open",
     "sample_rates",
     "sample_rate_for_bandwidth",
     "diagnose",
 ]
 
-class AaroniaConnectionError(Exception):
+class SpectranConnectionError(Exception):
     """The RTSA HTTP endpoint or device could not be reached."""
 
-class AaroniaHardwareError(Exception):
+class SpectranHardwareError(Exception):
     """The device or SDK reported an error."""
 
-class AaroniaTimeoutError(Exception):
+class SpectranTimeoutError(Exception):
     """A read or control operation timed out."""
 
-class AaroniaStreamClosed(AaroniaConnectionError):
+class SpectranStreamClosed(SpectranConnectionError):
     """The sample stream ended and will produce no more data.
 
-    Subclasses :class:`AaroniaConnectionError`, so existing handlers
-    still catch it. :meth:`AaroniaSource.blocks` ends the iteration on
+    Subclasses :class:`SpectranConnectionError`, so existing handlers
+    still catch it. :meth:`SpectranSource.blocks` ends the iteration on
     this and only this.
     """
 
 WireFormat = Literal["F32", "F16", "I16"]
 ReceiverChannel = Literal["Rx1", "Rx2", "Rx1And2"]
 
-class AaroniaConfig:
-    """Configuration for an :class:`AaroniaSource`.
+class SpectranConfig:
+    """Configuration for an :class:`SpectranSource`.
 
     Setting ``http_base_url`` selects the HTTP backend; setting
     ``file_path`` selects file playback. Every property is readable and
@@ -57,14 +57,14 @@ class AaroniaConfig:
     http_base_url: Optional[str]
     file_path: Optional[str]
     device_serial: Optional[str]
-    native_sdk: bool
+    force_native_sdk: bool
 
     # RF parameters.
-    center_freq: float
+    center_frequency_hz: float
     """Center frequency in Hz."""
-    sample_rate: float
-    """IQ sample rate in Hz (the Aaronia "span")."""
-    reference_level: float
+    sample_rate_hz: float
+    """IQ sample rate (Fs) in Hz. The device key behind it is `spanfreq`."""
+    reference_level_dbm: float
     """Reference level in dBm."""
     scale: Optional[float]
     """Integer encode multiplier for the ``I16`` wire format
@@ -74,7 +74,7 @@ class AaroniaConfig:
     step is ``1 / scale``. At the default the step is 1/16384, which is
     coarser than a quiet band's noise floor — measured on a live
     server, 70% of samples came back exactly zero. Raise it, or raise
-    the gain by lowering ``reference_level``. Must be positive and
+    the gain by lowering ``reference_level_dbm``. Must be positive and
     finite."""
 
     # Transport behaviour. `format` and `receiver_channel` read back as
@@ -96,13 +96,13 @@ class AaroniaConfig:
     def receiver_channel(self, value: ReceiverChannel) -> None:
         """Assigning an unrecognised string raises ``ValueError``."""
 
-    read_timeout: float
-    """Seconds a blocking read waits before ``AaroniaTimeoutError``
+    read_timeout_s: float
+    """Seconds a blocking read waits before ``SpectranTimeoutError``
     (default 30.0). Must be positive and finite."""
     auto_reconnect: bool
     """Reconnect the HTTP stream after a drop (default ``True``)."""
 
-class AaroniaSource:
+class SpectranSource:
     """A streaming IQ source.
 
     Construct, call :meth:`start_streaming`, then read. Blocking calls
@@ -110,12 +110,12 @@ class AaroniaSource:
     ``KeyboardInterrupt`` is delivered between calls.
 
     Every method other than :meth:`start_streaming` and
-    :meth:`stop_streaming` raises ``AaroniaHardwareError`` when the
+    :meth:`stop_streaming` raises ``SpectranHardwareError`` when the
     source is not streaming.
     """
 
     def __init__(self) -> None: ...
-    def __enter__(self) -> "AaroniaSource":
+    def __enter__(self) -> "SpectranSource":
         """Return the already-streaming source."""
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
@@ -124,17 +124,17 @@ class AaroniaSource:
     def blocks(self, count: int) -> "BlockIterator":
         """Iterate ``count``-sample blocks until the stream closes.
 
-        Ends on ``AaroniaStreamClosed`` or an empty read (a recording
+        Ends on ``SpectranStreamClosed`` or an empty read (a recording
         running out). Timeouts and connection failures still raise, so
         a truncated capture is not mistaken for a finished one.
         """
 
-    def start_streaming(self, config: AaroniaConfig) -> None:
+    def start_streaming(self, config: SpectranConfig) -> None:
         """Connect to the backend selected by ``config`` and start streaming.
 
-        Raises ``AaroniaConnectionError`` if the endpoint is
+        Raises ``SpectranConnectionError`` if the endpoint is
         unreachable, ``ValueError`` for invalid configuration, and
-        ``AaroniaHardwareError`` for device or SDK failures.
+        ``SpectranHardwareError`` for device or SDK failures.
         """
 
     def stop_streaming(self) -> None:
@@ -143,8 +143,8 @@ class AaroniaSource:
     def read_samples_numpy(self, count: int) -> npt.NDArray[np.complex64]:
         """Read up to ``count`` IQ samples into a NumPy ``complex64`` array.
 
-        Raises ``AaroniaTimeoutError`` if no data arrives within
-        ``config.read_timeout``, ``AaroniaConnectionError`` if the
+        Raises ``SpectranTimeoutError`` if no data arrives within
+        ``config.read_timeout_s``, ``SpectranConnectionError`` if the
         stream is closed, and ``ValueError`` if ``count`` exceeds the
         per-read limit of 2**26 samples.
         """
@@ -166,11 +166,11 @@ class AaroniaSource:
         exceptions as :meth:`read_samples_numpy`.
         """
 
-    def set_center_frequency(self, freq_hz: float) -> None:
+    def set_center_frequency_hz(self, freq_hz: float) -> None:
         """Retune the running source without tearing it down."""
 
-    def set_sample_rate(self, rate_hz: float) -> None: ...
-    def set_reference_level(self, dbm: float) -> None: ...
+    def set_sample_rate_hz(self, rate_hz: float) -> None: ...
+    def set_reference_level_dbm(self, dbm: float) -> None: ...
     def take_overrun(self) -> bool:
         """True once per detected receive-side overrun, then cleared."""
 
@@ -182,7 +182,7 @@ class AaroniaSource:
         HTTP backend only; 0 otherwise."""
 
 class BlockIterator:
-    """Iterator returned by :meth:`AaroniaSource.blocks`."""
+    """Iterator returned by :meth:`SpectranSource.blocks`."""
 
     def __iter__(self) -> "BlockIterator": ...
     def __next__(self) -> npt.NDArray[np.complex64]: ...
@@ -190,20 +190,20 @@ class BlockIterator:
 def open(
     url: Optional[str] = None,
     *,
-    freq: Optional[float] = None,
-    rate: Optional[float] = None,
-    bandwidth: Optional[float] = None,
-    ref_level: Optional[float] = None,
+    center_frequency_hz: Optional[float] = None,
+    sample_rate_hz: Optional[float] = None,
+    bandwidth_hz: Optional[float] = None,
+    reference_level_dbm: Optional[float] = None,
     file: Optional[str] = None,
     sdk: bool = False,
     serial: Optional[str] = None,
     format: Optional[WireFormat] = None,
     scale: Optional[float] = None,
-    read_timeout: Optional[float] = None,
-) -> AaroniaSource:
+    read_timeout_s: Optional[float] = None,
+) -> SpectranSource:
     """Open a source and start streaming, in one call.
 
-    Give either ``rate`` (an exact sample rate) or ``bandwidth`` (how
+    Give either ``sample_rate_hz`` (an exact rate) or ``bandwidth_hz`` (how
     much spectrum to cover, from which a real rate is chosen); passing
     both raises ``ValueError``, as does passing both ``url`` and
     ``file``. With neither ``url`` nor ``file``, connects to

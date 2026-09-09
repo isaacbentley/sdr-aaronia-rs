@@ -144,7 +144,9 @@ pip install python-aaronia
 ```python
 import aaronia
 
-with aaronia.open("http://localhost:54664", freq=2.44e9, bandwidth=10e6) as src:
+with aaronia.open(
+    "http://localhost:54664", center_frequency_hz=2.44e9, bandwidth_hz=10e6
+) as src:
     for block in src.blocks(65536):   # numpy complex64 arrays
         process(block)
 ```

@@ -13,17 +13,17 @@ aaronia = pytest.importorskip("aaronia")
 
 
 def test_config_roundtrip():
-    cfg = aaronia.AaroniaConfig()
-    cfg.center_freq = 2.44e9
-    cfg.sample_rate = 15.36e6
-    cfg.reference_level = -30.0
+    cfg = aaronia.SpectranConfig()
+    cfg.center_frequency_hz = 2.44e9
+    cfg.sample_rate_hz = 15.36e6
+    cfg.reference_level_dbm = -30.0
     cfg.http_base_url = "http://example.invalid:54664"
     cfg.device_serial = "V6-1234"
     cfg.format = "I16"
     cfg.receiver_channel = "Rx1And2"
-    assert cfg.center_freq == 2.44e9
-    assert cfg.sample_rate == 15.36e6
-    assert cfg.reference_level == -30.0
+    assert cfg.center_frequency_hz == 2.44e9
+    assert cfg.sample_rate_hz == 15.36e6
+    assert cfg.reference_level_dbm == -30.0
     assert cfg.http_base_url == "http://example.invalid:54664"
     assert cfg.device_serial == "V6-1234"
     assert cfg.format == "I16"
@@ -31,26 +31,26 @@ def test_config_roundtrip():
 
 
 def test_config_rejects_unknown_format():
-    cfg = aaronia.AaroniaConfig()
+    cfg = aaronia.SpectranConfig()
     with pytest.raises(ValueError):
         cfg.format = "CF32"
 
 
 def test_config_rejects_unknown_receiver_channel():
-    cfg = aaronia.AaroniaConfig()
+    cfg = aaronia.SpectranConfig()
     with pytest.raises(ValueError):
         cfg.receiver_channel = "Rx3"
 
 
 def test_read_before_streaming_raises_typed_error():
-    src = aaronia.AaroniaSource()
-    with pytest.raises(aaronia.AaroniaHardwareError):
+    src = aaronia.SpectranSource()
+    with pytest.raises(aaronia.SpectranHardwareError):
         src.read_samples_numpy(1024)
 
 
 def test_absurd_count_raises_value_error_not_abort():
-    src = aaronia.AaroniaSource()
-    with pytest.raises((ValueError, aaronia.AaroniaHardwareError)):
+    src = aaronia.SpectranSource()
+    with pytest.raises((ValueError, aaronia.SpectranHardwareError)):
         # Order of checks puts the streaming check first; either typed
         # error is fine — the point is no interpreter abort.
         src.read_samples_numpy(1 << 40)
@@ -77,12 +77,14 @@ def test_open_rejects_contradictory_arguments():
     with pytest.raises(ValueError):
         aaronia.open("http://example.invalid:54664", file="capture.rtsa")
     with pytest.raises(ValueError):
-        aaronia.open(rate=15.36e6, bandwidth=8e6)
+        aaronia.open(sample_rate_hz=15.36e6, bandwidth_hz=8e6)
 
 
 def test_open_reports_an_unreachable_server_as_a_connection_error():
-    with pytest.raises(aaronia.AaroniaConnectionError):
-        aaronia.open("http://127.0.0.1:1", freq=2.44e9, rate=15.36e6)
+    with pytest.raises(aaronia.SpectranConnectionError):
+        aaronia.open(
+            "http://127.0.0.1:1", center_frequency_hz=2.44e9, sample_rate_hz=15.36e6
+        )
 
 
 def test_diagnose_names_a_fix_for_an_unreachable_server():
@@ -97,23 +99,23 @@ def test_diagnose_names_a_fix_for_an_unreachable_server():
 
 def test_context_manager_does_not_swallow_exceptions():
     with pytest.raises(RuntimeError):
-        with aaronia.AaroniaSource():
+        with aaronia.SpectranSource():
             raise RuntimeError("body failed")
 
 
 def test_blocks_propagates_errors_other_than_a_closed_stream():
-    src = aaronia.AaroniaSource()
+    src = aaronia.SpectranSource()
     it = iter(src.blocks(1024))
     # Not streaming is a hardware error, not end-of-stream: it must not
     # be mistaken for a loop that finished normally.
-    with pytest.raises(aaronia.AaroniaHardwareError):
+    with pytest.raises(aaronia.SpectranHardwareError):
         next(it)
 
 
 def test_stream_closed_is_a_connection_error_subclass():
-    # Existing `except AaroniaConnectionError` handlers must keep
+    # Existing `except SpectranConnectionError` handlers must keep
     # catching a finished stream.
-    assert issubclass(aaronia.AaroniaStreamClosed, aaronia.AaroniaConnectionError)
+    assert issubclass(aaronia.SpectranStreamClosed, aaronia.SpectranConnectionError)
 
 
 @pytest.mark.skipif(
@@ -144,7 +146,7 @@ def test_diagnose_passes_against_a_working_server():
 
 
 def test_scale_rejects_nonsense():
-    cfg = aaronia.AaroniaConfig()
+    cfg = aaronia.SpectranConfig()
     assert cfg.scale is None
     cfg.scale = 1e6
     assert cfg.scale == 1e6
@@ -160,6 +162,6 @@ def test_open_accepts_scale():
     import inspect
 
     assert "scale" in str(inspect.signature(aaronia.open)) or True
-    with pytest.raises((ValueError, aaronia.AaroniaConnectionError)):
-        aaronia.open("http://127.0.0.1:1", freq=2.44e9, rate=15.36e6,
+    with pytest.raises((ValueError, aaronia.SpectranConnectionError)):
+        aaronia.open("http://127.0.0.1:1", center_frequency_hz=2.44e9, sample_rate_hz=15.36e6,
                      format="I16", scale=1e6)

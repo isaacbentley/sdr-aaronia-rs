@@ -96,14 +96,16 @@ aaronia-doctor http://localhost:54664
 ```python
 import aaronia
 
-with aaronia.open("http://localhost:54664", freq=2.44e9, bandwidth=10e6) as src:
+with aaronia.open(
+    "http://localhost:54664", center_frequency_hz=2.44e9, bandwidth_hz=10e6
+) as src:
     samples = src.read_samples_numpy(65536)   # numpy complex64
     print(samples[:4], src.cumulative_drops())
 ```
 
-`bandwidth` picks a sample rate the hardware can run. Pass `rate=` to
-name one exactly, or build an `AaroniaConfig` for the full set of
-options.
+`bandwidth_hz` picks a sample rate the hardware can run. Pass
+`sample_rate_hz=` to name one exactly, or build a `SpectranConfig` for
+the full set of options.
 
 ### SoapySDR
 

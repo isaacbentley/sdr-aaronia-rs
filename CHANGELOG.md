@@ -66,6 +66,33 @@ that surface: `aaronia.AaroniaConfig` becomes `aaronia.SpectranConfig`, module
 named for the vendor and class for the device, which is what Python convention
 wants anyway.
 
+**Python takes the same vocabulary.** The classes are `aaronia.SpectranConfig`
+and `aaronia.SpectranSource`, and the four exceptions follow —
+`SpectranConnectionError`, `SpectranHardwareError`, `SpectranTimeoutError`,
+`SpectranStreamClosed`. Leaving those as `Aaronia*` beside a `SpectranConfig` in
+one module would have been the same drift this release is removing.
+
+| Old Python | New |
+| --- | --- |
+| `aaronia.AaroniaConfig` | `aaronia.SpectranConfig` |
+| `aaronia.AaroniaSource` | `aaronia.SpectranSource` |
+| `aaronia.Aaronia{Connection,Hardware,Timeout}Error`, `AaroniaStreamClosed` | `Spectran…` |
+| `cfg.center_freq` | `cfg.center_frequency_hz` |
+| `cfg.sample_rate` | `cfg.sample_rate_hz` |
+| `cfg.reference_level` | `cfg.reference_level_dbm` |
+| `cfg.read_timeout` | `cfg.read_timeout_s` |
+| `cfg.native_sdk` | `cfg.force_native_sdk` |
+| `src.set_center_frequency()` / `set_sample_rate()` / `set_reference_level()` | `set_center_frequency_hz()` / `set_sample_rate_hz()` / `set_reference_level_dbm()` |
+| `open(freq=, rate=, bandwidth=, ref_level=, read_timeout=)` | `open(center_frequency_hz=, sample_rate_hz=, bandwidth_hz=, reference_level_dbm=, read_timeout_s=)` |
+
+`open()`'s keywords were the one real trade here: it is the one-line front door,
+and the longer names cost the headline example a line wrap. They changed anyway,
+because `open(url, bandwidth=10e6)` gives no way to tell Hz from MHz, and the
+most-used entry point is where that ambiguity does the most damage. `sdk=`,
+`url=`, `file=`, `serial=`, `format=` and `scale=` carry no unit and are
+unchanged, and `sample_rate_for_bandwidth(bandwidth_hz)` already named its
+argument properly.
+
 **The C ABI is renamed with no forwarders.** A C consumer gets an undefined
 symbol at link time rather than a deprecation warning, so this table is the
 migration guide. The `FfiSourceInfo` struct fields moved too — those are

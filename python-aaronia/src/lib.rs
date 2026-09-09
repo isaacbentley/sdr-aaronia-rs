@@ -12,7 +12,7 @@
 //! returned freshly-zeroed memory instead of samples, growing the
 //! scratch buffer without bound. See `read_scratch` below.)
 //!
-//! All blocking work (connect, reads with their `read_timeout`, default
+//! All blocking work (connect, reads with their `read_timeout_s`, default
 //! 30 s, shutdown) releases the GIL, so other Python threads keep
 //! running and `KeyboardInterrupt` stays deliverable between calls.
 
@@ -32,26 +32,26 @@ use tokio::runtime::Runtime;
 
 create_exception!(
     aaronia,
-    AaroniaConnectionError,
+    SpectranConnectionError,
     pyo3::exceptions::PyException,
     "The RTSA HTTP endpoint or device could not be reached."
 );
 create_exception!(
     aaronia,
-    AaroniaHardwareError,
+    SpectranHardwareError,
     pyo3::exceptions::PyException,
     "The device/SDK reported an error."
 );
 create_exception!(
     aaronia,
-    AaroniaTimeoutError,
+    SpectranTimeoutError,
     pyo3::exceptions::PyException,
     "A read or control operation timed out."
 );
 create_exception!(
     aaronia,
-    AaroniaStreamClosed,
-    AaroniaConnectionError,
+    SpectranStreamClosed,
+    SpectranConnectionError,
     "The sample stream ended and will produce no more data."
 );
 
@@ -78,30 +78,30 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 /// Map the crate's structured error to a typed Python exception by
 /// *variant*, not by substring-matching display strings (the earlier
 /// approach misrouted lowercase "operation timed out" and every
-/// `Config` error to `AaroniaHardwareError`).
+/// `Config` error to `SpectranHardwareError`).
 fn map_aaronia_err(e: AaroniaError) -> PyErr {
     let msg = error_chain(&e);
     match &e {
         AaroniaError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
-            AaroniaTimeoutError::new_err(msg)
+            SpectranTimeoutError::new_err(msg)
         }
-        AaroniaError::Transport(t) if t.is_timeout() => AaroniaTimeoutError::new_err(msg),
-        // Subclasses AaroniaConnectionError, so `except
-        // AaroniaConnectionError` still catches it — but a loop over
+        AaroniaError::Transport(t) if t.is_timeout() => SpectranTimeoutError::new_err(msg),
+        // Subclasses SpectranConnectionError, so `except
+        // SpectranConnectionError` still catches it — but a loop over
         // blocks can tell "no more data" from "a read failed".
-        AaroniaError::StreamClosed(_) => AaroniaStreamClosed::new_err(msg),
+        AaroniaError::StreamClosed(_) => SpectranStreamClosed::new_err(msg),
         AaroniaError::Http { .. } | AaroniaError::Transport(_) | AaroniaError::Protocol(_) => {
-            AaroniaConnectionError::new_err(msg)
+            SpectranConnectionError::new_err(msg)
         }
         AaroniaError::Config(_) | AaroniaError::Initialization(_) => PyValueError::new_err(msg),
-        _ => AaroniaHardwareError::new_err(msg),
+        _ => SpectranHardwareError::new_err(msg),
     }
 }
 
 /// Fallback for non-`Error` failure types (runtime construction,
 /// arrow layout errors).
 fn map_any_err<E: std::fmt::Display>(e: E) -> PyErr {
-    AaroniaHardwareError::new_err(e.to_string())
+    SpectranHardwareError::new_err(e.to_string())
 }
 
 /// Configuration for a [`SpectranSource`].
@@ -109,14 +109,14 @@ fn map_any_err<E: std::fmt::Display>(e: E) -> PyErr {
 /// Every field is settable *and* readable (the earlier revision was
 /// write-only, and offered no way to reach a non-localhost device or a
 /// recorded file at all).
-#[pyclass(name = "AaroniaConfig", skip_from_py_object)]
+#[pyclass(name = "SpectranConfig", skip_from_py_object)]
 #[derive(Clone)]
-struct PyAaroniaConfig {
+struct PySpectranConfig {
     inner: SpectranConfig,
 }
 
 #[pymethods]
-impl PyAaroniaConfig {
+impl PySpectranConfig {
     #[new]
     fn new() -> Self {
         Self {
@@ -151,23 +151,23 @@ impl PyAaroniaConfig {
     }
 
     #[setter]
-    fn set_center_freq(&mut self, freq: f64) {
+    fn set_center_frequency_hz(&mut self, freq: f64) {
         self.inner.center_frequency_hz = freq;
     }
 
     #[getter]
-    fn get_center_freq(&self) -> f64 {
+    fn get_center_frequency_hz(&self) -> f64 {
         self.inner.center_frequency_hz
     }
 
     /// IQ sample rate in Hz (the Aaronia "span" frequency).
     #[setter]
-    fn set_sample_rate(&mut self, rate: f64) {
+    fn set_sample_rate_hz(&mut self, rate: f64) {
         self.inner.sample_rate_hz = rate;
     }
 
     #[getter]
-    fn get_sample_rate(&self) -> f64 {
+    fn get_sample_rate_hz(&self) -> f64 {
         self.inner.sample_rate_hz
     }
 
@@ -180,7 +180,7 @@ impl PyAaroniaConfig {
     /// the default the step measured 1/16384 on a live server, which
     /// is coarser than a quiet band's noise floor: 70% of samples came
     /// back exactly zero. Raising the scale, or raising the gain by
-    /// lowering `reference_level`, keeps the signal above it.
+    /// lowering `reference_level_dbm`, keeps the signal above it.
     #[setter]
     fn set_scale(&mut self, scale: Option<f64>) -> PyResult<()> {
         match scale {
@@ -200,12 +200,12 @@ impl PyAaroniaConfig {
     }
 
     #[setter]
-    fn set_reference_level(&mut self, dbm: f64) {
+    fn set_reference_level_dbm(&mut self, dbm: f64) {
         self.inner.reference_level_dbm = dbm;
     }
 
     #[getter]
-    fn get_reference_level(&self) -> f64 {
+    fn get_reference_level_dbm(&self) -> f64 {
         self.inner.reference_level_dbm
     }
 
@@ -287,7 +287,7 @@ impl PyAaroniaConfig {
     /// SDK an error, so a capture never silently comes from the wrong
     /// backend.
     #[setter]
-    fn set_native_sdk(&mut self, on: bool) {
+    fn set_force_native_sdk(&mut self, on: bool) {
         use sdr_aaronia_rs::unified_source::SourceType;
         if on {
             self.inner.force_source_type = Some(SourceType::NativeSdk);
@@ -297,14 +297,14 @@ impl PyAaroniaConfig {
     }
 
     #[getter]
-    fn get_native_sdk(&self) -> bool {
+    fn get_force_native_sdk(&self) -> bool {
         self.inner.force_source_type == Some(sdr_aaronia_rs::unified_source::SourceType::NativeSdk)
     }
 
     /// Seconds a blocking read waits for samples before raising
-    /// `AaroniaTimeoutError` (default 30.0). Must be > 0.
+    /// `SpectranTimeoutError` (default 30.0). Must be > 0.
     #[setter]
-    fn set_read_timeout(&mut self, seconds: f64) -> PyResult<()> {
+    fn set_read_timeout_s(&mut self, seconds: f64) -> PyResult<()> {
         // `try_from_secs_f64`, not `from_secs_f64`: the latter panics on
         // NaN/negative/overflowing input, which would abort the whole
         // interpreter over a bad assignment.
@@ -321,7 +321,7 @@ impl PyAaroniaConfig {
     }
 
     #[getter]
-    fn get_read_timeout(&self) -> f64 {
+    fn get_read_timeout_s(&self) -> f64 {
         self.inner.read_timeout.as_secs_f64()
     }
 
@@ -347,10 +347,10 @@ type DualArrays<'py> = (
 
 /// A streaming IQ source. Construct, `start_streaming(config)`, then
 /// call the `read_samples_*` methods; each blocks (GIL released) until
-/// `count` samples arrive or `config.read_timeout` (default 30 s)
-/// elapses, which raises `AaroniaTimeoutError`.
-#[pyclass(name = "AaroniaSource")]
-struct PyAaroniaSource {
+/// `count` samples arrive or `config.read_timeout_s` (default 30 s)
+/// elapses, which raises `SpectranTimeoutError`.
+#[pyclass(name = "SpectranSource")]
+struct PySpectranSource {
     // Field order matters: `source` must drop before `rt` so the
     // source's background tasks shut down while the runtime is alive.
     source: Option<SpectranSource>,
@@ -361,7 +361,7 @@ struct PyAaroniaSource {
     read_scratch: Vec<Complex32>,
 }
 
-impl PyAaroniaSource {
+impl PySpectranSource {
     /// Clear the scratch, read up to `count` samples (GIL released),
     /// and return how many landed in `self.read_scratch[..n]`.
     fn read_into_scratch(&mut self, py: Python<'_>, count: usize) -> PyResult<usize> {
@@ -373,7 +373,7 @@ impl PyAaroniaSource {
         let source = self
             .source
             .as_mut()
-            .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
 
         self.read_scratch.clear();
         let rt = self.rt.clone();
@@ -384,7 +384,7 @@ impl PyAaroniaSource {
 }
 
 #[pymethods]
-impl PyAaroniaSource {
+impl PySpectranSource {
     #[new]
     fn new() -> PyResult<Self> {
         let rt = Runtime::new().map_err(map_any_err)?;
@@ -397,7 +397,7 @@ impl PyAaroniaSource {
 
     /// Connect to the backend selected by `config` and start streaming.
     /// Blocking (GIL released).
-    fn start_streaming(&mut self, py: Python<'_>, config: &PyAaroniaConfig) -> PyResult<()> {
+    fn start_streaming(&mut self, py: Python<'_>, config: &PySpectranConfig) -> PyResult<()> {
         let rt = self.rt.clone();
         let config_inner = config.inner.clone();
         let source = py
@@ -467,11 +467,11 @@ impl PyAaroniaSource {
     /// Retune the running source's center frequency in Hz. Blocking
     /// (GIL released). Previously the only way to retune was tearing
     /// down and rebuilding the whole source.
-    fn set_center_frequency(&mut self, py: Python<'_>, freq_hz: f64) -> PyResult<()> {
+    fn set_center_frequency_hz(&mut self, py: Python<'_>, freq_hz: f64) -> PyResult<()> {
         let source = self
             .source
             .as_mut()
-            .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
         py.detach(|| rt.block_on(source.set_center_frequency_hz(freq_hz)))
             .map_err(map_aaronia_err)
@@ -479,11 +479,11 @@ impl PyAaroniaSource {
 
     /// Change the running source's IQ sample rate in Hz (validated
     /// against the IQ-mode constraint). Blocking (GIL released).
-    fn set_sample_rate(&mut self, py: Python<'_>, rate_hz: f64) -> PyResult<()> {
+    fn set_sample_rate_hz(&mut self, py: Python<'_>, rate_hz: f64) -> PyResult<()> {
         let source = self
             .source
             .as_mut()
-            .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
         py.detach(|| rt.block_on(source.set_sample_rate_hz(rate_hz)))
             .map_err(map_aaronia_err)
@@ -491,11 +491,11 @@ impl PyAaroniaSource {
 
     /// Change the running source's reference level in dBm. Blocking
     /// (GIL released).
-    fn set_reference_level(&mut self, py: Python<'_>, dbm: f64) -> PyResult<()> {
+    fn set_reference_level_dbm(&mut self, py: Python<'_>, dbm: f64) -> PyResult<()> {
         let source = self
             .source
             .as_mut()
-            .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
         py.detach(|| rt.block_on(source.set_reference_level_dbm(dbm)))
             .map_err(map_aaronia_err)
@@ -518,7 +518,7 @@ impl PyAaroniaSource {
         let source = self
             .source
             .as_mut()
-            .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
         let (rx1, rx2) = py
             .detach(|| {
@@ -545,7 +545,7 @@ impl PyAaroniaSource {
         let source = self
             .source
             .as_mut()
-            .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
         Ok(source.take_overrun())
     }
 
@@ -588,7 +588,7 @@ impl PyAaroniaSource {
         let source = self
             .source
             .as_ref()
-            .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
         Ok(source.cumulative_drops())
     }
 
@@ -598,16 +598,16 @@ impl PyAaroniaSource {
         let source = self
             .source
             .as_ref()
-            .ok_or_else(|| AaroniaHardwareError::new_err("Not streaming"))?;
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
         Ok(source.last_timestamp_ns())
     }
 }
 
 /// Iterator over fixed-size sample blocks, returned by
-/// `AaroniaSource.blocks` on the Python side.
+/// `SpectranSource.blocks` on the Python side.
 #[pyclass(name = "BlockIterator")]
 struct BlockIterator {
-    source: Py<PyAaroniaSource>,
+    source: Py<PySpectranSource>,
     count: usize,
 }
 
@@ -628,7 +628,7 @@ impl BlockIterator {
             // Only a finished stream ends the loop. Timeouts, transport
             // failures and protocol errors all propagate: a truncated
             // capture must not look like one that simply ran out.
-            Err(e) if e.is_instance_of::<AaroniaStreamClosed>(py) => Ok(None),
+            Err(e) if e.is_instance_of::<SpectranStreamClosed>(py) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -656,26 +656,26 @@ fn sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
 
 /// Open a source and start streaming, in one call.
 ///
-/// Give either `rate` (an exact sample rate) or `bandwidth` (how much
+/// Give either `sample_rate_hz` (an exact rate) or `bandwidth_hz` (how much
 /// spectrum you want to see, from which a real rate is chosen). Pass
 /// `file` instead of `url` to play back a recording.
 #[pyfunction]
-#[pyo3(signature = (url=None, *, freq=None, rate=None, bandwidth=None, ref_level=None, file=None, sdk=false, serial=None, format=None, scale=None, read_timeout=None))]
+#[pyo3(signature = (url=None, *, center_frequency_hz=None, sample_rate_hz=None, bandwidth_hz=None, reference_level_dbm=None, file=None, sdk=false, serial=None, format=None, scale=None, read_timeout_s=None))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
     url: Option<String>,
-    freq: Option<f64>,
-    rate: Option<f64>,
-    bandwidth: Option<f64>,
-    ref_level: Option<f64>,
+    center_frequency_hz: Option<f64>,
+    sample_rate_hz: Option<f64>,
+    bandwidth_hz: Option<f64>,
+    reference_level_dbm: Option<f64>,
     file: Option<String>,
     sdk: bool,
     serial: Option<String>,
     format: Option<&str>,
     scale: Option<f64>,
-    read_timeout: Option<f64>,
-) -> PyResult<Py<PyAaroniaSource>> {
+    read_timeout_s: Option<f64>,
+) -> PyResult<Py<PySpectranSource>> {
     if [url.is_some(), file.is_some(), sdk]
         .iter()
         .filter(|&&b| b)
@@ -691,34 +691,34 @@ fn open(
             "serial selects a device on the native SDK; pass sdk=True with it",
         ));
     }
-    if rate.is_some() && bandwidth.is_some() {
+    if sample_rate_hz.is_some() && bandwidth_hz.is_some() {
         return Err(PyValueError::new_err(
-            "give rate or bandwidth, not both: bandwidth chooses a rate for you",
+            "give sample_rate_hz or bandwidth_hz, not both: bandwidth_hz chooses a sample_rate_hz for you",
         ));
     }
 
-    let mut cfg = PyAaroniaConfig::new();
+    let mut cfg = PySpectranConfig::new();
     match (&url, &file, sdk) {
         (Some(u), _, _) => cfg.set_http_base_url(Some(u.clone())),
         (None, Some(f), _) => cfg.set_file_path(Some(f.clone())),
         (None, None, true) => {
-            cfg.set_native_sdk(true);
+            cfg.set_force_native_sdk(true);
             cfg.set_device_serial(serial.clone());
         }
         // Nothing chosen: the RTSA HTTP server's own default, which is
         // where it listens on the machine running RTSA-Suite.
         (None, None, false) => cfg.set_http_base_url(Some("http://localhost:54664".to_string())),
     }
-    if let Some(freq) = freq {
-        cfg.set_center_freq(freq);
+    if let Some(center_frequency_hz) = center_frequency_hz {
+        cfg.set_center_frequency_hz(center_frequency_hz);
     }
-    if let Some(rate) = rate {
-        cfg.set_sample_rate(rate);
-    } else if let Some(bw) = bandwidth {
-        cfg.set_sample_rate(sdr_aaronia_rs::iq_sample_rate_for_bandwidth(bw));
+    if let Some(sample_rate_hz) = sample_rate_hz {
+        cfg.set_sample_rate_hz(sample_rate_hz);
+    } else if let Some(bw) = bandwidth_hz {
+        cfg.set_sample_rate_hz(sdr_aaronia_rs::iq_sample_rate_for_bandwidth(bw));
     }
-    if let Some(dbm) = ref_level {
-        cfg.set_reference_level(dbm);
+    if let Some(dbm) = reference_level_dbm {
+        cfg.set_reference_level_dbm(dbm);
     }
     if let Some(fmt) = format {
         cfg.set_format(fmt)?;
@@ -726,11 +726,11 @@ fn open(
     if scale.is_some() {
         cfg.set_scale(scale)?;
     }
-    if let Some(seconds) = read_timeout {
-        cfg.set_read_timeout(seconds)?;
+    if let Some(seconds) = read_timeout_s {
+        cfg.set_read_timeout_s(seconds)?;
     }
 
-    let mut source = PyAaroniaSource::new()?;
+    let mut source = PySpectranSource::new()?;
     source.start_streaming(py, &cfg)?;
     Py::new(py, source)
 }
@@ -956,8 +956,8 @@ fn aaronia(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // into a PanicException.
     let _ = pyo3_log::try_init();
 
-    m.add_class::<PyAaroniaConfig>()?;
-    m.add_class::<PyAaroniaSource>()?;
+    m.add_class::<PySpectranConfig>()?;
+    m.add_class::<PySpectranSource>()?;
     m.add_class::<BlockIterator>()?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(sample_rates, m)?)?;
@@ -966,15 +966,21 @@ fn aaronia(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(doctor_cli, m)?)?;
 
     m.add(
-        "AaroniaConnectionError",
-        py.get_type::<AaroniaConnectionError>(),
+        "SpectranConnectionError",
+        py.get_type::<SpectranConnectionError>(),
     )?;
     m.add(
-        "AaroniaHardwareError",
-        py.get_type::<AaroniaHardwareError>(),
+        "SpectranHardwareError",
+        py.get_type::<SpectranHardwareError>(),
     )?;
-    m.add("AaroniaTimeoutError", py.get_type::<AaroniaTimeoutError>())?;
-    m.add("AaroniaStreamClosed", py.get_type::<AaroniaStreamClosed>())?;
+    m.add(
+        "SpectranTimeoutError",
+        py.get_type::<SpectranTimeoutError>(),
+    )?;
+    m.add(
+        "SpectranStreamClosed",
+        py.get_type::<SpectranStreamClosed>(),
+    )?;
 
     Ok(())
 }

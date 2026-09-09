@@ -16,21 +16,21 @@ import aaronia
 
 url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:54664"
 
-config = aaronia.AaroniaConfig()
+config = aaronia.SpectranConfig()
 config.http_base_url = url          # pins the HTTP backend
-config.center_freq = 2.44e9         # Hz
-config.sample_rate = 15.36e6        # Hz
+config.center_frequency_hz = 2.44e9         # Hz
+config.sample_rate_hz = 15.36e6        # Hz
 
-source = aaronia.AaroniaSource()
+source = aaronia.SpectranSource()
 try:
     source.start_streaming(config)
-except aaronia.AaroniaConnectionError as e:
+except aaronia.SpectranConnectionError as e:
     raise SystemExit(f"cannot reach {url}: {e}")
 
 try:
     for i in range(5):
         # Blocks (GIL released) until 16384 samples arrive or the
-        # internal 30 s timeout raises AaroniaTimeoutError.
+        # internal 30 s timeout raises SpectranTimeoutError.
         batch = source.read_samples_arrow(16384)
         first = batch[0].as_py()
         print(

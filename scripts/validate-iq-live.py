@@ -130,13 +130,21 @@ def collect_python(url, fmt, rate, freq, scale=None):
 
     kw = {"scale": scale} if scale is not None else {}
     try:
-        src = aaronia.open(url, freq=freq, rate=rate, format=fmt, **kw)
+        src = aaronia.open(
+            url,
+            center_frequency_hz=freq,
+            sample_rate_hz=rate,
+            format=fmt,
+            **kw,
+        )
     except TypeError:
         # python-aaronia before 0.7.5 has no `scale`. Fall back rather
         # than fail, and let the caller see it through SCALE_SUPPORTED.
         global SCALE_SUPPORTED
         SCALE_SUPPORTED = False
-        src = aaronia.open(url, freq=freq, rate=rate, format=fmt)
+        src = aaronia.open(
+            url, center_frequency_hz=freq, sample_rate_hz=rate, format=fmt
+        )
     try:
         for _ in range(3):  # discard the retune transient
             src.read_samples_numpy(NFFT * 4)
