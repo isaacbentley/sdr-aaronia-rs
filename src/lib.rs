@@ -24,6 +24,10 @@ mod usage_guide {}
 #[doc = include_str!("../PLUGINS.md")]
 mod plugins_guide {}
 
+#[cfg(doctest)]
+#[doc = include_str!("../docs/SYNC.md")]
+mod sync_guide {}
+
 #[cfg(feature = "ffi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
 pub mod c_api;

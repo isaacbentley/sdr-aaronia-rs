@@ -67,10 +67,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Read the current master stream time from the device
     // This is required to correctly schedule our packets on the device's FPGA
-    let mut current_time = sdk_sink.get_master_stream_time()?;
+    let now_ns = sdk_sink.master_stream_time_ns()?;
 
-    // Pre-buffer by scheduling the first packet 200 ms in the future
-    current_time += 0.2;
+    // Burst times go into the vendor's packet header, which is seconds:
+    // convert once, here. Pre-buffer by scheduling the first packet
+    // 200 ms in the future.
+    let mut current_time = sdr_aaronia_rs::utils::epoch_nanos_to_seconds(now_ns) + 0.2;
 
     let duration_per_burst = SAMPLES_PER_BURST as f64 / config.sample_rate_hz;
 

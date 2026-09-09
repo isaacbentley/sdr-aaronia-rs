@@ -904,6 +904,46 @@ pub unsafe extern "C" fn spectran_source_get_gps_time_ns(
     }
 }
 
+/// Get the device's master stream clock in nanoseconds since the Unix
+/// epoch. Returns `true` when `out_time_ns` was written, otherwise
+/// `false`.
+///
+/// This is the clock the device paces streams against, and the timebase
+/// a packet timestamp is expressed in. Unlike
+/// [`spectran_source_get_last_timestamp_ns`] it is available before any
+/// packet has arrived, so a caller that must not stamp data to 1970 can
+/// read it instead of waiting.
+///
+/// Native-SDK backend only; `false` over HTTP and file playback, and
+/// `false` when no device is open.
+///
+/// Pass `NULL` for `out_time_ns` to ask only whether the clock is
+/// readable, matching [`spectran_source_get_gps_time_ns`].
+///
+/// # Safety
+/// - `ptr` must be a valid pointer returned by [`spectran_source_build`]
+///   and not yet freed; null returns `false`.
+/// - `out_time_ns`, when not null, must be a valid pointer to an `i64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_source_get_master_stream_time_ns(
+    ptr: *mut c_void,
+    out_time_ns: *mut i64,
+) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+    match source.master_stream_time_ns() {
+        Some(nanos) => {
+            if !out_time_ns.is_null() {
+                unsafe { *out_time_ns = nanos };
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 /// Start streaming on the source. Returns a `SpectranFfiError`.
 ///
 /// # Safety

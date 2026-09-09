@@ -26,12 +26,14 @@ nothing asserts it.
 | `.rtsa` file playback | **Verified against real captures** | — |
 | TX (`UnifiedSink`, `spectran_sink_*`) | Endpoint only, no RF measured | Unverified |
 | Dual-channel RX (Rust, C, Python, SoapySDR) | — | Unverified — needs a full V6 |
-| GPS time (`gps_time_ns`) | — | Unverified |
+| GPS time (`gps_time_ns`) | — | Unverified — needs a GPS antenna |
+| Master stream clock (`master_stream_time_ns`) | — | Unverified |
 
 ## What is not verified, and why
 
-**TX, dual-channel RX and GPS time** need hardware this project does
-not have: a TX licence, a full V6, or a GPS antenna. If you
+**TX, dual-channel RX, GPS time and multi-device sync** need hardware
+this project does not have: a TX licence, a full V6, a GPS antenna, or a
+second device. If you
 have any of them, exercising one of these paths is the most valuable
 contribution you can make here — the first native-SDK run against a real
 device found five defects that compile-checking never would.
@@ -66,5 +68,6 @@ passing — along with a SoapySDR probe through the renamed C ABI.
 ## Related
 
 - [QUICKSTART.md](QUICKSTART.md) — setting up an RTSA-Suite mission.
+- [SYNC.md](SYNC.md) — what multi-device timing the hardware supports.
 - [USAGE.md](USAGE.md) — worked examples for each part of the API.
 - [../CHANGELOG.md](../CHANGELOG.md) — what changed in each release.

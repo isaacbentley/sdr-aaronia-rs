@@ -177,9 +177,14 @@ impl UnifiedSink {
         Ok(())
     }
 
-    /// Read the device's master stream clock, in seconds. TX burst
-    /// times are expressed against this clock — not wall-clock time.
-    pub fn get_master_stream_time(&mut self) -> Result<f64> {
+    /// The device's master stream clock, in nanoseconds since the Unix
+    /// epoch. TX burst times are expressed against this clock, not
+    /// wall-clock time.
+    ///
+    /// Nanoseconds to match every other clock the crate reports;
+    /// [`Self::send_burst`] takes the vendor's seconds, so convert with
+    /// [`crate::utils::epoch_nanos_to_seconds`].
+    pub fn master_stream_time_ns(&mut self) -> Result<i64> {
         #[cfg(all(
             feature = "native-sdk",
             any(target_os = "windows", target_os = "linux")
@@ -189,7 +194,7 @@ impl UnifiedSink {
                 .backend
                 .as_mut()
                 .ok_or_else(|| Error::Sdk("Sink not initialized".to_string()))?;
-            backend.get_master_stream_time()
+            backend.master_stream_time_ns()
         }
         #[cfg(not(all(
             feature = "native-sdk",
@@ -203,7 +208,9 @@ impl UnifiedSink {
     /// Queue one burst of IQ samples for transmission.
     ///
     /// `start_time_s`/`end_time_s` are in **master stream time**
-    /// seconds (see [`Self::get_master_stream_time`]); `flags` are
+    /// seconds — the vendor's own unit for the packet header. Read the
+    /// clock with [`Self::master_stream_time_ns`] and convert with
+    /// [`crate::utils::epoch_nanos_to_seconds`]. `flags` are
     /// [`crate::native_sdk::tx_flags`]-style packet boundary flags
     /// (callers streaming continuously should not set
     /// `SEGMENT_START|SEGMENT_END` on every packet — that was a

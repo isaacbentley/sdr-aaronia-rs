@@ -236,6 +236,7 @@ Start here:
 - [Quickstart](docs/QUICKSTART.md) — configuring an RTSA-Suite mission, first samples in Rust, Python and SoapySDR, and troubleshooting for common setup failures.
 - [Usage](docs/USAGE.md) — worked examples for each part of the API, plus the `AARONIA_SDK_PATH` and `AARONIA_USER_AGENT` environment variables.
 - [Using existing SDR apps](docs/APPS.md) — SDR++, GQRX, GNU Radio, SoapySDR from Python.
+- [Synchronising receivers](docs/SYNC.md) — what the hardware can and cannot do for multi-device timing, and the recipe that works.
 
 Reference:
 

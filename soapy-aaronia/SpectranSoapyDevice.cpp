@@ -506,6 +506,14 @@ bool SpectranSoapyDevice::hasHardwareTime(const std::string &what) const {
         std::lock_guard<std::mutex> lock(_mutex);
         return spectran_source_get_gps_time_ns(_source, nullptr);
     }
+    if (what == "master") {
+        // The device's own stream clock, native-SDK backend only. Like
+        // GPS above this is a value test, not a capability test: the
+        // call needs an open device, and there is nothing to report
+        // without one.
+        std::lock_guard<std::mutex> lock(_mutex);
+        return spectran_source_get_master_stream_time_ns(_source, nullptr);
+    }
     if (what.empty()) {
         // A capability, not a current value. Every RTSA packet header
         // carries startTime/endTime, so this device timestamps its
@@ -549,11 +557,22 @@ long long SpectranSoapyDevice::getHardwareTime(const std::string &what) const {
         }
         return 0;
     }
+    if (what == "master") {
+        // The device's master stream clock — the timebase it paces
+        // streams against, and what a caller aligning two receivers
+        // works in. Readable before the first packet, which is exactly
+        // what the default below cannot do.
+        int64_t master_time_ns = 0;
+        if (spectran_source_get_master_stream_time_ns(_source, &master_time_ns)) {
+            return master_time_ns;
+        }
+        return 0;
+    }
     // Default: the last stream timestamp, and `0` before any packet has
     // arrived. SoapySDR has no way to say "no time yet" here, so a
     // caller that must not stamp data to 1970 should take its time from
-    // readStream's SOAPY_SDR_HAS_TIME buffers rather than polling this
-    // before the stream is running.
+    // readStream's SOAPY_SDR_HAS_TIME buffers, or read the "master"
+    // clock above, rather than polling this before the stream runs.
     return spectran_source_get_last_timestamp_ns(_source);
 }
 

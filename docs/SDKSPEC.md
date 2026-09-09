@@ -258,7 +258,16 @@ The Aaronia RTSA SDK (`aaroniartsaapi.h`) exposes a C-style API for maximum comp
 *   **`AARTSAAPI_AvailPackets(AARTSAAPI_Device * dhandle, int32_t channel, int32_t * num)`**: Gets the number of available packets in a specified data `channel`.
 *   **`AARTSAAPI_GetPacket(AARTSAAPI_Device * dhandle, int32_t channel, int32_t index, AARTSAAPI_Packet * packet)`**: Retrieves a specific packet from the output queue.
 *   **`AARTSAAPI_ConsumePackets(AARTSAAPI_Device * dhandle, int32_t channel, int32_t num)`**: Consumes (removes) a number of packets from the data channel. Essential to prevent blocking and data drops.
-*   **`AARTSAAPI_GetMasterStreamTime(AARTSAAPI_Device * dhandle, double * stime)`**: Gets the current master stream time.
+*   **`AARTSAAPI_GetMasterStreamTime(AARTSAAPI_Device * dhandle, double * stime)`**:
+    Gets the current master stream time, seconds since the epoch. The
+    header declares the out-parameter as a C++ *reference* (`double &`),
+    which is a pointer in the ABI — hence `*mut f64` here. Exposed as
+    `NativeSdkSource::master_stream_time_ns` and
+    `SpectranSource::master_stream_time_ns`, converted to nanoseconds so
+    it reads in the same unit as every other clock the crate reports.
+    This is the device's own timebase: it paces streams against it, TX
+    burst times are expressed in it, and it is what a multi-device
+    capture is aligned on — see [SYNC.md](SYNC.md).
 *   **`AARTSAAPI_SendPacket(AARTSAAPI_Device * dhandle, int32_t channel, const AARTSAAPI_Packet * packet)`**: Sends a packet to an inbound channel (for transmission modes).
 
 ### File I/O API
@@ -461,7 +470,7 @@ values an `f64`'s step is about **238 ns**, which is the real resolution of
 any GPS timestamp this device gives — no conversion downstream can improve
 on it.
 
-`utils::gps_seconds_to_nanos` converts to `i64` nanoseconds by handling the
+`utils::epoch_seconds_to_nanos` converts to `i64` nanoseconds by handling the
 whole and fractional seconds separately. That is not pedantry: epoch
 nanoseconds are around `1.7e18`, where an `f64`'s step is 256 ns, so a single
 `seconds * 1e9` multiply discards tens of nanoseconds the reading still had.

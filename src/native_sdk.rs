@@ -1353,6 +1353,16 @@ impl NativeSdkClient {
         }
     }
 
+    /// `AARTSAAPI_GetMasterStreamTime`, verbatim: seconds since the
+    /// epoch as the vendor's `double`.
+    ///
+    /// Keeps the vendor's name and unit because this layer is a 1:1 ABI
+    /// mirror — renaming it here would hide which call it is. The
+    /// library-level accessor is
+    /// [`NativeSdkSource::master_stream_time_ns`], which converts.
+    ///
+    /// # Safety
+    /// `device` must be an open, connected device handle.
     pub unsafe fn get_master_stream_time(&self, device: &mut AARTSAAPI_Device) -> Result<f64> {
         unsafe {
             let mut stime = 0.0;
@@ -1739,7 +1749,7 @@ pub struct GpsState {
     /// GPS time (`gpstime`), seconds since the Unix epoch, as the vendor
     /// reports it. `None` unless `time_valid`. Seconds rather than
     /// nanoseconds because that is the health tree's own type; use
-    /// [`crate::utils::gps_seconds_to_nanos`] to convert, and read its
+    /// [`crate::utils::epoch_seconds_to_nanos`] to convert, and read its
     /// note on how precise this actually is.
     pub time_s: Option<f64>,
 }
@@ -3337,17 +3347,40 @@ impl NativeSdkSource {
         }
     }
 
-    /// Read the device's master stream time.
+    /// The device's master stream clock, in nanoseconds since the Unix
+    /// epoch.
     ///
-    /// This time is required to correctly schedule `TxBurst` packets.
-    pub fn get_master_stream_time(&mut self) -> Result<f64> {
-        unsafe {
+    /// This is the clock the device paces streams against, and the one
+    /// `TxBurst` times are expressed in — read it and derive burst times
+    /// from it rather than from `SystemTime::now()`, which is a
+    /// different clock and drifts against this one.
+    ///
+    /// It is also what aligns two receivers sharing a reference: the
+    /// vendor API has no set-time and no arm-at-time, so a multi-device
+    /// capture is disciplined by a common reference and then aligned
+    /// afterwards on timestamps. See `docs/SYNC.md`.
+    ///
+    /// Nanoseconds to match [`Self::last_timestamp_ns`] and
+    /// `gps_time_ns`. The device reports `double` seconds, so the
+    /// reading is quantised at roughly 240 ns whatever it is converted
+    /// to; the conversion loses nothing beyond that.
+    ///
+    /// Errors when no device is open, or when the SDK returns a value
+    /// that is not a finite non-negative epoch time.
+    pub fn master_stream_time_ns(&mut self) -> Result<i64> {
+        let seconds = unsafe {
             let device = self
                 .device
                 .as_mut()
                 .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
-            self.client.get_master_stream_time(device)
-        }
+            self.client.get_master_stream_time(device)?
+        };
+        crate::utils::epoch_seconds_to_nanos(seconds).ok_or_else(|| {
+            Error::Sdk(format!(
+                "master stream time {} is not a representable epoch time in nanoseconds",
+                seconds
+            ))
+        })
     }
 
     pub unsafe fn stop_streaming(&mut self) -> Result<()> {
@@ -3503,9 +3536,14 @@ pub mod tx_flags {
 /// as "seconds since start of the unix epoch" — an SDK-supplied wall
 /// clock, not zero. Real timestamps matter for TX: they're how the
 /// device schedules the burst against its own master stream time (see
-/// [`NativeSdkClient::get_master_stream_time`]), so a caller should read
+/// [`NativeSdkSource::master_stream_time_ns`]), so a caller should read
 /// that clock and derive `start_time`/`end_time` from it rather than
 /// passing zero.
+///
+/// These two fields are the one place the crate hands a caller seconds
+/// rather than nanoseconds: they are written straight into the vendor's
+/// packet header, which is `double` seconds. Convert with
+/// [`crate::utils::epoch_nanos_to_seconds`].
 #[derive(Debug, Clone, Copy)]
 pub struct TxBurst {
     /// Burst start time, seconds since the Unix epoch (device master

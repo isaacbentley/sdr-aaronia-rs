@@ -202,6 +202,12 @@ int64_t spectran_source_get_last_timestamp_ns(SpectranSource* source);
 // library now, so callers no longer split whole/fractional seconds
 // themselves. Resolution is ~240 ns, set by the vendor's own double.
 bool spectran_source_get_gps_time_ns(SpectranSource* source, int64_t* out_gps_time_ns);
+// The device's master stream clock, nanoseconds since the Unix epoch:
+// the timebase it paces streams against, readable before the first
+// packet (unlike get_last_timestamp_ns, which is 0 until one arrives).
+// Native-SDK backend only; false over HTTP and file playback.
+// out_time_ns may be NULL to probe only whether the clock is readable.
+bool spectran_source_get_master_stream_time_ns(SpectranSource* source, int64_t* out_time_ns);
 SpectranFfiError spectran_source_start_streaming(SpectranSource* source);
 SpectranFfiError spectran_source_stop_streaming(SpectranSource* source);
 SpectranFfiError spectran_source_set_center_frequency_hz(SpectranSource* source, double hz);

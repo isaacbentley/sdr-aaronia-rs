@@ -601,6 +601,31 @@ impl PySpectranSource {
             .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
         Ok(source.last_timestamp_ns())
     }
+
+    /// The device's master stream clock (epoch ns) — the timebase it
+    /// paces streams against. Unlike `last_timestamp_ns` it is readable
+    /// before the first block arrives. Native-SDK backend only; `None`
+    /// otherwise.
+    fn master_stream_time_ns(&mut self) -> PyResult<Option<i64>> {
+        let source = self
+            .source
+            .as_mut()
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
+        Ok(source.master_stream_time_ns())
+    }
+
+    /// The latest GPS time (epoch ns), or `None` without a valid fix.
+    /// Native-SDK backend only, and only once `device/gpsmode` has been
+    /// enabled — the device ships with GPS off, in which state this
+    /// stays `None`. Quantised at roughly 240 ns by the device's own
+    /// reading.
+    fn gps_time_ns(&mut self) -> PyResult<Option<i64>> {
+        let source = self
+            .source
+            .as_mut()
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
+        Ok(source.gps_time_ns())
+    }
 }
 
 /// Iterator over fixed-size sample blocks, returned by

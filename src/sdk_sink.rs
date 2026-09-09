@@ -151,15 +151,15 @@ impl SdkSink {
         Ok(())
     }
 
-    /// Read the device's master stream time.
-    ///
-    /// This time is required to correctly schedule `TxBurst` packets.
-    pub fn get_master_stream_time(&mut self) -> Result<f64> {
+    /// The device's master stream clock, in nanoseconds since the Unix
+    /// epoch. `TxBurst` times are expressed against this clock, not
+    /// wall-clock time.
+    pub fn master_stream_time_ns(&mut self) -> Result<i64> {
         let native_source = self
             .native_source
             .as_mut()
             .ok_or_else(|| crate::Error::Sdk("Source not initialized".to_string()))?;
-        native_source.get_master_stream_time()
+        native_source.master_stream_time_ns()
     }
 
     /// Obtain a `TxStream` handle to write samples.
@@ -332,9 +332,12 @@ pub mod futuresdr_sink {
             };
             let mut flags = crate::native_sdk::tx_flags::SEGMENT_START
                 | crate::native_sdk::tx_flags::SEGMENT_END;
-            let (start_time, end_time) = match self.sink.get_master_stream_time() {
-                Ok(now) => {
-                    let start = now + TX_SCHEDULE_LEAD_S;
+            let (start_time, end_time) = match self.sink.master_stream_time_ns() {
+                Ok(now_ns) => {
+                    // Back to the vendor's seconds here, at the one
+                    // boundary that wants them: TxBurst feeds the packet
+                    // header directly.
+                    let start = crate::utils::epoch_nanos_to_seconds(now_ns) + TX_SCHEDULE_LEAD_S;
                     (start, start + duration_s)
                 }
                 Err(e) => {

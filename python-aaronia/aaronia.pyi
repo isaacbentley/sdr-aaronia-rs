@@ -181,6 +181,18 @@ class SpectranSource:
         """Epoch-nanosecond timestamp of the most recent block.
         HTTP backend only; 0 otherwise."""
 
+    def master_stream_time_ns(self) -> Optional[int]:
+        """The device's master stream clock, in epoch nanoseconds.
+
+        The timebase the device paces streams against, readable before
+        the first block arrives. Native-SDK backend only; None otherwise."""
+
+    def gps_time_ns(self) -> Optional[int]:
+        """The latest GPS time in epoch nanoseconds, or None without a fix.
+
+        Native-SDK backend only, and only once ``device/gpsmode`` is
+        enabled — the device ships with GPS off."""
+
 class BlockIterator:
     """Iterator returned by :meth:`SpectranSource.blocks`."""
 

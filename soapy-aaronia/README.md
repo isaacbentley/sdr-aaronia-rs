@@ -199,6 +199,11 @@ it does offer. `listClockSources` reports the device's own vocabulary.
 - `hasHardwareTime("GPS")` reports a value rather than a capability —
   true only on the native-SDK backend with a valid fix.
   `getHardwareTime("GPS")` returns epoch nanoseconds.
+- `getHardwareTime("master")` returns the device's own stream clock in
+  epoch nanoseconds — the timebase it paces streams against, and the one
+  to align two receivers on. Native-SDK backend only. Unlike the default
+  it is readable before the first packet, so a probe gets a real answer.
+  See [SYNC.md](../docs/SYNC.md).
 - The single gain element, `REF`, is the Aaronia reference level in dBm.
   It is not an amplifier gain: raising it reduces sensitivity. Range and
   step come from the device — −55…+23 dBm in 0.5 dB steps on a V6 ECO.

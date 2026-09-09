@@ -95,7 +95,7 @@ if ! skipped fences; then
             }
         }
         END { exit rc }
-    ' README.md docs/QUICKSTART.md docs/USAGE.md PLUGINS.md
+    ' README.md docs/QUICKSTART.md docs/USAGE.md PLUGINS.md docs/SYNC.md
 fi
 
 if ! skipped test; then

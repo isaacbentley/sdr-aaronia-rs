@@ -28,6 +28,33 @@ All notable changes to this project will be documented in this file.
   **`spectran_source_read_samples_dual_timeout`** (C), the dual counterparts of
   the existing deadline-bounded reads. `readStream` must honour the
   application's `timeoutUs`, which the blocking dual read ignored.
+- **The device's master stream clock is readable from a source.**
+  `SpectranSource::master_stream_time_ns`,
+  `spectran_source_get_master_stream_time_ns`, Python
+  `master_stream_time_ns()`, and SoapySDR `getHardwareTime("master")`. It was
+  reachable only through the TX sink before. Unlike `last_timestamp_ns` it
+  answers before the first packet, so a caller that must not stamp data to
+  1970 has something to read; it is also the clock two receivers are aligned
+  on. Native-SDK backend only.
+- **Python gained `master_stream_time_ns()` and `gps_time_ns()`**, which the
+  Rust and C surfaces already had.
+- **[docs/SYNC.md](docs/SYNC.md)** — what the hardware does and does not offer
+  for multi-device timing. The vendor API has no set-time, no arm-at-time and
+  no trigger in any of its 34 functions, so UHD-style commanded capture is not
+  possible; a shared reference plus post-alignment on timestamps is, and that
+  is written down with its resolution floor (~240 ns, set by the vendor's own
+  `double`). Wired into the doctests, so its snippets cannot rot.
+
+### Breaking changes
+- **`get_master_stream_time()` is now `master_stream_time_ns()`**, on
+  `NativeSdkSource`, `SdkSink` and `UnifiedSink`, returning `i64` nanoseconds
+  instead of `f64` seconds. One unit per dimension, matching every other clock
+  the crate reports. `TxBurst` still carries the vendor's `f64` seconds — it is
+  written straight into the packet header — so convert with the new
+  `utils::epoch_nanos_to_seconds`.
+- **`utils::gps_seconds_to_nanos` is now `utils::epoch_seconds_to_nanos`.**
+  Two of the vendor's clocks arrive as `float64` epoch seconds, not one, and
+  the old name claimed otherwise.
 
 ### Fixed
 - **A timed-out read no longer discards the staging buffer.**

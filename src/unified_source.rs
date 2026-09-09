@@ -492,7 +492,7 @@ impl SpectranSource {
     /// nanoseconds correctly is fiddly enough that the SoapySDR plugin
     /// used to carry its own copy of the arithmetic. **It is not more
     /// precise than the vendor's own reading** — see
-    /// [`crate::utils::gps_seconds_to_nanos`], which puts the floor at
+    /// [`crate::utils::epoch_seconds_to_nanos`], which puts the floor at
     /// roughly 240 ns and explains why a cross-receiver correlation wants
     /// the per-packet stream timestamps instead.
     ///
@@ -517,11 +517,46 @@ impl SpectranSource {
                 if let Some(sdk) = &mut self.native_source
                     && let Ok((_health, gps)) = unsafe { sdk.get_health_and_gps() }
                 {
-                    return gps.time_s.and_then(crate::utils::gps_seconds_to_nanos);
+                    return gps.time_s.and_then(crate::utils::epoch_seconds_to_nanos);
                 }
                 None
             }
             _ => None, // HTTP and File don't support GPS time yet
+        }
+    }
+
+    /// The device's master stream clock, in nanoseconds since the Unix
+    /// epoch — the clock it paces streams against, and the reference a
+    /// per-packet timestamp is expressed in.
+    ///
+    /// Native SDK only; `None` on the HTTP and file backends, where the
+    /// SDK call has no counterpart. `None` also when the device is not
+    /// open, or when the value is not a representable epoch time.
+    ///
+    /// Use it to relate a stream to the device's own timebase without
+    /// waiting for a packet — [`Self::last_timestamp_ns`] reports 0 until
+    /// one arrives, which is indistinguishable from 1970. Across two
+    /// receivers on a shared reference it is the clock the alignment is
+    /// computed in; the vendor API has neither a set-time nor an
+    /// arm-at-time call, so a capture is disciplined first and aligned
+    /// afterwards. `docs/SYNC.md` sets out the whole recipe.
+    ///
+    /// The device reports `double` seconds, so this is quantised at
+    /// roughly 240 ns however it is converted — see
+    /// [`crate::utils::epoch_seconds_to_nanos`].
+    ///
+    /// Hardware-unverified.
+    pub fn master_stream_time_ns(&mut self) -> Option<i64> {
+        match self.source_type {
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            SourceType::NativeSdk => self
+                .native_source
+                .as_mut()
+                .and_then(|sdk| sdk.master_stream_time_ns().ok()),
+            _ => None,
         }
     }
 

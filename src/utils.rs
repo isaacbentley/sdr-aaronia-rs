@@ -563,8 +563,9 @@ pub fn decimation_index_for_bandwidth(bandwidth_hz: f64) -> usize {
     decimation_index_for_rate(iq_sample_rate_for_bandwidth(bandwidth_hz))
 }
 
-/// Convert the vendor's GPS time — `float64` seconds since the Unix epoch,
-/// as `gpstime` in the health tree — to integer nanoseconds.
+/// Convert one of the vendor's clocks — `float64` seconds since the Unix
+/// epoch — to integer nanoseconds. Two of them arrive this way: `gpstime`
+/// in the health tree, and `AARTSAAPI_GetMasterStreamTime`.
 ///
 /// Done as whole seconds plus fraction rather than one `s * 1e9` multiply.
 /// The product is around `1.7e18`, past the point where an `f64` step is
@@ -580,11 +581,11 @@ pub fn decimation_index_for_bandwidth(bandwidth_hz: f64) -> usize {
 /// this, are what a correlation should be built on; GPS time is for
 /// disciplining and for wall-clock labelling.
 ///
-/// `None` for a value that is not finite, is negative (there is no
-/// pre-epoch GPS fix), or would overflow `i64` nanoseconds, which runs
-/// out around the year 2262.
+/// `None` for a value that is not finite, is negative (neither clock
+/// reports a pre-epoch time), or would overflow `i64` nanoseconds, which
+/// runs out around the year 2262.
 #[must_use]
-pub fn gps_seconds_to_nanos(seconds: f64) -> Option<i64> {
+pub fn epoch_seconds_to_nanos(seconds: f64) -> Option<i64> {
     if !seconds.is_finite() || seconds < 0.0 {
         return None;
     }
@@ -598,6 +599,30 @@ pub fn gps_seconds_to_nanos(seconds: f64) -> Option<i64> {
     (whole as i64)
         .checked_mul(1_000_000_000)?
         .checked_add(((seconds - whole) * 1e9).round() as i64)
+}
+
+/// The inverse of [`epoch_seconds_to_nanos`]: integer nanoseconds since
+/// the Unix epoch back to the `float64` seconds the vendor's own fields
+/// use.
+///
+/// Needed because [`crate::native_sdk::TxBurst`] carries the vendor's
+/// seconds — it feeds the packet header directly — while every clock the
+/// crate hands a caller is in nanoseconds. Converting at that one
+/// boundary keeps a single unit in the API without misrepresenting the
+/// packet contract.
+///
+/// Lossy in the direction it has to be: an `f64` holding present-day
+/// epoch seconds steps about 238 ns, so the result is quantised to
+/// roughly that. This loses nothing real — the device's own clock
+/// arrived through the same `f64`.
+#[must_use]
+pub fn epoch_nanos_to_seconds(nanos: i64) -> f64 {
+    // Whole seconds and fraction separately, mirroring the forward
+    // conversion: `nanos as f64 / 1e9` rounds the 19-digit integer to an
+    // f64 first, and that rounding is coarser than the division.
+    let whole = nanos.div_euclid(1_000_000_000);
+    let rem = nanos.rem_euclid(1_000_000_000);
+    whole as f64 + (rem as f64) * 1e-9
 }
 
 /// Hardware constraint for IQ Mode: the configured sample rate must
@@ -969,6 +994,76 @@ mod tests {
     /// rate. Both arms therefore assume this equality — if the label
     /// table and the default ever drift apart, that check would silently
     /// validate against a clock the device does not end up on.
+    /// The nanoseconds-to-seconds conversion must be *correctly rounded*,
+    /// not merely close, because it is the one place a caller's integer
+    /// nanoseconds re-enter the vendor's `f64` seconds (a TX burst time).
+    ///
+    /// Ground truth comes from exact rational arithmetic in i128, not
+    /// from the function under test: `nanos / 1e9` computed as an exact
+    /// fraction, then rounded once to the nearest `f64`. The naive
+    /// `nanos as f64 / 1e9` rounds a 19-digit integer to an `f64`
+    /// *first*, and that rounding is coarser than the division — over
+    /// 200k present-day samples it lands on the wrong `f64` 27% of the
+    /// time, by up to one full ULP (238 ns). This case is one of them.
+    #[test]
+    fn epoch_nanos_to_seconds_rounds_the_way_an_exact_division_would() {
+        let nanos: i64 = 1_713_565_570_606_665_771;
+
+        // The correctly-rounded result, derived independently: the two
+        // f64 candidates that bracket nanos/1e9 are compared by exact
+        // i128 cross-multiplication, with no float division anywhere.
+        let candidate = epoch_nanos_to_seconds(nanos);
+        let below = candidate.min(f64::from_bits(candidate.to_bits() - 1));
+        let above = f64::from_bits(below.to_bits() + 1);
+        // |below*1e9 - nanos| vs |above*1e9 - nanos|, in exact integers.
+        // Both candidates are exactly representable as rationals with a
+        // power-of-two denominator, so scaling by 2^30 keeps them whole.
+        let err = |x: f64| -> i128 {
+            let scaled = (x * (1u64 << 30) as f64) as i128; // exact: x has < 30 fractional bits here
+            (scaled * 1_000_000_000 - (nanos as i128) * (1i128 << 30)).abs()
+        };
+        let expected = if err(below) <= err(above) {
+            below
+        } else {
+            above
+        };
+
+        assert_eq!(
+            epoch_nanos_to_seconds(nanos).to_bits(),
+            expected.to_bits(),
+            "not the nearest f64 to {nanos} ns"
+        );
+
+        // And the naive form really does miss it, so this test is
+        // guarding something rather than restating an identity.
+        let naive = nanos as f64 / 1e9;
+        assert_ne!(naive.to_bits(), expected.to_bits());
+        assert!((naive - expected).abs() > 200e-9);
+    }
+
+    /// Round-tripping a time that came from the device must return the
+    /// same `f64`. Every value this conversion sees originated as one —
+    /// the vendor reports both its clocks that way — so a round trip
+    /// that drifted would put a TX burst on a different tick than the
+    /// clock read that produced it.
+    #[test]
+    fn a_device_reading_survives_the_round_trip_to_nanos_and_back() {
+        for seconds in [
+            0.0,
+            1.0,
+            1_713_565_570.606_665_8_f64,
+            1_800_000_000.25,
+            f64::from_bits(1_713_565_570.0_f64.to_bits() + 1),
+        ] {
+            let nanos = epoch_seconds_to_nanos(seconds).expect("representable");
+            assert_eq!(
+                epoch_nanos_to_seconds(nanos).to_bits(),
+                seconds.to_bits(),
+                "round trip changed {seconds}"
+            );
+        }
+    }
+
     #[test]
     fn the_92mhz_label_is_the_default_receiver_clock() {
         assert_eq!(
@@ -981,7 +1076,7 @@ mod tests {
     /// Exactly what an `f64` is worth in nanoseconds, from its bit
     /// pattern in `i128`.
     ///
-    /// Deliberately shares no arithmetic with `gps_seconds_to_nanos`: a
+    /// Deliberately shares no arithmetic with `epoch_seconds_to_nanos`: a
     /// ground truth computed the same whole-plus-fraction way would only
     /// prove the function equals itself. An `f64` is `mantissa * 2^exp`
     /// exactly, so scaling by `1e9` in integers is exact too, and the
@@ -1016,7 +1111,8 @@ mod tests {
         // rounded to this anyway, which is the same lossiness the
         // function exists to handle.
         let seconds = 1_757_376_000.123_456_7_f64;
-        let split = i128::from(gps_seconds_to_nanos(seconds).expect("a present-day fix converts"));
+        let split =
+            i128::from(epoch_seconds_to_nanos(seconds).expect("a present-day fix converts"));
         let naive = (seconds * 1e9) as i128;
         let exact = exact_nanos(seconds);
 
@@ -1047,7 +1143,7 @@ mod tests {
         // 0.125 == 2^-3, exact in binary.
         let seconds = 1_757_376_000.125_f64;
         assert_eq!(
-            gps_seconds_to_nanos(seconds),
+            epoch_seconds_to_nanos(seconds),
             Some(1_757_376_000_125_000_000)
         );
         assert_ne!(
@@ -1063,17 +1159,17 @@ mod tests {
     #[test]
     fn gps_nanos_refuse_the_final_partial_second() {
         let last_whole = (i64::MAX / 1_000_000_000) as f64; // 9_223_372_036
-        assert!(gps_seconds_to_nanos(last_whole).is_some());
+        assert!(epoch_seconds_to_nanos(last_whole).is_some());
         // Same whole second, but the fraction pushes it past i64::MAX.
-        assert_eq!(gps_seconds_to_nanos(last_whole + 0.9), None);
+        assert_eq!(epoch_seconds_to_nanos(last_whole + 0.9), None);
     }
 
     #[test]
     fn gps_nanos_round_trip_whole_seconds() {
-        assert_eq!(gps_seconds_to_nanos(0.0), Some(0));
-        assert_eq!(gps_seconds_to_nanos(1.0), Some(1_000_000_000));
+        assert_eq!(epoch_seconds_to_nanos(0.0), Some(0));
+        assert_eq!(epoch_seconds_to_nanos(1.0), Some(1_000_000_000));
         assert_eq!(
-            gps_seconds_to_nanos(1_757_376_000.0),
+            epoch_seconds_to_nanos(1_757_376_000.0),
             Some(1_757_376_000_000_000_000)
         );
     }
@@ -1081,12 +1177,12 @@ mod tests {
     /// Garbage in the health tree must not become a plausible timestamp.
     #[test]
     fn gps_nanos_reject_the_unrepresentable() {
-        assert_eq!(gps_seconds_to_nanos(f64::NAN), None);
-        assert_eq!(gps_seconds_to_nanos(f64::INFINITY), None);
-        assert_eq!(gps_seconds_to_nanos(-1.0), None);
+        assert_eq!(epoch_seconds_to_nanos(f64::NAN), None);
+        assert_eq!(epoch_seconds_to_nanos(f64::INFINITY), None);
+        assert_eq!(epoch_seconds_to_nanos(-1.0), None);
         // i64 nanoseconds run out in 2262; past that there is no answer
         // to give rather than a wrapped one.
-        assert_eq!(gps_seconds_to_nanos(1e19), None);
+        assert_eq!(epoch_seconds_to_nanos(1e19), None);
     }
 
     #[test]
