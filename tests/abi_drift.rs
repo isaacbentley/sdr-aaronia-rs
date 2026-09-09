@@ -27,7 +27,9 @@ fn balanced_args(src: &str, open: usize) -> Option<&str> {
         match b {
             b'(' => depth += 1,
             b')' => {
-                depth -= 1;
+                // Guard the underflow: an unbalanced source should make
+                // this parser give up, never panic in a debug build.
+                depth = depth.checked_sub(1)?;
                 if depth == 0 {
                     return Some(&src[open + 1..i]);
                 }
@@ -51,13 +53,20 @@ fn arity(args: &str) -> usize {
     }
     let mut depth = 0usize;
     let mut n = 1usize;
+    let mut prev = ' ';
     for c in trimmed.chars() {
         match c {
-            '(' | '[' | '<' => depth += 1,
-            ')' | ']' | '>' => depth = depth.saturating_sub(1),
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            // `<`/`>` are only brackets when they are not the `->` of a
+            // function-pointer return type, which would otherwise
+            // unbalance the depth and inflate the count.
+            '<' => depth += 1,
+            '>' if prev != '-' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => n += 1,
             _ => {}
         }
+        prev = c;
     }
     n
 }
@@ -140,8 +149,13 @@ fn header_decls(src: &str) -> BTreeMap<String, usize> {
 /// same arity — in both directions.
 #[test]
 fn c_header_matches_the_exported_symbols() {
+    let header_path = repo("include/aaronia.h");
+    if !header_path.exists() {
+        eprintln!("include/aaronia.h not present (packaged build) — skipping");
+        return;
+    }
     let rust = std::fs::read_to_string(repo("src/c_api.rs")).expect("src/c_api.rs");
-    let header = std::fs::read_to_string(repo("include/aaronia.h")).expect("include/aaronia.h");
+    let header = std::fs::read_to_string(&header_path).expect("include/aaronia.h");
 
     let exports = rust_exports(&rust);
     let decls = header_decls(&header);
@@ -181,10 +195,92 @@ fn c_header_matches_the_exported_symbols() {
     );
 }
 
-/// Every name PyO3 exposes must appear in the hand-written stub.
+/// Does the stub declare `name`, as a declaration rather than as an
+/// incidental substring? A bare `contains` passes vacuously for short
+/// names that occur in a comment or another symbol.
+fn stub_declares(stub: &str, name: &str) -> bool {
+    stub.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with(&format!("def {name}("))
+            || t.starts_with(&format!("async def {name}("))
+            || t.starts_with(&format!("class {name}"))
+            || t.starts_with(&format!("{name}:"))
+            || t.starts_with(&format!("{name} ="))
+    })
+}
+
+/// Collect every name PyO3 actually exposes to Python.
+///
+/// Covers all three shapes, because missing any one makes the test pass
+/// vacuously for exactly the names a rename touches: `#[pyclass]` names,
+/// `get_`/`set_` pairs (which become properties), plain `#[pymethods]`
+/// functions, and `#[pyfunction]` module-level functions.
+fn pyo3_exposed(src: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    let mut cursor = 0usize;
+    while let Some(rel) = src[cursor..].find("#[pyclass(name = \"") {
+        let at = cursor + rel + "#[pyclass(name = \"".len();
+        out.push(src[at..].chars().take_while(|c| *c != '"').collect());
+        cursor = at;
+    }
+
+    // Every `fn` inside a #[pymethods] block, plus #[pyfunction]s. Both
+    // are found by scanning forward from the attribute; a `fn` in a plain
+    // `impl` block is not exposed and must not be collected.
+    let mut collect_fns = |from: usize, until: usize| {
+        let mut i = from;
+        while let Some(rel) = src[i..until.min(src.len())].find("fn ") {
+            let at = i + rel + 3;
+            let name: String = src[at..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() && !name.starts_with("__") && name != "new" {
+                // Only a #[getter]/#[setter] becomes a property; a plain
+                // `fn set_center_frequency` stays a method of that name.
+                // Stripping the prefix unconditionally invents a property
+                // that Python never exposes.
+                let preceding = &src[at.saturating_sub(64)..at];
+                let is_accessor =
+                    preceding.contains("#[getter]") || preceding.contains("#[setter]");
+                let exposed = match (
+                    is_accessor,
+                    name.strip_prefix("get_"),
+                    name.strip_prefix("set_"),
+                ) {
+                    (true, Some(prop), _) | (true, _, Some(prop)) => prop.to_string(),
+                    _ => name.clone(),
+                };
+                out.push(exposed);
+            }
+            i = at;
+        }
+    };
+
+    for (attr, span) in [("#[pymethods]", 6000usize), ("#[pyfunction]", 400usize)] {
+        let mut cursor = 0usize;
+        while let Some(rel) = src[cursor..].find(attr) {
+            let at = cursor + rel + attr.len();
+            let end = match src[at..].find(attr) {
+                Some(next) => at + next,
+                None => (at + span).min(src.len()),
+            };
+            collect_fns(at, end.min(at + span));
+            cursor = at;
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every name PyO3 exposes must be declared in the hand-written stub.
 ///
 /// One-directional on purpose: a stub carrying an extra overload or alias
-/// is harmless, a stub missing a real method is not.
+/// is harmless; a stub missing a real method is not, because it degrades
+/// silently to `Any` rather than erroring.
 #[test]
 fn python_stub_declares_everything_pyo3_exposes() {
     let lib = repo("python-aaronia/src/lib.rs");
@@ -196,40 +292,20 @@ fn python_stub_declares_everything_pyo3_exposes() {
     let src = std::fs::read_to_string(&lib).expect("python-aaronia/src/lib.rs");
     let stub = std::fs::read_to_string(&pyi).expect("python-aaronia/aaronia.pyi");
 
-    let mut expected: Vec<String> = Vec::new();
+    let exposed = pyo3_exposed(&src);
+    assert!(
+        exposed.len() > 20,
+        "collected only {} exposed names — the scanner, not the bindings, is probably wrong",
+        exposed.len()
+    );
 
-    // Class names, which PyO3 takes from #[pyclass(name = "...")].
-    let mut cursor = 0usize;
-    while let Some(rel) = src[cursor..].find("#[pyclass(name = \"") {
-        let at = cursor + rel + "#[pyclass(name = \"".len();
-        let name: String = src[at..].chars().take_while(|c| *c != '"').collect();
-        expected.push(name);
-        cursor = at;
-    }
-
-    // Property names, which PyO3 derives from the get_/set_ fn name.
-    for line in src.lines() {
-        let t = line.trim_start();
-        for prefix in ["fn get_", "fn set_"] {
-            if let Some(rest) = t.strip_prefix(prefix) {
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                if !name.is_empty() {
-                    expected.push(name);
-                }
-            }
-        }
-    }
-
-    expected.sort();
-    expected.dedup();
-
-    let missing: Vec<_> = expected.iter().filter(|n| !stub.contains(*n)).collect();
+    let missing: Vec<_> = exposed
+        .iter()
+        .filter(|n| !stub_declares(&stub, n))
+        .collect();
     assert!(
         missing.is_empty(),
-        "exposed to Python but absent from aaronia.pyi: {missing:?}\n\
+        "exposed to Python but not declared in aaronia.pyi: {missing:?}\n\
          The stub is maintained by hand and nothing else checks it."
     );
 }

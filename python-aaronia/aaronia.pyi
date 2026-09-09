@@ -223,3 +223,12 @@ def diagnose(url: str = "http://localhost:54664") -> List[Tuple[bool, str, str]]
     Returns ``(ok, message, fix)`` for each check. The
     ``aaronia-doctor`` console script prints the same results.
     """
+
+def doctor_cli() -> int:
+    """Entry point behind the ``aaronia-doctor`` console script.
+
+    Runs :func:`diagnose` against the default server, prints the results,
+    and returns a process exit code — ``0`` when every check passed.
+    Exported from the module, so it is declared here; call
+    :func:`diagnose` instead if you want the results as data.
+    """

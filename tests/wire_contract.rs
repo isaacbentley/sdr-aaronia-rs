@@ -152,39 +152,81 @@ fn packet_metadata_parses_the_documented_header_including_optionals() {
     assert_eq!(meta.scale, Some(16384.0), "scale");
 }
 
-/// Literals that must survive any rename, checked in the source itself.
+/// The `#[repr(C)]` vendor mirror must keep its exact field list, in order.
 ///
-/// This is the only guard that catches a search-and-replace reaching the
-/// `#[repr(C)]` vendor mirror: renaming a field there changes no layout,
-/// so the crate still compiles and every other test still passes while the
-/// correspondence to `aaroniartsaapi.h` is quietly destroyed.
+/// This is the only guard for the quietest failure in the tree: renaming
+/// *or reordering* a field of `AARTSAAPI_Packet` changes no size and no
+/// alignment, so the crate compiles and every other test passes while the
+/// struct stops matching `aaroniartsaapi.h`. Reordering is the worse of
+/// the two — it silently reads the wrong bytes.
+///
+/// Note `step_frequency` is the vendor's name for the sample rate and
+/// `span_frequency` is theirs for the span; neither may be "corrected" to
+/// this crate's vocabulary.
 #[test]
-fn vendor_and_device_key_literals_are_intact() {
-    let root = env!("CARGO_MANIFEST_DIR");
-    let cases: &[(&str, &[&str])] = &[
-        (
-            "src/native_sdk.rs",
-            // AARTSAAPI_Packet mirrors the vendor header field-for-field.
-            // `step_frequency` is the vendor's name for the sample rate.
-            &["span_frequency", "step_frequency", "start_frequency"],
-        ),
-        (
-            "src/http_endpoints.rs",
-            // RTSA config-tree keys, typed by the device, not by us.
-            &["centerfreq0", "reflevel0", "decimation0", "sclksource"],
-        ),
+fn vendor_packet_struct_fields_are_intact() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/native_sdk.rs"),
+    )
+    .expect("src/native_sdk.rs");
+
+    let at = src
+        .find("pub struct AARTSAAPI_Packet {")
+        .expect("AARTSAAPI_Packet must exist — it mirrors the vendor header");
+    let open = src[at..].find('{').expect("struct body") + at;
+    let close = src[open..].find('}').expect("struct end") + open;
+    let body = &src[open + 1..close];
+
+    let fields: Vec<String> = body
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("pub "))
+        .filter_map(|r| r.split(':').next())
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    let expected = [
+        "cbsize",
+        "stream_id",
+        "flags",
+        "start_time",
+        "end_time",
+        "start_frequency",
+        "step_frequency",
+        "span_frequency",
+        "rbw_frequency",
+        "num",
+        "total",
+        "size",
+        "stride",
+        "fp32",
+        "interleave",
     ];
 
-    for (rel, literals) in cases {
-        let path = std::path::Path::new(root).join(rel);
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        for lit in *literals {
-            assert!(
-                src.contains(lit),
-                "{rel} no longer contains `{lit}` — if a rename moved it, the vendor \
-                 struct or an RTSA wire key has been broken silently"
-            );
-        }
+    assert_eq!(
+        fields, expected,
+        "AARTSAAPI_Packet no longer mirrors the vendor header field-for-field, in order. \
+         A rename or reorder here breaks nothing the compiler can see."
+    );
+}
+
+/// RTSA config-tree keys are typed by the device, not chosen by us.
+///
+/// Matched with their quotes so a mention in prose does not satisfy the
+/// check — these must survive as string literals.
+#[test]
+fn rtsa_device_key_literals_are_intact() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/http_endpoints.rs"),
+    )
+    .expect("src/http_endpoints.rs");
+
+    for key in ["centerfreq0", "reflevel0", "decimation0", "sclksource"] {
+        let quoted = format!("\"{key}\"");
+        assert!(
+            src.contains(&quoted),
+            "src/http_endpoints.rs no longer contains the string literal {quoted} — \
+             renaming an RTSA config key silently stops addressing the device"
+        );
     }
 }
