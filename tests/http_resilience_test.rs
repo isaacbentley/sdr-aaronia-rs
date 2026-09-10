@@ -271,16 +271,38 @@ async fn stream_reconnects_and_reapplies_tuning() {
 
     let puts_after_start = full_tuple_control_puts(&server).await;
 
+    // A reconnect is a discontinuity: the stream stopped and resumed,
+    // so the samples either side are not adjacent. Reads therefore
+    // *stop* at it rather than splicing across — the point is that they
+    // continue afterwards, not that one read spans the hole.
     let mut buffer = Vec::new();
-    source
-        .read_samples(&mut buffer, 12)
-        .await
-        .expect("reads must continue across a reconnect");
+    let mut total = 0usize;
+    let mut reads = 0;
+    let mut saw_overrun = false;
+    while total < 12 && reads < 6 {
+        let mut chunk = Vec::new();
+        let n = source
+            .read_samples(&mut chunk, 12 - total)
+            .await
+            .expect("reads must continue across a reconnect");
+        if n == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk);
+        total += n;
+        reads += 1;
+        saw_overrun |= source.take_overrun();
+    }
 
     assert_eq!(
         buffer.len(),
         12,
-        "expected samples from several connections"
+        "expected samples from several connections, in {reads} read(s)"
+    );
+    assert!(
+        reads >= 2,
+        "the reconnect should have ended a block, so 12 samples take \
+         more than one read"
     );
     assert!(
         opens.load(Ordering::SeqCst) >= 2,
@@ -291,9 +313,12 @@ async fn stream_reconnects_and_reapplies_tuning() {
         "reconnect must re-apply the tuning, or a restarted server \
          silently streams its mission's frequency instead"
     );
+    // The flag rides with the read that *began* at the gap, so it was
+    // observed during the loop above rather than being left pending
+    // here. What matters is that some read carried it.
     assert!(
-        source.take_overrun(),
-        "samples were missed across the gap; the first packet after a \
+        saw_overrun,
+        "samples were missed across the gap; the read beginning after a \
          reconnect must be flagged as an overrun"
     );
 }

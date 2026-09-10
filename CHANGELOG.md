@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A stream gap now ends the block it precedes, instead of hiding inside
+  one.** Read assembly noted a dropped chunk and carried on concatenating,
+  so a returned block held samples from both sides of the hole while
+  `take_overrun` said only "somewhere in there". A consumer resetting its
+  filters once, before the block, still ran the discontinuity through
+  them — and for an FM discriminator that is a phase step, i.e. a
+  frequency spike that reads downstream as a sync edge.
+
+  A gap has a position, and the only position a consumer can act on is a
+  read boundary. The post-gap chunk is now stashed and the block ends,
+  exactly as it already did for a retune, with the flag carried to the
+  read that begins there. A gap on a read's first chunk still reports
+  against that read, since nothing precedes it to split from.
+
+  This also reaches reconnects, which are discontinuities for the same
+  reason: the stream stopped and resumed, so the samples either side are
+  not adjacent. Reads continue across a reconnect as before, they just
+  no longer splice across it.
+
+
 ## [v0.11.0] - 2026-09-09
 
 ### Changed

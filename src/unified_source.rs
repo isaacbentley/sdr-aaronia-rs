@@ -421,6 +421,17 @@ pub struct SpectranSource {
     /// Capture frequency of whatever is sitting in `sample_buffer`, so a
     /// leftover tail is never merged into a read at another frequency.
     sample_buffer_freq_hz: f64,
+    /// Whether the stashed samples in `sample_buffer` begin immediately
+    /// after a break in the stream.
+    ///
+    /// A gap has a *position*, not merely a presence. Assembly used to
+    /// note a dropped chunk and carry on concatenating, so the block
+    /// handed back straddled the hole while the overrun flag said only
+    /// "somewhere in there" — and a consumer resetting its filters once,
+    /// before the block, still ran the discontinuity through them. The
+    /// gap is now put on a read boundary instead, exactly as a retune
+    /// is, and this carries the flag to the read that starts there.
+    sample_buffer_after_gap: bool,
     /// Capture frequency of the samples the most recent read returned —
     /// what the stream itself reported, not what was requested. Read it
     /// with [`SpectranSource::capture_frequency_hz`].
@@ -574,6 +585,7 @@ impl SpectranSource {
             source_type: SourceType::Http, // Will be updated during detection
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
 
             #[cfg(all(
@@ -1341,6 +1353,13 @@ impl SpectranSource {
                 let from_buffer = self.sample_buffer.len().min(max_samples);
                 if from_buffer > 0 {
                     buffer.extend(self.sample_buffer.drain(0..from_buffer));
+                    // These samples were stashed because they follow a
+                    // gap; this is the read that begins with them, so
+                    // this is the read that must be told.
+                    if self.sample_buffer_after_gap {
+                        self.pending_overrun = true;
+                        self.sample_buffer_after_gap = false;
+                    }
                 }
 
                 // Capture frequency of this read. Seeded from the
@@ -1358,6 +1377,25 @@ impl SpectranSource {
                     match recv {
                         Ok(Some((mut new_samples, dropped, cum_drops, ts_ns, pkt_freq_hz))) => {
                             if dropped {
+                                if collected > 0 {
+                                    // Put the gap on a boundary rather
+                                    // than inside this block: stash the
+                                    // post-gap chunk and let the next
+                                    // read start with it, carrying the
+                                    // flag. Same shape as the retune
+                                    // boundary below, for the same
+                                    // reason — a consumer can only reset
+                                    // its state between reads.
+                                    self.sample_buffer.extend(new_samples);
+                                    self.sample_buffer_freq_hz = pkt_freq_hz;
+                                    self.sample_buffer_after_gap = true;
+                                    self.cumulative_drops = cum_drops;
+                                    self.last_timestamp_ns = ts_ns;
+                                    break;
+                                }
+                                // Nothing collected yet, so this chunk
+                                // opens the block and the gap really is
+                                // immediately before it.
                                 self.pending_overrun = true;
                             }
                             self.cumulative_drops = cum_drops;
@@ -1499,6 +1537,13 @@ impl SpectranSource {
                 let from_buffer = self.sample_buffer.len().min(max_samples);
                 if from_buffer > 0 {
                     buffer.extend(self.sample_buffer.drain(0..from_buffer));
+                    // These samples were stashed because they follow a
+                    // gap; this is the read that begins with them, so
+                    // this is the read that must be told.
+                    if self.sample_buffer_after_gap {
+                        self.pending_overrun = true;
+                        self.sample_buffer_after_gap = false;
+                    }
                 }
 
                 // 2. If we need more, receive from channel
@@ -1513,6 +1558,25 @@ impl SpectranSource {
                     match tokio::time::timeout(read_timeout, receiver.recv()).await {
                         Ok(Some((mut new_samples, dropped, cum_drops, ts_ns, pkt_freq_hz))) => {
                             if dropped {
+                                if collected > 0 {
+                                    // Put the gap on a boundary rather
+                                    // than inside this block: stash the
+                                    // post-gap chunk and let the next
+                                    // read start with it, carrying the
+                                    // flag. Same shape as the retune
+                                    // boundary below, for the same
+                                    // reason — a consumer can only reset
+                                    // its state between reads.
+                                    self.sample_buffer.extend(new_samples);
+                                    self.sample_buffer_freq_hz = pkt_freq_hz;
+                                    self.sample_buffer_after_gap = true;
+                                    self.cumulative_drops = cum_drops;
+                                    self.last_timestamp_ns = ts_ns;
+                                    break;
+                                }
+                                // Nothing collected yet, so this chunk
+                                // opens the block and the gap really is
+                                // immediately before it.
                                 self.pending_overrun = true;
                             }
                             self.cumulative_drops = cum_drops;
@@ -2727,6 +2791,7 @@ mod tests {
             source_type: SourceType::Http, // Will be updated
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
@@ -2810,6 +2875,7 @@ mod tests {
             source_type: SourceType::Http,
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
@@ -2845,6 +2911,7 @@ mod tests {
             source_type: SourceType::File,
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
@@ -2882,6 +2949,7 @@ mod tests {
             source_type: SourceType::NativeSdk,
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
@@ -3072,18 +3140,18 @@ mod tests {
         assert!(debug_str.contains("TEST123"));
     }
 
-    /// A read never spans a retune: samples captured before the device
-    /// moved must not be handed back tagged with the new frequency.
-    /// That mislabelling is what makes a sweep report a signal at a
-    /// centre it was never received on.
-    #[tokio::test]
-    async fn a_read_stops_at_a_capture_frequency_boundary() {
-        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
-        let mut source = SpectranSource {
+    /// An HTTP-backed source fed by `chunk_rx`, for the read-assembly
+    /// tests. Factored out because three of them build the same thing
+    /// and a new field otherwise has to be added in every copy.
+    fn http_test_source(
+        chunk_rx: tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64, f64)>,
+    ) -> SpectranSource {
+        SpectranSource {
             config: SpectranConfig::default(),
             source_type: SourceType::Http,
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
@@ -3102,7 +3170,91 @@ mod tests {
             last_timestamp_ns: 0,
             read_scratch: Vec::new(),
             read_scratch_rx2: Vec::new(),
-        };
+        }
+    }
+
+    /// A gap must land on a read boundary, not inside a block.
+    ///
+    /// Assembly used to note a dropped chunk and keep concatenating, so
+    /// one returned block held samples from both sides of the hole. The
+    /// overrun flag said only "somewhere in this block", and a consumer
+    /// that resets its filters once — before the block — still ran the
+    /// discontinuity through them. A gap has a position, and the only
+    /// position a consumer can act on is a boundary.
+    #[tokio::test]
+    async fn a_stream_gap_ends_the_block_it_precedes() {
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
+        let mut source = http_test_source(chunk_rx);
+
+        // Three chunks: two contiguous, then one flagged as following a
+        // dropped chunk. All the same frequency, so only the gap can
+        // split them.
+        chunk_tx
+            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 1, 915e6))
+            .await
+            .expect("channel open");
+        chunk_tx
+            .send((vec![Complex32::new(2.0, 0.0)], false, 0, 2, 915e6))
+            .await
+            .expect("channel open");
+        chunk_tx
+            .send((vec![Complex32::new(3.0, 0.0)], true, 1, 3, 915e6))
+            .await
+            .expect("channel open");
+        drop(chunk_tx);
+
+        // Asking for all three must stop at the gap.
+        let mut buffer = Vec::new();
+        let n = source
+            .read_samples(&mut buffer, 3)
+            .await
+            .expect("first read succeeds");
+        assert_eq!(n, 2, "read should stop before the post-gap chunk");
+        assert!(
+            !source.take_overrun(),
+            "this block is contiguous — the gap is after it, not in it"
+        );
+
+        // The next read starts with the post-gap chunk and owns the flag.
+        buffer.clear();
+        let n = source
+            .read_samples(&mut buffer, 3)
+            .await
+            .expect("second read succeeds");
+        assert_eq!(n, 1);
+        assert_eq!(buffer[0], Complex32::new(3.0, 0.0));
+        assert!(
+            source.take_overrun(),
+            "the read that begins at the gap must report it"
+        );
+    }
+
+    /// A gap on the very first chunk of a read has nothing before it to
+    /// split from, so it is reported against that read directly.
+    #[tokio::test]
+    async fn a_gap_on_the_first_chunk_is_reported_immediately() {
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
+        let mut source = http_test_source(chunk_rx);
+        chunk_tx
+            .send((vec![Complex32::new(9.0, 0.0)], true, 1, 1, 915e6))
+            .await
+            .expect("channel open");
+        drop(chunk_tx);
+
+        let mut buffer = Vec::new();
+        let n = source.read_samples(&mut buffer, 4).await.expect("reads");
+        assert_eq!(n, 1);
+        assert!(source.take_overrun(), "nothing preceded it to split from");
+    }
+
+    /// A read never spans a retune: samples captured before the device
+    /// moved must not be handed back tagged with the new frequency.
+    /// That mislabelling is what makes a sweep report a signal at a
+    /// centre it was never received on.
+    #[tokio::test]
+    async fn a_read_stops_at_a_capture_frequency_boundary() {
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
+        let mut source = http_test_source(chunk_rx);
 
         // Two chunks either side of a retune, queued before any read.
         chunk_tx
@@ -3139,32 +3291,14 @@ mod tests {
     async fn take_overrun_reflects_a_dropped_http_chunk() {
         // Regression test for overrun wiring: a chunk arriving from the
         // HTTP reader task flagged as dropped must surface via
-        // `take_overrun()` on the next call, and clear after being read.
+        // `take_overrun()`, and clear after being read.
+        //
+        // It surfaces on the read that *begins* with that chunk, not on
+        // one that merely contains it: a gap ends the block before it,
+        // so a consumer resetting between reads resets in the right
+        // place. See `a_stream_gap_ends_the_block_it_precedes`.
         let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
-        let mut source = SpectranSource {
-            config: SpectranConfig::default(),
-            source_type: SourceType::Http,
-            sample_buffer: VecDeque::new(),
-            sample_buffer_freq_hz: 0.0,
-            last_read_frequency_hz: 0.0,
-            #[cfg(all(
-                feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
-            ))]
-            native_source: None,
-            http_client: None,
-            http_observed: None,
-            http_rate_bits: None,
-            http_tuning: None,
-            file_source: None,
-            http_receiver: Some(chunk_rx),
-            http_task: None,
-            pending_overrun: false,
-            cumulative_drops: 0,
-            last_timestamp_ns: 0,
-            read_scratch: Vec::new(),
-            read_scratch_rx2: Vec::new(),
-        };
+        let mut source = http_test_source(chunk_rx);
 
         assert!(!source.take_overrun(), "no chunk received yet");
 
@@ -3182,12 +3316,22 @@ mod tests {
         let n = source
             .read_samples(&mut buffer, 2)
             .await
-            .expect("read_samples should drain both queued chunks");
-        assert_eq!(n, 2);
+            .expect("first read succeeds");
+        assert_eq!(n, 1, "the gap ends this block");
+        assert!(
+            !source.take_overrun(),
+            "these samples are contiguous; the gap follows them"
+        );
 
+        buffer.clear();
+        let n = source
+            .read_samples(&mut buffer, 2)
+            .await
+            .expect("second read succeeds");
+        assert_eq!(n, 1);
         assert!(
             source.take_overrun(),
-            "a dropped chunk was received during read_samples"
+            "a dropped chunk opened this read's block"
         );
         assert!(
             !source.take_overrun(),
