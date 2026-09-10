@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "python-aaronia"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "num-complex",
