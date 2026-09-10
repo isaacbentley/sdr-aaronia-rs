@@ -72,17 +72,50 @@ pub struct SpectranSdrSource {
     pub stream_format: Option<crate::http_streaming::StreamFormat>,
 }
 
-/// Tunable: how long to actively drain the read buffer after a
-/// retune before we trust subsequent reads. RTSA HTTP takes ~50–100
-/// ms to apply `configure_capture` server-side; the native SDK
-/// config-write is faster but the IQ pipeline still flushes a few
-/// packets at the old frequency. We pump `read_samples` in a tight
-/// loop during this window and discard everything we get — that
-/// keeps stale old-channel data from being tagged with the new
-/// channel frequency (a real false-positive driver: a transmitter
-/// on channel A would otherwise register as a detection on
-/// channel B for the first dwell after a hop).
-const RETUNE_SETTLE: Duration = Duration::from_millis(75);
+/// How far a packet's reported capture frequency may sit from the
+/// commanded channel and still count as that channel.
+///
+/// The device reports where it is actually tuned, which is not exactly
+/// what was asked for: its reference is offset, and the error scales
+/// with frequency. Measured on a V6 ECO, it is a consistent −0.79 ppm —
+/// −873 Hz at 1.1 GHz rising to −4.71 kHz at 5.93 GHz:
+///
+/// ```text
+///   commanded      reported        offset
+///   1100.000 MHz   1099.999127     -873 Hz
+///   3500.000 MHz   3499.997223    -2777 Hz
+///   5931.000 MHz   5930.995294    -4706 Hz
+/// ```
+///
+/// So this cannot be a tight fixed value; a 1 kHz tolerance rejects
+/// every hop above ~1.3 GHz as stale. 100 kHz clears the offset by more
+/// than 20x at the top of the range while staying far below the
+/// smallest gap between two hops (megahertz), which is all it has to
+/// separate.
+const STALE_TOLERANCE_HZ: f64 = 100_000.0;
+
+/// How long to drain the read buffer after a retune before reading for
+/// real.
+///
+/// This is an optimisation, not the correctness mechanism. Correctness
+/// comes from [`SpectranSource::capture_frequency_hz`]: every packet
+/// carries the frequency the stream says it was captured at, and the
+/// hop loop drops any that does not match the commanded channel. Stale
+/// samples are therefore rejected exactly, however long the device
+/// takes, rather than waited out and hoped about.
+///
+/// The drain only avoids spending reads on samples that will be thrown
+/// away. Measured on a V6 ECO over RTSA HTTP at 61.44 MSPS, a retune is
+/// carried by the signal within 24 ms median and 39 ms worst case over
+/// 24 hops.
+///
+/// 20 ms is below that, deliberately. The drain is pure added time on
+/// every hop, so raising it to clear the worst case costs more than the
+/// rejected reads it avoids: measured end to end, 50 ms made a 6-tune
+/// 5.8 GHz sweep slower (1.71 s against 1.54 s). Whatever the drain
+/// does not cover, the capture-frequency check rejects exactly, so the
+/// only thing at stake here is efficiency.
+const RETUNE_SETTLE: Duration = Duration::from_millis(20);
 
 /// Number of consecutive empty `read_samples` calls before assuming
 /// the source is wedged or at EOF (file backend) and exiting the
@@ -510,9 +543,33 @@ async fn hop_pump(
                 continue;
             }
             empty_reads = 0;
+            // Tag the packet with the frequency the stream says these
+            // samples were captured at, not the one just commanded.
+            // A retune takes effect a little after the config write, so
+            // the first reads after a hop can still carry the old
+            // centre; stamping those with the new channel is what makes
+            // a sweep report a transmitter at a frequency it was never
+            // received on. `capture_frequency_hz` is 0.0 on backends
+            // that carry no per-packet frequency (file, native SDK), so
+            // those fall back to the commanded channel.
+            let captured_hz = source.capture_frequency_hz();
+            if captured_hz > 0.0 && (captured_hz - channel).abs() > STALE_TOLERANCE_HZ {
+                // Pre-retune samples. Discard rather than mislabel them;
+                // the settle is short and the next read is clean. Hand
+                // the buffer back to the pool by the same route a
+                // delivered packet takes — dropping it here would shrink
+                // the pool by one on every hop.
+                raw_buffer.clear();
+                let _ = pool_tx.send(raw_buffer);
+                continue;
+            }
             let pkt = IqPacket {
                 samples: crate::sdr_source::PooledIqBuffer::new_pooled(raw_buffer, pool_tx.clone()),
-                center_frequency_hz: channel,
+                center_frequency_hz: if captured_hz > 0.0 {
+                    captured_hz
+                } else {
+                    channel
+                },
                 sample_rate_hz: source.sample_rate_hz() as f32,
                 overrun: source.take_overrun(),
             };

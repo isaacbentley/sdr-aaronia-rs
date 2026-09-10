@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.11.0] - 2026-09-09
+
+### Changed
+- **A read never spans a retune, and packets carry the frequency they
+  were captured at.** The centre frequency now travels through the
+  sample channel with the samples it belongs to, so
+  `read_samples`/`read_samples_deadline` stop at a frequency boundary
+  and `SpectranSource::capture_frequency_hz` reports what the stream
+  said, not what was requested.
+
+  Reading the frequency from shared state at consume time cannot work:
+  the reader task runs ahead of the consumer, so a buffer parsed before
+  a retune would be tagged with the frequency after it. Measured on a
+  V6 ECO over RTSA HTTP at 61.44 MSPS, a retune is carried by the signal
+  within 24 ms median and 39 ms worst case, and during that window the
+  device is still delivering the old centre.
+
+  Callers already handle short reads — `read_samples_numpy` slices what
+  it got, and a SoapySDR `readStream` returning fewer than `numElems` is
+  ordinary — so the visible change is that a buffer taken across a
+  retune is no longer a mixture of two frequencies. `RETUNE_SETTLE` in
+  the `SdrSource` facade drops from 75 ms to 20 ms with it: the
+  frequency check rejects stale samples exactly, so the drain is only an
+  efficiency measure. A 48-tune sweep of every FPV band falls from 28.2 s
+  to 5.9 s.
+
 ### Added
 - **The GPS mode can be set, not just the clock source.** `device/gpsmode`
   decides whether GPS supplies location, time, both, or nothing, and the device

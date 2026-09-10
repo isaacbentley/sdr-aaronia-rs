@@ -143,6 +143,12 @@ class SpectranSource:
     def read_samples_numpy(self, count: int) -> npt.NDArray[np.complex64]:
         """Read up to ``count`` IQ samples into a NumPy ``complex64`` array.
 
+        A read never spans a retune: if the centre frequency changes
+        part-way through, the read returns the samples captured before
+        it and the rest arrive on the next call. Expect a short array
+        around a :meth:`set_center_frequency_hz`, rather than one whose
+        samples come from two different frequencies.
+
         Raises ``SpectranTimeoutError`` if no data arrives within
         ``config.read_timeout_s``, ``SpectranConnectionError`` if the
         stream is closed, and ``ValueError`` if ``count`` exceeds the

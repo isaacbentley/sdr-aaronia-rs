@@ -418,6 +418,13 @@ pub struct SpectranSource {
     config: SpectranConfig,
     source_type: SourceType,
     sample_buffer: VecDeque<Complex32>,
+    /// Capture frequency of whatever is sitting in `sample_buffer`, so a
+    /// leftover tail is never merged into a read at another frequency.
+    sample_buffer_freq_hz: f64,
+    /// Capture frequency of the samples the most recent read returned —
+    /// what the stream itself reported, not what was requested. Read it
+    /// with [`SpectranSource::capture_frequency_hz`].
+    last_read_frequency_hz: f64,
 
     // Source-specific implementations
     #[cfg(all(
@@ -444,7 +451,7 @@ pub struct SpectranSource {
     /// task's `DropDetector` observed a timestamp gap ending at (or
     /// before) that chunk — see `pending_overrun`.
     #[allow(clippy::type_complexity)]
-    http_receiver: Option<tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64)>>,
+    http_receiver: Option<tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64, f64)>>,
     /// Background task draining the HTTP `/stream` connection. Held so it
     /// can be aborted on `stop_streaming` / drop — otherwise it lingers
     /// parked on `next().await` (holding the open connection, so the
@@ -566,6 +573,8 @@ impl SpectranSource {
             config: config.clone(),
             source_type: SourceType::Http, // Will be updated during detection
             sample_buffer: VecDeque::new(),
+            sample_buffer_freq_hz: 0.0,
+            last_read_frequency_hz: 0.0,
 
             #[cfg(all(
                 feature = "native-sdk",
@@ -970,8 +979,22 @@ impl SpectranSource {
                                 ) || std::mem::take(&mut flag_overrun_after_gap);
                                 let timestamp_ns = (packet.metadata.start_time * 1e9) as i64;
                                 let cumulative_drops = drop_detector.drops();
+                                // The capture frequency rides with the
+                                // samples it belongs to. Reading it from
+                                // shared state at consume time instead
+                                // would race the reader task, which runs
+                                // ahead of the consumer: a buffer parsed
+                                // before a retune would be tagged with the
+                                // frequency after it.
+                                let packet_center_hz = packet.sdr_config.center_frequency_hz;
                                 if sender
-                                    .send((packet.samples, dropped, cumulative_drops, timestamp_ns))
+                                    .send((
+                                        packet.samples,
+                                        dropped,
+                                        cumulative_drops,
+                                        timestamp_ns,
+                                        packet_center_hz,
+                                    ))
                                     .await
                                     .is_err()
                                 {
@@ -1292,6 +1315,14 @@ impl SpectranSource {
     /// awaiting this on a tokio worker occupies it for the duration.
     /// The C ABI wraps it in `block_in_place`; a Rust caller inside a
     /// runtime should do the same, or call it from a plain thread.
+    /// Append up to `max_samples` samples, giving up at `timeout`.
+    ///
+    /// A read never spans a retune. When the capture frequency changes
+    /// part-way through, the samples captured before it are returned and
+    /// the rest are held for the next call, so one read is always
+    /// describable by a single frequency —
+    /// [`Self::capture_frequency_hz`]. Expect a short read around a
+    /// retune; that was already possible on a timeout.
     pub async fn read_samples_deadline(
         &mut self,
         buffer: &mut Vec<Complex32>,
@@ -1312,16 +1343,43 @@ impl SpectranSource {
                     buffer.extend(self.sample_buffer.drain(0..from_buffer));
                 }
 
+                // Capture frequency of this read. Seeded from the
+                // leftover tail when there is one; otherwise the first
+                // packet to arrive sets it. A read never spans two
+                // frequencies — see the boundary check below.
+                let mut batch_freq_hz = if from_buffer > 0 {
+                    self.sample_buffer_freq_hz
+                } else {
+                    0.0
+                };
                 let mut collected = from_buffer;
                 while collected < max_samples {
                     let recv = tokio::time::timeout_at(deadline, receiver.recv()).await;
                     match recv {
-                        Ok(Some((mut new_samples, dropped, cum_drops, ts_ns))) => {
+                        Ok(Some((mut new_samples, dropped, cum_drops, ts_ns, pkt_freq_hz))) => {
                             if dropped {
                                 self.pending_overrun = true;
                             }
                             self.cumulative_drops = cum_drops;
                             self.last_timestamp_ns = ts_ns;
+                            // A retune landed mid-read. Stash the whole
+                            // packet with its own frequency and return
+                            // what we have: mixing the two would produce
+                            // a buffer that is partly stale and wholly
+                            // mislabelled, which is the failure this
+                            // frequency tag exists to prevent.
+                            if collected > 0
+                                && pkt_freq_hz > 0.0
+                                && batch_freq_hz > 0.0
+                                && (pkt_freq_hz - batch_freq_hz).abs() > 1.0
+                            {
+                                self.sample_buffer.extend(new_samples);
+                                self.sample_buffer_freq_hz = pkt_freq_hz;
+                                break;
+                            }
+                            if batch_freq_hz == 0.0 {
+                                batch_freq_hz = pkt_freq_hz;
+                            }
                             let needed = max_samples - collected;
                             if new_samples.len() <= needed {
                                 collected += new_samples.len();
@@ -1330,6 +1388,7 @@ impl SpectranSource {
                                 collected += needed;
                                 buffer.extend(new_samples.drain(0..needed));
                                 self.sample_buffer.extend(new_samples);
+                                self.sample_buffer_freq_hz = batch_freq_hz;
                             }
                         }
                         Ok(None) => {
@@ -1351,6 +1410,9 @@ impl SpectranSource {
                         std::io::ErrorKind::TimedOut,
                         "no samples arrived within the read deadline",
                     )));
+                }
+                if batch_freq_hz > 0.0 {
+                    self.last_read_frequency_hz = batch_freq_hz;
                 }
                 Ok(buffer.len() - start_len)
             }
@@ -1395,6 +1457,11 @@ impl SpectranSource {
         }
     }
 
+    /// Append up to `max_samples` samples, waiting up to the config's
+    /// read timeout.
+    ///
+    /// A read never spans a retune — see [`Self::read_samples_deadline`]
+    /// for what that means for callers.
     pub async fn read_samples(
         &mut self,
         buffer: &mut Vec<Complex32>,
@@ -1435,16 +1502,35 @@ impl SpectranSource {
                 }
 
                 // 2. If we need more, receive from channel
+                let mut batch_freq_hz = if from_buffer > 0 {
+                    self.sample_buffer_freq_hz
+                } else {
+                    0.0
+                };
                 let mut collected = from_buffer;
                 while collected < max_samples {
                     // If buffer is empty, try to receive more samples from the channel
                     match tokio::time::timeout(read_timeout, receiver.recv()).await {
-                        Ok(Some((mut new_samples, dropped, cum_drops, ts_ns))) => {
+                        Ok(Some((mut new_samples, dropped, cum_drops, ts_ns, pkt_freq_hz))) => {
                             if dropped {
                                 self.pending_overrun = true;
                             }
                             self.cumulative_drops = cum_drops;
                             self.last_timestamp_ns = ts_ns;
+                            // See `read_samples_deadline`: a read never
+                            // spans a retune.
+                            if collected > 0
+                                && pkt_freq_hz > 0.0
+                                && batch_freq_hz > 0.0
+                                && (pkt_freq_hz - batch_freq_hz).abs() > 1.0
+                            {
+                                self.sample_buffer.extend(new_samples);
+                                self.sample_buffer_freq_hz = pkt_freq_hz;
+                                break;
+                            }
+                            if batch_freq_hz == 0.0 {
+                                batch_freq_hz = pkt_freq_hz;
+                            }
                             let needed = max_samples - collected;
                             if new_samples.len() <= needed {
                                 collected += new_samples.len();
@@ -1456,6 +1542,7 @@ impl SpectranSource {
                                 // accept `Vec::append` — extend from the
                                 // remainder instead.
                                 self.sample_buffer.extend(new_samples);
+                                self.sample_buffer_freq_hz = batch_freq_hz;
                             }
                         }
                         Ok(None) => {
@@ -1491,6 +1578,9 @@ impl SpectranSource {
                             )));
                         }
                     }
+                }
+                if batch_freq_hz > 0.0 {
+                    self.last_read_frequency_hz = batch_freq_hz;
                 }
                 Ok(buffer.len() - start_len)
             }
@@ -1530,6 +1620,23 @@ impl SpectranSource {
         let overrun = self.pending_overrun;
         self.pending_overrun = false;
         overrun | self.native_take_overrun()
+    }
+
+    /// Centre frequency the samples from the most recent `read_samples`
+    /// were actually captured at, as the stream itself reported it.
+    ///
+    /// This is not the frequency that was requested. After a retune the
+    /// device keeps delivering old-centre samples for a short window
+    /// (measured at ~24 ms typical, 39 ms worst case on a V6 ECO over
+    /// RTSA HTTP), and tagging those with the commanded frequency makes
+    /// a signal appear at a centre it was never received on. A read
+    /// never spans a retune, so one value describes the whole buffer.
+    ///
+    /// `0.0` before any IQ packet has been parsed, and on the file and
+    /// native-SDK backends, which do not carry per-packet frequency —
+    /// callers should fall back to the commanded frequency then.
+    pub fn capture_frequency_hz(&self) -> f64 {
+        self.last_read_frequency_hz
     }
 
     /// Number of timestamp gaps the drop detector has seen since the
@@ -2619,6 +2726,8 @@ mod tests {
             config,
             source_type: SourceType::Http, // Will be updated
             sample_buffer: VecDeque::new(),
+            sample_buffer_freq_hz: 0.0,
+            last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -2700,6 +2809,8 @@ mod tests {
             config,
             source_type: SourceType::Http,
             sample_buffer: VecDeque::new(),
+            sample_buffer_freq_hz: 0.0,
+            last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -2733,6 +2844,8 @@ mod tests {
             config,
             source_type: SourceType::File,
             sample_buffer: VecDeque::new(),
+            sample_buffer_freq_hz: 0.0,
+            last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -2768,6 +2881,8 @@ mod tests {
             config,
             source_type: SourceType::NativeSdk,
             sample_buffer: VecDeque::new(),
+            sample_buffer_freq_hz: 0.0,
+            last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -2957,6 +3072,69 @@ mod tests {
         assert!(debug_str.contains("TEST123"));
     }
 
+    /// A read never spans a retune: samples captured before the device
+    /// moved must not be handed back tagged with the new frequency.
+    /// That mislabelling is what makes a sweep report a signal at a
+    /// centre it was never received on.
+    #[tokio::test]
+    async fn a_read_stops_at_a_capture_frequency_boundary() {
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
+        let mut source = SpectranSource {
+            config: SpectranConfig::default(),
+            source_type: SourceType::Http,
+            sample_buffer: VecDeque::new(),
+            sample_buffer_freq_hz: 0.0,
+            last_read_frequency_hz: 0.0,
+            #[cfg(all(
+                feature = "native-sdk",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            native_source: None,
+            http_client: None,
+            http_observed: None,
+            http_rate_bits: None,
+            http_tuning: None,
+            file_source: None,
+            http_receiver: Some(chunk_rx),
+            http_task: None,
+            pending_overrun: false,
+            cumulative_drops: 0,
+            last_timestamp_ns: 0,
+            read_scratch: Vec::new(),
+            read_scratch_rx2: Vec::new(),
+        };
+
+        // Two chunks either side of a retune, queued before any read.
+        chunk_tx
+            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 1, 915e6))
+            .await
+            .expect("channel open");
+        chunk_tx
+            .send((vec![Complex32::new(2.0, 0.0)], false, 0, 2, 2_400e6))
+            .await
+            .expect("channel open");
+        drop(chunk_tx);
+
+        // Asking for both must yield only the first: the second belongs
+        // to a different capture frequency.
+        let mut buffer = Vec::new();
+        let n = source
+            .read_samples(&mut buffer, 2)
+            .await
+            .expect("first read succeeds");
+        assert_eq!(n, 1, "read must stop at the retune boundary");
+        assert_eq!(source.capture_frequency_hz(), 915e6);
+
+        // The stashed chunk comes back next, under its own frequency.
+        buffer.clear();
+        let n = source
+            .read_samples(&mut buffer, 2)
+            .await
+            .expect("second read succeeds");
+        assert_eq!(n, 1);
+        assert_eq!(source.capture_frequency_hz(), 2_400e6);
+    }
+
     #[tokio::test]
     async fn take_overrun_reflects_a_dropped_http_chunk() {
         // Regression test for overrun wiring: a chunk arriving from the
@@ -2967,6 +3145,8 @@ mod tests {
             config: SpectranConfig::default(),
             source_type: SourceType::Http,
             sample_buffer: VecDeque::new(),
+            sample_buffer_freq_hz: 0.0,
+            last_read_frequency_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -2989,11 +3169,11 @@ mod tests {
         assert!(!source.take_overrun(), "no chunk received yet");
 
         chunk_tx
-            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 123456789))
+            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 123456789, 915e6))
             .await
             .expect("channel open");
         chunk_tx
-            .send((vec![Complex32::new(2.0, 0.0)], true, 1, 123456790))
+            .send((vec![Complex32::new(2.0, 0.0)], true, 1, 123456790, 915e6))
             .await
             .expect("channel open");
         drop(chunk_tx);
