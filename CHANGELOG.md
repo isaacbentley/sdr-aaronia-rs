@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.11.1] - 2026-09-10
+
 ### Fixed
 - **A stream gap now ends the block it precedes, instead of hiding inside
   one.** Read assembly noted a dropped chunk and carried on concatenating,
