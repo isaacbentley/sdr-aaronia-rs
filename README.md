@@ -93,6 +93,8 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 # sdr-aaronia-rs = { version = "0.8", features = ["native-sdk", "futuresdr"] }
 ```
 
+HTTP reads use one timeout budget for the entire requested block and return partial data at a timeout, frequency change, sample-rate change, or detected gap. `capture_frequency_hz()` and `capture_sample_rate_hz()` describe the returned samples even when newer packets are queued. File tuning setters preserve the recording's metadata.
+
 ## Quickstart
 
 Set the RF parameters and read:

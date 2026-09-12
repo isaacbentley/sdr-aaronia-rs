@@ -129,13 +129,41 @@ const EMPTY_READ_BAILOUT: u32 = 16;
 /// should see EOF rather than be silently fed an empty channel.
 const READ_ERROR_BAILOUT: u32 = 5;
 
+fn accepted_override(requested: Option<f64>, rejected: Option<u64>) -> Option<f64> {
+    requested.filter(|f| f.is_finite() && *f > 0.0 && rejected != Some(f.to_bits()))
+}
+
+fn read_budget(parked: bool, deadline: Instant) -> Duration {
+    if parked {
+        Duration::from_millis(50)
+    } else {
+        deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+fn packet_frequency(captured_hz: f64, commanded_hz: f64) -> Option<f64> {
+    if captured_hz > 0.0 {
+        ((captured_hz - commanded_hz).abs() <= STALE_TOLERANCE_HZ).then_some(captured_hz)
+    } else {
+        Some(commanded_hz)
+    }
+}
+
 impl SdrSource for SpectranSdrSource {
     fn start(
         self: Box<Self>,
         config: SourceConfig,
         advice: Arc<dyn DwellAdvice>,
     ) -> Result<SdrHandle, SdrError> {
-        let (tx, receiver) = channel::bounded::<IqPacket>(1024);
+        let block_size = self.block_size.max(1024);
+        if block_size > 8 * 1024 * 1024 {
+            return Err(SdrError::BadConfig(
+                "block_size exceeds the 64 MiB sample-buffer limit".into(),
+            ));
+        }
+        let pool_depth =
+            (64 * 1024 * 1024 / (block_size * std::mem::size_of::<Complex32>())).clamp(1, 64);
+        let (tx, receiver) = channel::bounded::<IqPacket>(pool_depth);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_thread = stop_flag.clone();
 
@@ -243,12 +271,9 @@ impl SdrSource for SpectranSdrSource {
                     let hopping =
                         !channels_hz.is_empty() && !matches!(backend, SpectranBackend::File(_));
 
-                    let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(256);
-                    for _ in 0..256 {
-                        let _ = pool_tx.send(Vec::with_capacity(block_size));
-                    }
+                    let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(pool_depth);
 
-                    if hopping {
+                    let pump_result = if hopping {
                         info!(
                             "Aaronia hop mode: {} channels, dwell {:?}-{:?} (adaptive={})",
                             channels_hz.len(),
@@ -268,7 +293,6 @@ impl SdrSource for SpectranSdrSource {
                             &pool_tx,
                         )
                         .await
-                        .map_err(|e| Error::Config(e.to_string()))?;
                     } else {
                         single_channel_pump(
                             &mut source,
@@ -281,11 +305,10 @@ impl SdrSource for SpectranSdrSource {
                             &pool_tx,
                         )
                         .await
-                        .map_err(|e| Error::Config(e.to_string()))?;
-                    }
+                    };
 
                     let _ = source.stop_streaming().await;
-                    Ok::<_, Error>(())
+                    pump_result
                 })?;
                             Ok(())
                         })() {
@@ -340,13 +363,23 @@ async fn single_channel_pump(
 ) -> Result<()> {
     let mut empty_reads = 0u32;
     let mut current_freq = center_frequency_hz;
+    let file_playback = source.source_info().source_type == SourceType::File;
+    let mut rejected_override = None;
     while !stop_thread.load(Ordering::SeqCst) {
-        let target = advice.channel_override().unwrap_or(center_frequency_hz);
+        let requested = if file_playback {
+            None
+        } else {
+            accepted_override(advice.channel_override(), rejected_override)
+        };
+        let target = requested.unwrap_or(center_frequency_hz);
         if (target - current_freq).abs() > 1.0 {
             if let Err(e) = source.set_center_frequency_hz(target).await {
                 warn!("Aaronia retune to {:.3} MHz failed: {e}", target / 1e6);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+                if requested.is_some() {
+                    rejected_override = Some(target.to_bits());
+                    continue;
+                }
+                return Err(e);
             }
             current_freq = target;
             drain_during_settle(source, block_size, RETUNE_SETTLE).await;
@@ -357,8 +390,12 @@ async fn single_channel_pump(
             .unwrap_or_else(|_| Vec::with_capacity(block_size));
         raw_buffer.clear();
 
-        let n = match source.read_samples(&mut raw_buffer, block_size).await {
+        let n = match source
+            .read_samples_deadline(&mut raw_buffer, block_size, Duration::from_millis(50))
+            .await
+        {
             Ok(v) => v,
+            Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => {
                 warn!("Aaronia read_samples error: {e} — stopping");
                 break;
@@ -374,13 +411,19 @@ async fn single_channel_pump(
             continue;
         }
         empty_reads = 0;
+        let Some(packet_center) = packet_frequency(source.capture_frequency_hz(), current_freq)
+        else {
+            raw_buffer.clear();
+            let _ = pool_tx.try_send(raw_buffer);
+            continue;
+        };
         // The rate is read per packet: on HTTP the rate the device actually
         // streams is only known once packets flow, and may not be the one
         // asked for (it snaps to the decimation ladder).
         let pkt = IqPacket {
             samples: crate::sdr_source::PooledIqBuffer::new_pooled(raw_buffer, pool_tx.clone()),
-            center_frequency_hz: current_freq,
-            sample_rate_hz: source.sample_rate_hz() as f32,
+            center_frequency_hz: packet_center,
+            sample_rate_hz: source.capture_sample_rate_hz() as f32,
             overrun: source.take_overrun(),
         };
         if tx.send(pkt).is_err() {
@@ -426,12 +469,13 @@ async fn hop_pump(
     // by contrast is per-hop on purpose: a quiet channel isn't a
     // dead source, and hopping is the cure.
     let mut read_errors = 0u32;
+    let mut rejected_override = None;
     while !stop_thread.load(Ordering::SeqCst) {
         // A live `/video` viewer wants a specific channel: park there,
         // bypassing the hop list, until the override changes or clears.
         // `channel_idx` only advances on a genuine hop below, so hopping
         // resumes exactly where it left off once the viewer disconnects.
-        let override_freq = advice.channel_override();
+        let override_freq = accepted_override(advice.channel_override(), rejected_override);
         let channel = override_freq.unwrap_or_else(|| {
             let c = channels_hz[channel_idx];
             channel_idx = (channel_idx + 1) % channels_hz.len();
@@ -444,6 +488,10 @@ async fn hop_pump(
         if channel != current_channel {
             if let Err(e) = source.set_center_frequency_hz(channel).await {
                 warn!("Aaronia retune to {:.3} MHz failed: {e}", channel / 1e6);
+                if override_freq.is_some() {
+                    rejected_override = Some(channel.to_bits());
+                    continue;
+                }
                 consecutive_retune_failures += 1;
                 if consecutive_retune_failures >= READ_ERROR_BAILOUT {
                     return Err(Error::Config(format!(
@@ -473,22 +521,10 @@ async fn hop_pump(
             if stop_thread.load(Ordering::SeqCst) {
                 break;
             }
-            let still_overridden = advice.channel_override() == Some(channel);
-            if override_freq.is_some() {
-                // Parked here for live view: hold regardless of the dwell
-                // deadline, but break out the moment the viewer's channel
-                // changes or they disconnect so the outer loop can retune
-                // or resume hopping.
-                if !still_overridden {
-                    break;
-                }
-            } else if still_overridden {
-                // A viewer just requested this exact channel while we were
-                // still mid-hop-dwell here — break out now (rather than
-                // waiting for the normal dwell deadline) so the next outer
-                // iteration parks on it promptly.
+            if accepted_override(advice.channel_override(), rejected_override) != override_freq {
                 break;
-            } else if Instant::now() >= deadline {
+            }
+            if override_freq.is_none() && Instant::now() >= deadline {
                 break;
             }
 
@@ -506,7 +542,7 @@ async fn hop_pump(
             // channel stays open instead of closing. Returning whatever
             // arrived by the deadline keeps the hop cadence intact, and
             // the `n == 0` branch below already handles an empty read.
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = read_budget(override_freq.is_some(), deadline);
             let n = match source
                 .read_samples_deadline(&mut raw_buffer, block_size, remaining)
                 .await
@@ -553,24 +589,20 @@ async fn hop_pump(
             // that carry no per-packet frequency (file, native SDK), so
             // those fall back to the commanded channel.
             let captured_hz = source.capture_frequency_hz();
-            if captured_hz > 0.0 && (captured_hz - channel).abs() > STALE_TOLERANCE_HZ {
+            let Some(packet_center) = packet_frequency(captured_hz, channel) else {
                 // Pre-retune samples. Discard rather than mislabel them;
                 // the settle is short and the next read is clean. Hand
                 // the buffer back to the pool by the same route a
                 // delivered packet takes — dropping it here would shrink
                 // the pool by one on every hop.
                 raw_buffer.clear();
-                let _ = pool_tx.send(raw_buffer);
+                let _ = pool_tx.try_send(raw_buffer);
                 continue;
-            }
+            };
             let pkt = IqPacket {
                 samples: crate::sdr_source::PooledIqBuffer::new_pooled(raw_buffer, pool_tx.clone()),
-                center_frequency_hz: if captured_hz > 0.0 {
-                    captured_hz
-                } else {
-                    channel
-                },
-                sample_rate_hz: source.sample_rate_hz() as f32,
+                center_frequency_hz: packet_center,
+                sample_rate_hz: source.capture_sample_rate_hz() as f32,
                 overrun: source.take_overrun(),
             };
             if tx.send(pkt).is_err() {
@@ -610,5 +642,33 @@ async fn drain_during_settle(
             Ok(Ok(_samples)) => continue, // discard old-channel data
             Ok(Err(_)) | Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    #[test]
+    fn parked_reads_continue_after_the_original_dwell_expires() {
+        let expired = Instant::now() - Duration::from_secs(1);
+        assert!(!read_budget(true, expired).is_zero());
+        assert!(read_budget(false, expired).is_zero());
+    }
+    #[test]
+    fn single_channel_packets_reject_stale_frequency_metadata() {
+        assert_eq!(packet_frequency(433e6, 915e6), None);
+        assert_eq!(packet_frequency(915e6 - 500.0, 915e6), Some(915e6 - 500.0));
+        assert_eq!(packet_frequency(0.0, 915e6), Some(915e6));
+    }
+    #[test]
+    fn override_can_move_to_another_channel_or_clear() {
+        assert_ne!(None, accepted_override(Some(915e6), None));
+        assert_ne!(Some(915e6), accepted_override(Some(433e6), None));
+        assert_ne!(Some(915e6), accepted_override(None, None));
+        assert_eq!(None, accepted_override(Some(f64::NAN), None));
+        assert_eq!(
+            None,
+            accepted_override(Some(915e6), Some(915e6_f64.to_bits()))
+        );
     }
 }

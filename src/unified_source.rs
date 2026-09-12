@@ -421,6 +421,7 @@ pub struct SpectranSource {
     /// Capture frequency of whatever is sitting in `sample_buffer`, so a
     /// leftover tail is never merged into a read at another frequency.
     sample_buffer_freq_hz: f64,
+    sample_buffer_rate_hz: f64,
     /// Whether the stashed samples in `sample_buffer` begin immediately
     /// after a break in the stream.
     ///
@@ -436,6 +437,7 @@ pub struct SpectranSource {
     /// what the stream itself reported, not what was requested. Read it
     /// with [`SpectranSource::capture_frequency_hz`].
     last_read_frequency_hz: f64,
+    last_read_sample_rate_hz: f64,
 
     // Source-specific implementations
     #[cfg(all(
@@ -462,7 +464,7 @@ pub struct SpectranSource {
     /// task's `DropDetector` observed a timestamp gap ending at (or
     /// before) that chunk — see `pending_overrun`.
     #[allow(clippy::type_complexity)]
-    http_receiver: Option<tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64, f64)>>,
+    http_receiver: Option<tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64, f64, f64)>>,
     /// Background task draining the HTTP `/stream` connection. Held so it
     /// can be aborted on `stop_streaming` / drop — otherwise it lingers
     /// parked on `next().await` (holding the open connection, so the
@@ -585,8 +587,10 @@ impl SpectranSource {
             source_type: SourceType::Http, // Will be updated during detection
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_rate_hz: 0.0,
             sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
+            last_read_sample_rate_hz: 0.0,
 
             #[cfg(all(
                 feature = "native-sdk",
@@ -1006,6 +1010,7 @@ impl SpectranSource {
                                         cumulative_drops,
                                         timestamp_ns,
                                         packet_center_hz,
+                                        packet.sdr_config.sample_rate_hz,
                                     ))
                                     .await
                                     .is_err()
@@ -1329,12 +1334,11 @@ impl SpectranSource {
     /// runtime should do the same, or call it from a plain thread.
     /// Append up to `max_samples` samples, giving up at `timeout`.
     ///
-    /// A read never spans a retune. When the capture frequency changes
-    /// part-way through, the samples captured before it are returned and
-    /// the rest are held for the next call, so one read is always
-    /// describable by a single frequency —
-    /// [`Self::capture_frequency_hz`]. Expect a short read around a
-    /// retune; that was already possible on a timeout.
+    /// A read never spans a frequency or sample-rate change. Samples
+    /// captured before the change are returned and the rest are held for
+    /// the next call. [`Self::capture_frequency_hz`] and
+    /// [`Self::capture_sample_rate_hz`] describe the returned samples.
+    /// Expect a short read at either boundary, as on a timeout.
     pub async fn read_samples_deadline(
         &mut self,
         buffer: &mut Vec<Complex32>,
@@ -1371,11 +1375,23 @@ impl SpectranSource {
                 } else {
                     0.0
                 };
+                let mut batch_rate_hz = if from_buffer > 0 {
+                    self.sample_buffer_rate_hz
+                } else {
+                    0.0
+                };
                 let mut collected = from_buffer;
                 while collected < max_samples {
                     let recv = tokio::time::timeout_at(deadline, receiver.recv()).await;
                     match recv {
-                        Ok(Some((mut new_samples, dropped, cum_drops, ts_ns, pkt_freq_hz))) => {
+                        Ok(Some((
+                            mut new_samples,
+                            dropped,
+                            cum_drops,
+                            ts_ns,
+                            pkt_freq_hz,
+                            pkt_rate_hz,
+                        ))) => {
                             if dropped {
                                 if collected > 0 {
                                     // Put the gap on a boundary rather
@@ -1388,6 +1404,7 @@ impl SpectranSource {
                                     // its state between reads.
                                     self.sample_buffer.extend(new_samples);
                                     self.sample_buffer_freq_hz = pkt_freq_hz;
+                                    self.sample_buffer_rate_hz = pkt_rate_hz;
                                     self.sample_buffer_after_gap = true;
                                     self.cumulative_drops = cum_drops;
                                     self.last_timestamp_ns = ts_ns;
@@ -1400,23 +1417,28 @@ impl SpectranSource {
                             }
                             self.cumulative_drops = cum_drops;
                             self.last_timestamp_ns = ts_ns;
-                            // A retune landed mid-read. Stash the whole
-                            // packet with its own frequency and return
+                            // A frequency or rate change landed mid-read. Stash
+                            // the packet with its own metadata and return
                             // what we have: mixing the two would produce
                             // a buffer that is partly stale and wholly
                             // mislabelled, which is the failure this
                             // frequency tag exists to prevent.
                             if collected > 0
-                                && pkt_freq_hz > 0.0
-                                && batch_freq_hz > 0.0
-                                && (pkt_freq_hz - batch_freq_hz).abs() > 1.0
+                                && ((pkt_freq_hz > 0.0
+                                    && batch_freq_hz > 0.0
+                                    && (pkt_freq_hz - batch_freq_hz).abs() > 1.0)
+                                    || pkt_rate_hz != batch_rate_hz)
                             {
                                 self.sample_buffer.extend(new_samples);
                                 self.sample_buffer_freq_hz = pkt_freq_hz;
+                                self.sample_buffer_rate_hz = pkt_rate_hz;
                                 break;
                             }
                             if batch_freq_hz == 0.0 {
                                 batch_freq_hz = pkt_freq_hz;
+                            }
+                            if batch_rate_hz == 0.0 {
+                                batch_rate_hz = pkt_rate_hz;
                             }
                             let needed = max_samples - collected;
                             if new_samples.len() <= needed {
@@ -1427,6 +1449,7 @@ impl SpectranSource {
                                 buffer.extend(new_samples.drain(0..needed));
                                 self.sample_buffer.extend(new_samples);
                                 self.sample_buffer_freq_hz = batch_freq_hz;
+                                self.sample_buffer_rate_hz = batch_rate_hz;
                             }
                         }
                         Ok(None) => {
@@ -1451,6 +1474,9 @@ impl SpectranSource {
                 }
                 if batch_freq_hz > 0.0 {
                     self.last_read_frequency_hz = batch_freq_hz;
+                }
+                if collected > 0 {
+                    self.last_read_sample_rate_hz = batch_rate_hz;
                 }
                 Ok(buffer.len() - start_len)
             }
@@ -1491,7 +1517,7 @@ impl SpectranSource {
                     }
                 }
             }
-            _ => self.read_samples(buffer, max_samples).await,
+            _ => Box::pin(self.read_samples(buffer, max_samples)).await,
         }
     }
 
@@ -1525,128 +1551,8 @@ impl SpectranSource {
             )))]
             SourceType::NativeSdk => Err(Error::Config("Native SDK not available".to_string())),
             SourceType::Http => {
-                let start_len = buffer.len();
-                // Read before the `&mut self` borrow of `http_receiver`.
-                let read_timeout = self.config.read_timeout;
-                let receiver = self
-                    .http_receiver
-                    .as_mut()
-                    .ok_or_else(|| Error::Config("HTTP receiver not initialized".to_string()))?;
-
-                // 1. Drain from internal buffer first
-                let from_buffer = self.sample_buffer.len().min(max_samples);
-                if from_buffer > 0 {
-                    buffer.extend(self.sample_buffer.drain(0..from_buffer));
-                    // These samples were stashed because they follow a
-                    // gap; this is the read that begins with them, so
-                    // this is the read that must be told.
-                    if self.sample_buffer_after_gap {
-                        self.pending_overrun = true;
-                        self.sample_buffer_after_gap = false;
-                    }
-                }
-
-                // 2. If we need more, receive from channel
-                let mut batch_freq_hz = if from_buffer > 0 {
-                    self.sample_buffer_freq_hz
-                } else {
-                    0.0
-                };
-                let mut collected = from_buffer;
-                while collected < max_samples {
-                    // If buffer is empty, try to receive more samples from the channel
-                    match tokio::time::timeout(read_timeout, receiver.recv()).await {
-                        Ok(Some((mut new_samples, dropped, cum_drops, ts_ns, pkt_freq_hz))) => {
-                            if dropped {
-                                if collected > 0 {
-                                    // Put the gap on a boundary rather
-                                    // than inside this block: stash the
-                                    // post-gap chunk and let the next
-                                    // read start with it, carrying the
-                                    // flag. Same shape as the retune
-                                    // boundary below, for the same
-                                    // reason — a consumer can only reset
-                                    // its state between reads.
-                                    self.sample_buffer.extend(new_samples);
-                                    self.sample_buffer_freq_hz = pkt_freq_hz;
-                                    self.sample_buffer_after_gap = true;
-                                    self.cumulative_drops = cum_drops;
-                                    self.last_timestamp_ns = ts_ns;
-                                    break;
-                                }
-                                // Nothing collected yet, so this chunk
-                                // opens the block and the gap really is
-                                // immediately before it.
-                                self.pending_overrun = true;
-                            }
-                            self.cumulative_drops = cum_drops;
-                            self.last_timestamp_ns = ts_ns;
-                            // See `read_samples_deadline`: a read never
-                            // spans a retune.
-                            if collected > 0
-                                && pkt_freq_hz > 0.0
-                                && batch_freq_hz > 0.0
-                                && (pkt_freq_hz - batch_freq_hz).abs() > 1.0
-                            {
-                                self.sample_buffer.extend(new_samples);
-                                self.sample_buffer_freq_hz = pkt_freq_hz;
-                                break;
-                            }
-                            if batch_freq_hz == 0.0 {
-                                batch_freq_hz = pkt_freq_hz;
-                            }
-                            let needed = max_samples - collected;
-                            if new_samples.len() <= needed {
-                                collected += new_samples.len();
-                                buffer.append(&mut new_samples);
-                            } else {
-                                collected += needed;
-                                buffer.extend(new_samples.drain(0..needed));
-                                // `sample_buffer` is a VecDeque, so it can't
-                                // accept `Vec::append` — extend from the
-                                // remainder instead.
-                                self.sample_buffer.extend(new_samples);
-                                self.sample_buffer_freq_hz = batch_freq_hz;
-                            }
-                        }
-                        Ok(None) => {
-                            // Reader task gone (server closed the stream or
-                            // the parser gave up). Returning Ok(0) forever
-                            // here made every consumer spin on a dead
-                            // stream with no way to distinguish "no data
-                            // yet" from "stream is dead" — surface it.
-                            if collected == 0 {
-                                return Err(Error::StreamClosed(
-                                    "HTTP sample stream closed (reader task ended)".to_string(),
-                                ));
-                            }
-                            break;
-                        }
-                        Err(_) => {
-                            // Samples already moved into `buffer` are not
-                            // put back, so a timeout after a partial block
-                            // returns that block, as `read_samples_deadline`
-                            // does. Erroring here lost everything collected
-                            // so far without flagging a gap.
-                            if collected > 0 {
-                                warn!(
-                                    "Timeout waiting for HTTP samples; returning {} of {} requested",
-                                    collected, max_samples
-                                );
-                                break;
-                            }
-                            error!("Timeout waiting for HTTP samples.");
-                            return Err(Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "Timeout waiting for HTTP samples",
-                            )));
-                        }
-                    }
-                }
-                if batch_freq_hz > 0.0 {
-                    self.last_read_frequency_hz = batch_freq_hz;
-                }
-                Ok(buffer.len() - start_len)
+                self.read_samples_deadline(buffer, max_samples, self.config.read_timeout)
+                    .await
             }
             SourceType::File => {
                 if let Some(ref mut source) = self.file_source {
@@ -1701,6 +1607,18 @@ impl SpectranSource {
     /// callers should fall back to the commanded frequency then.
     pub fn capture_frequency_hz(&self) -> f64 {
         self.last_read_frequency_hz
+    }
+
+    /// Sample rate of the most recently returned samples. HTTP reads keep
+    /// this metadata with queued samples and stop at a rate change, even
+    /// when the background reader has already observed a newer rate.
+    /// Other backends, or HTTP packets without a rate, use `sample_rate_hz`.
+    pub fn capture_sample_rate_hz(&self) -> f64 {
+        if self.last_read_sample_rate_hz.is_finite() && self.last_read_sample_rate_hz > 0.0 {
+            self.last_read_sample_rate_hz
+        } else {
+            self.sample_rate_hz()
+        }
     }
 
     /// Number of timestamp gaps the drop detector has seen since the
@@ -1904,6 +1822,9 @@ impl SpectranSource {
     ///   meaningless. Hopping orchestrators shouldn't drive a file backend,
     ///   but the no-op keeps the abstraction tidy.
     pub async fn set_center_frequency_hz(&mut self, hz: f64) -> Result<()> {
+        if self.source_type == SourceType::File {
+            return Ok(());
+        }
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
@@ -1966,6 +1887,9 @@ impl SpectranSource {
 
     /// Update the IQ sample rate of the running source.
     pub async fn set_sample_rate_hz(&mut self, hz: f64) -> Result<()> {
+        if self.source_type == SourceType::File {
+            return Ok(());
+        }
         // Enforce the IQ-mode constraint at runtime exactly as the
         // builder does at construction: without this, an out-of-range
         // runtime rate was shipped to the server unchecked, the request
@@ -2030,6 +1954,9 @@ impl SpectranSource {
 
     /// Update the reference level (in dBm) of the running source.
     pub async fn set_reference_level_dbm(&mut self, dbm: f64) -> Result<()> {
+        if self.source_type == SourceType::File {
+            return Ok(());
+        }
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
@@ -2791,8 +2718,10 @@ mod tests {
             source_type: SourceType::Http, // Will be updated
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_rate_hz: 0.0,
             sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
+            last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -2875,8 +2804,10 @@ mod tests {
             source_type: SourceType::Http,
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_rate_hz: 0.0,
             sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
+            last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -2911,8 +2842,10 @@ mod tests {
             source_type: SourceType::File,
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_rate_hz: 0.0,
             sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
+            last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -2949,8 +2882,10 @@ mod tests {
             source_type: SourceType::NativeSdk,
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_rate_hz: 0.0,
             sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
+            last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -3144,15 +3079,17 @@ mod tests {
     /// tests. Factored out because three of them build the same thing
     /// and a new field otherwise has to be added in every copy.
     fn http_test_source(
-        chunk_rx: tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64, f64)>,
+        chunk_rx: tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64, f64, f64)>,
     ) -> SpectranSource {
         SpectranSource {
             config: SpectranConfig::default(),
             source_type: SourceType::Http,
             sample_buffer: VecDeque::new(),
             sample_buffer_freq_hz: 0.0,
+            sample_buffer_rate_hz: 0.0,
             sample_buffer_after_gap: false,
             last_read_frequency_hz: 0.0,
+            last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
                 any(target_os = "windows", target_os = "linux")
@@ -3173,6 +3110,88 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn queued_samples_keep_their_rate_and_reads_stop_at_rate_changes() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut source = http_test_source(rx);
+        // The producer has already seen 2 MS/s while 1 MS/s data is queued.
+        source.http_rate_bits = Some(Arc::new(std::sync::atomic::AtomicU64::new(
+            2e6_f64.to_bits(),
+        )));
+        tx.send((vec![Complex32::new(1.0, 0.0); 2], false, 0, 1, 915e6, 1e6))
+            .await
+            .unwrap();
+        tx.send((vec![Complex32::new(2.0, 0.0); 3], false, 0, 2, 915e6, 2e6))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut buffer = Vec::new();
+        assert_eq!(source.read_samples(&mut buffer, 10).await.unwrap(), 2);
+        assert_eq!(source.capture_sample_rate_hz(), 1e6);
+        assert!(buffer.iter().all(|s| s.re == 1.0));
+        buffer.clear();
+        assert_eq!(source.read_samples(&mut buffer, 2).await.unwrap(), 2);
+        assert_eq!(source.capture_sample_rate_hz(), 2e6);
+        buffer.clear();
+        assert_eq!(source.read_samples(&mut buffer, 10).await.unwrap(), 1);
+        assert_eq!(source.capture_sample_rate_hz(), 2e6);
+        assert_eq!(buffer[0].re, 2.0);
+    }
+
+    #[tokio::test]
+    async fn read_timeout_is_a_budget_for_the_whole_block() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut source = http_test_source(rx);
+        source.config.read_timeout = Duration::from_millis(80);
+        tx.send((vec![Complex32::new(1.0, 0.0)], false, 0, 1, 915e6, 1e6))
+            .await
+            .unwrap();
+        let feeder = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if tx
+                    .send((vec![Complex32::new(2.0, 0.0)], false, 0, 2, 915e6, 1e6))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut buffer = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_millis(400),
+            source.read_samples(&mut buffer, 100),
+        )
+        .await;
+        feeder.abort();
+        let count = result
+            .expect("each new packet restarted the timeout")
+            .unwrap();
+        assert!((1..100).contains(&count));
+        assert_eq!(buffer.len(), count);
+    }
+
+    #[tokio::test]
+    async fn file_setters_do_not_rewrite_recording_metadata() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut source = http_test_source(rx);
+        source.source_type = SourceType::File;
+        let before = source.config.clone();
+        source.set_center_frequency_hz(915e6).await.unwrap();
+        source.set_sample_rate_hz(1e6).await.unwrap();
+        source.set_reference_level_dbm(-10.0).await.unwrap();
+        assert_eq!(
+            source.config.center_frequency_hz,
+            before.center_frequency_hz
+        );
+        assert_eq!(source.config.sample_rate_hz, before.sample_rate_hz);
+        assert_eq!(
+            source.config.reference_level_dbm,
+            before.reference_level_dbm
+        );
+    }
+
     /// A gap must land on a read boundary, not inside a block.
     ///
     /// Assembly used to note a dropped chunk and keep concatenating, so
@@ -3190,15 +3209,15 @@ mod tests {
         // dropped chunk. All the same frequency, so only the gap can
         // split them.
         chunk_tx
-            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 1, 915e6))
+            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 1, 915e6, 1e6))
             .await
             .expect("channel open");
         chunk_tx
-            .send((vec![Complex32::new(2.0, 0.0)], false, 0, 2, 915e6))
+            .send((vec![Complex32::new(2.0, 0.0)], false, 0, 2, 915e6, 1e6))
             .await
             .expect("channel open");
         chunk_tx
-            .send((vec![Complex32::new(3.0, 0.0)], true, 1, 3, 915e6))
+            .send((vec![Complex32::new(3.0, 0.0)], true, 1, 3, 915e6, 1e6))
             .await
             .expect("channel open");
         drop(chunk_tx);
@@ -3236,7 +3255,7 @@ mod tests {
         let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
         let mut source = http_test_source(chunk_rx);
         chunk_tx
-            .send((vec![Complex32::new(9.0, 0.0)], true, 1, 1, 915e6))
+            .send((vec![Complex32::new(9.0, 0.0)], true, 1, 1, 915e6, 1e6))
             .await
             .expect("channel open");
         drop(chunk_tx);
@@ -3258,11 +3277,11 @@ mod tests {
 
         // Two chunks either side of a retune, queued before any read.
         chunk_tx
-            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 1, 915e6))
+            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 1, 915e6, 1e6))
             .await
             .expect("channel open");
         chunk_tx
-            .send((vec![Complex32::new(2.0, 0.0)], false, 0, 2, 2_400e6))
+            .send((vec![Complex32::new(2.0, 0.0)], false, 0, 2, 2_400e6, 1e6))
             .await
             .expect("channel open");
         drop(chunk_tx);
@@ -3303,11 +3322,25 @@ mod tests {
         assert!(!source.take_overrun(), "no chunk received yet");
 
         chunk_tx
-            .send((vec![Complex32::new(1.0, 0.0)], false, 0, 123456789, 915e6))
+            .send((
+                vec![Complex32::new(1.0, 0.0)],
+                false,
+                0,
+                123456789,
+                915e6,
+                1e6,
+            ))
             .await
             .expect("channel open");
         chunk_tx
-            .send((vec![Complex32::new(2.0, 0.0)], true, 1, 123456790, 915e6))
+            .send((
+                vec![Complex32::new(2.0, 0.0)],
+                true,
+                1,
+                123456790,
+                915e6,
+                1e6,
+            ))
             .await
             .expect("channel open");
         drop(chunk_tx);
