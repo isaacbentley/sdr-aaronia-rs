@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.11.2] - 2026-09-11
+
+### Added
+- **`capture_sample_rate_hz()`** on `SpectranSource`, the rate counterpart of
+  `capture_frequency_hz()`. It describes the samples a read just returned, not
+  the newest rate the background reader has seen, so a consumer that resamples
+  or sizes an FFT from it agrees with the block in its hands.
+
+### Fixed
+- **A read no longer spans a sample-rate change.** The retune boundary rule
+  from 0.11.0 covered frequency only, so a rate change could land mid-block —
+  with the returned samples labelled at whichever rate the reader had reached
+  by then. Reads now stop at a rate change too, holding the rest for the next
+  call, and queued samples keep the rate they were captured at.
+- **The HTTP read timeout is a budget for the whole block, not per receive.**
+  A read asking for a large block against a slow stream could wait the full
+  timeout repeatedly and take far longer than the caller allowed.
+- **File tuning setters no longer rewrite the recording's metadata.**
+  `set_center_frequency_hz`, `set_sample_rate_hz` and `set_reference_level_dbm`
+  overwrote the config on a file source, so the playback then described itself
+  by what was asked for rather than by what was recorded.
+
+### Fixed (futuresdr source)
+- **The buffer pool is bounded by bytes, not by a fixed count.** It held 256
+  buffers of `block_size` regardless of size — 256 MiB at a 1 Mi-sample block.
+  Depth is now derived from `block_size` against a 64 MiB ceiling, and a
+  `block_size` past that ceiling is rejected at `start()` instead of consuming
+  the memory.
+- **A refused channel override is no longer retried forever.** A retune the
+  device rejected slept 100 ms and tried the same frequency again, indefinitely.
+  The rejected frequency is now remembered and skipped until the override
+  changes. A retune failure on the *commanded* frequency, which has no such
+  fallback, propagates rather than spinning.
+- **A parked viewer keeps receiving after its dwell expires.** Reads for an
+  override channel were budgeted from the hop deadline, which is already in the
+  past once parked — so the read budget was zero and the viewer starved.
+- **Packets carry the metadata of the samples in them.** They reported the
+  commanded frequency and the source's current rate; they now carry the
+  captured pair, and samples whose frequency cannot be confirmed are dropped
+  rather than mislabelled.
+- **Returning a buffer to a full pool cannot block the pump.**
+
 ## [v0.11.1] - 2026-09-10
 
 ### Fixed
