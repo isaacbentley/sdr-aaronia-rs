@@ -1047,20 +1047,62 @@ impl StreamParser {
             .collect())
     }
 
-    /// Optimized Float16 IQ parsing with bulk operations
+    /// Convert half-float IQ in bulk so `half` can use SIMD conversion.
     fn parse_iq_float16_optimized(&self, data: &[u8]) -> Result<Vec<Complex32>> {
-        // Same `collect`-over-`TrustedLen` shape as the int16 path above,
-        // for the same reason.
-        Ok(data
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|chunk| {
-                let i_raw = f16::from_le_bytes([chunk[0], chunk[1]]);
-                let q_raw = f16::from_le_bytes([chunk[2], chunk[3]]);
-                Complex32::new(i_raw.to_f32(), q_raw.to_f32())
-            })
-            .collect())
+        #[cfg(target_endian = "little")]
+        {
+            use half::slice::HalfFloatSliceExt;
+
+            let num_samples = data.len() / 4;
+            let payload = &data[..num_samples * 4];
+            let mut samples = vec![Complex32::default(); num_samples];
+            // Complex32 is repr(C), with two adjacent f32 fields. Pin
+            // their size and alignment before borrowing them as scalars.
+            const _: () = {
+                assert!(std::mem::size_of::<Complex32>() == 2 * std::mem::size_of::<f32>());
+                assert!(std::mem::align_of::<Complex32>() == std::mem::align_of::<f32>());
+            };
+            // SAFETY: the vector contains initialized, exclusively borrowed
+            // pairs of f32. The length covers exactly those fields; there
+            // is no padding or allocation/deallocation through this view.
+            let output = unsafe {
+                std::slice::from_raw_parts_mut(samples.as_mut_ptr().cast::<f32>(), num_samples * 2)
+            };
+            // SAFETY: f16 is repr(transparent) over u16 and all bit patterns
+            // are valid. align_to checks alignment before forming the
+            // middle slice, and little-endian wire bytes are native here.
+            let (prefix, halves, suffix) = unsafe { payload.align_to::<f16>() };
+            if prefix.is_empty() && suffix.is_empty() {
+                halves.convert_to_f32_slice(output);
+            } else {
+                // A JSON header can place the payload at an odd address.
+                // Copy bounded blocks into aligned storage instead of
+                // manufacturing an unaligned f16 reference or allocating
+                // a second packet-sized vector.
+                let mut scratch = [f16::ZERO; 512];
+                for (bytes, values) in payload.chunks(1024).zip(output.chunks_mut(512)) {
+                    for (half, raw) in scratch.iter_mut().zip(bytes.as_chunks::<2>().0) {
+                        *half = f16::from_le_bytes(*raw);
+                    }
+                    scratch[..values.len()].convert_to_f32_slice(values);
+                }
+            }
+            Ok(samples)
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            Ok(data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| {
+                    let i_raw = f16::from_le_bytes([chunk[0], chunk[1]]);
+                    let q_raw = f16::from_le_bytes([chunk[2], chunk[3]]);
+                    Complex32::new(i_raw.to_f32(), q_raw.to_f32())
+                })
+                .collect())
+        }
     }
 
     /// Optimized Float32 IQ parsing.
@@ -1549,6 +1591,139 @@ mod tests {
         );
     }
     use super::*;
+
+    // The per-scalar implementation preceding the bulk conversion. Keep
+    // this independent reference for exact tests and the opt-in A/B meter.
+    fn scalar_float16_iq(data: &[u8]) -> Vec<Complex32> {
+        data.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| {
+                Complex32::new(
+                    f16::from_le_bytes([chunk[0], chunk[1]]).to_f32(),
+                    f16::from_le_bytes([chunk[2], chunk[3]]).to_f32(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_float16_iq_matches_scalar(data: &[u8]) {
+        let parser = StreamParser::new(StreamFormat::Float16, None).unwrap();
+        let actual = parser.parse_iq_float16_optimized(data).unwrap();
+        let expected = scalar_float16_iq(data);
+        assert_eq!(actual.len(), expected.len());
+        for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(a.re.to_bits(), e.re.to_bits(), "I sample {index}");
+            assert_eq!(a.im.to_bits(), e.im.to_bits(), "Q sample {index}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "half SIMD conversion uses hardware intrinsics / inline assembly"
+    )]
+    fn float16_bulk_matches_every_half_bit_pattern_at_both_alignments() {
+        // Exhaust all 65,536 representations, including both zeros,
+        // subnormals, infinities, and signed quiet/signaling NaN payloads.
+        // Compare bits rather than float equality so NaN and signed-zero
+        // behavior is checked against the previous scalar conversion.
+        let payload: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        for offset in 0..2 {
+            let mut storage = vec![0; payload.len() + offset];
+            storage[offset..].copy_from_slice(&payload);
+            assert_eq!(storage[offset..].as_ptr() as usize % 2, offset);
+            assert_float16_iq_matches_scalar(&storage[offset..]);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "half SIMD conversion uses hardware intrinsics / inline assembly"
+    )]
+    fn float16_bulk_handles_odd_pair_counts_and_partial_trailing_bytes() {
+        let patterns = [
+            0x0000u16, 0x8000, 0x0001, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x8400, 0x3c00, 0xbc00,
+            0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00, 0xfe00, 0x7c01, 0xfc01, 0x7fff, 0xffff,
+        ];
+        for pairs in [0, 1, 2, 3, 7, 255, 256, 257, 511, 512, 513] {
+            for offset in 0..2 {
+                for trailing in 0..4 {
+                    let mut storage = vec![0; offset + pairs * 4 + trailing];
+                    for (n, bytes) in storage[offset..offset + pairs * 4]
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .enumerate()
+                    {
+                        *bytes = patterns[n % patterns.len()].to_le_bytes();
+                    }
+                    storage[offset + pairs * 4..].fill(0xff);
+                    assert_float16_iq_matches_scalar(&storage[offset..]);
+                }
+            }
+        }
+    }
+
+    /// Compare the production bulk parser against its preceding scalar
+    /// implementation in one binary. Nothing outside these decode calls
+    /// is timed. Run without concurrent builds or decoder benchmarks:
+    /// `cargo test --release --lib float16_bulk_throughput_meter -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "A/B throughput meter, run with --release and --nocapture"]
+    fn float16_bulk_throughput_meter() {
+        use std::hint::black_box;
+
+        const ITERATIONS: usize = 20_000;
+        let parser = StreamParser::new(StreamFormat::Float16, None).unwrap();
+        let time = |decode: &mut dyn FnMut() -> Vec<Complex32>| {
+            for _ in 0..2000 {
+                black_box(decode());
+            }
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(decode());
+            }
+            started.elapsed().as_secs_f64()
+        };
+        for pairs in [49_152, 65_535] {
+            for offset in 0..2 {
+                let mut storage = vec![0; offset + pairs * 4];
+                for (n, bytes) in storage[offset..]
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                {
+                    // Finite signed values with varied exponents and
+                    // mantissas, representative of IQ amplitude samples.
+                    *bytes = (((n as u16).wrapping_mul(37) % 0x7c00) | ((n as u16 & 1) << 15))
+                        .to_le_bytes();
+                }
+                let payload = &storage[offset..];
+                for round in 0..3 {
+                    let mut scalar = || scalar_float16_iq(black_box(payload));
+                    let mut bulk = || {
+                        parser
+                            .parse_iq_float16_optimized(black_box(payload))
+                            .unwrap()
+                    };
+                    let (before, after) = if round % 2 == 0 {
+                        (time(&mut scalar), time(&mut bulk))
+                    } else {
+                        let after = time(&mut bulk);
+                        (time(&mut scalar), after)
+                    };
+                    println!(
+                        "float16 pairs={pairs} offset={offset} round={round} scalar={before:.6}s bulk={after:.6}s reduction={:.1}% throughput={:.1} MS/s",
+                        (1.0 - after / before) * 100.0,
+                        pairs as f64 * ITERATIONS as f64 / after / 1e6,
+                    );
+                }
+            }
+        }
+    }
 
     /// A minimal int16 IQ header for `n` pairs, without its terminator.
     fn scan_header(n: usize) -> Vec<u8> {

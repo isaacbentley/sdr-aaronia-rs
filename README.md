@@ -79,6 +79,35 @@ format: stay on `int16` or `float16`.
 Treat the table as a starting point. `link_budget` measures *your* path end
 to end and names the widest span that fits.
 
+## HTTP sample conversion
+
+Float16 IQ payloads use `half`'s bulk conversion, which selects SIMD at
+runtime on supported CPUs (AArch64 FP16 or x86 F16C) and retains a portable
+fallback. On little-endian targets, aligned payloads are borrowed directly;
+odd-aligned payloads pass through a 1 KiB stack buffer. Big-endian targets
+retain scalar little-endian decoding. Tests compare every half-float bit
+pattern with the preceding scalar implementation, including subnormals,
+signed zeros, and NaN payloads, at both alignments and with odd IQ counts.
+
+On the local macOS ARM64 host, release-mode conversion time fell as follows.
+Each result compares median elapsed times from three alternating A/B rounds,
+with 20,000 conversions per round after 2,000 warm-up calls:
+
+| IQ pairs per payload | Aligned payload | Odd-aligned payload |
+| --- | ---: | ---: |
+| 49,152 | 35.6% less time | 9.5% less time |
+| 65,535 | 36.3% less time | 9.8% less time |
+
+These measurements include output allocation, but exclude HTTP framing,
+networking, and application DSP; they are not Raspberry Pi measurements.
+This change applies to Float16 IQ, not the default Int16 capture format.
+Run the same comparison without concurrent builds or other benchmarks:
+
+```bash
+cargo test --release --lib --no-default-features --features http \
+  float16_bulk_throughput_meter -- --ignored --nocapture
+```
+
 ## Installation
 
 Add the following to your `Cargo.toml`:

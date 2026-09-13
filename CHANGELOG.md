@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Float16 IQ payloads convert in bulk.** The per-sample `f16::to_f32` loop is
+  replaced by `half`'s slice conversion, which selects SIMD at runtime on
+  AArch64 FP16 and x86 F16C and keeps a portable fallback. Aligned
+  little-endian payloads are borrowed in place; an odd-aligned payload — a JSON
+  header can leave one at any address — passes through a 1 KiB stack buffer
+  rather than a second packet-sized allocation. Big-endian targets keep the
+  scalar path. Measured on macOS ARM64 in release, against the scalar
+  implementation over three alternating A/B rounds: 36% less time for an
+  aligned payload, 10% for an odd-aligned one, at 49 152 and 65 535 IQ pairs.
+  Every half-float bit pattern — subnormals, signed zeros and NaN payloads
+  included — is compared against the previous implementation at both
+  alignments and with odd IQ counts.
+
 ## [v0.11.2] - 2026-09-11
 
 ### Added
