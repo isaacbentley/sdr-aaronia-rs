@@ -10,6 +10,7 @@ use tracing::{debug, info, trace, warn};
 // Import our new advanced streaming capabilities
 use crate::http_endpoints::{AuthMethod, HttpEndpointsClient};
 use crate::http_streaming::{DropDetector, StreamFormat, StreamParser};
+use crate::stream_break::StreamDiscontinuity;
 
 /// How many of the largest observed packets the sample buffer must be able to
 /// hold, whatever `buffer_size` the caller configured.
@@ -119,6 +120,15 @@ const LINK_BUDGET_TOLERANCE: f64 = 0.98;
 /// `current_sample_rate` adoption hysteresis, which are the same
 /// question: has the device actually moved?
 const RATE_CHANGE_BAND: f64 = 0.1;
+
+/// Centre-frequency move that counts as a real retune rather than round-off.
+///
+/// The packet declares a frequency *range* and the centre is the mean of its
+/// ends, so a centre that has not moved can still differ in its last bits.
+/// One hertz is far below any retune worth reporting — the coarse channels a
+/// consumer builds from this span hundreds of kilohertz — and far above the
+/// round-off, so it separates the two without a judgement call.
+const CENTER_CHANGE_HZ: f64 = 1.0;
 
 /// Whether `current` differs from `previous` by more than
 /// [`RATE_CHANGE_BAND`] — the one spelling of "the device has retuned",
@@ -363,6 +373,34 @@ pub struct HttpSource {
     /// retune) must only reconnect the `/stream`, never re-push this
     /// source's now-stale target, which would undo that retune.
     initial_tune_done: bool,
+
+    /// Where stream breaks are reported, or `None` when nobody asked.
+    ///
+    /// Set through [`HttpSourceBuilder::with_stream_breaks`]. With no sink
+    /// the whole mechanism below is inert: nothing is queued, nothing is
+    /// rebased, and the only cost is one `is_some()` per event.
+    break_sink: Option<std::sync::Arc<dyn crate::stream_break::StreamBreakSink>>,
+    /// Samples produced downstream so far, which is the absolute index of the
+    /// next one. This — not the number received — is the coordinate a break is
+    /// keyed on: trimmed and cleared samples never reach the consumer, so they
+    /// never occupy an index. See [`crate::stream_break`].
+    produced: u64,
+    /// Breaks that apply to samples still sitting in `sample_buffer`, as
+    /// offsets from the front of that buffer.
+    ///
+    /// They are held here rather than reported as they happen because the
+    /// buffer is not append-only: the capacity trim discards from the front
+    /// and a reconnect clears the whole thing, and either would move an index
+    /// already handed to the consumer. Holding them until their samples are
+    /// actually produced makes the reported index final by construction.
+    /// Offsets are non-decreasing, and `publish_breaks` maintains that.
+    pending_breaks: VecDeque<(usize, StreamDiscontinuity)>,
+    /// Geometry the last IQ packet declared, or `None` before the first one
+    /// of the run. Compared against each new packet to spot a retune; a
+    /// reconnect deliberately keeps it, because reconnecting to the same
+    /// configuration is not a retune.
+    epoch_center_hz: Option<f64>,
+    epoch_rate_hz: Option<f64>,
 }
 
 impl HttpSource {
@@ -479,6 +517,11 @@ impl HttpSource {
             shared_stats: None,
             drop_detector: DropDetector::default(),
             initial_tune_done: false,
+            break_sink: None,
+            produced: 0,
+            pending_breaks: VecDeque::new(),
+            epoch_center_hz: None,
+            epoch_rate_hz: None,
         })
     }
 
@@ -1130,6 +1173,15 @@ impl HttpSource {
         // the link.
         self.stream_parser.reset();
         self.drop_detector.resync();
+        // Whatever comes back on the next connection does not continue what
+        // was on this one: the server restarts its stream at the present
+        // moment, the partial packet just dropped took some samples with it,
+        // and the drop detector has deliberately forgotten the timestamp that
+        // would have measured the hole. Recorded here rather than at each
+        // reconnect site so no path can add one and forget; repeated gaps at
+        // one position collapse, so the error path calling this twice reports
+        // one break.
+        self.note_break(StreamDiscontinuity::Gap);
     }
 
     /// Parse one stream chunk into the sample buffer.
@@ -1186,11 +1238,23 @@ impl HttpSource {
         // link delivers — and an operator seeing undecodable digital traffic
         // needs to know that is why. Same geometric schedule as the trim,
         // for the same reason.
-        for packet in &packets {
+        //
+        // Detection sits inside the same loop that queues the samples, so
+        // the gap can be keyed on the position it happened at. A separate
+        // pass over the batch would measure every packet's gap against the
+        // buffer length *before* any of the batch had been appended, which
+        // is the right answer only for the first packet in it.
+
+        for packet in packets {
             if let crate::http_streaming::DropResult::Drop { gap_seconds } =
-                self.drop_detector.observe(packet)
+                self.drop_detector.observe(&packet)
             {
                 self.stream_gap_seconds += gap_seconds;
+                // Where it happened, not just that it did. The samples
+                // already queued are sound; everything from the next one
+                // on belongs to a later moment in time, and only an index
+                // can say which is which.
+                self.note_break(StreamDiscontinuity::Gap);
                 let drops = self.drop_detector.drops();
                 if drops >= self.next_gap_report {
                     // When the link-budget check has already measured this
@@ -1242,9 +1306,7 @@ impl HttpSource {
                     self.spawn_gap_health_probe(drops);
                 }
             }
-        }
 
-        for packet in packets {
             // Update current stream metadata from the parsed packet. The
             // packet reports its frequency *range*; the tuned frequency is
             // the center of that range, not its lower edge.
@@ -1274,6 +1336,13 @@ impl HttpSource {
                 }
             }
 
+            // What the samples that follow *mean*, checked before they are
+            // queued for the same reason the gap is. A retune leaves no mark
+            // in the samples themselves: the new band's look exactly like the
+            // old band's, so a consumer that is not told will process them
+            // under a stale frequency map.
+            self.note_geometry(&packet);
+
             // Add samples to the buffer, enforcing the configured capacity:
             // if the consumer can't keep up, drop the *oldest* samples so
             // the buffer stays bounded and current.
@@ -1291,6 +1360,12 @@ impl HttpSource {
             if self.sample_buffer.len() > capacity {
                 let overflow = self.sample_buffer.len() - capacity;
                 self.sample_buffer.drain(0..overflow);
+                // Loss this process caused, and the one kind the consumer
+                // could otherwise never learn about: the samples arrived,
+                // were counted, and were thrown away between the counter and
+                // the consumer. The break rebases everything still queued —
+                // see `note_trim`.
+                self.note_trim(overflow);
                 // Overflow here means the consumer cannot keep up with the
                 // stream — expected and correct at a wide span, where no
                 // consumer can process 61 MS/s of a 49 MHz survey in real
@@ -1363,6 +1438,181 @@ impl HttpSource {
     /// enforcing 1, so `buffer_level` could exceed `buffer_capacity` and a
     /// consumer computing a fill ratio divided by zero. The bare `* 2` was
     /// also the only unguarded one on overflow.
+    /// Record a break before the samples that have **not yet** been queued.
+    ///
+    /// The offset is the current buffer length, so the break sits between the
+    /// last sample already queued and whatever is appended next — which is why
+    /// every caller must call this *before* extending the buffer.
+    ///
+    /// Repeated gaps at the same offset collapse into one. Nothing separates
+    /// them: with no sample between two gaps there is one discontinuity, and a
+    /// reconnect that reports through `cleanup_stream` on both the error path
+    /// and the restart path would otherwise report it twice.
+    fn note_break(&mut self, cause: StreamDiscontinuity) {
+        if self.break_sink.is_none() {
+            return;
+        }
+        let at = self.sample_buffer.len();
+        if cause == StreamDiscontinuity::Gap
+            && self.pending_breaks.back() == Some(&(at, StreamDiscontinuity::Gap))
+        {
+            return;
+        }
+        self.pending_breaks.push_back((at, cause));
+    }
+
+    /// Account for `discarded` samples removed from the **front** of the
+    /// buffer, and record the gap they leave.
+    ///
+    /// Every pending offset rebases, including those inside the discarded
+    /// region: a break there is not stale, because the samples it separates
+    /// the old epoch *from* include the ones that survived. A `Retune` in
+    /// particular still describes what follows, so dropping it would leave the
+    /// consumer processing the new band's samples under the old geometry. They
+    /// land at offset 0, ahead of nothing, which is exactly where they belong.
+    ///
+    /// The trim's own gap goes to the front rather than the back, because it
+    /// is at offset 0 and the queue is ordered by offset, not by when the
+    /// break was noticed.
+    fn note_trim(&mut self, discarded: usize) {
+        if self.break_sink.is_none() {
+            return;
+        }
+        for (offset, _) in self.pending_breaks.iter_mut() {
+            *offset = offset.saturating_sub(discarded);
+        }
+        // One hole, one gap. Everything the rebase brought to offset 0 now
+        // separates the same two samples this trim does, so any gap already
+        // there is this one — whether it was the previous trim (nothing
+        // produced in between), a server gap the rebase pulled down, or a
+        // reconnect. Testing only the *front* was not enough: a rebased
+        // `[Retune, Gap]` puts a non-gap in front, and a third break was
+        // pushed ahead of both (found by cross-model review).
+        self.pending_breaks
+            .retain(|(offset, cause)| *offset > 0 || *cause != StreamDiscontinuity::Gap);
+        self.pending_breaks
+            .push_front((0, StreamDiscontinuity::Gap));
+    }
+
+    /// Account for the whole buffer being discarded, as a reconnect does.
+    ///
+    /// Unlike the trim, nothing survives, so a pending break describes only
+    /// samples that will never be produced — and a pending `Retune` would
+    /// announce a geometry that no longer applies to anything. They are
+    /// dropped and replaced by the single gap the clear actually is. The
+    /// geometry trackers are deliberately left alone: the next packet compares
+    /// against what the device was last streaming, so reconnecting to an
+    /// unchanged configuration reports no retune and reconnecting to a changed
+    /// one does.
+    fn note_buffer_cleared(&mut self) {
+        if self.break_sink.is_none() {
+            return;
+        }
+        self.pending_breaks.clear();
+        self.pending_breaks.push_back((0, StreamDiscontinuity::Gap));
+    }
+
+    /// Compare `packet`'s geometry with the run so far and record what changed.
+    ///
+    /// IQ packets only. A spectra or histogram header carries a *frame* rate
+    /// orders of magnitude below the IQ rate, and its frequency range is the
+    /// displayed span — feeding either into this would report a retune on
+    /// every interleaved packet of a mixed mission.
+    fn note_geometry(&mut self, packet: &crate::http_streaming::StreamPacket) {
+        if self.break_sink.is_none()
+            || packet.metadata.payload != crate::http_streaming::PayloadType::Iq
+        {
+            return;
+        }
+        let center_hz = packet.sdr_config.center_frequency_hz;
+        let rate_hz = packet.sdr_config.sample_rate_hz;
+        // A packet that declares no usable rate says nothing about geometry:
+        // `sample_rate_hz` is 0.0 when the header carries neither
+        // `sampleFrequency` nor a duration to derive one from. Comparing
+        // against that would announce a retune to nothing, and then — because
+        // the comparison needs a positive baseline — never announce one again
+        // for the rest of the run (found by cross-model review). A header that
+        // broken describes nothing worth publishing either.
+        if rate_hz <= 0.0 {
+            return;
+        }
+
+        let (Some(epoch_center), Some(epoch_rate)) = (self.epoch_center_hz, self.epoch_rate_hz)
+        else {
+            self.note_break(StreamDiscontinuity::Initial { center_hz, rate_hz });
+            self.epoch_center_hz = Some(center_hz);
+            self.epoch_rate_hz = Some(rate_hz);
+            return;
+        };
+
+        let moved_center = (epoch_center - center_hz).abs() > CENTER_CHANGE_HZ;
+        // `rate_moved` is the crate's one definition of "the device has
+        // retuned", shared with the `current_sample_rate` hysteresis and the
+        // link check. A rate the parser had to infer from `samples / duration`
+        // wobbles well inside its band, so reusing it is what keeps a derived
+        // rate from manufacturing a retune per packet.
+        let moved_rate = rate_moved(epoch_rate, rate_hz);
+        if !moved_center && !moved_rate {
+            return;
+        }
+
+        self.note_break(StreamDiscontinuity::Retune { center_hz, rate_hz });
+        // The baseline is what was last *announced*, not what the last packet
+        // happened to say. Advancing it every packet would make a device
+        // creeping by less than a tolerance per packet move arbitrarily far
+        // without ever reporting a retune, since each step is measured against
+        // the step before it rather than against what the consumer believes
+        // (found by cross-model review).
+        self.epoch_center_hz = Some(center_hz);
+        self.epoch_rate_hz = Some(rate_hz);
+    }
+
+    /// Report every break that falls inside the `produced` samples about to be
+    /// published, and advance the absolute counter.
+    ///
+    /// Called after the samples have been copied into the output slice but
+    /// **before** `produce()` makes them visible, so a break always reaches the
+    /// consumer ahead of the samples it precedes.
+    ///
+    /// A break at offset exactly `produced` is held back rather than reported
+    /// early. It sits before the first sample of the *next* batch, which is
+    /// still in the buffer and can still be trimmed away — reporting it now
+    /// would pin an index that a later trim would move.
+    ///
+    /// A **gap at absolute sample 0** is dropped. Nothing precedes the first
+    /// sample a consumer ever sees, so there is no epoch for it to be
+    /// discontinuous from and no state for it to invalidate — and it is
+    /// reachable in the ordinary case, because the server's connect backlog
+    /// arrives faster than real time and the trim discards some of it before
+    /// the first `work()` produces anything. Reporting it would open every
+    /// such run with a gap the consumer did not suffer. The trim is still
+    /// counted and logged where it happens; what is suppressed is only the
+    /// claim that the stream broke before it began. `Initial` is unaffected:
+    /// it is not a loss, and at sample 0 it is the whole point.
+    fn publish_breaks(&mut self, produced: usize) {
+        // The clone is an atomic increment, so it is skipped in the ordinary
+        // case: with nothing queued both loops below are no-ops anyway.
+        if !self.pending_breaks.is_empty()
+            && let Some(sink) = self.break_sink.clone()
+        {
+            while let Some(&(offset, cause)) = self.pending_breaks.front() {
+                if offset >= produced {
+                    break;
+                }
+                self.pending_breaks.pop_front();
+                let at = self.produced + offset as u64;
+                if at == 0 && cause == StreamDiscontinuity::Gap {
+                    continue;
+                }
+                sink.record(at, cause);
+            }
+            for (offset, _) in self.pending_breaks.iter_mut() {
+                *offset = offset.saturating_sub(produced);
+            }
+        }
+        self.produced = self.produced.saturating_add(produced as u64);
+    }
+
     fn buffer_capacity(&self) -> usize {
         let configured = self.buffer_size.saturating_mul(2).max(1);
         // Never sit below a few packets. See `max_packet_samples`: the trim
@@ -1656,6 +1906,7 @@ impl Kernel for HttpSource {
                     self.cleanup_stream().await;
                     self.stream_active = false;
                     self.sample_buffer.clear();
+                    self.note_buffer_cleared();
                     if let Err(e) = self.start_stream().await {
                         warn!(
                             "Failed to restart stream during configuration change: {}",
@@ -1667,6 +1918,7 @@ impl Kernel for HttpSource {
                 self.cleanup_stream().await;
                 self.stream_active = false;
                 self.sample_buffer.clear();
+                self.note_buffer_cleared();
                 if let Err(e) = self.start_stream().await {
                     warn!(
                         "Failed to restart stream during configuration change: {}",
@@ -1794,6 +2046,10 @@ impl Kernel for HttpSource {
 
         let o = self.output.slice();
         let samples_to_copy = copy_out(&mut self.sample_buffer, o);
+        // Report the breaks these samples carry *before* publishing them, so
+        // the consumer can never hold a sample whose break it has not been
+        // told about. See `publish_breaks`.
+        self.publish_breaks(samples_to_copy);
         self.output.produce(samples_to_copy);
 
         // Log sample production periodically
@@ -1852,6 +2108,7 @@ pub struct HttpSourceBuilder {
     /// JSON field.
     scale: Option<f64>,
     shared_stats: Option<std::sync::Arc<std::sync::RwLock<StreamStats>>>,
+    break_sink: Option<std::sync::Arc<dyn crate::stream_break::StreamBreakSink>>,
 }
 
 impl HttpSourceBuilder {
@@ -1875,6 +2132,7 @@ impl HttpSourceBuilder {
             rate_reduction: None,
             scale: None,
             shared_stats: None,
+            break_sink: None,
         }
     }
 
@@ -1984,6 +2242,24 @@ impl HttpSourceBuilder {
         self
     }
 
+    /// Report stream breaks — server gaps, capacity trims, reconnects and
+    /// retunes — to `sink`, keyed on the absolute index of the first sample
+    /// after each one. See [`crate::stream_break`].
+    ///
+    /// Optional, because a caller that only wants samples should not have to
+    /// care. It is worth wiring for anything that carries state *across*
+    /// deliveries — symbol timing, carrier tracking, burst framing, a
+    /// recording's contiguity — because that state is exactly what a
+    /// discontinuity invalidates, and without this it is invalidated silently.
+    #[must_use]
+    pub fn with_stream_breaks(
+        mut self,
+        sink: std::sync::Arc<dyn crate::stream_break::StreamBreakSink>,
+    ) -> Self {
+        self.break_sink = Some(sink);
+        self
+    }
+
     /// No-op kept for backward API compatibility. `HttpSource` always
     /// streams over HTTP; routing through the native SDK instead lives in
     /// [`crate::sdk_source`] / [`crate::unified_source`].
@@ -2008,6 +2284,7 @@ impl HttpSourceBuilder {
             self.scale,
         )?;
         source.shared_stats = self.shared_stats;
+        source.break_sink = self.break_sink;
         Ok(source)
     }
 }
@@ -2017,6 +2294,7 @@ mod tests {
     use super::*;
     use crate::http_endpoints::AuthMethod;
     use crate::http_streaming::StreamFormat;
+    use crate::stream_break::RecordingBreakSink;
 
     // Test HttpSource creation and initialization
     #[tokio::test]
@@ -3026,6 +3304,433 @@ mod tests {
             Some(true),
             "the mocked device is clean, so the gap is downstream of it",
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Stream breaks. The index a break is reported at is the whole point
+    // of the mechanism, so these check the arithmetic rather than that
+    // something was counted. See `crate::stream_break`.
+    // ---------------------------------------------------------------
+
+    /// A block wired to a recording sink, with the parser fed nothing yet.
+    fn block_with_breaks() -> (HttpSource, std::sync::Arc<RecordingBreakSink>) {
+        let sink = std::sync::Arc::new(RecordingBreakSink::new());
+        let block = HttpSourceBuilder::new("http://localhost:54664")
+            .format(StreamFormat::Int16)
+            .with_stream_breaks(sink.clone())
+            .build()
+            .expect("Should create HttpSource");
+        (block, sink)
+    }
+
+    /// Stand in for `work()`'s copy-out: take `n` samples off the buffer and
+    /// publish the breaks they carry, in the same order the block does.
+    fn drain(block: &mut HttpSource, n: usize) {
+        let n = n.min(block.sample_buffer.len());
+        block.sample_buffer.drain(..n);
+        block.publish_breaks(n);
+    }
+
+    #[test]
+    fn a_break_is_reported_at_the_first_sample_after_it() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+        block.note_break(StreamDiscontinuity::Gap);
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+
+        drain(&mut block, 200);
+        assert_eq!(sink.breaks(), vec![(100, StreamDiscontinuity::Gap)]);
+    }
+
+    #[test]
+    fn an_index_does_not_depend_on_how_the_samples_were_delivered() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+        block.note_break(StreamDiscontinuity::Gap);
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+
+        // Produced in two batches that land exactly on the break. The first
+        // must report nothing — the break sits before a sample still in the
+        // buffer, which a trim could yet discard — and the second must report
+        // it at the same absolute index the single-batch case gives.
+        drain(&mut block, 100);
+        assert_eq!(sink.breaks(), vec![], "nothing produced past the break yet");
+        drain(&mut block, 100);
+        assert_eq!(sink.breaks(), vec![(100, StreamDiscontinuity::Gap)]);
+    }
+
+    #[test]
+    fn a_trim_reports_where_the_hole_is_and_moves_what_survived() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        // Produce a prefix first, so the trim below lands mid-run rather than
+        // before the first sample — where a gap would be suppressed as the
+        // break away from an epoch that does not exist.
+        block.sample_buffer.extend(vec![Complex32::default(); 40]);
+        drain(&mut block, 40);
+
+        // 100 samples queued, then a retune, then 100 more. The trim takes
+        // 150 — the first 100 and half of the new band's.
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+        block.note_break(StreamDiscontinuity::Retune {
+            center_hz: 200e6,
+            rate_hz: 1e6,
+        });
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+        block.sample_buffer.drain(0..150);
+        block.note_trim(150);
+
+        drain(&mut block, 50);
+        assert_eq!(
+            sink.breaks(),
+            vec![
+                (40, StreamDiscontinuity::Gap),
+                (
+                    40,
+                    StreamDiscontinuity::Retune {
+                        center_hz: 200e6,
+                        rate_hz: 1e6
+                    }
+                ),
+            ],
+            "the retune survives the trim that discarded the samples before \
+             it — the 50 that remain are the new band's — and the gap the \
+             trim itself left is reported ahead of it",
+        );
+    }
+
+    #[test]
+    fn trims_with_nothing_produced_between_them_are_one_hole() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        block.sample_buffer.extend(vec![Complex32::default(); 340]);
+        drain(&mut block, 40);
+        for _ in 0..3 {
+            block.sample_buffer.drain(0..50);
+            block.note_trim(50);
+        }
+
+        drain(&mut block, 150);
+        assert_eq!(
+            sink.breaks(),
+            vec![(40, StreamDiscontinuity::Gap)],
+            "no sample separates the three trims, so they are one \
+             discontinuity, not three",
+        );
+    }
+
+    #[test]
+    fn clearing_the_buffer_retires_the_breaks_whose_samples_it_discarded() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        block.sample_buffer.extend(vec![Complex32::default(); 140]);
+        drain(&mut block, 40);
+        block.note_break(StreamDiscontinuity::Retune {
+            center_hz: 200e6,
+            rate_hz: 1e6,
+        });
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+        // A restart: everything queued goes, and with it the announcement of
+        // a geometry that now applies to no sample anyone will see.
+        block.sample_buffer.clear();
+        block.note_buffer_cleared();
+        block.sample_buffer.extend(vec![Complex32::default(); 10]);
+
+        drain(&mut block, 10);
+        assert_eq!(sink.breaks(), vec![(40, StreamDiscontinuity::Gap)]);
+    }
+
+    #[test]
+    fn a_trim_over_a_retune_and_a_gap_still_reports_one_gap() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        block.sample_buffer.extend(vec![Complex32::default(); 400]);
+        drain(&mut block, 40);
+        // A retune, then a gap after it — an ordinary sequence: one packet
+        // changes the geometry and a later one arrives after a server skip.
+        block.note_break(StreamDiscontinuity::Retune {
+            center_hz: 200e6,
+            rate_hz: 1e6,
+        });
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+        block.note_break(StreamDiscontinuity::Gap);
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+        // A trim that reaches past both. Testing only the front of the queue
+        // for a gap missed this: the rebased retune sits in front, so a second
+        // gap was pushed ahead of it and one hole was reported twice.
+        block.sample_buffer.drain(0..500);
+        block.note_trim(500);
+
+        drain(&mut block, 60);
+        assert_eq!(
+            sink.breaks(),
+            vec![
+                (40, StreamDiscontinuity::Gap),
+                (
+                    40,
+                    StreamDiscontinuity::Retune {
+                        center_hz: 200e6,
+                        rate_hz: 1e6
+                    }
+                ),
+            ],
+            "one boundary, one gap — and the retune still describes what \
+             follows it",
+        );
+    }
+
+    #[test]
+    fn a_creep_inside_the_tolerance_still_reaches_a_retune() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        // Each step halves the rate's distance to the previous packet by less
+        // than the 10% band, so a baseline that advanced per packet would
+        // follow the device all the way down and report nothing. Against what
+        // was last announced, the third step clears the band.
+        for rate in [15_360_000.0, 14_600_000.0, 13_900_000.0, 13_200_000.0] {
+            let wire = Bytes::from(int16_iq_packet(rate, 100.0, 100.001, 4));
+            block.process_advanced_stream_data(&wire).expect("parses");
+        }
+        drain(&mut block, 16);
+
+        let kinds: Vec<&str> = sink.breaks().iter().map(|(_, c)| c.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["initial", "retune"],
+            "the drift must be reported once it has left the band the \
+             consumer was told about: {:?}",
+            sink.breaks(),
+        );
+    }
+
+    #[test]
+    fn a_packet_declaring_no_rate_does_not_poison_the_baseline() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        // `sampleFrequency` absent and zero duration: the parser has nothing
+        // to derive a rate from and reports 0.0. Taken as a baseline, no later
+        // rate could ever be compared against it — a positive baseline is
+        // required — and the run would never report another retune.
+        let broken = r#"{"startTime":100.0,"endTime":100.0,"startFrequency":95e6,"endFrequency":105e6,"samples":4,"unit":"volt","payload":"iq","minPower":-120,"maxPower":0,"sampleSize":2}"#;
+        let mut wire = broken.as_bytes().to_vec();
+        wire.extend_from_slice(&[0x0A, 0x1E]);
+        wire.extend_from_slice(&[0u8; 16]);
+        block
+            .process_advanced_stream_data(&Bytes::from(wire))
+            .expect("parses");
+        assert_eq!(block.epoch_rate_hz, None, "nothing was declared to adopt");
+
+        let first = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 4));
+        block.process_advanced_stream_data(&first).expect("parses");
+        let second = Bytes::from(int16_iq_packet(7_680_000.0, 100.001, 100.002, 4));
+        block.process_advanced_stream_data(&second).expect("parses");
+        drain(&mut block, 12);
+
+        let kinds: Vec<&str> = sink.breaks().iter().map(|(_, c)| c.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["initial", "retune"],
+            "the first packet that actually declares a rate opens the run, \
+             and a later change is still reported: {:?}",
+            sink.breaks(),
+        );
+    }
+
+    #[test]
+    fn a_gap_before_the_first_sample_is_not_a_break() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        // The server's connect backlog arrives faster than real time, so the
+        // trim routinely discards some of it before anything is produced.
+        let iq = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 16));
+        block.process_advanced_stream_data(&iq).expect("parses");
+        block.sample_buffer.drain(0..8);
+        block.note_trim(8);
+        drain(&mut block, 8);
+
+        assert_eq!(
+            sink.breaks(),
+            vec![(
+                0,
+                StreamDiscontinuity::Initial {
+                    center_hz: 100e6,
+                    rate_hz: 15_360_000.0
+                }
+            )],
+            "nothing precedes the first sample, so there is no epoch for a \
+             gap there to break away from — but the geometry still stands",
+        );
+    }
+
+    #[test]
+    fn with_no_sink_nothing_is_queued() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .build()
+            .expect("Should create HttpSource");
+
+        block.sample_buffer.extend(vec![Complex32::default(); 100]);
+        block.note_break(StreamDiscontinuity::Gap);
+        block.note_trim(10);
+        block.note_buffer_cleared();
+        assert!(
+            block.pending_breaks.is_empty(),
+            "a caller that asked for nothing pays for nothing",
+        );
+    }
+
+    #[test]
+    fn the_first_packet_publishes_the_geometry_it_actually_arrived_under() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        // Built asking for 100 MHz / 1 MS/s; the server streams 95–105 MHz at
+        // 15.36 MS/s. Nothing downstream could tell without being told.
+        let iq = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 4));
+        block
+            .process_advanced_stream_data(&iq)
+            .expect("the IQ packet parses");
+        drain(&mut block, 4);
+
+        assert_eq!(
+            sink.breaks(),
+            vec![(
+                0,
+                StreamDiscontinuity::Initial {
+                    center_hz: 100e6,
+                    rate_hz: 15_360_000.0
+                }
+            )],
+        );
+    }
+
+    #[test]
+    fn a_spectra_frame_rate_is_not_a_retune() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        let iq = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 4));
+        block.process_advanced_stream_data(&iq).expect("parses");
+        // A spectra header derives a *frame* rate — 100 Hz here — from
+        // `samples / duration`. Reported as a retune it would retire every
+        // signal on every interleaved packet of a mixed mission.
+        let spectra = Bytes::from(int16_spectra_packet(100.001, 100.011, 4));
+        block
+            .process_advanced_stream_data(&spectra)
+            .expect("parses");
+        drain(&mut block, 8);
+
+        assert_eq!(sink.breaks().len(), 1, "the Initial and nothing else");
+        assert_eq!(sink.breaks()[0].1.kind(), "initial");
+    }
+
+    #[test]
+    fn a_rate_change_mid_stream_is_a_retune_at_the_sample_it_starts() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        let first = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 16));
+        block.process_advanced_stream_data(&first).expect("parses");
+        // The next rung down, contiguous in time so no gap is reported: the
+        // samples that follow cover half the bandwidth the ones before did.
+        let second = Bytes::from(int16_iq_packet(7_680_000.0, 100.001, 100.002, 16));
+        block.process_advanced_stream_data(&second).expect("parses");
+        drain(&mut block, 32);
+
+        assert_eq!(
+            sink.breaks(),
+            vec![
+                (
+                    0,
+                    StreamDiscontinuity::Initial {
+                        center_hz: 100e6,
+                        rate_hz: 15_360_000.0
+                    }
+                ),
+                (
+                    16,
+                    StreamDiscontinuity::Retune {
+                        center_hz: 100e6,
+                        rate_hz: 7_680_000.0
+                    }
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_server_gap_is_reported_at_the_packet_that_follows_it() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        let first = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 16));
+        block.process_advanced_stream_data(&first).expect("parses");
+        // 10 ms of signal the server never sent, well past the detector's
+        // 1 ms tolerance.
+        let second = Bytes::from(int16_iq_packet(15_360_000.0, 100.011, 100.012, 16));
+        block.process_advanced_stream_data(&second).expect("parses");
+        drain(&mut block, 32);
+
+        let breaks = sink.breaks();
+        assert_eq!(breaks.len(), 2);
+        assert_eq!(breaks[0].1.kind(), "initial");
+        assert_eq!(
+            breaks[1],
+            (16, StreamDiscontinuity::Gap),
+            "the gap precedes the second packet's first sample, not the \
+             batch it was parsed in",
+        );
+    }
+
+    #[test]
+    fn every_packet_in_a_batch_gets_its_own_position() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        // Three packets in one chunk, each separated from the last by a gap.
+        // Detecting them in a pass of their own — before any of the batch had
+        // been queued — would put all three at the same index.
+        let mut wire = int16_iq_packet(15_360_000.0, 100.000, 100.001, 16);
+        wire.extend(int16_iq_packet(15_360_000.0, 100.011, 100.012, 16));
+        wire.extend(int16_iq_packet(15_360_000.0, 100.022, 100.023, 16));
+        block
+            .process_advanced_stream_data(&Bytes::from(wire))
+            .expect("parses");
+        drain(&mut block, 48);
+
+        let gaps: Vec<u64> = sink
+            .breaks()
+            .into_iter()
+            .filter(|(_, c)| *c == StreamDiscontinuity::Gap)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(gaps, vec![16, 32]);
     }
 
     /// One serialized RTSA int16 IQ packet as the wire carries it: JSON

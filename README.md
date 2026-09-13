@@ -108,6 +108,82 @@ cargo test --release --lib --no-default-features --features http \
   float16_bulk_throughput_meter -- --ignored --nocapture
 ```
 
+## Stream continuity
+
+A source hands its consumer a flat run of samples, and that run *claims* to be
+continuous. Four things break the claim, and `HttpSource` knows about all four:
+
+| event | cause |
+| --- | --- |
+| server gap | the RTSA server dropped what it could not send; seen as a jump between one packet's `endTime` and the next's `startTime` |
+| capacity trim | the consumer fell behind, so the oldest buffered samples were discarded to keep the buffer current |
+| reconnect | the stream ended and was reopened; the parser and the drop detector both reset |
+| retune | the device's centre frequency or sample rate changed mid-stream |
+
+Counters for these have always been available through `StreamStats`. What a
+counter cannot say is *which* samples belong to the old epoch — and that is the
+only thing a consumer can act on, because symbol timing, carrier tracking and
+burst framing are all carried across the boundary between one delivery and the
+next. `link_budget`'s own warning applies here: every dropped sample is an
+unsignalled phase discontinuity that breaks digital symbol lock.
+
+`with_stream_breaks` reports each one against the **absolute index of the first
+sample after it**, counted in this source's output stream:
+
+```rust,no_run
+use std::sync::Arc;
+use sdr_aaronia_rs::{HttpSourceBuilder, RecordingBreakSink, StreamDiscontinuity};
+
+let breaks = Arc::new(RecordingBreakSink::new());
+let source = HttpSourceBuilder::new("http://atc.local:54664")
+    .center_frequency_hz(146.52e6)
+    .sample_rate_hz(1e6)
+    .with_stream_breaks(breaks.clone())
+    .build()?;
+
+// …later, after the flowgraph has run:
+for (at_sample, cause) in breaks.breaks() {
+    match cause {
+        StreamDiscontinuity::Gap => println!("reset decoder state at {at_sample}"),
+        StreamDiscontinuity::Initial { center_hz, rate_hz }
+        | StreamDiscontinuity::Retune { center_hz, rate_hz } => {
+            println!("samples from {at_sample} are {center_hz} Hz at {rate_hz} Sa/s")
+        }
+    }
+}
+# Ok::<(), sdr_aaronia_rs::Error>(())
+```
+
+Implement `StreamBreakSink` yourself to push into whatever queue the consumer
+already reads; `RecordingBreakSink` is the built-in one, for tests and for
+looking at a finished run.
+
+Two properties make the index usable. A break is recorded **before** the
+samples it precedes are published, so by the time a consumer can see sample
+`i`, every break at or before `i` is already in the sink. And samples the
+source discards — trimmed, or cleared on a reconnect — never occupy an index,
+so the coordinate is simply how many samples the block has produced. Breaks are
+held against the samples still queued and emitted only as those are produced,
+which is what makes a reported index final: a trim that arrives later rebases
+what is still pending rather than invalidating what was already said.
+
+A `Retune` is measured against the geometry **last announced**, not against the
+previous packet. A baseline that moved with every packet would let a device
+creeping by less than a tolerance per packet travel arbitrarily far without
+ever reporting a change, since each step would be judged against the step
+before it rather than against what the consumer believes. Centre moves of more
+than 1 Hz and rate moves outside the crate's 10% band count; the rate ladder
+steps in powers of two, so a real change clears that band by a wide margin
+while a rate the parser had to infer from `samples / duration` wobbles well
+inside it. A packet declaring no usable rate at all is ignored for this
+purpose rather than taken as a new baseline.
+
+`Initial` is emitted at sample 0 of every run, whether or not it differs from
+what was requested. The server serves the nearest rung of its own rate ladder
+and the span its mission is configured for, so the first packet is exactly
+where a disagreement with the request appears — and a consumer comparing
+packets only against each other would never see it.
+
 ## Installation
 
 Add the following to your `Cargo.toml`:

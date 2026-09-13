@@ -65,6 +65,8 @@ pub mod sdr_source_impl;
 #[cfg(feature = "seify")]
 #[cfg_attr(docsrs, doc(cfg(feature = "seify")))]
 pub mod seify_impl;
+/// Where the sample stream broke, and what that invalidates
+pub mod stream_break;
 pub mod unified_sink;
 #[cfg(all(feature = "http", feature = "file"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "http", feature = "file"))))]
@@ -149,6 +151,8 @@ pub use link_budget::{
 #[cfg(feature = "sdr-source")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sdr-source")))]
 pub use sdr_source_impl::{SpectranBackend, SpectranSdrSource};
+/// Stream-break reporting, shared by every source that can lose continuity
+pub use stream_break::{RecordingBreakSink, StreamBreakSink, StreamDiscontinuity};
 /// Unified SDR Source abstraction
 #[cfg(all(feature = "http", feature = "file"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "http", feature = "file"))))]

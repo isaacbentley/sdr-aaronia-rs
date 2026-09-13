@@ -4,7 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`HttpSource` reports where the stream broke**, not just how often.
+  `HttpSourceBuilder::with_stream_breaks` takes a `StreamBreakSink` (see the
+  new `stream_break` module) and the source calls it with the **absolute index
+  of the first sample after each discontinuity**, in its own output stream:
+  a server gap the drop detector saw, a capacity trim, a reconnect, and a
+  centre or rate change the device declared. Optional; a caller that does not
+  ask pays nothing.
+
+  The counters that were there before cannot be acted on. A consumer carrying
+  state across deliveries — symbol timing, carrier tracking, burst framing, a
+  recording's contiguity — needs to know *which* samples belong to the old
+  epoch, and "the server skipped 3 times" does not say. Breaks are held against
+  the samples still queued and emitted only as those samples are produced, so a
+  later trim cannot move an index already reported; samples the source discards
+  never occupy an index at all.
+
 ### Changed
+- **Gap detection and sample queuing share one pass over each batch.** They
+  were two loops, so every packet's gap was measured against the buffer length
+  *before* any of the batch had been appended — the right answer only for the
+  first packet in it. No change to what is reported, only to where.
 - **Float16 IQ payloads convert in bulk.** The per-sample `f16::to_f32` loop is
   replaced by `half`'s slice conversion, which selects SIMD at runtime on
   AArch64 FP16 and x86 F16C and keeps a portable fallback. Aligned
