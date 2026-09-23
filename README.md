@@ -111,14 +111,19 @@ cargo test --release --lib --no-default-features --features http \
 ## Stream continuity
 
 A source hands its consumer a flat run of samples, and that run *claims* to be
-continuous. Four things break the claim, and `HttpSource` knows about all four:
+continuous. Five things break the claim, and `HttpSource` knows about all five:
 
 | event | cause |
 | --- | --- |
-| server gap | the RTSA server dropped what it could not send; seen as a jump between one packet's `endTime` and the next's `startTime` |
+| server gap | the RTSA server dropped what it could not send; seen as a jump between one packet's `endTime` and the next's `startTime` larger than a tolerance measured from the stream (half a packet, or above the observed timestamp jitter, capped at 1 ms — see `DropDetector`; not yet verified live at high rates) |
+| undecodable packet | a packet framed but could not be decoded; it is skipped and its neighbours kept, and the hole is a gap where it sat |
 | capacity trim | the consumer fell behind, so the oldest buffered samples were discarded to keep the buffer current |
-| reconnect | the stream ended and was reopened; the parser and the drop detector both reset |
+| reconnect | the stream ended, errored, or delivered nothing for 5 s, and was reopened; the parser and the drop detector both reset |
 | retune | the device's centre frequency or sample rate changed mid-stream |
+
+`HttpSource` outputs IQ only. Spectra, histogram and category packets on a
+mixed mission are skipped and counted in `StreamStats::non_iq_packets_skipped`;
+they feed neither the output, the drop detector nor the frequency tracking.
 
 Counters for these have always been available through `StreamStats`. What a
 counter cannot say is *which* samples belong to the old epoch — and that is the
@@ -176,13 +181,20 @@ than 1 Hz and rate moves outside the crate's 10% band count; the rate ladder
 steps in powers of two, so a real change clears that band by a wide margin
 while a rate the parser had to infer from `samples / duration` wobbles well
 inside it. A packet declaring no usable rate at all is ignored for this
-purpose rather than taken as a new baseline.
+purpose rather than taken as a new baseline. A restart that clears the buffer
+also discards any announcement still queued in it, so the baseline goes back to
+the last geometry actually *reported* — a retune the restart swallowed is then
+announced after it.
 
 `Initial` is emitted at sample 0 of every run, whether or not it differs from
 what was requested. The server serves the nearest rung of its own rate ladder
 and the span its mission is configured for, so the first packet is exactly
 where a disagreement with the request appears — and a consumer comparing
-packets only against each other would never see it.
+packets only against each other would never see it. Breaks at one index are
+reported as one boundary — at most a gap, then at most one geometry — so when
+a trim before the first sample discards the band the run opened on, the
+consumer gets a single `Initial` naming the geometry its first sample actually
+arrived under.
 
 ## Installation
 

@@ -25,9 +25,9 @@ typedef enum SpectranFfiError {
 
 // --- C-compatible SourceType --- //
 typedef enum CSpectranSourceType {
-    NativeSdk,
-    Http,
-    File,
+    NativeSdk = 0,
+    Http = 1,
+    File = 2,
 } CSpectranSourceType;
 
 // --- C-compatible Complex struct --- //
@@ -137,9 +137,10 @@ void spectran_source_builder_device_serial(SpectranSourceBuilder* builder, const
 
 /* Pin the source to one backend instead of auto-detecting. Forcing
  * NativeSdk makes a missing SDK a build error rather than a silent
- * fallback to localhost HTTP. */
+ * fallback to localhost HTTP. `source_type` is a CSpectranSourceType
+ * value, passed as int; a value outside the enum is ignored. */
 void spectran_source_builder_force_source_type(SpectranSourceBuilder *builder,
-                                              CSpectranSourceType source_type);
+                                              int source_type);
 
 /* Whether the native SDK library is present, by the search the builder
  * uses; does not load it. */

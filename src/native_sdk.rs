@@ -2934,11 +2934,15 @@ impl NativeSdkSource {
                 const MAX_IQ_STRIDE: i64 = 4096;
                 let valid_iq_stride = (2..=MAX_IQ_STRIDE).contains(&packet.stride);
                 if !packet.fp32.is_null() && packet.num > 0 && !valid_iq_stride {
-                    // Consume it without mis-reading pairs out of it.
+                    // Consume it without mis-reading pairs out of it. Its
+                    // samples are lost as surely as a `WARN_DROPPED`
+                    // packet's, and the caller must hear so the same way.
                     warn!(
                         "Skipping packet with out-of-range IQ stride {} (expected 2..={})",
                         packet.stride, MAX_IQ_STRIDE
                     );
+                    self.drop_events += 1;
+                    self.overrun_pending = true;
                 }
                 // Process IQ data from the packet
                 // The device says when it lost or doubted samples; until
@@ -2986,7 +2990,10 @@ impl NativeSdkSource {
                         // Consume before erroring: get_packet always
                         // returns the head of the queue, so a leaked
                         // packet would make every subsequent call
-                        // re-fetch it and re-error forever.
+                        // re-fetch it and re-error forever. Consumed and
+                        // not delivered is a loss, counted as one.
+                        self.drop_events += 1;
+                        self.overrun_pending = true;
                         self.client.consume_packets(device, 0, 1)?;
                         return Err(Error::Sdk(format!(
                             "Packet sample count {} exceeds maximum allowed {}",
@@ -3204,11 +3211,15 @@ impl NativeSdkSource {
                     // dual lower bound (4 floats per sample) is enforced
                     // by `deinterleave_dual_iq` with a clearer error.
                     const MAX_IQ_STRIDE: i64 = 4096;
+                    // Every early exit below consumes the packet without
+                    // delivering it: a loss, reported like the device's own.
                     if packet.stride > MAX_IQ_STRIDE {
                         warn!(
                             "Skipping packet with out-of-range IQ stride {} (expected <= {})",
                             packet.stride, MAX_IQ_STRIDE
                         );
+                        self.drop_events += 1;
+                        self.overrun_pending = true;
                         self.client.consume_packets(device, 0, 1)?;
                         return Ok(pairs_read);
                     }
@@ -3218,6 +3229,8 @@ impl NativeSdkSource {
                         // returns the head of the queue, so a leaked
                         // packet would make every subsequent call
                         // re-fetch it and re-error forever.
+                        self.drop_events += 1;
+                        self.overrun_pending = true;
                         self.client.consume_packets(device, 0, 1)?;
                         return Err(Error::Sdk(format!(
                             "Packet sample count {} exceeds maximum allowed {}",
@@ -3237,6 +3250,8 @@ impl NativeSdkSource {
                         const MAX_PACKET_FLOATS: usize = 1 << 26;
                         let float_count = (packet_samples - 1) * stride + 4;
                         if float_count > MAX_PACKET_FLOATS {
+                            self.drop_events += 1;
+                            self.overrun_pending = true;
                             self.client.consume_packets(device, 0, 1)?;
                             return Err(Error::Sdk(format!(
                                 "dual-channel packet describes {} floats ({} samples x stride {}), \
@@ -3261,6 +3276,8 @@ impl NativeSdkSource {
                             Err(e) => {
                                 // Hand the packet back before surfacing the
                                 // error so the stream can continue.
+                                self.drop_events += 1;
+                                self.overrun_pending = true;
                                 self.client.consume_packets(device, 0, 1)?;
                                 return Err(e);
                             }

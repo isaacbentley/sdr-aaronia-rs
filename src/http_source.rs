@@ -9,7 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 // Import our new advanced streaming capabilities
 use crate::http_endpoints::{AuthMethod, HttpEndpointsClient};
-use crate::http_streaming::{DropDetector, StreamFormat, StreamParser};
+use crate::http_streaming::{DropDetector, StreamFormat, StreamParser, rate_moved};
 use crate::stream_break::StreamDiscontinuity;
 
 /// How many of the largest observed packets the sample buffer must be able to
@@ -110,17 +110,6 @@ const LINK_CHECK_WINDOW: std::time::Duration = std::time::Duration::from_secs(2)
 /// that matters: the measured `--span 20M` failure lost ~5%.
 const LINK_BUDGET_TOLERANCE: f64 = 0.98;
 
-/// Relative change in the device-reported sample rate that counts as a
-/// real retune rather than jitter.
-///
-/// The device's rate ladder steps in powers of two, so a genuine retune
-/// always clears this band by a wide margin, while a rate inferred from
-/// `samples / duration` wobbles well inside it. Shared by the
-/// link-budget restart in [`HttpSource::note_device_rate`] and the
-/// `current_sample_rate` adoption hysteresis, which are the same
-/// question: has the device actually moved?
-const RATE_CHANGE_BAND: f64 = 0.1;
-
 /// Centre-frequency move that counts as a real retune rather than round-off.
 ///
 /// The packet declares a frequency *range* and the centre is the mean of its
@@ -130,11 +119,59 @@ const RATE_CHANGE_BAND: f64 = 0.1;
 /// round-off, so it separates the two without a judgement call.
 const CENTER_CHANGE_HZ: f64 = 1.0;
 
-/// Whether `current` differs from `previous` by more than
-/// [`RATE_CHANGE_BAND`] — the one spelling of "the device has retuned",
-/// shared by both rate trackers. `previous` must be positive.
-fn rate_moved(previous: f64, current: f64) -> bool {
-    (current - previous).abs() / previous > RATE_CHANGE_BAND
+/// How long the `/stream` body may deliver nothing before the reader gives
+/// up on the connection.
+///
+/// The streaming client deliberately has no total timeout (it would cover
+/// the whole body), so without this a server that stops sending while
+/// keeping the socket open — a hung RTSA process, a half-open TCP
+/// connection after a network change — parks the reader forever, and the
+/// source produces nothing and never reconnects. A live stream delivers a
+/// chunk every few milliseconds at any usable rate, so several seconds of
+/// nothing is not a slow link. Ending the reader hands the source to its
+/// ordinary reconnect path.
+const STREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Drain `stream` into `tx` until it ends, errors, stalls for `stall`, or
+/// the receiver is dropped. Dropping `tx` on return is what tells the
+/// source to reconnect.
+async fn read_stream_into<S, E>(
+    stream: S,
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+    stall: std::time::Duration,
+) where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt;
+    let mut stream = std::pin::pin!(stream);
+    loop {
+        match tokio::time::timeout(stall, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                // `send` awaits when the channel is full — this is the
+                // backpressure point, and where TCP flow control kicks in.
+                // A send error means the receiver was dropped, so the
+                // source is gone and the task should end.
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Some(Err(e))) => {
+                warn!("Stream chunk error in reader task: {}", e);
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                warn!(
+                    "Aaronia stream delivered nothing for {:.1} s; dropping the \
+                     connection so the source reconnects",
+                    stall.as_secs_f64()
+                );
+                break;
+            }
+        }
+    }
+    debug!("Aaronia stream reader task ended");
 }
 
 /// Stream statistics for monitoring.
@@ -177,6 +214,12 @@ pub struct StreamStats {
     /// keeps a slower, older reading from overwriting a newer one, and
     /// lets a consumer tell how current the counters are.
     pub device_health_drops: u64,
+    /// Spectra, histogram and category packets the stream carried and
+    /// this source skipped — it outputs IQ only.
+    pub non_iq_packets_skipped: u64,
+    /// Packets the parser framed but could not decode. Each is skipped
+    /// and reported to the break sink as a gap where it sat.
+    pub packets_lost_to_parse_errors: u64,
 }
 
 impl Default for StreamStats {
@@ -196,6 +239,8 @@ impl Default for StreamStats {
             link_budget: None,
             device_health: None,
             device_health_drops: 0,
+            non_iq_packets_skipped: 0,
+            packets_lost_to_parse_errors: 0,
         }
     }
 }
@@ -297,6 +342,11 @@ pub struct HttpSource {
     stream_active: bool,
     current_frequency: f64,
     current_sample_rate: f64,
+    /// The centre and rate this source was built to request, which the
+    /// one-shot tune pushes. Kept apart from `current_*`, which follow the
+    /// stream.
+    configured_center_hz: f64,
+    configured_rate_hz: f64,
     /// Raw stream chunks from the background reader task.
     ///
     /// The socket used to be read one chunk per `work()` call, so throughput
@@ -317,6 +367,12 @@ pub struct HttpSource {
     /// reached the process, so no sample counter here can show it.
     stream_gap_seconds: f64,
     next_gap_report: u64,
+    /// Packets skipped because they were not IQ. See `note_non_iq_packet`.
+    non_iq_packets_skipped: u64,
+    /// Packets skipped because they could not be decoded, and the next
+    /// count that warrants a log line. See `note_lost_packet`.
+    packets_lost_to_parse_errors: u64,
+    next_parse_loss_report: u64,
     /// Passive link-budget check, armed at stream start and settled into
     /// its verdict at most once per configuration.
     ///
@@ -367,7 +423,7 @@ pub struct HttpSource {
     drop_detector: DropDetector,
 
     /// Whether the one-shot device retune in [`Self::configure_rtsa_device`]
-    /// has already run. The tune applies the builder's centre / rate /
+    /// has already been attempted (successful or not). The tune applies the builder's centre / rate /
     /// reference level on the **first** stream start; subsequent restarts
     /// (triggered via `shared_stats.restart_pending` after an external
     /// retune) must only reconnect the `/stream`, never re-push this
@@ -395,12 +451,18 @@ pub struct HttpSource {
     /// actually produced makes the reported index final by construction.
     /// Offsets are non-decreasing, and `publish_breaks` maintains that.
     pending_breaks: VecDeque<(usize, StreamDiscontinuity)>,
-    /// Geometry the last IQ packet declared, or `None` before the first one
-    /// of the run. Compared against each new packet to spot a retune; a
-    /// reconnect deliberately keeps it, because reconnecting to the same
-    /// configuration is not a retune.
+    /// Geometry last announced (queued as an `Initial` or `Retune`), or
+    /// `None` before the first. Compared against each new packet to spot a
+    /// retune. A reconnect that keeps the buffer keeps it too, because
+    /// reconnecting to the same configuration is not a retune; a restart
+    /// that clears the buffer rewinds it to `published_geometry`, since the
+    /// announcements it discards were never delivered.
     epoch_center_hz: Option<f64>,
     epoch_rate_hz: Option<f64>,
+    /// `(center_hz, rate_hz)` of the last geometry break actually reported
+    /// to the sink — what the consumer believes. A restart rewinds the
+    /// baseline above to this; see `note_buffer_cleared`.
+    published_geometry: Option<(f64, f64)>,
 }
 
 impl HttpSource {
@@ -502,10 +564,15 @@ impl HttpSource {
             stream_active: false,
             current_frequency: center_frequency_hz,
             current_sample_rate: sample_rate_hz,
+            configured_center_hz: center_frequency_hz,
+            configured_rate_hz: sample_rate_hz,
             overflow_samples: 0,
             next_overflow_report: 1,
             stream_gap_seconds: 0.0,
             next_gap_report: 1,
+            non_iq_packets_skipped: 0,
+            packets_lost_to_parse_errors: 0,
+            next_parse_loss_report: 1,
             link_check: LinkCheck::Unmeasured,
             link_device_rate: None,
             chunk_rx: None,
@@ -522,6 +589,7 @@ impl HttpSource {
             pending_breaks: VecDeque::new(),
             epoch_center_hz: None,
             epoch_rate_hz: None,
+            published_geometry: None,
         })
     }
 
@@ -577,8 +645,19 @@ impl HttpSource {
         }
 
         // Configure RTSA device to enable connection and streaming
+        // Warn on the first start, where it decides what the whole run
+        // streams; a reconnect repeating the same refusal says nothing new,
+        // and a stalled or paused mission reconnects every few seconds.
+        let first_start = !self.initial_tune_done;
         if let Err(e) = self.configure_rtsa_device().await {
-            debug!("Could not configure RTSA device: {}", e);
+            if first_start {
+                warn!(
+                    "Could not set the RTSA block's connect/run switches ({e}); \
+                     streaming from whatever state the mission is in"
+                );
+            } else {
+                debug!("Could not set the RTSA block's connect/run switches on reconnect: {e}");
+            }
         }
 
         // Try to start streaming via control endpoint
@@ -643,29 +722,12 @@ impl HttpSource {
         // 4 MB — about 45 ms at the 88 MB/s a WiFi 6E path delivers. The
         // task ends when the stream does, or when the receiver is dropped
         // on reconnect/retune.
-        let mut stream = response.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
-        let task = tokio::spawn(async move {
-            use futures::StreamExt;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(chunk) => {
-                        // `send` awaits when the channel is full — this is the
-                        // backpressure point, and where TCP flow control kicks
-                        // in. A send error means the receiver was dropped, so
-                        // the source is gone and the task should end.
-                        if tx.send(chunk).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Stream chunk error in reader task: {}", e);
-                        break;
-                    }
-                }
-            }
-            debug!("Aaronia stream reader task ended");
-        });
+        let task = tokio::spawn(read_stream_into(
+            response.bytes_stream(),
+            tx,
+            STREAM_STALL_TIMEOUT,
+        ));
         self.chunk_rx = Some(rx);
         self.reader_task = Some(task);
 
@@ -1015,7 +1077,7 @@ impl HttpSource {
     /// *old* configuration, so a retune after `Done` re-arms too: the
     /// new rate has its own budget and deserves its own one check.
     /// Rung steps are 2x, so a real retune always clears
-    /// [`RATE_CHANGE_BAND`]; jitter in a rate derived from
+    /// [`RATE_CHANGE_BAND`](crate::http_streaming::RATE_CHANGE_BAND); jitter in a rate derived from
     /// `samples / duration` does not, and must not reset the meter on
     /// every packet.
     fn note_device_rate(&mut self, inferred_rate: f64) {
@@ -1187,11 +1249,20 @@ impl HttpSource {
     /// Parse one stream chunk into the sample buffer.
     ///
     /// Returns `(samples_added, iq_samples)`: everything queued for the
-    /// consumer, and the subset decoded from IQ-payload packets. The
-    /// split exists for the link-budget meter, which must count only IQ —
-    /// spectra/histogram/categories scalars occupy half the wire bytes an
-    /// IQ sample does (and decompress to more than arrived), so counting
-    /// them as IQ payload inflates the measured rate on mixed missions.
+    /// consumer, and the subset decoded from IQ-payload packets. Only IQ
+    /// is queued, so the two are equal; they are reported separately
+    /// because they answer different questions — the consumer's refill
+    /// loop wants the first, the link-budget meter the second.
+    ///
+    /// Spectra, histogram and category packets are counted and skipped.
+    /// Their payloads are power scalars, not complex baseband: queued as
+    /// IQ they reach the consumer as samples of a signal that was never
+    /// received, at a rate that is not the stream's.
+    ///
+    /// A packet the parser could not decode is skipped too, and marked as
+    /// a gap where it sat — its samples are gone, so the packets either
+    /// side of it are not contiguous. Only an unrecoverable framing error
+    /// is returned as `Err`.
     fn process_advanced_stream_data(&mut self, data: &Bytes) -> Result<(usize, usize)> {
         // All stream formats use JSON+binary format
         // even binary formats like float16/float32/int16 when streaming via /stream endpoint
@@ -1220,7 +1291,7 @@ impl HttpSource {
             );
         }
 
-        let packets = self.stream_parser.process_data(data)?;
+        let items = self.stream_parser.process_data_recovering(data)?;
 
         let mut total_samples_added = 0;
         let mut iq_samples_added = 0;
@@ -1245,7 +1316,19 @@ impl HttpSource {
         // buffer length *before* any of the batch had been appended, which
         // is the right answer only for the first packet in it.
 
-        for packet in packets {
+        for item in items {
+            let packet = match item {
+                crate::http_streaming::ParsedItem::Packet(packet) => packet,
+                crate::http_streaming::ParsedItem::Lost(e) => {
+                    self.note_lost_packet(&e);
+                    continue;
+                }
+            };
+            if packet.metadata.payload != crate::http_streaming::PayloadType::Iq {
+                self.note_non_iq_packet(&packet);
+                continue;
+            }
+
             if let crate::http_streaming::DropResult::Drop { gap_seconds } =
                 self.drop_detector.observe(&packet)
             {
@@ -1309,8 +1392,13 @@ impl HttpSource {
 
             // Update current stream metadata from the parsed packet. The
             // packet reports its frequency *range*; the tuned frequency is
-            // the center of that range, not its lower edge.
-            self.current_frequency = packet.sdr_config.center_frequency_hz;
+            // the center of that range, not its lower edge. IQ packets
+            // only (everything else was skipped above): a spectra header's
+            // range is the displayed span, and a marker declares none.
+            let center_hz = packet.sdr_config.center_frequency_hz;
+            if center_hz > 0.0 {
+                self.current_frequency = center_hz;
+            }
 
             // The parser derives the rate from `sampleFrequency` when
             // present and from `samples / duration` otherwise; adopt it
@@ -1320,20 +1408,17 @@ impl HttpSource {
             // magnitude below the IQ rate, which would ping-pong the
             // link check into restarting on every interleaved packet and
             // hand it a nonsense yardstick on non-IQ-dominated streams.
-            let is_iq = packet.metadata.payload == crate::http_streaming::PayloadType::Iq;
             let inferred_rate = packet.sdr_config.sample_rate_hz;
-            if is_iq {
-                self.note_device_rate(inferred_rate);
-                if inferred_rate > 0.0
-                    && (self.current_sample_rate <= 0.0
-                        || rate_moved(self.current_sample_rate, inferred_rate))
-                {
-                    debug!(
-                        "Sample rate updated from metadata: {:.0} -> {:.0} Hz",
-                        self.current_sample_rate, inferred_rate
-                    );
-                    self.current_sample_rate = inferred_rate;
-                }
+            self.note_device_rate(inferred_rate);
+            if inferred_rate > 0.0
+                && (self.current_sample_rate <= 0.0
+                    || rate_moved(self.current_sample_rate, inferred_rate))
+            {
+                debug!(
+                    "Sample rate updated from metadata: {:.0} -> {:.0} Hz",
+                    self.current_sample_rate, inferred_rate
+                );
+                self.current_sample_rate = inferred_rate;
             }
 
             // What the samples that follow *mean*, checked before they are
@@ -1353,9 +1438,7 @@ impl HttpSource {
             // Bulk `extend` (one reserve) rather than per-element `push_back`.
             self.sample_buffer.extend(packet.samples);
             total_samples_added += packet_samples;
-            if is_iq {
-                iq_samples_added += packet_samples;
-            }
+            iq_samples_added += packet_samples;
             let capacity = self.buffer_capacity();
             if self.sample_buffer.len() > capacity {
                 let overflow = self.sample_buffer.len() - capacity;
@@ -1438,6 +1521,42 @@ impl HttpSource {
     /// enforcing 1, so `buffer_level` could exceed `buffer_capacity` and a
     /// consumer computing a fill ratio divided by zero. The bare `* 2` was
     /// also the only unguarded one on overflow.
+    /// Account for a packet the parser framed but could not decode.
+    ///
+    /// Its samples are lost, so the stream breaks here exactly as it does
+    /// at a server gap. The drop detector is re-seeded because the next
+    /// packet's timestamp will show the hole, and it is ours to report, not
+    /// the server's.
+    fn note_lost_packet(&mut self, error: &Error) {
+        self.packets_lost_to_parse_errors = self.packets_lost_to_parse_errors.saturating_add(1);
+        self.note_break(StreamDiscontinuity::Gap);
+        self.drop_detector.resync();
+        if self.packets_lost_to_parse_errors >= self.next_parse_loss_report {
+            warn!(
+                "Skipped an undecodable stream packet ({error}); {} lost so far. \
+                 The packets either side are kept and the hole is marked as a gap.",
+                self.packets_lost_to_parse_errors,
+            );
+            self.next_parse_loss_report = self.packets_lost_to_parse_errors.saturating_mul(4);
+        }
+    }
+
+    /// Account for a spectra, histogram or category packet on the stream.
+    ///
+    /// This block produces complex baseband, and those payloads are power
+    /// scalars. They are counted so a mixed mission is visible in
+    /// [`StreamStats::non_iq_packets_skipped`], and said once in the log.
+    fn note_non_iq_packet(&mut self, packet: &crate::http_streaming::StreamPacket) {
+        if self.non_iq_packets_skipped == 0 {
+            warn!(
+                "The stream carries {:?} packets as well as IQ; this source outputs IQ only, \
+                 so they are skipped (counted in StreamStats::non_iq_packets_skipped)",
+                packet.metadata.payload,
+            );
+        }
+        self.non_iq_packets_skipped = self.non_iq_packets_skipped.saturating_add(1);
+    }
+
     /// Record a break before the samples that have **not yet** been queued.
     ///
     /// The offset is the current buffer length, so the break sits between the
@@ -1499,17 +1618,24 @@ impl HttpSource {
     /// Unlike the trim, nothing survives, so a pending break describes only
     /// samples that will never be produced — and a pending `Retune` would
     /// announce a geometry that no longer applies to anything. They are
-    /// dropped and replaced by the single gap the clear actually is. The
-    /// geometry trackers are deliberately left alone: the next packet compares
-    /// against what the device was last streaming, so reconnecting to an
-    /// unchanged configuration reports no retune and reconnecting to a changed
-    /// one does.
+    /// dropped and replaced by the single gap the clear actually is.
+    ///
+    /// The geometry baseline goes back to what the consumer was last *told*
+    /// — the last geometry published, or nothing before the first. The next
+    /// packet is compared against that, so reconnecting to an unchanged
+    /// configuration reports no retune and reconnecting to a changed one
+    /// does. Leaving the baseline where the discarded packets had moved it
+    /// would make that comparison against a geometry that was never
+    /// announced: after a retune queued and cleared by a restart, the new
+    /// band would match the baseline and never be reported at all.
     fn note_buffer_cleared(&mut self) {
         if self.break_sink.is_none() {
             return;
         }
         self.pending_breaks.clear();
         self.pending_breaks.push_back((0, StreamDiscontinuity::Gap));
+        self.epoch_center_hz = self.published_geometry.map(|(center, _)| center);
+        self.epoch_rate_hz = self.published_geometry.map(|(_, rate)| rate);
     }
 
     /// Compare `packet`'s geometry with the run so far and record what changed.
@@ -1595,16 +1721,56 @@ impl HttpSource {
         if !self.pending_breaks.is_empty()
             && let Some(sink) = self.break_sink.clone()
         {
-            while let Some(&(offset, cause)) = self.pending_breaks.front() {
+            while let Some(&(offset, _)) = self.pending_breaks.front() {
                 if offset >= produced {
                     break;
                 }
-                self.pending_breaks.pop_front();
-                let at = self.produced + offset as u64;
-                if at == 0 && cause == StreamDiscontinuity::Gap {
-                    continue;
+                // Every break at this position separates the same two
+                // samples, so they are reported as one boundary: at most
+                // one gap, then at most one geometry. Several geometries
+                // meet here when a trim discards the samples between them
+                // — an `Initial` for a band nobody will see a sample of,
+                // then the `Retune` away from it. Only the last describes
+                // what follows; it keeps the `Initial` kind when one was
+                // among them, because that is still the run's first word
+                // on geometry.
+                let mut gap = false;
+                let mut geometry: Option<StreamDiscontinuity> = None;
+                while let Some(&(o, cause)) = self.pending_breaks.front() {
+                    if o != offset {
+                        break;
+                    }
+                    self.pending_breaks.pop_front();
+                    geometry = match (cause, geometry) {
+                        (StreamDiscontinuity::Gap, g) => {
+                            gap = true;
+                            g
+                        }
+                        (
+                            StreamDiscontinuity::Initial { .. }
+                            | StreamDiscontinuity::Retune { .. },
+                            None,
+                        ) => Some(cause),
+                        (
+                            StreamDiscontinuity::Initial { center_hz, rate_hz }
+                            | StreamDiscontinuity::Retune { center_hz, rate_hz },
+                            Some(StreamDiscontinuity::Initial { .. }),
+                        ) => Some(StreamDiscontinuity::Initial { center_hz, rate_hz }),
+                        (later, Some(_)) => Some(later),
+                    };
                 }
-                sink.record(at, cause);
+                let at = self.produced + offset as u64;
+                if gap && at != 0 {
+                    sink.record(at, StreamDiscontinuity::Gap);
+                }
+                if let Some(geometry) = geometry {
+                    if let StreamDiscontinuity::Initial { center_hz, rate_hz }
+                    | StreamDiscontinuity::Retune { center_hz, rate_hz } = geometry
+                    {
+                        self.published_geometry = Some((center_hz, rate_hz));
+                    }
+                    sink.record(at, geometry);
+                }
             }
             for (offset, _) in self.pending_breaks.iter_mut() {
                 *offset = offset.saturating_sub(produced);
@@ -1660,6 +1826,8 @@ impl HttpSource {
             // handle, which carries it across this snapshot.
             device_health: None,
             device_health_drops: 0,
+            non_iq_packets_skipped: self.non_iq_packets_skipped,
+            packets_lost_to_parse_errors: self.packets_lost_to_parse_errors,
         }
     }
 }
@@ -1682,8 +1850,36 @@ impl Drop for HttpSource {
 }
 
 impl HttpSource {
-    /// Configure RTSA device to enable connection and streaming
+    /// Configure RTSA device to enable connection and streaming, and on the
+    /// first start, tune it.
+    ///
+    /// The two writes are independent. The tune used to run only inside the
+    /// success arm of the connect/run write, so a mission whose RTSA block
+    /// refused that write — or a server that refused the config read in
+    /// front of it — never received the requested centre and span, and the
+    /// only trace was a debug line. The tune is attempted either way, and
+    /// only once: `initial_tune_done` is set when it is *attempted*, so a
+    /// later restart cannot fire it for the first time after an external
+    /// retune it would undo.
     async fn configure_rtsa_device(&mut self) -> Result<()> {
+        let connect_run = self.write_connect_run().await;
+
+        // Tune the hardware *before* opening the stream — but only on the
+        // first start. A restart (from `restart_pending`) happens *after* an
+        // external retune, and re-pushing this source's target would undo
+        // it; the stream just needs to reconnect. See `initial_tune_done`.
+        if self.initial_tune_done {
+            debug!("Skipping device retune on stream restart (already tuned once)");
+        } else {
+            self.initial_tune_done = true;
+            self.apply_initial_tune().await;
+        }
+
+        connect_run
+    }
+
+    /// Set the RTSA block's `connect` and `run` switches.
+    async fn write_connect_run(&mut self) -> Result<()> {
         use crate::http_endpoints::ConfigItem;
 
         info!("Configuring RTSA device for streaming...");
@@ -1717,36 +1913,13 @@ impl HttpSource {
             },
         ];
 
-        // Update RTSA configuration
-        match self
-            .endpoints_client
+        self.endpoints_client
             .update_config(config.request + 1, "RTSA", rtsa_config)
-            .await
-        {
-            Ok(_) => {
-                info!("Successfully configured RTSA device: connect=true, run=true");
-                // Give device a moment to process the configuration
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                // Tune the hardware *before* opening the stream — but only on
-                // the first start. A restart (from `restart_pending`) happens
-                // *after* an external retune, and re-pushing this source's
-                // stale target would undo it; the stream just needs to
-                // reconnect. See `initial_tune_done`.
-                if self.initial_tune_done {
-                    debug!("Skipping device retune on stream restart (already tuned once)");
-                } else {
-                    self.apply_initial_tune().await;
-                    self.initial_tune_done = true;
-                }
-
-                Ok(())
-            }
-            Err(e) => {
-                debug!("Could not update RTSA configuration: {}", e);
-                Err(e)
-            }
-        }
+            .await?;
+        info!("Successfully configured RTSA device: connect=true, run=true");
+        // Give device a moment to process the configuration
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        Ok(())
     }
 
     /// Push this source's centre / rate / reference level to the device and
@@ -1769,20 +1942,25 @@ impl HttpSource {
     /// opening on whatever the device is currently tuned to, and the caller
     /// gets a warning naming what did not take rather than a silent success.
     async fn apply_initial_tune(&mut self) {
-        let decimation_index = (self.current_sample_rate > 0.0)
-            .then(|| crate::decimation_index_for_rate(self.current_sample_rate));
+        // The builder's request, never `current_*`: those track what the
+        // packets declare, so any stream data received before this ran
+        // would turn "tune to what was asked" into "tune to where the
+        // device already is".
+        let center_hz = self.configured_center_hz;
+        let rate_hz = self.configured_rate_hz;
+        let decimation_index = (rate_hz > 0.0).then(|| crate::decimation_index_for_rate(rate_hz));
 
         info!(
             "Tuning RTSA device to center={:.6} MHz, span={:.3} MHz \
              (decimation index {:?}), ref_level={:?} dBm",
-            self.current_frequency / 1e6,
-            self.current_sample_rate / 1e6,
+            center_hz / 1e6,
+            rate_hz / 1e6,
             decimation_index,
             self.reference_level_dbm,
         );
 
         let request = crate::http_endpoints::CaptureConfig {
-            center_frequency_hz: (self.current_frequency > 0.0).then_some(self.current_frequency),
+            center_frequency_hz: (center_hz > 0.0).then_some(center_hz),
             decimation_index,
             reference_level_dbm: self.reference_level_dbm,
         };
@@ -1833,16 +2011,23 @@ impl HttpSource {
                     "Could not tune via /remoteconfig ({e}); falling back to the \
                      unverified /control capture command"
                 );
-                let fallback = self
-                    .endpoints_client
-                    .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center_hz: Some(self.current_frequency),
-                        frequency_span_hz: Some(self.current_sample_rate),
-                        reference_level_dbm: self.reference_level_dbm.map(|dbm| dbm as f32),
-                        control_type: crate::http_endpoints::ControlType::Capture,
-                        ..Default::default()
-                    })
-                    .await;
+                // Only what was asked for, as the `/remoteconfig` request
+                // above does: an unset (non-positive) centre or span is
+                // omitted, not sent as a command to tune to 0 Hz.
+                let control = crate::http_endpoints::CaptureControl {
+                    frequency_center_hz: (center_hz > 0.0).then_some(center_hz),
+                    frequency_span_hz: (rate_hz > 0.0).then_some(rate_hz),
+                    reference_level_dbm: self.reference_level_dbm.map(|dbm| dbm as f32),
+                    control_type: crate::http_endpoints::ControlType::Capture,
+                    ..Default::default()
+                };
+                if control.frequency_center_hz.is_none()
+                    && control.frequency_span_hz.is_none()
+                    && control.reference_level_dbm.is_none()
+                {
+                    return;
+                }
+                let fallback = self.endpoints_client.configure_capture(control).await;
                 match fallback {
                     Ok(_) => info!(
                         "/control capture accepted (unverified: the server answers \
@@ -3306,6 +3491,145 @@ mod tests {
         );
     }
 
+    /// The first start tunes the device to what the source was built
+    /// with, even when the connect/run write in front of it fails, and
+    /// even when stream data has already moved `current_*`. It used to
+    /// run only on that write's success — so a refused write meant no
+    /// tune at all — and to take its target from the packet-tracked
+    /// fields, which a reconnect before the first successful tune had
+    /// already overwritten with wherever the device happened to be.
+    #[tokio::test]
+    async fn the_first_start_tunes_to_the_request_whatever_the_connect_write_did() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // No usable /remoteconfig: the connect/run write fails, and the
+        // tune falls back to /control.
+        Mock::given(method("GET"))
+            .and(path("/remoteconfig"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/control"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let mut block = HttpSourceBuilder::new(&server.uri())
+            .center_frequency_hz(915e6)
+            .build()
+            .expect("Should create HttpSource");
+        // Stream data has since reported a different centre.
+        block.current_frequency = 433e6;
+
+        assert!(
+            block.configure_rtsa_device().await.is_err(),
+            "the connect/run write failed, and the caller hears so",
+        );
+        assert!(block.initial_tune_done, "the tune was attempted");
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let tunes: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/control")
+            .filter_map(|r| serde_json::from_slice(&r.body).ok())
+            .collect();
+        assert_eq!(tunes.len(), 1, "one tune, on the first start only");
+        assert_eq!(tunes[0]["frequencyCenter"].as_f64(), Some(915e6));
+
+        // A restart does not tune again.
+        let _ = block.configure_rtsa_device().await;
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() == "/control")
+                .count(),
+            1,
+        );
+    }
+
+    /// The `/control` fallback sends only what was requested. It wrapped
+    /// the builder's centre and span in `Some` unconditionally, so a source
+    /// built without a centre commanded the device to 0 Hz, where the
+    /// `/remoteconfig` path beside it omits the field.
+    #[tokio::test]
+    async fn the_control_fallback_never_commands_a_zero_centre() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/remoteconfig"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/control"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let mut block = HttpSourceBuilder::new(&server.uri())
+            .center_frequency_hz(0.0)
+            .build()
+            .expect("Should create HttpSource");
+        block.apply_initial_tune().await;
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let tunes: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/control")
+            .filter_map(|r| serde_json::from_slice(&r.body).ok())
+            .collect();
+        assert_eq!(tunes.len(), 1, "the requested span is still sent");
+        assert!(tunes[0].get("frequencyCenter").is_none(), "{}", tunes[0]);
+        assert_eq!(tunes[0]["frequencySpan"].as_f64(), Some(1e6));
+
+        // Nothing requested at all: nothing sent.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/remoteconfig"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let mut block = HttpSourceBuilder::new(&server.uri())
+            .center_frequency_hz(0.0)
+            .sample_rate_hz(0.0)
+            .build()
+            .expect("Should create HttpSource");
+        block.apply_initial_tune().await;
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests.iter().all(|r| r.url.path() != "/control"));
+    }
+
+    /// A server that stops sending while holding the socket open must not
+    /// park the reader forever: it gives up after the stall timeout and
+    /// drops its sender, which is what sends the source down its
+    /// reconnect path.
+    #[tokio::test]
+    async fn a_stalled_stream_ends_the_reader() {
+        use futures::StreamExt;
+        let chunks =
+            futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"one"))])
+                .chain(futures::stream::pending());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let reader = tokio::spawn(read_stream_into(
+            chunks,
+            tx,
+            std::time::Duration::from_millis(50),
+        ));
+
+        assert_eq!(rx.recv().await, Some(Bytes::from_static(b"one")));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the stalled reader must give up, not hang");
+        assert_eq!(ended, None, "the channel closes: the source reconnects");
+        reader.await.unwrap();
+    }
+
     // ---------------------------------------------------------------
     // Stream breaks. The index a break is reported at is the whole point
     // of the mechanism, so these check the arithmetic rather than that
@@ -3582,6 +3906,83 @@ mod tests {
         );
     }
 
+    /// A retune whose announcement is discarded by a restart must still be
+    /// announced after it. The baseline had already moved to the new band
+    /// when the announcement was queued, so without rewinding it the first
+    /// packet after the restart matched and the consumer went on believing
+    /// the old geometry for the rest of the run.
+    #[test]
+    fn a_retune_discarded_by_a_restart_is_announced_after_it() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        let first = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 16));
+        block.process_advanced_stream_data(&first).expect("parses");
+        drain(&mut block, 16);
+        // The device moves to 7.68 MS/s; the packet is queued, not produced.
+        let moved = Bytes::from(int16_iq_packet(7_680_000.0, 100.001, 100.002, 16));
+        block.process_advanced_stream_data(&moved).expect("parses");
+        // The restart discards it and the retune queued with it.
+        block.sample_buffer.clear();
+        block.note_buffer_cleared();
+        // The new connection streams the new band.
+        let after = Bytes::from(int16_iq_packet(7_680_000.0, 200.0, 200.001, 16));
+        block.process_advanced_stream_data(&after).expect("parses");
+        drain(&mut block, 16);
+
+        assert_eq!(
+            sink.breaks(),
+            vec![
+                (
+                    0,
+                    StreamDiscontinuity::Initial {
+                        center_hz: 100e6,
+                        rate_hz: 15_360_000.0
+                    }
+                ),
+                (16, StreamDiscontinuity::Gap),
+                (
+                    16,
+                    StreamDiscontinuity::Retune {
+                        center_hz: 100e6,
+                        rate_hz: 7_680_000.0
+                    }
+                ),
+            ],
+        );
+    }
+
+    /// A trim before the first sample can discard the band a run opened
+    /// on. The consumer is then owed one statement of the geometry its
+    /// first sample arrived under, not an `Initial` for a band it never
+    /// saw followed by a `Retune` away from it at the same index.
+    #[test]
+    fn a_trim_past_the_opening_band_publishes_one_initial() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        let first = Bytes::from(int16_iq_packet(15_360_000.0, 100.0, 100.001, 16));
+        block.process_advanced_stream_data(&first).expect("parses");
+        let second = Bytes::from(int16_iq_packet(7_680_000.0, 100.001, 100.002, 16));
+        block.process_advanced_stream_data(&second).expect("parses");
+        block.sample_buffer.drain(0..20);
+        block.note_trim(20);
+        drain(&mut block, 12);
+
+        assert_eq!(
+            sink.breaks(),
+            vec![(
+                0,
+                StreamDiscontinuity::Initial {
+                    center_hz: 100e6,
+                    rate_hz: 7_680_000.0
+                }
+            )],
+        );
+    }
+
     #[test]
     fn with_no_sink_nothing_is_queued() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3733,6 +4134,76 @@ mod tests {
         assert_eq!(gaps, vec![16, 32]);
     }
 
+    /// A mixed mission interleaves spectra with the IQ. The consumer must
+    /// receive the IQ and nothing else, the drop detector must measure
+    /// the IQ timeline rather than the two interleaved ones, and the
+    /// frequency a spectra frame (or a marker, which declares 0 Hz)
+    /// reports must not overwrite the stream's.
+    #[test]
+    fn interleaved_spectra_are_neither_samples_nor_gaps() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        let mut wire = int16_iq_packet(15_360_000.0, 100.000, 100.001, 16);
+        // Spectra frames stamped between and after the IQ packets: fed to
+        // the drop detector, each would read as a jump in the IQ timeline.
+        wire.extend(int16_spectra_packet(100.0005, 100.0105, 8));
+        wire.extend(int16_iq_packet(15_360_000.0, 100.001, 100.002, 16));
+        wire.extend(int16_spectra_packet(100.020, 100.030, 8));
+        wire.extend(int16_iq_packet(15_360_000.0, 100.002, 100.003, 16));
+        let counts = block
+            .process_advanced_stream_data(&Bytes::from(wire))
+            .expect("parses");
+        assert_eq!(counts, (48, 48));
+        assert_eq!(block.sample_buffer.len(), 48, "the IQ and only the IQ");
+        drain(&mut block, 48);
+
+        let stats = block.get_stream_stats();
+        assert_eq!(stats.non_iq_packets_skipped, 2);
+        assert_eq!(stats.dropped_packets, 0, "the IQ timeline is contiguous");
+        assert_eq!(stats.current_frequency, 100e6);
+        assert_eq!(sink.breaks().len(), 1, "the Initial and nothing else");
+    }
+
+    /// A packet the parser cannot decode costs itself only. Its
+    /// neighbours are queued, and the hole is a gap at the sample where
+    /// it sat — not a reconnect that throws away the whole backlog.
+    #[test]
+    fn an_undecodable_packet_is_a_gap_where_it_sat() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        let mut wire = int16_iq_packet(15_360_000.0, 100.000, 100.001, 16);
+        // Frames, but its payload cannot be sized.
+        wire.extend(
+            format!(
+                r#"{{"startTime":100.001,"endTime":100.002,"startFrequency":95e6,"endFrequency":105e6,"sampleFrequency":15360000,"samples":{},"unit":"volt","payload":"iq","minPower":-120,"maxPower":0,"sampleSize":2}}"#,
+                u64::MAX
+            )
+            .into_bytes(),
+        );
+        wire.extend_from_slice(&[0x0A, 0x1E]);
+        wire.extend(int16_iq_packet(15_360_000.0, 100.002, 100.003, 16));
+        let counts = block
+            .process_advanced_stream_data(&Bytes::from(wire))
+            .expect("a lost packet is not an error");
+        assert_eq!(counts, (32, 32), "both neighbours are kept");
+        drain(&mut block, 32);
+
+        let breaks = sink.breaks();
+        assert_eq!(breaks.len(), 2, "{breaks:?}");
+        assert_eq!(breaks[0].1.kind(), "initial");
+        assert_eq!(breaks[1], (16, StreamDiscontinuity::Gap));
+        let stats = block.get_stream_stats();
+        assert_eq!(stats.packets_lost_to_parse_errors, 1);
+        assert_eq!(
+            stats.dropped_packets, 0,
+            "the hole is ours, not a server skip",
+        );
+    }
+
     /// One serialized RTSA int16 IQ packet as the wire carries it: JSON
     /// header, the live server's LF+RS separator, then `pairs` zeroed
     /// little-endian int16 IQ pairs.
@@ -3766,8 +4237,8 @@ mod tests {
     /// stream. Handed to the device-rate tracker, that "retune" would
     /// restart the measurement on every interleaved packet; handed to the
     /// meter, its scalars would be counted as IQ payload at twice their
-    /// wire width. Neither may happen, and the consumer still gets the
-    /// samples.
+    /// wire width. Neither may happen — and the scalars are not IQ, so
+    /// they do not reach the consumer either.
     #[test]
     fn spectra_packets_feed_neither_the_rate_tracker_nor_the_meter() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3797,9 +4268,11 @@ mod tests {
             .expect("the spectra packet parses");
         assert_eq!(
             counts,
-            (4, 0),
-            "spectra scalars reach the consumer but are not IQ payload",
+            (0, 0),
+            "spectra scalars are not IQ, for the consumer or the meter",
         );
+        assert_eq!(block.sample_buffer.len(), 4, "only the IQ was queued");
+        assert_eq!(block.get_stream_stats().non_iq_packets_skipped, 1);
         assert_eq!(
             block.link_device_rate,
             Some(15_360_000.0),

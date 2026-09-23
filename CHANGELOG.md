@@ -21,6 +21,68 @@ All notable changes to this project will be documented in this file.
   later trim cannot move an index already reported; samples the source discards
   never occupy an index at all.
 
+- `StreamParser::process_data_recovering` and `ParsedItem`: a malformed
+  packet becomes a `ParsedItem::Lost` in stream order instead of an `Err` that
+  discards the rest of the chunk. `process_data` keeps its contract.
+- `StreamStats::non_iq_packets_skipped` and
+  `StreamStats::packets_lost_to_parse_errors`.
+
+### Fixed
+- **A lost packet at a high sample rate is now reported.** `DropDetector`
+  flagged a gap only past a fixed 1 ms, and at 61.44 MS/s a 16 384-sample
+  packet lasts 267 µs, so a whole lost packet was spliced over silently. The
+  tolerance is now relative to the stream: half the packet's own duration, or
+  four times the residual observed between contiguous packets (at most three
+  quarters of a packet), floored at the timestamps' microsecond resolution
+  and still capped at 1 ms, so low rates behave as before.
+  `DropDetector::observed_jitter_seconds` exposes the calibration. Not yet
+  verified live against a real RTSA stream at a high rate.
+- **A compressed spectra or histogram packet no longer swallows the IQ behind
+  it.** It was framed at its *uncompressed* size, but a compressed payload is
+  a bitstream whose length the header does not carry. It is now reported lost
+  (`ParsedItem::Lost`, a gap where it sat) and the parser resynchronises on
+  the next header.
+- **Compressed spectra decode on a frames × bins grid.** The wavelet grid was
+  sized from the square root of one frame's bins, ignoring the frame count
+  and dropping bins. Shapes whose layout is undocumented — more than one
+  16-spectrum block, depth planes, histograms — are refused instead of
+  decoded into a wrong shape.
+- **`HttpSource` no longer outputs spectra, histogram or category scalars as
+  IQ.** They were queued with the IQ, fed the drop detector (whose timeline
+  they are not on) and overwrote `current_frequency` (a marker declares 0 Hz).
+  They are now counted and skipped.
+- **One undecodable packet no longer costs the connection.** `HttpSource`
+  skips it, keeps the packets either side, and records a gap where it sat;
+  only an unrecoverable framing error still reconnects.
+- **A stalled `/stream` reconnects.** The reader waited forever on a socket
+  that stayed open and sent nothing; it now gives up after 5 s and the source
+  takes its ordinary reconnect path.
+- **A retune swallowed by a restart is announced after it.** The restart
+  discarded the queued `Retune` but kept the baseline it had advanced, so the
+  new band was never reported. The baseline now rewinds to the last geometry
+  reported.
+- **A trim before the first sample publishes one `Initial`**, carrying the
+  geometry the first sample arrived under, instead of `Initial` for a
+  discarded band followed by `Retune` at the same index.
+- **The first-start tune runs even when the connect/run write fails**, takes
+  its target from the builder rather than from packet-tracked fields, and is
+  marked done once attempted. The connect/run failure is logged at warn.
+- **`UnifiedSource` HTTP reads no longer split on a derived-rate wobble.** The
+  read boundary compared rates with `!=`; it uses the crate's 10% band.
+- **RTSA files:** resync over a corrupt region scans in 64 KiB blocks instead
+  of one `seek` per byte (16 MiB of zeroes: 34 s → well under a second); an IQ
+  `SAMP` chunk declaring other than one I/Q pair per sample is refused rather
+  than read with a mismatched stride; `seek_to_sample` indexes chunks per
+  sub-stream, as reads do; and `validate_structure` no longer overflows on an
+  absurd sample count.
+- **C ABI:** `spectran_source_builder_force_source_type` takes the source type
+  as `int` and ignores an unknown value. Taking the `#[repr(C)]` enum by value
+  made an out-of-range value from C undefined behaviour. Source-compatible for
+  C and C++ callers passing an enumerator.
+- **Native SDK:** a packet consumed without being delivered (bad stride,
+  oversized, undemuxable) now counts in `cumulative_drops` and sets
+  `take_overrun`, like a packet the device itself flagged as dropped.
+
 ### Changed
 - **Gap detection and sample queuing share one pass over each batch.** They
   were two loops, so every packet's gap was measured against the buffer length

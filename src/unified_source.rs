@@ -1427,7 +1427,17 @@ impl SpectranSource {
                                 && ((pkt_freq_hz > 0.0
                                     && batch_freq_hz > 0.0
                                     && (pkt_freq_hz - batch_freq_hz).abs() > 1.0)
-                                    || pkt_rate_hz != batch_rate_hz)
+                                    // The crate's band test, not `!=`: a
+                                    // rate derived from `samples / duration`
+                                    // differs in its low bits on every
+                                    // packet, and exact comparison split
+                                    // every read into one-packet reads.
+                                    || (pkt_rate_hz > 0.0
+                                        && batch_rate_hz > 0.0
+                                        && crate::http_streaming::rate_moved(
+                                            batch_rate_hz,
+                                            pkt_rate_hz,
+                                        )))
                             {
                                 self.sample_buffer.extend(new_samples);
                                 self.sample_buffer_freq_hz = pkt_freq_hz;
@@ -2422,7 +2432,7 @@ impl std::fmt::Display for SourceInfo {
 
 /// Builder pattern for easy SpectranSource configuration
 pub struct SpectranSourceBuilder {
-    config: SpectranConfig,
+    pub(crate) config: SpectranConfig,
 }
 
 impl SpectranSourceBuilder {
@@ -3136,6 +3146,31 @@ mod tests {
         assert_eq!(source.read_samples(&mut buffer, 10).await.unwrap(), 1);
         assert_eq!(source.capture_sample_rate_hz(), 2e6);
         assert_eq!(buffer[0].re, 2.0);
+    }
+
+    /// A rate the server did not declare is derived per packet from
+    /// `samples / duration`, and wobbles in its low bits. That is jitter,
+    /// not a retune, and must not end the read.
+    #[tokio::test]
+    async fn a_derived_rate_wobble_does_not_split_a_read() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut source = http_test_source(rx);
+        for (i, rate) in [1e6, 1.000_3e6, 0.999_8e6].into_iter().enumerate() {
+            tx.send((
+                vec![Complex32::new(1.0, 0.0); 2],
+                false,
+                0,
+                i as i64,
+                915e6,
+                rate,
+            ))
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let mut buffer = Vec::new();
+        assert_eq!(source.read_samples(&mut buffer, 6).await.unwrap(), 6);
+        assert_eq!(source.capture_sample_rate_hz(), 1e6);
     }
 
     #[tokio::test]

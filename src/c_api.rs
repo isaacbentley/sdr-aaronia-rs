@@ -123,11 +123,30 @@ pub enum SpectranFfiError {
 
 // --- C-compatible SourceType --- //
 /// CSpectranSourceType enumeration.
+///
+/// Returned to C (in [`FfiSourceInfo`]) as this type, but never *accepted*
+/// from C as it: a C caller can pass any integer where the enum is
+/// declared, and a Rust enum holding a value outside its variants is
+/// undefined behaviour before any check can run. Entry points take a
+/// `c_int` and convert with `TryFrom`.
 #[repr(C)]
 pub enum CSpectranSourceType {
-    NativeSdk,
-    Http,
-    File,
+    NativeSdk = 0,
+    Http = 1,
+    File = 2,
+}
+
+impl TryFrom<std::os::raw::c_int> for CSpectranSourceType {
+    type Error = std::os::raw::c_int;
+
+    fn try_from(value: std::os::raw::c_int) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(CSpectranSourceType::NativeSdk),
+            1 => Ok(CSpectranSourceType::Http),
+            2 => Ok(CSpectranSourceType::File),
+            other => Err(other),
+        }
+    }
 }
 
 impl From<CSpectranSourceType> for SourceType {
@@ -348,13 +367,27 @@ pub unsafe extern "C" fn spectran_source_builder_device_serial(
 /// — the same guarantee `SpectranConfig::force_native_sdk` gives Rust and
 /// `sdk=True` gives Python.
 ///
+/// `source_type` is a [`CSpectranSourceType`] value, taken as a `c_int`
+/// (the width C gives an enum) so that an out-of-range value is a value
+/// this can refuse rather than undefined behaviour. An unknown value is
+/// ignored and leaves the builder as it was.
+///
 /// # Safety
 /// `builder` must be a live pointer from [`spectran_source_builder_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_builder_force_source_type(
     builder: *mut SpectranSourceBuilder,
-    source_type: CSpectranSourceType,
+    source_type: std::os::raw::c_int,
 ) {
+    let source_type = match CSpectranSourceType::try_from(source_type) {
+        Ok(source_type) => source_type,
+        Err(unknown) => {
+            tracing::warn!(
+                "spectran_source_builder_force_source_type: unknown source type {unknown}; ignored"
+            );
+            return;
+        }
+    };
     unsafe {
         if let Some(builder) = builder.as_mut() {
             builder.force_source_type(source_type.into());
@@ -2288,6 +2321,40 @@ mod tests {
             spectran_source_builder_reference_level_dbm(builder, -20.0);
 
             // Free the builder
+            spectran_source_builder_free(builder);
+        }
+    }
+
+    /// A C caller may pass any integer where the enum is declared. Taken
+    /// as the Rust enum, an out-of-range value was undefined behaviour on
+    /// entry; taken as `c_int`, it is refused and the builder is untouched.
+    #[test]
+    fn an_out_of_range_source_type_from_c_is_refused() {
+        assert!(matches!(
+            CSpectranSourceType::try_from(0),
+            Ok(CSpectranSourceType::NativeSdk)
+        ));
+        assert!(matches!(
+            CSpectranSourceType::try_from(1),
+            Ok(CSpectranSourceType::Http)
+        ));
+        assert!(matches!(
+            CSpectranSourceType::try_from(2),
+            Ok(CSpectranSourceType::File)
+        ));
+        assert_eq!(CSpectranSourceType::try_from(3).err(), Some(3));
+        assert_eq!(CSpectranSourceType::try_from(-1).err(), Some(-1));
+
+        unsafe {
+            let builder = spectran_source_builder_new();
+            spectran_source_builder_force_source_type(builder, 7);
+            assert_eq!((*builder).config.force_source_type, None, "7 is refused");
+            spectran_source_builder_force_source_type(builder, CSpectranSourceType::File as _);
+            assert_eq!((*builder).config.force_source_type, Some(SourceType::File));
+            // Refused again, and the earlier choice is left standing.
+            spectran_source_builder_force_source_type(builder, -1);
+            assert_eq!((*builder).config.force_source_type, Some(SourceType::File));
+            spectran_source_builder_force_source_type(ptr::null_mut(), 1);
             spectran_source_builder_free(builder);
         }
     }

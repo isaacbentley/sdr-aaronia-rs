@@ -1669,7 +1669,7 @@ impl RtsaSource {
             match RtsaChunkHeader::read_from(reader) {
                 Ok(header) => {
                     if header.size < 16 || !Self::is_valid_rtsa_chunk_id(&header.id) {
-                        reader.seek(SeekFrom::Start(current_pos + 1))?;
+                        Self::resync_to_chunk_id(reader, current_pos + 1, actual_end_pos)?;
                     } else {
                         let next_chunk_pos = current_pos + header.size as u64;
                         if &header.id == b"SAMP" {
@@ -1691,10 +1691,51 @@ impl RtsaSource {
                         "scan_for_samp_chunks: failed to read header at offset {}: {:?}",
                         current_pos, e
                     );
-                    reader.seek(SeekFrom::Start(current_pos + 1))?;
+                    Self::resync_to_chunk_id(reader, current_pos + 1, actual_end_pos)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Leave `reader` at the first offset in `from..end` that starts with a
+    /// known chunk ID, or at `end` if none does.
+    ///
+    /// Resync used to step one byte and re-read a header, and every step was
+    /// a `BufReader::seek`, which discards the buffer — one syscall and one
+    /// refill per byte of a corrupt or zeroed region. This reads the region
+    /// in blocks and scans them in memory instead. It only finds a
+    /// *candidate*: the caller still validates the header there, and resyncs
+    /// again past it if that fails.
+    fn resync_to_chunk_id(
+        reader: &mut std::io::BufReader<std::fs::File>,
+        from: u64,
+        end: u64,
+    ) -> Result<()> {
+        const BLOCK: usize = 64 * 1024;
+        let mut block = vec![0u8; BLOCK];
+        let mut pos = from;
+        reader.seek(SeekFrom::Start(pos))?;
+        while pos < end {
+            let want = BLOCK.min((end - pos) as usize);
+            let got = read_up_to(reader, &mut block[..want])?;
+            if let Some(i) = block[..got]
+                .windows(4)
+                .position(|w| Self::is_valid_rtsa_chunk_id(w.try_into().expect("windows(4)")))
+            {
+                return reader
+                    .seek(SeekFrom::Start(pos + i as u64))
+                    .map(|_| ())
+                    .map_err(Into::into);
+            }
+            if got < 4 {
+                break;
+            }
+            // Step back three bytes so an ID straddling blocks is still seen.
+            pos += (got - 3) as u64;
+            reader.seek(SeekFrom::Start(pos))?;
+        }
+        reader.seek(SeekFrom::Start(end))?;
         Ok(())
     }
 
@@ -1853,14 +1894,26 @@ impl RtsaSource {
         }
 
         // Validate sample count consistency
+        // Both figures come from the file, so neither may be trusted to keep
+        // the arithmetic in range: `* 8` overflowed on a large count, and
+        // the signed difference's `abs()` panicked at `i64::MIN`.
         if self.metadata.total_samples > 0 && self.metadata.sample_data_size > 0 {
-            let expected_bytes = self.metadata.total_samples * 8; // 8 bytes per Complex32
             let actual_bytes = self.metadata.sample_data_size;
-            if (expected_bytes as i64 - actual_bytes as i64).abs() > (expected_bytes / 10) as i64 {
-                warnings.push(format!(
-                    "Sample count mismatch: expected {} bytes from {} samples, found {} bytes",
-                    expected_bytes, self.metadata.total_samples, actual_bytes
-                ));
+            // 8 bytes per Complex32
+            match self.metadata.total_samples.checked_mul(8) {
+                Some(expected_bytes)
+                    if expected_bytes.abs_diff(actual_bytes) > expected_bytes / 10 =>
+                {
+                    warnings.push(format!(
+                        "Sample count mismatch: expected {} bytes from {} samples, found {} bytes",
+                        expected_bytes, self.metadata.total_samples, actual_bytes
+                    ));
+                }
+                Some(_) => {}
+                None => warnings.push(format!(
+                    "Sample count {} is too large for any payload (found {} bytes)",
+                    self.metadata.total_samples, actual_bytes
+                )),
             }
         }
 
@@ -2023,6 +2076,29 @@ impl RtsaSource {
                         && self.current_sample_index >= chunk_start_sample
                     {
                         self.chunk_scan_hint = idx;
+                        // The IQ readers take one I/Q pair per sample, so the
+                        // stride below — `sample_size` values — only agrees
+                        // with them at 2. Any other count would size the
+                        // guard and the skip for one layout and read another.
+                        if samp_chunk.payload_type == DspStreamPayloadType::DsptIq
+                            && matches!(
+                                samp_chunk.sample_type,
+                                DspStreamSampleType::DsStF32
+                                    | DspStreamSampleType::DsStF32N
+                                    | DspStreamSampleType::DsStS16
+                                    | DspStreamSampleType::DsStS16N
+                            )
+                            && samp_chunk.sample_size != 2
+                        {
+                            return Err(Error::FileFormat {
+                                offset,
+                                reason: format!(
+                                    "IQ SAMP chunk at 0x{:08X} declares {} values per sample; \
+                                     IQ samples are one I/Q pair (2)",
+                                    offset, samp_chunk.sample_size
+                                ),
+                            });
+                        }
                         let samples_in_chunk_before =
                             (self.current_sample_index - chunk_start_sample) as u32;
                         let bytes_to_skip =
@@ -2233,12 +2309,17 @@ impl RtsaSource {
             self.current_sample_index = sample_index;
             return Ok(());
         }
-        let mut current_total_samples = 0;
+        // The same index the read path uses: each chunk's first sample is
+        // counted within its own sub-stream (`samp_chunk_start_samples`), and
+        // the first chunk in file order whose range holds the index is the
+        // one a read resumes in. Counting across sub-streams, as this did,
+        // put the reader in a different chunk than the next read chose.
         for &(offset, ref samp_chunk) in &self.samp_chunk_offsets {
             if samp_chunk.stream_id == self.iq_stream_id {
-                let chunk_end_sample = current_total_samples + samp_chunk.num_samples as u64;
-                if (current_total_samples..chunk_end_sample).contains(&sample_index) {
-                    let samples_into_chunk = sample_index - current_total_samples;
+                let chunk_start_sample = *self.samp_chunk_start_samples.get(&offset).unwrap_or(&0);
+                let chunk_end_sample = chunk_start_sample + samp_chunk.num_samples as u64;
+                if (chunk_start_sample..chunk_end_sample).contains(&sample_index) {
+                    let samples_into_chunk = sample_index - chunk_start_sample;
                     let byte_offset = samples_into_chunk * samp_chunk.sample_stride_bytes();
                     let data_start = offset + samp_chunk.header.header_size as u64;
                     self.reader
@@ -2249,7 +2330,6 @@ impl RtsaSource {
                     self.chunk_scan_hint = 0;
                     return Ok(());
                 }
-                current_total_samples = chunk_end_sample;
             }
         }
         Err(Error::FileFormat {
@@ -2439,6 +2519,21 @@ impl RtsaSource {
 const MAX_RTSA_CHUNK_SIZE: u32 = 1_000_000_000; // 1 GB
 
 // Helper traits for reading chunks from a reader.
+/// Fill `buf` from `reader` until it is full or the reader is exhausted,
+/// returning how many bytes were read.
+fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
 impl RtsaChunkHeader {
     fn read_from<R: Read + Seek>(reader: &mut R) -> Result<Self> {
         let mut id = [0u8; 4];
@@ -4576,8 +4671,10 @@ mod tests {
         assert_eq!(samp_chunk_offsets[1].1.num_samples, 20);
     }
 
-    #[test]
-    fn test_read_samples_with_metadata_chunk_in_between() {
+    /// A complete two-chunk float32 IQ file: DSFH, STRM, SSTR, STRT, then
+    /// SAMP (10 samples) at offset 400, a DUMY chunk, SAMP (15 samples),
+    /// and the DSFT tail.
+    fn two_chunk_iq_file() -> Vec<u8> {
         use byteorder::WriteBytesExt;
 
         let mut data = Vec::new();
@@ -4664,6 +4761,12 @@ mod tests {
         data.write_f64::<LittleEndian>(1609459201.0).unwrap(); // completion_time
         data.write_u64::<LittleEndian>(760).unwrap(); // stream_offset = 760
         data.write_u32::<LittleEndian>(1).unwrap(); // num_streams = 1
+        data
+    }
+
+    #[test]
+    fn test_read_samples_with_metadata_chunk_in_between() {
+        let data = two_chunk_iq_file();
 
         let path = create_temp_file(&data);
         let mut source = RtsaSource::open(&path).unwrap();
@@ -4701,6 +4804,113 @@ mod tests {
             panic!("Expected IQ samples");
         }
         assert_eq!(source.current_position(), 20);
+    }
+
+    /// Resync over a corrupt or zeroed region reads it in blocks. It used
+    /// to step one byte per `BufReader::seek`, which discards the buffer, so
+    /// every byte of the region cost a syscall and a refill; a few megabytes
+    /// of zeroes took seconds. The bound below is generous for the block
+    /// scan and far below what the byte-wise walk needed.
+    #[test]
+    fn a_large_zeroed_region_is_resynced_across_quickly() {
+        let mut data = vec![0u8; 16 * 1024 * 1024];
+        let samp_at = data.len() as u64;
+        write_chunk(&mut data, b"SAMP", 80, 64, 123, 1, 10);
+
+        let path = create_temp_file(&data);
+        let file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let mut reader = std::io::BufReader::new(file);
+
+        let started = std::time::Instant::now();
+        let mut samp_chunk_offsets = Vec::new();
+        RtsaSource::scan_for_samp_chunks(&mut reader, 0, len, &mut samp_chunk_offsets).unwrap();
+        let took = started.elapsed();
+
+        assert_eq!(samp_chunk_offsets.len(), 1);
+        assert_eq!(samp_chunk_offsets[0].0, samp_at);
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "resync took {took:?} over 16 MiB of zeroes",
+        );
+    }
+
+    /// The IQ readers take one I/Q pair per sample; a chunk declaring any
+    /// other count would have its size guard and skip computed for one
+    /// layout and its payload read as another. It is refused.
+    #[test]
+    fn an_iq_chunk_that_is_not_one_pair_per_sample_is_refused() {
+        let mut data = two_chunk_iq_file();
+        // `mSampleSize` of the first SAMP chunk (at 400): 16 bytes of chunk
+        // header and 36 of SAMP fields before it.
+        data[400 + 52..400 + 56].copy_from_slice(&4u32.to_le_bytes());
+
+        let path = create_temp_file(&data);
+        let mut source = RtsaSource::open(&path).unwrap();
+        let err = source.read_samples(5, None).unwrap_err();
+        assert!(
+            err.to_string().contains("values per sample"),
+            "unexpected error: {err}",
+        );
+    }
+
+    /// `seek_to_sample` and `read_samples` must agree on which chunk an
+    /// index lives in. Reads index each chunk within its own sub-stream;
+    /// the seek counted across all of them, so with two sub-streams
+    /// interleaved it positioned the reader in the other sub-stream's
+    /// chunk.
+    #[test]
+    fn a_seek_lands_in_the_chunk_a_read_would_use() {
+        let mut data = Vec::new();
+        write_chunk(&mut data, b"SAMP", 144, 64, 1, 1, 10);
+        write_chunk(&mut data, b"SAMP", 144, 64, 1, 2, 10);
+        let third = data.len() as u64;
+        write_chunk(&mut data, b"SAMP", 144, 64, 1, 1, 10);
+
+        let path = create_temp_file(&data);
+        let file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let mut source = rtsa_source_with_sub_streams(Vec::new());
+        source.reader = std::io::BufReader::new(file);
+        source.metadata.total_samples = 30;
+        RtsaSource::scan_for_samp_chunks(
+            &mut source.reader,
+            0,
+            len,
+            &mut source.samp_chunk_offsets,
+        )
+        .unwrap();
+        let mut counters = HashMap::new();
+        for &(offset, ref samp) in &source.samp_chunk_offsets {
+            let counter = counters.entry(samp.sub_stream_id).or_insert(0u64);
+            source.samp_chunk_start_samples.insert(offset, *counter);
+            *counter += samp.num_samples as u64;
+        }
+
+        // Index 15 is sample 5 of sub-stream 1's second chunk.
+        source.seek_to_sample(15).unwrap();
+        assert_eq!(source.reader.stream_position().unwrap(), third + 64 + 5 * 8,);
+    }
+
+    /// Header figures are untrusted: a sample count whose byte size does
+    /// not fit a `u64` must be reported, not overflow.
+    #[test]
+    fn an_absurd_sample_count_is_a_warning_not_a_panic() {
+        let mut source = rtsa_source_with_sub_streams(Vec::new());
+        source.metadata.total_samples = u64::MAX;
+        source.metadata.sample_data_size = 1;
+        let report = source.validate_structure().unwrap();
+        assert!(
+            report.warnings.iter().any(|w| w.contains("too large")),
+            "{:?}",
+            report.warnings,
+        );
+
+        // Fits, but past `i64`: the signed difference used to wrap.
+        source.metadata.total_samples = u64::MAX / 8;
+        source.metadata.sample_data_size = 1;
+        let report = source.validate_structure().unwrap();
+        assert!(report.warnings.iter().any(|w| w.contains("mismatch")));
     }
 
     #[test]

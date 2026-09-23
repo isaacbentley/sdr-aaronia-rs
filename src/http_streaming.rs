@@ -20,6 +20,24 @@ pub(crate) const ASCII_LINE_FEED: u8 = 10;
 /// decoded as `value = raw / 32768`.
 const DEFAULT_INT16_ENCODE_SCALE: f64 = 32768.0;
 
+/// Relative change in the device-reported sample rate that counts as a
+/// real retune rather than jitter.
+///
+/// The device's rate ladder steps in powers of two, so a genuine retune
+/// always clears this band by a wide margin, while a rate inferred from
+/// `samples / duration` wobbles well inside it. Shared by the
+/// HTTP source's link-budget restart, its `current_sample_rate` adoption
+/// hysteresis and its retune detection, and by the unified source's
+/// read boundary — all the same question: has the device actually moved?
+pub(crate) const RATE_CHANGE_BAND: f64 = 0.1;
+
+/// Whether `current` differs from `previous` by more than
+/// [`RATE_CHANGE_BAND`] — the one spelling of "the device has retuned",
+/// shared by every rate tracker in the crate. `previous` must be positive.
+pub(crate) fn rate_moved(previous: f64, current: f64) -> bool {
+    (current - previous).abs() / previous > RATE_CHANGE_BAND
+}
+
 #[derive(Debug, Default, Clone)]
 struct StatsCounters {
     packets_parsed: u64,
@@ -553,13 +571,48 @@ impl StreamPacket {
 /// comparing the timestamps of two adjacent data packets". `DropDetector`
 /// implements that check: feed it consecutive packets and it reports the
 /// gap between this packet's `start_time` and the previous packet's
-/// `end_time`. Gaps longer than `tolerance` are returned as a drop event.
+/// `end_time`.
+///
+/// **The tolerance is measured from the stream, not fixed.** A fixed
+/// 1 ms was right only while a packet lasted longer than that: at
+/// 61.44 MS/s a 16 384-sample packet is 267 µs, so a whole lost packet
+/// opened a gap well under 1 ms and was spliced over without a word. A
+/// gap is now a drop when it exceeds the largest of
+///
+/// - [`Self::PACKET_FRACTION`] of the shorter of this packet's and the
+///   previous packet's own duration — a lost packet opens a gap of about
+///   one packet, so it always clears this;
+/// - [`Self::JITTER_MARGIN`] times the residual `start - prev_end`
+///   observed on packets judged contiguous (a decaying peak), so a server
+///   whose timestamps wobble calibrates the detector upwards rather than
+///   raising false gaps — but only as far as [`Self::PACKET_CEILING`] of
+///   a packet, because an accepted residual feeds the estimate and would
+///   otherwise ratchet the tolerance past the one thing it must catch;
+/// - [`Self::RESOLUTION_FLOOR`], the timestamps' own resolution: the
+///   server prints them to the microsecond (`"startTime":1783032873.309269`
+///   on live SpectranV6 hardware), and at a Unix-epoch magnitude an `f64`
+///   resolves only ~0.24 µs besides,
+///
+/// and never more than [`Self::tolerance`] (1 ms by default), so a stream
+/// whose packets last longer than 2 ms behaves exactly as before.
+///
+/// The server's timestamps are not documented as sample counts divided by
+/// the rate — the live header above carries a *measured*
+/// `sampleFrequency` of 61 439 951.213 Hz — so no exactness is assumed
+/// beyond what the residuals show. Live verification of the calibration
+/// against a real RTSA stream at a high rate is still pending.
 #[derive(Debug, Clone)]
 pub struct DropDetector {
-    /// Maximum tolerated `start_time - prev.end_time` before reporting a drop.
+    /// Upper bound on the tolerated `start_time - prev.end_time`: a gap
+    /// longer than this is always a drop, whatever the stream-derived
+    /// tolerance says.
     pub tolerance: f64,
     /// Last seen `end_time`, in seconds since the Unix epoch.
     last_end_time: Option<f64>,
+    /// Duration of the last seen packet, when its timestamps gave one.
+    last_duration: Option<f64>,
+    /// Decaying peak of `|start - prev_end|` over contiguous packets.
+    jitter: f64,
     /// Cumulative number of drops detected.
     drops: u64,
     /// Cumulative gap (in seconds) attributed to drops.
@@ -571,9 +624,9 @@ pub struct DropDetector {
 pub enum DropResult {
     /// First packet ever seen, or contiguous with the prior packet.
     Continuous,
-    /// A gap larger than `tolerance` was detected. `gap_seconds` is the
-    /// span between this packet's `start_time` and the previous packet's
-    /// `end_time`.
+    /// A gap larger than the detector's tolerance was detected.
+    /// `gap_seconds` is the span between this packet's `start_time` and
+    /// the previous packet's `end_time`.
     Drop {
         /// Length of the detected gap, in seconds.
         gap_seconds: f64,
@@ -582,21 +635,66 @@ pub enum DropResult {
 
 impl Default for DropDetector {
     fn default() -> Self {
-        // Default tolerance: 1 millisecond. Smaller than every practical
-        // packet duration we've seen but large enough to absorb f64 round-off.
+        // A 1 ms ceiling: below every packet duration at low rates, which
+        // is where it came from. Above ~2 ms packets the stream-derived
+        // tolerance never reaches it.
         Self::new(1e-3)
     }
 }
 
 impl DropDetector {
-    /// Create a detector with the given gap tolerance, in seconds.
+    /// Fraction of a packet's duration a gap must exceed to be a drop.
+    /// Half: a lost packet opens a gap of one packet, twice this.
+    pub const PACKET_FRACTION: f64 = 0.5;
+    /// How far above the observed contiguous-packet residual the
+    /// tolerance is held.
+    pub const JITTER_MARGIN: f64 = 4.0;
+    /// Fraction of a packet's duration jitter may raise the tolerance to.
+    /// Below one, so a whole lost packet shows however noisy the
+    /// timestamps have been.
+    pub const PACKET_CEILING: f64 = 0.75;
+    /// Smallest tolerance ever used, in seconds: four times the
+    /// microsecond the server prints its timestamps to.
+    pub const RESOLUTION_FLOOR: f64 = 4e-6;
+    /// Per-packet decay of the jitter peak, so one outlier does not
+    /// desensitise the detector for the rest of the stream.
+    const JITTER_DECAY: f64 = 0.999;
+
+    /// Create a detector whose tolerance is capped at `tolerance` seconds.
     pub fn new(tolerance: f64) -> Self {
         Self {
             tolerance,
             last_end_time: None,
+            last_duration: None,
+            jitter: 0.0,
             drops: 0,
             cumulative_gap: 0.0,
         }
+    }
+
+    /// A packet's own duration from its timestamps, when they give one.
+    fn duration_of(packet: &StreamPacket) -> Option<f64> {
+        let duration = packet.metadata.end_time - packet.metadata.start_time;
+        (duration.is_finite() && duration > 0.0).then_some(duration)
+    }
+
+    /// The gap tolerance for a packet of `duration` following the last
+    /// one: the stream-derived figure, capped at [`Self::tolerance`].
+    fn tolerance_for(&self, duration: Option<f64>) -> f64 {
+        let shortest = match (self.last_duration, duration) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        // With no duration from either packet there is nothing to scale
+        // by, and the cap is the only figure left.
+        let Some(shortest) = shortest else {
+            return self.tolerance;
+        };
+        (Self::JITTER_MARGIN * self.jitter)
+            .min(Self::PACKET_CEILING * shortest)
+            .max(Self::PACKET_FRACTION * shortest)
+            .max(Self::RESOLUTION_FLOOR)
+            .min(self.tolerance)
     }
 
     /// Inspect a packet's timing info and return whether the stream is
@@ -604,21 +702,34 @@ impl DropDetector {
     pub fn observe(&mut self, packet: &StreamPacket) -> DropResult {
         let start = packet.metadata.start_time;
         let end = packet.metadata.end_time;
+        let duration = Self::duration_of(packet);
         let result = match self.last_end_time {
             Some(prev_end) => {
                 let gap = start - prev_end;
-                if gap > self.tolerance {
+                if gap > self.tolerance_for(duration) {
                     self.drops += 1;
                     self.cumulative_gap += gap;
                     DropResult::Drop { gap_seconds: gap }
                 } else {
+                    // Contiguous: whatever separates the two timestamps
+                    // is the server's rounding and jitter, which is what
+                    // the tolerance has to stay clear of.
+                    self.jitter = (self.jitter * Self::JITTER_DECAY).max(gap.abs());
                     DropResult::Continuous
                 }
             }
             None => DropResult::Continuous,
         };
         self.last_end_time = Some(end);
+        self.last_duration = duration;
         result
+    }
+
+    /// The residual between contiguous packets the detector has observed
+    /// (a decaying peak), in seconds. Zero until two contiguous packets
+    /// have been seen.
+    pub fn observed_jitter_seconds(&self) -> f64 {
+        self.jitter
     }
 
     /// Cumulative number of drops detected so far.
@@ -634,7 +745,7 @@ impl DropDetector {
     /// Clear all accumulated drop statistics and forget the last
     /// observed packet.
     pub fn reset(&mut self) {
-        self.last_end_time = None;
+        self.resync();
         self.drops = 0;
         self.cumulative_gap = 0.0;
     }
@@ -647,10 +758,38 @@ impl DropDetector {
     /// previous one and would otherwise be reported as one enormous
     /// drop. [`Self::reset`] would zero the counters instead, making the
     /// cumulative total that consumers read as monotonic jump backwards
-    /// and corrupting anything computing deltas from it.
+    /// and corrupting anything computing deltas from it. The jitter
+    /// calibration is forgotten too: the new stream may be at another
+    /// rate from another server state, and recalibrates within a packet.
     pub fn resync(&mut self) {
         self.last_end_time = None;
+        self.last_duration = None;
+        self.jitter = 0.0;
     }
+}
+
+/// One outcome of [`StreamParser::process_data_recovering`], in stream
+/// order.
+// Nearly every item is a `Packet`; boxing it to shrink the rare `Lost`
+// would add an allocation per packet on the hot path for nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum ParsedItem {
+    /// A packet that parsed.
+    Packet(StreamPacket),
+    /// A packet whose framing was found but whose header or payload could
+    /// not be decoded. Its bytes have been skipped, so the samples it
+    /// carried are gone: the packets either side of it are not contiguous.
+    Lost(Error),
+}
+
+/// What one attempt at the front of the buffer produced. `Err` from
+/// `try_parse_complete_packet` is reserved for the unrecoverable case.
+#[allow(clippy::large_enum_variant)] // As `ParsedItem`.
+enum ParseStep {
+    Packet(StreamPacket),
+    NeedMore,
+    Lost(Error),
 }
 
 /// Simple HTTP stream parser for Aaronia RTSA format
@@ -749,20 +888,63 @@ impl StreamParser {
     /// erred on partials — was removed because it silently dropped the
     /// remaining packets in multi-packet chunks.
     pub fn process_data(&mut self, data: &Bytes) -> Result<Vec<StreamPacket>> {
+        // Stop at the first loss, leaving whatever follows it buffered for
+        // the next call — the contract this method has always had.
+        let mut completed_packets = Vec::new();
+        for item in self.parse_buffered(data, true)? {
+            match item {
+                ParsedItem::Packet(packet) => completed_packets.push(packet),
+                ParsedItem::Lost(e) => return Err(e),
+            }
+        }
+        Ok(completed_packets)
+    }
+
+    /// Like [`Self::process_data`], but a malformed packet costs only
+    /// itself.
+    ///
+    /// `process_data` answers a bad packet with `Err`, which throws away
+    /// every packet the same chunk completed — and a streaming caller that
+    /// reconnects on `Err` loses the connection's backlog besides. The
+    /// parser has already skipped the bad packet's bytes by the time it
+    /// reports one (header, and payload when its size was knowable), so
+    /// there is nothing to recover by reconnecting. Here each such packet
+    /// becomes a [`ParsedItem::Lost`] **in stream order**, so the caller
+    /// knows exactly which samples it falls between and can mark the hole
+    /// there.
+    ///
+    /// `Err` is kept for what skipping cannot cure: a header that never
+    /// terminates within [`Self::MAX_JSON_BUFFER`], where the stream has
+    /// no framing left to resync on.
+    pub fn process_data_recovering(&mut self, data: &Bytes) -> Result<Vec<ParsedItem>> {
+        self.parse_buffered(data, false)
+    }
+
+    /// Buffer `data` and parse every packet it completes. With
+    /// `stop_at_loss`, parsing ends at (and including) the first
+    /// [`ParsedItem::Lost`].
+    fn parse_buffered(&mut self, data: &Bytes, stop_at_loss: bool) -> Result<Vec<ParsedItem>> {
         self.counters.bytes_processed += data.len() as u64;
         // The tail of a rejected payload: drop it without buffering.
         let skip = self.skip_bytes.min(data.len());
         self.skip_bytes -= skip;
-        if skip == data.len() {
+        if skip > 0 && skip == data.len() {
             return Ok(Vec::new());
         }
         self.buffer.extend_from_slice(&data[skip..]);
 
-        let mut completed_packets = Vec::new();
+        let mut items = Vec::new();
         loop {
             match self.try_parse_complete_packet() {
-                Ok(Some(packet)) => completed_packets.push(packet),
-                Ok(None) => break,
+                Ok(ParseStep::Packet(packet)) => items.push(ParsedItem::Packet(packet)),
+                Ok(ParseStep::NeedMore) => break,
+                Ok(ParseStep::Lost(e)) => {
+                    self.counters.parse_errors += 1;
+                    items.push(ParsedItem::Lost(e));
+                    if stop_at_loss {
+                        break;
+                    }
+                }
                 Err(e) => {
                     self.counters.parse_errors += 1;
                     return Err(e);
@@ -770,7 +952,7 @@ impl StreamParser {
             }
         }
 
-        Ok(completed_packets)
+        Ok(items)
     }
 
     /// Upper bound on how much un-parseable data we buffer while waiting
@@ -820,7 +1002,7 @@ impl StreamParser {
     /// until the whole packet is buffered, so a payload whose second
     /// separator byte has not arrived yet is not mis-framed: the re-scan
     /// after the next chunk sees it.
-    fn try_parse_complete_packet(&mut self) -> Result<Option<StreamPacket>> {
+    fn try_parse_complete_packet(&mut self) -> Result<ParseStep> {
         let (metadata, json, payload_start) = match scan_packet_header(self.pending()) {
             HeaderScan::Incomplete {
                 skippable,
@@ -837,7 +1019,7 @@ impl StreamParser {
                         Self::MAX_JSON_BUFFER
                     )));
                 }
-                return Ok(None);
+                return Ok(ParseStep::NeedMore);
             }
             HeaderScan::Header {
                 metadata,
@@ -859,10 +1041,16 @@ impl StreamParser {
             // The scan just parsed this text as `PacketMetadata`, so it is
             // valid JSON; the error arm is unreachable but not worth a
             // panic path.
-            let json_value = serde_json::from_slice::<serde_json::Value>(&self.pending()[json])
-                .map_err(|e| {
-                    Error::Protocol(format!("packet header is not a JSON document: {e}"))
-                })?;
+            let json_value =
+                match serde_json::from_slice::<serde_json::Value>(&self.pending()[json]) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        self.consume_buffer(payload_start);
+                        return Ok(ParseStep::Lost(Error::Protocol(format!(
+                            "packet header is not a JSON document: {e}"
+                        ))));
+                    }
+                };
             let samples = match self.parse_json_samples(&metadata, &json_value) {
                 Ok(samples) => samples,
                 Err(e) => {
@@ -870,7 +1058,7 @@ impl StreamParser {
                     // packet so the next call moves on instead of failing
                     // on the same bytes forever.
                     self.consume_buffer(payload_start);
-                    return Err(e);
+                    return Ok(ParseStep::Lost(e));
                 }
             };
             let mut metadata = metadata;
@@ -881,7 +1069,7 @@ impl StreamParser {
             self.counters.packets_parsed += 1;
             self.counters.samples_decoded += samples.len() as u64;
             self.consume_buffer(payload_start);
-            return Ok(Some(StreamPacket::new(metadata, samples)));
+            return Ok(ParseStep::Packet(StreamPacket::new(metadata, samples)));
         }
 
         let expected_bytes = match self.calculate_binary_size(&metadata) {
@@ -890,7 +1078,7 @@ impl StreamParser {
                 // Same as the oversized case below: the header is bad,
                 // skip it rather than fail on it forever.
                 self.consume_buffer(payload_start);
-                return Err(e);
+                return Ok(ParseStep::Lost(e));
             }
         };
         if expected_bytes > Self::MAX_BINARY_PAYLOAD {
@@ -901,16 +1089,16 @@ impl StreamParser {
             let payload_already_here = buffered - payload_start;
             self.skip_bytes = expected_bytes.saturating_sub(payload_already_here);
             self.consume_buffer(buffered);
-            return Err(Error::Protocol(format!(
+            return Ok(ParseStep::Lost(Error::Protocol(format!(
                 "packet declares a binary payload of {} bytes (cap: {})",
                 expected_bytes,
                 Self::MAX_BINARY_PAYLOAD
-            )));
+            ))));
         }
         let binary_end = payload_start + expected_bytes;
 
         if self.pending().len() < binary_end {
-            return Ok(None);
+            return Ok(ParseStep::NeedMore);
         }
 
         let samples = {
@@ -924,14 +1112,14 @@ impl StreamParser {
                 // can be skipped. Leaving it in place made every later call
                 // fail on the same packet while the buffer grew unbounded.
                 self.consume_buffer(binary_end);
-                return Err(e);
+                return Ok(ParseStep::Lost(e));
             }
         };
         self.counters.packets_parsed += 1;
         self.counters.samples_decoded += samples.len() as u64;
         let packet = StreamPacket::new(metadata, samples);
         self.consume_buffer(binary_end);
-        Ok(Some(packet))
+        Ok(ParseStep::Packet(packet))
     }
 
     fn calculate_binary_size(&self, metadata: &PacketMetadata) -> Result<usize> {
@@ -956,6 +1144,26 @@ impl StreamParser {
                             metadata.samples
                         ))
                     })
+            }
+            PayloadType::Spectra | PayloadType::Histogram
+                if metadata.compression.is_some_and(|c| c > 0) =>
+            {
+                // A compressed payload is a Rice-coded bitstream whose
+                // length the header does not give: the HTTP endpoints
+                // document (v9) defines no compression field and no byte
+                // count, and the file format's spectra compression
+                // (RTSA File Format 4, "Compression of Spectrum Data") is
+                // delimited by its chunk's size, which this wire lacks.
+                // Framing it at the uncompressed size would swallow the
+                // packets behind it — IQ included — so refuse instead:
+                // the caller drops only the header, the scan resyncs on
+                // the next one, and the packet is reported lost.
+                Err(Error::Protocol(format!(
+                    "{:?} packet with compression factor {} carries no byte length; \
+                     skipped and resynchronised on the next header",
+                    metadata.payload,
+                    metadata.compression.unwrap_or(0)
+                )))
             }
             PayloadType::Spectra | PayloadType::Histogram => {
                 // A packet holds `samples` frames of `sample_size` bins ×
@@ -1331,18 +1539,16 @@ impl StreamParser {
             metadata.sample_size
         );
 
-        // Calculate expected dimensions for wavelet transform
-        let expected_samples = metadata.sample_size as usize;
-        let sample_depth = metadata.sample_depth.unwrap_or(1) as usize;
-
-        // For spectrum data, we typically have a 2D matrix that gets flattened
-        // Try to determine reasonable dimensions for the wavelet transform
-        let (num_rows, num_cols) =
-            self.calculate_wavelet_dimensions(expected_samples, sample_depth);
-
+        // The grid is the packet's own shape: one row per spectrum frame,
+        // one column per bin. RTSA File Format 4 transforms "up to 16
+        // spectra in one block", alternating time (rows) and frequency
+        // (columns) steps. Nothing documents how several blocks, or a
+        // histogram's depth planes, are laid out in one bitstream, so
+        // those shapes are refused rather than decoded into a wrong one.
+        let (num_rows, num_cols) = Self::spectra_wavelet_grid(metadata)?;
         debug!(
-            "Using wavelet dimensions: {} rows × {} cols for {} expected samples",
-            num_rows, num_cols, expected_samples
+            "Using wavelet dimensions: {} frames × {} bins",
+            num_rows, num_cols
         );
 
         // Use the existing RTSA decompression infrastructure
@@ -1375,33 +1581,40 @@ impl StreamParser {
         ))
     }
 
-    /// Calculate optimal dimensions for wavelet transform based on sample data
+    /// The inverse-wavelet grid of a compressed spectra packet: `samples`
+    /// frames by `sample_size` bins, or an error for a shape whose layout
+    /// is undocumented. Never a shape with fewer cells than the packet has
+    /// bins.
     #[cfg(feature = "file")]
-    fn calculate_wavelet_dimensions(
-        &self,
-        expected_samples: usize,
-        sample_depth: usize,
-    ) -> (usize, usize) {
-        // For spectrum data, we need dimensions that are powers of 2 for optimal wavelet transform
-        let total_elements = expected_samples * sample_depth;
-
-        // Find the largest power of 2 that fits in our data
-        let sqrt_elements = (total_elements as f64).sqrt() as usize;
-        let mut dim = 1;
-        while dim <= sqrt_elements {
-            dim <<= 1;
+    fn spectra_wavelet_grid(metadata: &PacketMetadata) -> Result<(usize, usize)> {
+        /// Spectra per wavelet block, per RTSA File Format 4.
+        const MAX_FRAMES_PER_BLOCK: u64 = 16;
+        if metadata.payload != PayloadType::Spectra {
+            return Err(Error::Protocol(format!(
+                "compressed {:?} payloads have no documented layout",
+                metadata.payload
+            )));
         }
-        dim >>= 1; // Back off to largest power of 2 <= sqrt
-
-        // Ensure we have valid dimensions
-        let num_rows = std::cmp::max(dim, 1);
-        let num_cols = if total_elements > 0 {
-            std::cmp::max(total_elements / num_rows, 1)
-        } else {
-            1
-        };
-
-        (num_rows, num_cols)
+        let depth = metadata.sample_depth.unwrap_or(1);
+        if depth > 1 {
+            return Err(Error::Protocol(format!(
+                "compressed spectra with sample depth {depth} have no documented layout"
+            )));
+        }
+        let frames = metadata.samples;
+        if frames == 0 || metadata.sample_size == 0 {
+            return Err(Error::Protocol(format!(
+                "compressed spectra packet declares {frames} frames of {} bins",
+                metadata.sample_size
+            )));
+        }
+        if frames > MAX_FRAMES_PER_BLOCK {
+            return Err(Error::Protocol(format!(
+                "compressed spectra packet holds {frames} frames; the layout of more than \
+                 {MAX_FRAMES_PER_BLOCK} (one wavelet block) is undocumented"
+            )));
+        }
+        Ok((frames as usize, metadata.sample_size as usize))
     }
 
     /// Convert f32 decompressed data back to the target format.
@@ -2008,6 +2221,187 @@ mod tests {
         assert_eq!(parser.stats().parse_errors, 1);
     }
 
+    /// A compressed spectra packet carries no byte length, so framing it
+    /// at its uncompressed size swallowed the IQ packets behind it. It is
+    /// now reported lost where it sat and the scan resyncs on the next
+    /// header, stray braces and separators in its bitstream included.
+    #[test]
+    fn a_compressed_spectra_packet_is_skipped_without_costing_the_iq_behind_it() {
+        let mut parser = StreamParser::new(StreamFormat::Int16, None).unwrap();
+        let mut wire = iq_packet_bytes(&[100, -100], Some(1.0));
+        // 4 frames of 64 bins would be 512 bytes uncompressed; the
+        // bitstream is 12, and holds what a header scan looks for.
+        let spectra = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":4,"unit":"dbm","payload":"spectra","minPower":-120,"maxPower":0,"sampleSize":64,"sampleDepth":1,"compression":3}"#;
+        wire.extend_from_slice(spectra.as_bytes());
+        wire.push(ASCII_RECORD_SEPARATOR);
+        wire.extend_from_slice(&[
+            0x93, b'{', 0x0A, 0x1E, 0xA5, b'{', b'"', 0x0A, 0x55, 0x1E, 0x00, 0xFF,
+        ]);
+        wire.extend_from_slice(&iq_packet_bytes(&[200, -200], Some(1.0)));
+        wire.extend_from_slice(&iq_packet_bytes(&[300, -300], Some(1.0)));
+
+        let items = parser.process_data_recovering(&Bytes::from(wire)).unwrap();
+        let shape: Vec<Option<f32>> = items
+            .iter()
+            .map(|item| match item {
+                ParsedItem::Packet(p) => Some(p.samples[0].re),
+                ParsedItem::Lost(_) => None,
+            })
+            .collect();
+        assert_eq!(shape, [Some(100.0), None, Some(200.0), Some(300.0)]);
+        let ParsedItem::Lost(e) = &items[1] else {
+            unreachable!()
+        };
+        assert!(e.to_string().contains("no byte length"), "{e}");
+        assert!(parser.pending().is_empty());
+    }
+
+    /// An uncompressed spectra packet still frames at its full size.
+    #[test]
+    fn an_uncompressed_spectra_packet_still_frames_at_its_size() {
+        let parser = StreamParser::new(StreamFormat::Int16, None).unwrap();
+        let mut metadata = iq_packet(0.0, 1.0).metadata;
+        metadata.payload = PayloadType::Spectra;
+        metadata.samples = 4;
+        metadata.sample_size = 64;
+        for compression in [None, Some(0)] {
+            metadata.compression = compression;
+            assert_eq!(parser.calculate_binary_size(&metadata).unwrap(), 512);
+        }
+    }
+
+    /// Rice codes for `values`, per RTSA File Format 4's bit-packing table
+    /// (tier 0 only: magnitudes up to 3).
+    #[cfg(feature = "file")]
+    fn rice_tier0(values: &[i32]) -> Vec<u8> {
+        let nibbles: Vec<u8> = values
+            .iter()
+            .map(|&v| {
+                assert!(v.abs() <= 3);
+                0b1000 | ((v.unsigned_abs() as u8) << 1) | u8::from(v < 0)
+            })
+            .collect();
+        nibbles
+            .chunks(2)
+            .map(|pair| (pair[0] << 4) | pair.get(1).copied().unwrap_or(0))
+            .collect()
+    }
+
+    /// The wavelet grid is frames × bins. It was sized from
+    /// `sqrt(sample_size × depth)`, ignoring the frame count: 2 frames of
+    /// 8 bins came out as a 2 × 4 grid, half the packet's bins gone.
+    #[cfg(feature = "file")]
+    #[test]
+    fn compressed_spectra_decode_to_every_bin_of_every_frame() {
+        use crate::decompression::Decompressor;
+        let parser = StreamParser::new(StreamFormat::Float32, None).unwrap();
+        let mut metadata = iq_packet(0.0, 1.0).metadata;
+        metadata.payload = PayloadType::Spectra;
+        metadata.samples = 2;
+        metadata.sample_size = 8;
+        metadata.compression = Some(1);
+        let coefficients: Vec<i32> = (0..16).map(|i| (i % 7) - 3).collect();
+        let bitstream = rice_tier0(&coefficients);
+
+        let bytes = parser
+            .decompress_spectrum_data(&bitstream, 1, &metadata)
+            .unwrap();
+        let decoded: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        assert_eq!(decoded.len(), 16);
+        let expected = Decompressor::new().decompress(&bitstream, 1, 2, 8).unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[cfg(feature = "file")]
+    #[test]
+    fn compressed_spectra_of_undocumented_shape_are_refused() {
+        let parser = StreamParser::new(StreamFormat::Float32, None).unwrap();
+        let bitstream = rice_tier0(&[1; 64]);
+        let mut metadata = iq_packet(0.0, 1.0).metadata;
+        metadata.payload = PayloadType::Spectra;
+        metadata.sample_size = 4;
+        metadata.compression = Some(1);
+
+        // More than one 16-spectrum wavelet block.
+        metadata.samples = 17;
+        assert!(
+            parser
+                .decompress_spectrum_data(&bitstream, 1, &metadata)
+                .is_err()
+        );
+        // Depth planes.
+        metadata.samples = 2;
+        metadata.sample_depth = Some(4);
+        assert!(
+            parser
+                .decompress_spectrum_data(&bitstream, 1, &metadata)
+                .is_err()
+        );
+        // Histograms.
+        metadata.sample_depth = None;
+        metadata.payload = PayloadType::Histogram;
+        assert!(
+            parser
+                .decompress_spectrum_data(&bitstream, 1, &metadata)
+                .is_err()
+        );
+    }
+
+    /// A packet that cannot be decoded costs itself, not its neighbours.
+    ///
+    /// The recovering entry point reports the loss where it happened and
+    /// goes on to the packet after it; the strict one keeps its contract
+    /// of stopping at the loss with what follows still buffered.
+    #[test]
+    fn a_malformed_packet_is_lost_in_place_and_parsing_continues() {
+        fn good(v: f32) -> Vec<u8> {
+            let header = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":1,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
+            let mut out = header.as_bytes().to_vec();
+            out.push(ASCII_RECORD_SEPARATOR);
+            out.extend_from_slice(&v.to_le_bytes());
+            out.extend_from_slice(&(-v).to_le_bytes());
+            out
+        }
+        // A sample count whose payload size overflows: the header frames,
+        // the payload cannot be sized, so the header is skipped.
+        let bad = format!(
+            r#"{{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":{},"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}}"#,
+            u64::MAX
+        );
+        let mut wire = good(0.25);
+        wire.extend_from_slice(bad.as_bytes());
+        wire.push(ASCII_RECORD_SEPARATOR);
+        wire.extend(good(0.5));
+        let wire = Bytes::from(wire);
+
+        let mut parser = StreamParser::new(StreamFormat::Float32, None).unwrap();
+        let items = parser.process_data_recovering(&wire).unwrap();
+        let shape: Vec<&str> = items
+            .iter()
+            .map(|item| match item {
+                ParsedItem::Packet(_) => "packet",
+                ParsedItem::Lost(_) => "lost",
+            })
+            .collect();
+        assert_eq!(shape, vec!["packet", "lost", "packet"]);
+        let ParsedItem::Packet(last) = &items[2] else {
+            unreachable!()
+        };
+        assert_eq!(last.samples[0], Complex32::new(0.5, -0.5));
+        assert_eq!(parser.stats().parse_errors, 1);
+
+        let mut strict = StreamParser::new(StreamFormat::Float32, None).unwrap();
+        assert!(strict.process_data(&wire).is_err());
+        let rest = strict.process_data(&Bytes::new()).unwrap();
+        assert_eq!(rest.len(), 1, "the packet after the loss stays buffered");
+        assert_eq!(rest[0].samples[0], Complex32::new(0.5, -0.5));
+    }
+
     /// Real Aaronia servers separate the JSON header from the binary
     /// payload with TWO bytes — `{json}\n\x1e<binary>` — verified on live
     /// SpectranV6 hardware across formats and payload types. Consuming
@@ -2312,6 +2706,113 @@ mod tests {
             det.observe(&iq_packet(200.0, 200.001)),
             DropResult::Continuous
         );
+    }
+
+    /// Timestamps of packet `k` in a contiguous run of `n`-sample packets
+    /// at `rate`, from a Unix-epoch-sized origin, rounded to the
+    /// microsecond the way the server prints them.
+    fn wire_times(k: u64, n: u64, rate: f64) -> (f64, f64) {
+        const ORIGIN: f64 = 1_786_000_000.0;
+        let round_us = |t: f64| format!("{t:.6}").parse::<f64>().unwrap();
+        let start = ORIGIN + (k * n) as f64 / rate;
+        let end = ORIGIN + ((k + 1) * n) as f64 / rate;
+        (round_us(start), round_us(end))
+    }
+
+    #[test]
+    fn a_lost_packet_at_61_44_msps_is_flagged() {
+        // 16 384 samples at 61.44 MS/s is 267 µs: a lost packet opens a
+        // gap a quarter of the old fixed 1 ms tolerance.
+        const RATE: f64 = 61.44e6;
+        const N: u64 = 16_384;
+        let mut det = DropDetector::default();
+        for k in 0..8 {
+            let (s, e) = wire_times(k, N, RATE);
+            assert_eq!(det.observe(&iq_packet(s, e)), DropResult::Continuous);
+        }
+        // Packet 8 never arrives.
+        let (s, e) = wire_times(9, N, RATE);
+        match det.observe(&iq_packet(s, e)) {
+            DropResult::Drop { gap_seconds } => {
+                assert!(
+                    (gap_seconds - N as f64 / RATE).abs() < 2e-6,
+                    "{gap_seconds}"
+                );
+            }
+            other => panic!("a lost 267 µs packet went unreported: {other:?}"),
+        }
+        assert_eq!(det.drops(), 1);
+    }
+
+    #[test]
+    fn timestamp_rounding_at_61_44_msps_is_not_a_drop() {
+        // Microsecond-rounded Unix-epoch timestamps, whose residuals
+        // between contiguous packets reach ±1 µs, over a small packet:
+        // 1024 samples is 16.7 µs, so half a packet is only 8.3 µs.
+        const RATE: f64 = 61.44e6;
+        for n in [1024, 16_384, 65_536] {
+            let mut det = DropDetector::default();
+            for k in 0..20_000 {
+                let (s, e) = wire_times(k, n, RATE);
+                det.observe(&iq_packet(s, e));
+            }
+            assert_eq!(det.drops(), 0, "{n}-sample packets");
+            assert!(det.observed_jitter_seconds() <= 1.5e-6);
+        }
+    }
+
+    #[test]
+    fn jittery_timestamps_raise_the_tolerance() {
+        // 267 µs packets whose starts wobble ±50 µs around contiguity:
+        // half a packet (133 µs) would pass them, and four times the
+        // wobble (200 µs) must be the tolerance afterwards.
+        const DURATION: f64 = 16_384.0 / 61.44e6;
+        let packet_at = |t: f64| iq_packet(t, t + DURATION);
+        let gap_of_150us = |det: &mut DropDetector, t: f64| {
+            det.observe(&packet_at(t));
+            det.observe(&packet_at(t + DURATION + 150e-6))
+        };
+
+        let mut calm = DropDetector::default();
+        assert!(matches!(
+            gap_of_150us(&mut calm, 1000.0),
+            DropResult::Drop { .. }
+        ));
+
+        let mut jittery = DropDetector::default();
+        let mut t = 1000.0;
+        for k in 0..100 {
+            jittery.observe(&packet_at(t));
+            let wobble = if k % 2 == 0 { 50e-6 } else { -50e-6 };
+            t += DURATION + wobble;
+        }
+        assert_eq!(jittery.drops(), 0);
+        assert!(jittery.observed_jitter_seconds() >= 45e-6);
+        assert_eq!(gap_of_150us(&mut jittery, t), DropResult::Continuous);
+        // A whole lost packet still clears it.
+        assert!(matches!(
+            jittery.observe(&packet_at(t + 3.0 * DURATION + 150e-6)),
+            DropResult::Drop { .. }
+        ));
+    }
+
+    #[test]
+    fn low_rate_packets_keep_the_one_millisecond_tolerance() {
+        // 16 384 samples at 1 MS/s is 16.4 ms: half a packet is far above
+        // 1 ms, so the ceiling is the tolerance, exactly as before.
+        const DURATION: f64 = 16_384.0 / 1e6;
+        let packet_at = |t: f64| iq_packet(t, t + DURATION);
+        let mut det = DropDetector::default();
+        det.observe(&packet_at(100.0));
+        let t = 100.0 + DURATION + 0.9e-3;
+        assert_eq!(det.observe(&packet_at(t)), DropResult::Continuous);
+        // Jitter of 0.9 ms would put four times it at 3.6 ms; the ceiling
+        // still holds a 1.1 ms gap to be a drop.
+        assert!(det.observed_jitter_seconds() > 0.8e-3);
+        assert!(matches!(
+            det.observe(&packet_at(t + DURATION + 1.1e-3)),
+            DropResult::Drop { .. }
+        ));
     }
 }
 

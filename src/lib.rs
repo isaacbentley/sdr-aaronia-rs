@@ -133,7 +133,7 @@ pub use http_source::{HttpSource, HttpSourceBuilder, StreamStats};
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub use http_streaming::{
-    PacketMetadata, PayloadType, StreamFormat, StreamPacket, StreamParser,
+    PacketMetadata, ParsedItem, PayloadType, StreamFormat, StreamPacket, StreamParser,
     StreamingPerformanceStats,
 };
 /// Link budget: whether the path can carry the span that was asked for

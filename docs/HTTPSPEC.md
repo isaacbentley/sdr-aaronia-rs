@@ -124,7 +124,7 @@ The stream server supports multiple data formats for high-performance streaming:
 | `minPower` | Minimum power in dBm | `integer` (e.g., `-95`, `-2`, `-165`); this crate parses it as `i32` |
 | `maxPower` | Maximum power in dBm | `integer` (e.g., `5`, `2`); this crate parses it as `i32` |
 | `sampleFrequency` | Sample rate in Hz | `double` (e.g., `100000000.0`) |
-| `compression` | Compression scheme of the binary payload; drives the wavelet decompression path when present | `integer` |
+| `compression` | Compression factor of the binary payload (0 = uncompressed). Not in the v9 endpoints document, and the server accepts `compression=N` only with `format=rtsa`. A compressed payload's byte length is not in the header, so a `spectra` or `histogram` packet with `compression > 0` on the JSON-plus-binary wire **cannot be framed**: `StreamParser` reports it lost and resynchronises on the next header rather than consuming an assumed length | `integer` |
 | `startFrequency` | Start of a frequency range | `double` (e.g., `2400250000`, `2402250128`) |
 | `endFrequency` | End of a frequency range | `double` (e.g., `2487750000`, `2489750128`) |
 | `sampleDepth` | Number of sample sets per sample, e.g., bins in a histogram | `integer` (e.g., `1`, `2`, `256`) |
@@ -197,6 +197,18 @@ announces the loss; it shows up only as a gap between the timestamps of
 two adjacent packets. A slow consumer, a slow link, or a rate the
 network cannot carry all end here, so reducing the wire format
 (`format=int16`) is the fix rather than a larger client-side buffer.
+
+How large a jump counts as a gap is measured from the stream itself.
+`DropDetector` flags a gap larger than half the shorter of the two
+packets' own durations — a lost packet opens a gap of a whole one — or
+four times the residual it has seen between contiguous packets, if that
+is larger (up to three quarters of a packet), never less than 4 µs (the
+server prints `startTime` to the microsecond) and never more than 1 ms.
+A fixed 1 ms was the old rule, and above roughly 16 MS/s with 16 384-sample
+packets a whole lost packet is shorter than that and went unreported.
+The calibration is unit-tested on synthetic timestamps; **live
+verification against a real RTSA stream at a high rate is still
+pending.**
 Narrowing the span works too, since it moves the device down its
 decimation ladder. `rate_reduction=n` does not help here either — it is
 time compression for frame-based payloads (see the parameter note above).
