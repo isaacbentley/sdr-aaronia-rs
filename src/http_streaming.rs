@@ -615,6 +615,8 @@ pub struct DropDetector {
     jitter: f64,
     /// Cumulative number of drops detected.
     drops: u64,
+    /// Cumulative number of backward timestamp steps detected.
+    backward_steps: u64,
     /// Cumulative gap (in seconds) attributed to drops.
     cumulative_gap: f64,
 }
@@ -630,6 +632,18 @@ pub enum DropResult {
     Drop {
         /// Length of the detected gap, in seconds.
         gap_seconds: f64,
+    },
+    /// This packet starts *before* the previous one ended, by more than
+    /// the detector's tolerance. No samples are known to be missing, but
+    /// the timeline is not continuous either: the two packets overlap or
+    /// the server's clock stepped back, and a demodulator stitching them
+    /// together is as wrong as across a gap. Not counted in
+    /// [`DropDetector::drops`] or its cumulative gap, which measure
+    /// signal that was never sent.
+    Backward {
+        /// How far this packet's `start_time` precedes the previous
+        /// packet's `end_time`, in seconds (positive).
+        overlap_seconds: f64,
     },
 }
 
@@ -668,6 +682,7 @@ impl DropDetector {
             last_duration: None,
             jitter: 0.0,
             drops: 0,
+            backward_steps: 0,
             cumulative_gap: 0.0,
         }
     }
@@ -706,10 +721,20 @@ impl DropDetector {
         let result = match self.last_end_time {
             Some(prev_end) => {
                 let gap = start - prev_end;
-                if gap > self.tolerance_for(duration) {
+                let tolerance = self.tolerance_for(duration);
+                if gap > tolerance {
                     self.drops += 1;
                     self.cumulative_gap += gap;
                     DropResult::Drop { gap_seconds: gap }
+                } else if -gap > tolerance {
+                    // The same tolerance in the other direction: past it
+                    // the step is not rounding, and it must not reach the
+                    // jitter estimate, where it would hold the tolerance
+                    // at its ceiling for everything after it.
+                    self.backward_steps += 1;
+                    DropResult::Backward {
+                        overlap_seconds: -gap,
+                    }
                 } else {
                     // Contiguous: whatever separates the two timestamps
                     // is the server's rounding and jitter, which is what
@@ -737,16 +762,24 @@ impl DropDetector {
         self.drops
     }
 
+    /// Cumulative number of backward timestamp steps detected so far
+    /// (see [`DropResult::Backward`]).
+    pub fn backward_steps(&self) -> u64 {
+        self.backward_steps
+    }
+
     /// Cumulative gap time, in seconds, attributed to detected drops.
     pub fn cumulative_gap_seconds(&self) -> f64 {
         self.cumulative_gap
     }
 
-    /// Clear all accumulated drop statistics and forget the last
-    /// observed packet.
+    /// Clear all accumulated drop statistics and the jitter calibration,
+    /// and forget the last observed packet.
     pub fn reset(&mut self) {
         self.resync();
+        self.jitter = 0.0;
         self.drops = 0;
+        self.backward_steps = 0;
         self.cumulative_gap = 0.0;
     }
 
@@ -758,13 +791,20 @@ impl DropDetector {
     /// previous one and would otherwise be reported as one enormous
     /// drop. [`Self::reset`] would zero the counters instead, making the
     /// cumulative total that consumers read as monotonic jump backwards
-    /// and corrupting anything computing deltas from it. The jitter
-    /// calibration is forgotten too: the new stream may be at another
-    /// rate from another server state, and recalibrates within a packet.
+    /// and corrupting anything computing deltas from it.
+    ///
+    /// The jitter calibration is **kept**. A lost packet or a reconnect
+    /// does not change how the server stamps its packets, and the
+    /// calibration cannot be relearned quickly: it grows only from
+    /// residuals already judged contiguous, so a server whose residuals
+    /// sit between half a packet and the tolerance it had learned would
+    /// raise a false drop on each, relearning only from the smaller
+    /// residuals in between. Keeping
+    /// it is safe even across a rate change — its effect is capped at
+    /// [`Self::PACKET_CEILING`] of the *current* packet, and it decays.
     pub fn resync(&mut self) {
         self.last_end_time = None;
         self.last_duration = None;
-        self.jitter = 0.0;
     }
 }
 
@@ -781,6 +821,21 @@ pub enum ParsedItem {
     /// not be decoded. Its bytes have been skipped, so the samples it
     /// carried are gone: the packets either side of it are not contiguous.
     Lost(Error),
+    /// A packet whose header was read and names a payload that is **not**
+    /// IQ, but which could not be decoded — a compressed spectra packet,
+    /// which carries no byte length to frame it by, is the ordinary case.
+    ///
+    /// Distinct from [`Self::Lost`] because it costs an IQ consumer
+    /// nothing: only this packet's own bytes were dropped, and they held
+    /// power scalars, so the IQ packets either side of it are as
+    /// contiguous as their timestamps say. Reporting it as `Lost` made a
+    /// source mark a gap in an IQ stream that had none.
+    Skipped {
+        /// The payload type the packet's header declared.
+        payload: PayloadType,
+        /// Why it could not be decoded.
+        reason: Error,
+    },
 }
 
 /// What one attempt at the front of the buffer produced. `Err` from
@@ -789,7 +844,15 @@ pub enum ParsedItem {
 enum ParseStep {
     Packet(StreamPacket),
     NeedMore,
+    /// Lost with nothing known about what was dropped: no header, or a
+    /// declared extent too large to trust.
     Lost(Error),
+    /// The header was read and exactly this packet was dropped, so its
+    /// payload type says what the loss cost.
+    Undecoded {
+        payload: PayloadType,
+        error: Error,
+    },
 }
 
 /// Simple HTTP stream parser for Aaronia RTSA format
@@ -894,7 +957,7 @@ impl StreamParser {
         for item in self.parse_buffered(data, true)? {
             match item {
                 ParsedItem::Packet(packet) => completed_packets.push(packet),
-                ParsedItem::Lost(e) => return Err(e),
+                ParsedItem::Lost(e) | ParsedItem::Skipped { reason: e, .. } => return Err(e),
             }
         }
         Ok(completed_packets)
@@ -911,7 +974,8 @@ impl StreamParser {
     /// there is nothing to recover by reconnecting. Here each such packet
     /// becomes a [`ParsedItem::Lost`] **in stream order**, so the caller
     /// knows exactly which samples it falls between and can mark the hole
-    /// there.
+    /// there — or a [`ParsedItem::Skipped`] when its header named a
+    /// non-IQ payload, whose loss leaves no hole in the IQ.
     ///
     /// `Err` is kept for what skipping cannot cure: a header that never
     /// terminates within [`Self::MAX_JSON_BUFFER`], where the stream has
@@ -941,6 +1005,22 @@ impl StreamParser {
                 Ok(ParseStep::Lost(e)) => {
                     self.counters.parse_errors += 1;
                     items.push(ParsedItem::Lost(e));
+                    if stop_at_loss {
+                        break;
+                    }
+                }
+                Ok(ParseStep::Undecoded { payload, error }) => {
+                    self.counters.parse_errors += 1;
+                    // An undecodable IQ packet took samples with it; any
+                    // other payload took only itself.
+                    items.push(if payload == PayloadType::Iq {
+                        ParsedItem::Lost(error)
+                    } else {
+                        ParsedItem::Skipped {
+                            payload,
+                            reason: error,
+                        }
+                    });
                     if stop_at_loss {
                         break;
                     }
@@ -1058,7 +1138,10 @@ impl StreamParser {
                     // packet so the next call moves on instead of failing
                     // on the same bytes forever.
                     self.consume_buffer(payload_start);
-                    return Ok(ParseStep::Lost(e));
+                    return Ok(ParseStep::Undecoded {
+                        payload: metadata.payload,
+                        error: e,
+                    });
                 }
             };
             let mut metadata = metadata;
@@ -1076,9 +1159,14 @@ impl StreamParser {
             Ok(n) => n,
             Err(e) => {
                 // Same as the oversized case below: the header is bad,
-                // skip it rather than fail on it forever.
+                // skip it rather than fail on it forever. Only the header
+                // is consumed and the scan resyncs on the next one, so
+                // nothing beyond this packet is dropped.
                 self.consume_buffer(payload_start);
-                return Ok(ParseStep::Lost(e));
+                return Ok(ParseStep::Undecoded {
+                    payload: metadata.payload,
+                    error: e,
+                });
             }
         };
         if expected_bytes > Self::MAX_BINARY_PAYLOAD {
@@ -1112,7 +1200,10 @@ impl StreamParser {
                 // can be skipped. Leaving it in place made every later call
                 // fail on the same packet while the buffer grew unbounded.
                 self.consume_buffer(binary_end);
-                return Ok(ParseStep::Lost(e));
+                return Ok(ParseStep::Undecoded {
+                    payload: metadata.payload,
+                    error: e,
+                });
             }
         };
         self.counters.packets_parsed += 1;
@@ -2223,8 +2314,9 @@ mod tests {
 
     /// A compressed spectra packet carries no byte length, so framing it
     /// at its uncompressed size swallowed the IQ packets behind it. It is
-    /// now reported lost where it sat and the scan resyncs on the next
-    /// header, stray braces and separators in its bitstream included.
+    /// now reported skipped where it sat — skipped, not lost: it held no
+    /// IQ — and the scan resyncs on the next header, stray braces and
+    /// separators in its bitstream included.
     #[test]
     fn a_compressed_spectra_packet_is_skipped_without_costing_the_iq_behind_it() {
         let mut parser = StreamParser::new(StreamFormat::Int16, None).unwrap();
@@ -2245,14 +2337,15 @@ mod tests {
             .iter()
             .map(|item| match item {
                 ParsedItem::Packet(p) => Some(p.samples[0].re),
-                ParsedItem::Lost(_) => None,
+                ParsedItem::Lost(_) | ParsedItem::Skipped { .. } => None,
             })
             .collect();
         assert_eq!(shape, [Some(100.0), None, Some(200.0), Some(300.0)]);
-        let ParsedItem::Lost(e) = &items[1] else {
-            unreachable!()
+        let ParsedItem::Skipped { payload, reason } = &items[1] else {
+            panic!("a non-IQ packet costs no IQ: {:?}", items[1]);
         };
-        assert!(e.to_string().contains("no byte length"), "{e}");
+        assert_eq!(*payload, PayloadType::Spectra);
+        assert!(reason.to_string().contains("no byte length"), "{reason}");
         assert!(parser.pending().is_empty());
     }
 
@@ -2386,6 +2479,7 @@ mod tests {
             .map(|item| match item {
                 ParsedItem::Packet(_) => "packet",
                 ParsedItem::Lost(_) => "lost",
+                ParsedItem::Skipped { .. } => "skipped",
             })
             .collect();
         assert_eq!(shape, vec!["packet", "lost", "packet"]);
@@ -2813,6 +2907,66 @@ mod tests {
             det.observe(&packet_at(t + DURATION + 1.1e-3)),
             DropResult::Drop { .. }
         ));
+    }
+
+    /// A packet that starts well before the previous one ended is a
+    /// broken timeline, not a contiguous one — and the step is not
+    /// rounding, so it must not teach the detector to tolerate more.
+    #[test]
+    fn a_backward_timestamp_is_a_break_and_not_jitter() {
+        const DURATION: f64 = 16_384.0 / 61.44e6;
+        let packet_at = |t: f64| iq_packet(t, t + DURATION);
+        let mut det = DropDetector::default();
+        det.observe(&packet_at(1000.0));
+        det.observe(&packet_at(1000.0 + DURATION));
+        let jitter_before = det.observed_jitter_seconds();
+
+        let back = 1000.0 + 2.0 * DURATION - 150e-6;
+        match det.observe(&packet_at(back - DURATION)) {
+            DropResult::Backward { overlap_seconds } => {
+                assert!((overlap_seconds - (DURATION + 150e-6)).abs() < 1e-9);
+            }
+            other => panic!("a backward step read as {other:?}"),
+        }
+        assert_eq!(det.backward_steps(), 1);
+        assert_eq!(det.drops(), 0);
+        assert_eq!(det.cumulative_gap_seconds(), 0.0);
+        assert_eq!(det.observed_jitter_seconds(), jitter_before);
+
+        // The timeline resumes from the packet that stepped back.
+        assert_eq!(det.observe(&packet_at(back)), DropResult::Continuous);
+    }
+
+    /// Losing a packet does not change how the server stamps the ones
+    /// after it, so re-seeding across the loss keeps the calibration a
+    /// jittery server needs; forgetting it turned every later residual
+    /// above half a packet into a false drop.
+    #[test]
+    fn a_resync_keeps_the_jitter_calibration() {
+        const DURATION: f64 = 16_384.0 / 61.44e6;
+        let packet_at = |t: f64| iq_packet(t, t + DURATION);
+        let mut det = DropDetector::default();
+        let mut t = 1000.0;
+        for k in 0..100 {
+            det.observe(&packet_at(t));
+            let wobble = if k % 2 == 0 { 50e-6 } else { -50e-6 };
+            t += DURATION + wobble;
+        }
+        let learned = det.observed_jitter_seconds();
+        assert!(learned >= 45e-6);
+
+        det.resync();
+        assert_eq!(det.observed_jitter_seconds(), learned);
+        det.observe(&packet_at(t));
+        // 150 µs is past half a packet (133 µs) and inside four times the
+        // learned wobble.
+        assert_eq!(
+            det.observe(&packet_at(t + DURATION + 150e-6)),
+            DropResult::Continuous
+        );
+
+        det.reset();
+        assert_eq!(det.observed_jitter_seconds(), 0.0);
     }
 }
 

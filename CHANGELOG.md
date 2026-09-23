@@ -39,9 +39,30 @@ All notable changes to this project will be documented in this file.
   verified live against a real RTSA stream at a high rate.
 - **A compressed spectra or histogram packet no longer swallows the IQ behind
   it.** It was framed at its *uncompressed* size, but a compressed payload is
-  a bitstream whose length the header does not carry. It is now reported lost
-  (`ParsedItem::Lost`, a gap where it sat) and the parser resynchronises on
-  the next header.
+  a bitstream whose length the header does not carry. It is now reported as
+  `ParsedItem::Skipped` where it sat and the parser resynchronises on the next
+  header.
+- **A skipped non-IQ packet is no longer reported as a gap in the IQ.** Any
+  packet whose header was read but whose non-IQ payload could not be decoded
+  was a `ParsedItem::Lost`, which `HttpSource` recorded as a `Gap` and counted
+  in `packets_lost_to_parse_errors` — a hole claimed in an IQ stream that had
+  none. The new `ParsedItem::Skipped { payload, reason }` carries the declared
+  payload type; `HttpSource` counts it in `non_iq_packets_skipped` and records
+  no break. An undecodable IQ packet, or one whose extent could not be trusted,
+  is still `Lost`. (Breaking for exhaustive matches on `ParsedItem`.)
+- **A timestamp that steps backwards is a break, not continuity.**
+  `DropDetector::observe` returned `Continuous` for a packet starting before
+  the previous one ended, however far, and fed the step into the jitter
+  estimate, holding the tolerance at its ceiling afterwards. A backward step
+  past the tolerance is now `DropResult::Backward { overlap_seconds }`, counted
+  in `DropDetector::backward_steps` and kept out of the jitter estimate and
+  the drop totals; `HttpSource` records a `Gap` there and `UnifiedSource`
+  flags the buffer. (Breaking for exhaustive matches on `DropResult`.)
+- **`DropDetector::resync` keeps the jitter calibration.** It was cleared on
+  every lost packet and reconnect, and since the estimate grows only from
+  residuals already judged contiguous, a server whose residuals sit above
+  half a packet raised false drops until it was relearned. `reset` still
+  clears it.
 - **Compressed spectra decode on a frames × bins grid.** The wavelet grid was
   sized from the square root of one frame's bins, ignoring the frame count
   and dropping bins. Shapes whose layout is undocumented — more than one
@@ -54,6 +75,10 @@ All notable changes to this project will be documented in this file.
 - **One undecodable packet no longer costs the connection.** `HttpSource`
   skips it, keeps the packets either side, and records a gap where it sat;
   only an unrecoverable framing error still reconnects.
+- **The README's stream-break example is doctested only where it compiles.**
+  It uses `HttpSourceBuilder`, which needs the `futuresdr` feature, so
+  `cargo test` with default features failed on it; the body is now gated on
+  that feature.
 - **A stalled `/stream` reconnects.** The reader waited forever on a socket
   that stayed open and sent nothing; it now gives up after 5 s and the source
   takes its ordinary reconnect path.

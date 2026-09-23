@@ -111,19 +111,22 @@ cargo test --release --lib --no-default-features --features http \
 ## Stream continuity
 
 A source hands its consumer a flat run of samples, and that run *claims* to be
-continuous. Five things break the claim, and `HttpSource` knows about all five:
+continuous. Six things break the claim, and `HttpSource` knows about all six:
 
 | event | cause |
 | --- | --- |
 | server gap | the RTSA server dropped what it could not send; seen as a jump between one packet's `endTime` and the next's `startTime` larger than a tolerance measured from the stream (half a packet, or above the observed timestamp jitter, capped at 1 ms — see `DropDetector`; not yet verified live at high rates) |
-| undecodable packet | a packet framed but could not be decoded; it is skipped and its neighbours kept, and the hole is a gap where it sat |
+| backward timestamp | a packet's `startTime` precedes the previous packet's `endTime` by more than the same tolerance: nothing is missing, but the two do not follow one another |
+| undecodable packet | an IQ packet, or one whose header could not be read, framed but could not be decoded; it is skipped and its neighbours kept, and the hole is a gap where it sat |
 | capacity trim | the consumer fell behind, so the oldest buffered samples were discarded to keep the buffer current |
-| reconnect | the stream ended, errored, or delivered nothing for 5 s, and was reopened; the parser and the drop detector both reset |
+| reconnect | the stream ended, errored, or delivered nothing for 5 s, and was reopened; the parser resets and the drop detector forgets the last timestamp (keeping its jitter calibration) |
 | retune | the device's centre frequency or sample rate changed mid-stream |
 
 `HttpSource` outputs IQ only. Spectra, histogram and category packets on a
 mixed mission are skipped and counted in `StreamStats::non_iq_packets_skipped`;
-they feed neither the output, the drop detector nor the frequency tracking.
+they feed neither the output, the drop detector nor the frequency tracking. That
+includes the ones the parser cannot decode — a compressed spectra packet carries
+no byte length to frame it by — which cost no IQ and so mark no gap.
 
 Counters for these have always been available through `StreamStats`. What a
 counter cannot say is *which* samples belong to the old epoch — and that is the
@@ -136,6 +139,9 @@ unsignalled phase discontinuity that breaks digital symbol lock.
 sample after it**, counted in this source's output stream:
 
 ```rust,no_run
+# // `HttpSourceBuilder` is the FutureSDR block: compiled only with that feature.
+# #[cfg(feature = "futuresdr")]
+# fn main() -> Result<(), sdr_aaronia_rs::Error> {
 use std::sync::Arc;
 use sdr_aaronia_rs::{HttpSourceBuilder, RecordingBreakSink, StreamDiscontinuity};
 
@@ -156,7 +162,10 @@ for (at_sample, cause) in breaks.breaks() {
         }
     }
 }
-# Ok::<(), sdr_aaronia_rs::Error>(())
+# Ok(())
+# }
+# #[cfg(not(feature = "futuresdr"))]
+# fn main() {}
 ```
 
 Implement `StreamBreakSink` yourself to push into whatever queue the consumer

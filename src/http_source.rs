@@ -215,10 +215,14 @@ pub struct StreamStats {
     /// lets a consumer tell how current the counters are.
     pub device_health_drops: u64,
     /// Spectra, histogram and category packets the stream carried and
-    /// this source skipped — it outputs IQ only.
+    /// this source skipped — it outputs IQ only. Includes those the parser
+    /// could not decode (a compressed spectra packet has no byte length to
+    /// frame it by): their loss costs no IQ, so they are not counted in
+    /// [`Self::packets_lost_to_parse_errors`] and mark no gap.
     pub non_iq_packets_skipped: u64,
-    /// Packets the parser framed but could not decode. Each is skipped
-    /// and reported to the break sink as a gap where it sat.
+    /// IQ packets, or packets of unknown type, that the parser framed but
+    /// could not decode. Each is skipped and reported to the break sink as
+    /// a gap where it sat.
     pub packets_lost_to_parse_errors: u64,
 }
 
@@ -1323,15 +1327,38 @@ impl HttpSource {
                     self.note_lost_packet(&e);
                     continue;
                 }
+                // A non-IQ packet this source would have skipped anyway,
+                // and whose loss cost only its own bytes: the IQ either
+                // side is as contiguous as its timestamps say, which the
+                // drop detector goes on to check. No break.
+                crate::http_streaming::ParsedItem::Skipped { payload, reason } => {
+                    self.note_undecoded_non_iq_packet(&payload, &reason);
+                    continue;
+                }
             };
             if packet.metadata.payload != crate::http_streaming::PayloadType::Iq {
                 self.note_non_iq_packet(&packet);
                 continue;
             }
 
-            if let crate::http_streaming::DropResult::Drop { gap_seconds } =
-                self.drop_detector.observe(&packet)
-            {
+            let drop = self.drop_detector.observe(&packet);
+            if let crate::http_streaming::DropResult::Backward { overlap_seconds } = drop {
+                // No signal is missing, but the packets do not follow one
+                // another either, and a demodulator cannot tell an
+                // overlap from a splice. The same break as a gap, then,
+                // without adding to the server-gap totals.
+                self.note_break(StreamDiscontinuity::Gap);
+                // A clock that steps back does it again: 1, 2, 4, 8, ...
+                let steps = self.drop_detector.backward_steps();
+                if steps.is_power_of_two() {
+                    warn!(
+                        "Stream timestamps stepped backwards by {:.6} s between two IQ \
+                         packets ({steps} so far); each is marked as a break in the stream",
+                        overlap_seconds,
+                    );
+                }
+            }
+            if let crate::http_streaming::DropResult::Drop { gap_seconds } = drop {
                 self.stream_gap_seconds += gap_seconds;
                 // Where it happened, not just that it did. The samples
                 // already queued are sound; everything from the next one
@@ -1510,23 +1537,13 @@ impl HttpSource {
         Ok((total_samples_added, iq_samples_added))
     }
 
-    /// Hard cap on `sample_buffer`, above which the oldest samples are
-    /// dropped to keep the buffer bounded and current.
-    ///
-    /// Single source of truth for both the enforcement in
-    /// [`Self::fetch_samples`] and the figure reported by
-    /// [`Self::get_stream_stats`]; these were separately-written
-    /// expressions (`saturating_mul(2).max(1)` vs a bare `* 2`) that
-    /// disagreed whenever `buffer_size` was 0 — reporting capacity 0 while
-    /// enforcing 1, so `buffer_level` could exceed `buffer_capacity` and a
-    /// consumer computing a fill ratio divided by zero. The bare `* 2` was
-    /// also the only unguarded one on overflow.
     /// Account for a packet the parser framed but could not decode.
     ///
     /// Its samples are lost, so the stream breaks here exactly as it does
     /// at a server gap. The drop detector is re-seeded because the next
     /// packet's timestamp will show the hole, and it is ours to report, not
-    /// the server's.
+    /// the server's. Its jitter calibration survives: losing a packet does
+    /// not change how the server stamps the ones after it.
     fn note_lost_packet(&mut self, error: &Error) {
         self.packets_lost_to_parse_errors = self.packets_lost_to_parse_errors.saturating_add(1);
         self.note_break(StreamDiscontinuity::Gap);
@@ -1539,6 +1556,29 @@ impl HttpSource {
             );
             self.next_parse_loss_report = self.packets_lost_to_parse_errors.saturating_mul(4);
         }
+    }
+
+    /// Account for a non-IQ packet the parser could not decode — a
+    /// compressed spectra packet, typically, which carries no byte length
+    /// to frame it by.
+    ///
+    /// It is counted with the non-IQ packets this source skips, not with
+    /// [`Self::note_lost_packet`]'s: the parser dropped only its bytes,
+    /// and this source outputs none of that payload anyway, so there is no
+    /// hole in the IQ to mark.
+    fn note_undecoded_non_iq_packet(
+        &mut self,
+        payload: &crate::http_streaming::PayloadType,
+        reason: &Error,
+    ) {
+        if self.non_iq_packets_skipped == 0 {
+            warn!(
+                "The stream carries {payload:?} packets as well as IQ ({reason}); this source \
+                 outputs IQ only, so they are skipped (counted in \
+                 StreamStats::non_iq_packets_skipped)",
+            );
+        }
+        self.non_iq_packets_skipped = self.non_iq_packets_skipped.saturating_add(1);
     }
 
     /// Account for a spectra, histogram or category packet on the stream.
@@ -1779,6 +1819,17 @@ impl HttpSource {
         self.produced = self.produced.saturating_add(produced as u64);
     }
 
+    /// Hard cap on `sample_buffer`, above which the oldest samples are
+    /// dropped to keep the buffer bounded and current.
+    ///
+    /// Single source of truth for both the enforcement in
+    /// [`Self::fetch_samples`] and the figure reported by
+    /// [`Self::get_stream_stats`]; these were separately-written
+    /// expressions (`saturating_mul(2).max(1)` vs a bare `* 2`) that
+    /// disagreed whenever `buffer_size` was 0 — reporting capacity 0 while
+    /// enforcing 1, so `buffer_level` could exceed `buffer_capacity` and a
+    /// consumer computing a fill ratio divided by zero. The bare `* 2` was
+    /// also the only unguarded one on overflow.
     fn buffer_capacity(&self) -> usize {
         let configured = self.buffer_size.saturating_mul(2).max(1);
         // Never sit below a few packets. See `max_packet_samples`: the trim
@@ -3827,8 +3878,14 @@ mod tests {
         // than the 10% band, so a baseline that advanced per packet would
         // follow the device all the way down and report nothing. Against what
         // was last announced, the third step clears the band.
-        for rate in [15_360_000.0, 14_600_000.0, 13_900_000.0, 13_200_000.0] {
-            let wire = Bytes::from(int16_iq_packet(rate, 100.0, 100.001, 4));
+        // Contiguous timestamps: a repeated one steps back a whole packet,
+        // which is a break of its own.
+        for (k, rate) in [15_360_000.0, 14_600_000.0, 13_900_000.0, 13_200_000.0]
+            .into_iter()
+            .enumerate()
+        {
+            let start = 100.0 + k as f64 * 0.001;
+            let wire = Bytes::from(int16_iq_packet(rate, start, start + 0.001, 4));
             block.process_advanced_stream_data(&wire).expect("parses");
         }
         drain(&mut block, 16);
@@ -4202,6 +4259,61 @@ mod tests {
             stats.dropped_packets, 0,
             "the hole is ours, not a server skip",
         );
+    }
+
+    /// A compressed spectra packet has no byte length, so the parser
+    /// refuses it — but it held no IQ, so the IQ either side of it is
+    /// contiguous and no gap may be claimed. It is a skipped non-IQ
+    /// packet, not a lost one.
+    #[test]
+    fn an_undecodable_spectra_packet_is_skipped_without_marking_a_gap() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        let mut wire = int16_iq_packet(15_360_000.0, 100.000, 100.001, 16);
+        wire.extend_from_slice(
+            br#"{"startTime":100.0005,"endTime":100.0105,"startFrequency":95e6,"endFrequency":105e6,"samples":4,"unit":"dbm","payload":"spectra","minPower":-120,"maxPower":0,"sampleSize":64,"sampleDepth":1,"compression":3}"#,
+        );
+        wire.extend_from_slice(&[0x0A, 0x1E]);
+        wire.extend_from_slice(&[0x93, b'{', 0x0A, 0x1E, 0xA5, 0x55, 0x00, 0xFF]);
+        wire.extend(int16_iq_packet(15_360_000.0, 100.001, 100.002, 16));
+        let counts = block
+            .process_advanced_stream_data(&Bytes::from(wire))
+            .expect("a skipped packet is not an error");
+        assert_eq!(counts, (32, 32));
+        drain(&mut block, 32);
+
+        let breaks = sink.breaks();
+        assert_eq!(breaks.len(), 1, "the Initial and nothing else: {breaks:?}");
+        let stats = block.get_stream_stats();
+        assert_eq!(stats.packets_lost_to_parse_errors, 0);
+        assert_eq!(stats.non_iq_packets_skipped, 1);
+        assert_eq!(stats.dropped_packets, 0);
+    }
+
+    /// A packet stamped before the previous one ended loses no signal, but
+    /// the timeline does not continue across it: a break where it sat, and
+    /// nothing added to the server-gap count.
+    #[test]
+    fn a_backward_timestamp_is_a_break_where_it_happened() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut block, sink) = block_with_breaks();
+
+        let mut wire = int16_iq_packet(15_360_000.0, 100.000, 100.001, 16);
+        wire.extend(int16_iq_packet(15_360_000.0, 100.001, 100.002, 16));
+        // 10 ms back from where the last packet ended.
+        wire.extend(int16_iq_packet(15_360_000.0, 99.992, 99.993, 16));
+        block
+            .process_advanced_stream_data(&Bytes::from(wire))
+            .expect("parses");
+        drain(&mut block, 48);
+
+        let breaks = sink.breaks();
+        assert_eq!(breaks.len(), 2, "{breaks:?}");
+        assert_eq!(breaks[1], (32, StreamDiscontinuity::Gap));
+        assert_eq!(block.get_stream_stats().dropped_packets, 0);
     }
 
     /// One serialized RTSA int16 IQ packet as the wire carries it: JSON

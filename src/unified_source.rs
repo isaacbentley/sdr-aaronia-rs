@@ -989,9 +989,13 @@ impl SpectranSource {
                                     }
                                 }
 
+                                // A backward timestamp step loses no
+                                // samples but is no less a discontinuity
+                                // to whoever stitches the buffers.
                                 let dropped = matches!(
                                     drop_detector.observe(&packet),
                                     crate::http_streaming::DropResult::Drop { .. }
+                                        | crate::http_streaming::DropResult::Backward { .. }
                                 ) || std::mem::take(&mut flag_overrun_after_gap);
                                 let timestamp_ns = (packet.metadata.start_time * 1e9) as i64;
                                 let cumulative_drops = drop_detector.drops();

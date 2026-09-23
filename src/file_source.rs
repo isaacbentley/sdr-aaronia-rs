@@ -4854,18 +4854,23 @@ mod tests {
         );
     }
 
-    /// `seek_to_sample` and `read_samples` must agree on which chunk an
-    /// index lives in. Reads index each chunk within its own sub-stream;
-    /// the seek counted across all of them, so with two sub-streams
-    /// interleaved it positioned the reader in the other sub-stream's
-    /// chunk.
-    #[test]
-    fn a_seek_lands_in_the_chunk_a_read_would_use() {
+    /// Three float32 IQ chunks on stream 1 — sub-stream 1, sub-stream 2,
+    /// sub-stream 1, ten samples each — whose sample `i` of chunk `c`
+    /// carries `I = 100·c + i`, so a read says which chunk it came from.
+    /// Returns the source, the file it reads (keep it alive) and each
+    /// chunk's offset.
+    fn interleaved_sub_stream_source() -> (RtsaSource, tempfile::TempPath, [u64; 3]) {
         let mut data = Vec::new();
-        write_chunk(&mut data, b"SAMP", 144, 64, 1, 1, 10);
-        write_chunk(&mut data, b"SAMP", 144, 64, 1, 2, 10);
-        let third = data.len() as u64;
-        write_chunk(&mut data, b"SAMP", 144, 64, 1, 1, 10);
+        let mut offsets = [0u64; 3];
+        for (c, sub) in [1u32, 2, 1].into_iter().enumerate() {
+            offsets[c] = data.len() as u64;
+            write_chunk(&mut data, b"SAMP", 144, 64, 1, sub, 10);
+            for i in 0..10 {
+                let at = offsets[c] as usize + 64 + i * 8;
+                let value = (100 * c + i) as f32;
+                data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
 
         let path = create_temp_file(&data);
         let file = std::fs::File::open(&path).unwrap();
@@ -4886,10 +4891,57 @@ mod tests {
             source.samp_chunk_start_samples.insert(offset, *counter);
             *counter += samp.num_samples as u64;
         }
+        (source, path, offsets)
+    }
+
+    /// The in-phase value of the one sample a read returns.
+    fn read_one(source: &mut RtsaSource, sub_stream_id: Option<u32>) -> f32 {
+        match source.read_samples(1, sub_stream_id).unwrap().unwrap() {
+            SampleData::Iq(samples) => samples[0].re,
+            other => panic!("expected IQ, got {other:?}"),
+        }
+    }
+
+    /// `seek_to_sample` and `read_samples` must agree on which chunk an
+    /// index lives in. Reads index each chunk within its own sub-stream;
+    /// the seek counted across all of them, so with two sub-streams
+    /// interleaved it positioned the reader in the other sub-stream's
+    /// chunk.
+    #[test]
+    fn a_seek_lands_in_the_chunk_a_read_would_use() {
+        let (mut source, _path, offsets) = interleaved_sub_stream_source();
 
         // Index 15 is sample 5 of sub-stream 1's second chunk.
         source.seek_to_sample(15).unwrap();
-        assert_eq!(source.reader.stream_position().unwrap(), third + 64 + 5 * 8,);
+        assert_eq!(
+            source.reader.stream_position().unwrap(),
+            offsets[2] + 64 + 5 * 8,
+        );
+        assert_eq!(read_one(&mut source, None), 205.0);
+    }
+
+    /// An index both sub-streams hold. The seek takes no sub-stream, so it
+    /// positions for the one an unfiltered read uses — the first chunk in
+    /// file order that holds the index — and a filtered read, which
+    /// positions itself from the cursor index, still reads its own
+    /// sub-stream's sample at that index.
+    #[test]
+    fn a_seek_to_an_index_every_sub_stream_holds_agrees_with_the_read() {
+        let (mut source, _path, offsets) = interleaved_sub_stream_source();
+
+        source.seek_to_sample(5).unwrap();
+        assert_eq!(
+            source.reader.stream_position().unwrap(),
+            offsets[0] + 64 + 5 * 8,
+        );
+        assert_eq!(read_one(&mut source, None), 5.0);
+
+        source.seek_to_sample(5).unwrap();
+        assert_eq!(read_one(&mut source, Some(1)), 5.0);
+
+        source.seek_to_sample(5).unwrap();
+        assert_eq!(read_one(&mut source, Some(2)), 105.0);
+        assert_eq!(source.current_position(), 6);
     }
 
     /// Header figures are untrusted: a sample count whose byte size does
