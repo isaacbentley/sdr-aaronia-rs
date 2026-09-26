@@ -23,6 +23,16 @@ use crate::stream_break::StreamDiscontinuity;
 /// few tens of thousands of samples).
 const PACKET_CAPACITY_FACTOR: usize = 4;
 
+/// Depth of the channel between the socket reader task and `work()`, in
+/// chunks, and the most chunks one `fetch_samples` sweep takes from it.
+///
+/// The bound on the sweep is what makes [`HttpSource::buffer_capacity`]'s
+/// catch-up headroom exact: a sweep starts below the refill target and can
+/// add at most this many chunks' worth of samples, so a catch-up after the
+/// consumer stalls always fits under the trim. Chunks queued past it wait
+/// for the next sweep of the same `work()` call.
+const CHUNK_CHANNEL_DEPTH: usize = 64;
+
 /// Move as many samples as fit from the front of `buffer` into `out`,
 /// returning how many moved.
 ///
@@ -326,6 +336,11 @@ pub struct HttpSource {
     /// from the stream rather than configured, since the packet size is the
     /// device's choice and no caller can be expected to guess it.
     max_packet_samples: usize,
+    /// Largest chunk the reader task has handed over, in bytes (0 until the
+    /// first). With [`CHUNK_CHANNEL_DEPTH`] it bounds what one sweep can
+    /// add, which is the catch-up headroom in [`Self::buffer_capacity`].
+    /// hyper's adaptive read settles at 32–64 KiB, measured live.
+    max_chunk_bytes: usize,
     /// Items the connected output buffer holds in total, learned from the
     /// writer once the flowgraph has wired it up (0 until then, and for the
     /// unit tests that never connect one). Feeds the `buffer_capacity` floor
@@ -559,6 +574,7 @@ impl HttpSource {
             streaming_client,
             sample_buffer: VecDeque::with_capacity(buffer_size * 2),
             max_packet_samples: 0,
+            max_chunk_bytes: 0,
             downstream_capacity: 0,
             stream_format,
             stream_parser,
@@ -726,7 +742,7 @@ impl HttpSource {
         // 4 MB — about 45 ms at the 88 MB/s a WiFi 6E path delivers. The
         // task ends when the stream does, or when the receiver is dropped
         // on reconnect/retune.
-        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(CHUNK_CHANNEL_DEPTH);
         let task = tokio::spawn(read_stream_into(
             response.bytes_stream(),
             tx,
@@ -795,7 +811,10 @@ impl HttpSource {
         // Collect first, then parse, so the `&mut self` borrow for parsing
         // does not overlap the `&mut self.chunk_rx` borrow above.
         let mut chunks: Vec<bytes::Bytes> = Vec::new();
-        loop {
+        // At most one channel's depth per sweep: the reader task refills the
+        // channel as this drains it, so an unbounded loop could take more
+        // than the catch-up headroom in `buffer_capacity` allows for.
+        while chunks.len() < CHUNK_CHANNEL_DEPTH {
             match rx.try_recv() {
                 Ok(chunk) => chunks.push(chunk),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -852,6 +871,15 @@ impl HttpSource {
             return Err(Error::StreamClosed("stream reader task ended".to_string()));
         }
 
+        // Before parsing, so the chunk that widens the headroom is itself
+        // covered by it — the same order `max_packet_samples` is raised in.
+        if let Some(largest) = chunks.iter().map(|c| c.len()).max() {
+            self.max_chunk_bytes = self.max_chunk_bytes.max(largest);
+        }
+        // A sweep that took a whole channel's depth found the channel full:
+        // the reader was waiting on this consumer.
+        let channel_was_full = chunks.len() >= CHUNK_CHANNEL_DEPTH;
+
         // Parse first, then feed the link-budget meter, then report — in
         // that order for two reasons. A parse error must not discard a
         // finished measurement: the error is held until the report has
@@ -902,6 +930,14 @@ impl HttpSource {
                 iq_samples.saturating_mul(bytes_per_sample),
             );
         }
+        // Behind a full channel the meter counts this consumer's rate, not
+        // the path's, and a verdict from it would blame the path for the
+        // consumer. Sweeps used to drain everything and trim the excess, so
+        // the meter saw the link even behind a slow consumer; bounded sweeps
+        // that never trim need the window marked instead.
+        if channel_was_full && let LinkCheck::Measuring(meter) = &mut self.link_check {
+            meter.note_consumer_limited(std::time::Instant::now());
+        }
         self.report_link_budget();
 
         if let Some(e) = parse_error {
@@ -951,6 +987,14 @@ impl HttpSource {
             return;
         };
         if !meter.is_complete() {
+            return;
+        }
+        if meter.consumer_limited() {
+            debug!(
+                "Link-budget window closed while this consumer, not the path, set the \
+                 rate (the chunk channel was full); no verdict, re-arming for a fresh window"
+            );
+            self.link_check = LinkCheck::armed();
             return;
         }
 
@@ -1455,9 +1499,11 @@ impl HttpSource {
             // under a stale frequency map.
             self.note_geometry(&packet);
 
-            // Add samples to the buffer, enforcing the configured capacity:
-            // if the consumer can't keep up, drop the *oldest* samples so
-            // the buffer stays bounded and current.
+            // Add samples to the buffer, enforcing its capacity. A sweep
+            // cannot overflow it — the trim sits one sweep above the refill
+            // target — so a consumer that falls behind backs up the socket
+            // instead; if the bound is ever reached, the *oldest* samples go
+            // and the buffer stays bounded.
             let packet_samples = packet.samples.len();
             // Raise the floor *before* trimming, so the packet that widens
             // it is itself protected rather than being the last casualty.
@@ -1476,30 +1522,37 @@ impl HttpSource {
                 // the consumer. The break rebases everything still queued —
                 // see `note_trim`.
                 self.note_trim(overflow);
-                // Overflow here means the consumer cannot keep up with the
-                // stream — expected and correct at a wide span, where no
-                // consumer can process 61 MS/s of a 49 MHz survey in real
-                // time, so the buffer keeps only the most recent samples.
-                // Counted always; logged on a geometric schedule, because
-                // with the continuous reader this fires thousands of times a
-                // second at wide span and a line each would bury the log.
+                // Overflow here is now the memory bound, not the overload
+                // path. A sweep starts below the refill target and adds at
+                // most `catch_up_headroom`, which the capacity sits above
+                // it by, so a consumer that falls behind — at a wide span no
+                // consumer can process in real time, say — backs up the
+                // chunk channel and the socket instead; the loss moves
+                // upstream, where the server drops what it cannot send and
+                // the packet timestamps report it as a gap. What still lands
+                // here is a stream whose samples have no fixed width (JSON,
+                // no headroom) or a sizing assumption that has stopped
+                // holding, and the trim then keeps the newest samples as it
+                // always did. Counted always; logged on a geometric
+                // schedule, because a stream that does reach it reaches it
+                // on every packet and a line each would bury the log.
                 self.overflow_samples = self.overflow_samples.saturating_add(overflow as u64);
                 if self.overflow_samples >= self.next_overflow_report {
-                    // Says what happened, not why. "The consumer is slower
-                    // than the stream" was the only diagnosis offered, and
-                    // now that the buffer is sized to the consumer's reach it
-                    // is usually the wrong one: what remains is the backlog
-                    // the server hands over at connect, which arrives faster
-                    // than real time and is stale by definition. Both causes
-                    // land here and the trim cannot tell them apart, so name
-                    // both rather than assert one.
+                    // Says what happened and when it is expected. It used to
+                    // name two causes, a slow consumer and the connect
+                    // backlog, because the trim could not tell them apart;
+                    // with the trim one sweep above the refill target
+                    // neither reaches it any more, so the warning names the
+                    // one stream it expects here and leaves anything else
+                    // for the log reader to treat as a surprise.
                     warn!(
                         "Sample buffer overflow: {} samples dropped so far \
                          (capacity {}); the oldest were discarded to keep the \
-                         buffer current. Expected in the first moments of a \
-                         stream, where the server delivers its backlog faster \
-                         than real time; sustained, it means the consumer \
-                         cannot keep up",
+                         buffer current. The capacity holds a whole fetch \
+                         sweep above the refill target, so a slow consumer \
+                         should back up the socket rather than land here; \
+                         this is expected only for a JSON stream, whose \
+                         samples have no fixed width",
                         self.overflow_samples, capacity
                     );
                     self.next_overflow_report = self.overflow_samples.saturating_mul(4);
@@ -1747,11 +1800,13 @@ impl HttpSource {
     ///
     /// A **gap at absolute sample 0** is dropped. Nothing precedes the first
     /// sample a consumer ever sees, so there is no epoch for it to be
-    /// discontinuous from and no state for it to invalidate — and it is
-    /// reachable in the ordinary case, because the server's connect backlog
-    /// arrives faster than real time and the trim discards some of it before
-    /// the first `work()` produces anything. Reporting it would open every
-    /// such run with a gap the consumer did not suffer. The trim is still
+    /// discontinuous from and no state for it to invalidate. It used to be
+    /// reachable in the ordinary case, the trim discarding part of the
+    /// connect backlog before the first `work()` produced anything; with the
+    /// trim one sweep above the refill target that backlog now fits, and a
+    /// gap here is reached only by a stream the headroom does not cover
+    /// (JSON). Reporting it would open such a run with a gap the consumer did
+    /// not suffer. The trim is still
     /// counted and logged where it happens; what is suppressed is only the
     /// claim that the stream broke before it began. `Initial` is unaffected:
     /// it is not a loss, and at sample 0 it is the whole point.
@@ -1831,6 +1886,44 @@ impl HttpSource {
     /// consumer computing a fill ratio divided by zero. The bare `* 2` was
     /// also the only unguarded one on overflow.
     fn buffer_capacity(&self) -> usize {
+        self.refill_capacity()
+            .saturating_add(self.catch_up_headroom())
+    }
+
+    /// Everything one `fetch_samples` sweep can add: [`CHUNK_CHANNEL_DEPTH`]
+    /// chunks of the largest size seen, in samples, plus a packet the
+    /// parser carried over from the sweep before. Zero until a chunk has
+    /// arrived, and for JSON, whose samples have no fixed width.
+    ///
+    /// This is what the trim sits above the refill target by. Without it a
+    /// sweep after a stall pulled every queued chunk — about a million
+    /// samples of int16 — into a buffer that trimmed at a few packets, so
+    /// one scheduling hiccup discarded most of what had arrived during it.
+    /// Measured live against a Spectran V6 at 15.36 MS/s, where the trim sat
+    /// at 147 456 samples (~9.6 ms): with one flowgraph executor, every
+    /// 45 s run trimmed, 2 to 10 times, mostly well into the run; with two,
+    /// two runs in five. A sweep now always fits, so a consumer that falls
+    /// behind backs up the chunk channel and the socket rather than
+    /// overflowing the buffer, and any loss moves upstream, where the server
+    /// drops what it cannot send and the packet timestamps report it.
+    fn catch_up_headroom(&self) -> usize {
+        if self.max_chunk_bytes == 0 {
+            return 0;
+        }
+        let Some(bytes_per_sample) = self.stream_format.iq_bytes_per_sample() else {
+            return 0;
+        };
+        CHUNK_CHANNEL_DEPTH
+            .saturating_mul(self.max_chunk_bytes)
+            .div_ceil(bytes_per_sample)
+            .saturating_add(self.max_packet_samples)
+    }
+
+    /// What `work()` refills the buffer towards: the configured size, a few
+    /// packets, or what the consumer can take in one call, whichever is
+    /// largest. The trim ([`Self::buffer_capacity`]) sits one sweep's worth
+    /// above it.
+    fn refill_capacity(&self) -> usize {
         let configured = self.buffer_size.saturating_mul(2).max(1);
         // Never sit below a few packets. See `max_packet_samples`: the trim
         // runs per packet, so a capacity under one packet discards most of
@@ -2199,14 +2292,16 @@ impl Kernel for HttpSource {
         // measures ~3 GB/s (`framing_throughput_meter`), so the decode
         // side never sets the ceiling.
         //
-        // The target is bounded by `buffer_capacity()`. It was
+        // The target is bounded by `refill_capacity()`. It was
         // `(capacity / 2).max(o_len)`, and `o_len` (up to a full downstream
         // buffer) is normally far above the capacity, so the condition could
         // never be satisfied by filling the buffer — every call ran the sweep
         // until the channel ran dry, and the per-packet trim threw away
-        // everything past the newest few packets.
-        let capacity = self.buffer_capacity();
-        let refill_below = (capacity / 2).max(o_len).min(capacity);
+        // everything past the newest few packets. Every sweep starts below
+        // it, and the trim sits one sweep's worth above it, so a sweep
+        // never trims what it just fetched.
+        let refill_cap = self.refill_capacity();
+        let refill_below = (refill_cap / 2).max(o_len).min(refill_cap);
         let mut fetches = 0usize;
         while self.sample_buffer.len() < refill_below && fetches < MAX_FETCHES_PER_WORK {
             fetches += 1;
@@ -3069,13 +3164,185 @@ mod tests {
         // `(capacity / 2).max(o_len).min(capacity)` has to be satisfiable by
         // filling the buffer, or the sweep only ever ends when the channel
         // runs dry.
+        // And a sweep started just below the refill target `work()` derives
+        // from it must fit under the trim once chunks are flowing, or the
+        // catch-up after a stall discards what it fetched.
+        block.max_chunk_bytes = 65_536;
+        let capacity = block.buffer_capacity();
         let o_len = block.downstream_capacity;
-        let refill_below = (capacity / 2).max(o_len).min(capacity);
+        let refill_cap = block.refill_capacity();
+        let refill_below = (refill_cap / 2).max(o_len).min(refill_cap);
         assert!(
-            refill_below <= capacity,
-            "refill target {refill_below} exceeds capacity {capacity}; the \
-             fetch loop can never satisfy it and will over-fetch every call",
+            refill_below + CHUNK_CHANNEL_DEPTH * 65_536 / 4 <= capacity,
+            "a sweep of a full channel started at the refill target \
+             {refill_below} overflows the trim at {capacity}",
         );
+    }
+
+    /// One int16 IQ packet on the wire — JSON header, record separator,
+    /// payload — with timestamps that continue from the packet before, so
+    /// the drop detector sees an unbroken stream.
+    fn wire_iq_packet(index: usize, pairs: usize, rate_hz: f64) -> Vec<u8> {
+        let t0 = index as f64 * pairs as f64 / rate_hz;
+        let t1 = (index + 1) as f64 * pairs as f64 / rate_hz;
+        let mut out = format!(
+            r#"{{"startTime":{t0},"endTime":{t1},"startFrequency":850000000.0,"endFrequency":{},"samples":{pairs},"unit":"generic","payload":"iq","minPower":-100,"maxPower":0,"sampleSize":2}}"#,
+            850e6 + rate_hz
+        )
+        .into_bytes();
+        out.push(0x1e); // ASCII record separator
+        out.extend(std::iter::repeat_n(0u8, pairs * 4));
+        out
+    }
+
+    /// The headroom is learned from the stream, as the packet floor is:
+    /// nothing before a chunk has arrived, then enough for a full channel
+    /// of chunks that size, and the reported capacity stays the enforced one.
+    #[test]
+    fn the_catch_up_headroom_is_learned_from_the_stream() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .buffer_size(8192)
+            .format(StreamFormat::Int16)
+            .build()
+            .expect("Should create HttpSource");
+        block.downstream_capacity = 131_072;
+        block.max_packet_samples = 36_864;
+        assert_eq!(
+            block.buffer_capacity(),
+            block.refill_capacity(),
+            "before any chunk has arrived there is nothing to size the headroom by"
+        );
+
+        block.max_chunk_bytes = 65_536;
+        assert!(
+            block.buffer_capacity() - block.refill_capacity() >= CHUNK_CHANNEL_DEPTH * 65_536 / 4,
+            "the headroom must hold a full channel of the largest chunks seen"
+        );
+        assert_eq!(
+            block.get_stream_stats().buffer_capacity,
+            block.buffer_capacity(),
+            "the reported capacity is the enforced one"
+        );
+    }
+
+    /// The failure itself, end to end through the parser: a sweep that starts
+    /// just below the refill target — the highest it can start — and finds a
+    /// full channel of real packets delivers every one of them and trims
+    /// nothing. With the trim at the refill target, as it was, this sweep
+    /// discarded nearly a whole channel.
+    #[tokio::test]
+    async fn a_full_channel_after_a_stall_is_delivered_without_a_trim() {
+        const PAIRS: usize = 8_192;
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .buffer_size(8192)
+            .format(StreamFormat::Int16)
+            .build()
+            .expect("Should create HttpSource");
+        block.downstream_capacity = 131_072;
+        let packets: Vec<Vec<u8>> = (0..CHUNK_CHANNEL_DEPTH)
+            .map(|k| wire_iq_packet(k, PAIRS, 15.36e6))
+            .collect();
+        // Sizes as a running stream would have learned them by now.
+        block.max_packet_samples = PAIRS;
+        block.max_chunk_bytes = packets[0].len();
+        let start = block.refill_capacity() - 1;
+        block
+            .sample_buffer
+            .extend(std::iter::repeat_n(Complex32::default(), start));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(CHUNK_CHANNEL_DEPTH);
+        for packet in packets {
+            tx.try_send(Bytes::from(packet))
+                .expect("room for a channel's depth");
+        }
+        block.chunk_rx = Some(rx);
+
+        let added = block
+            .fetch_samples(None)
+            .await
+            .expect("a sweep of whole packets parses");
+        assert_eq!(
+            added,
+            CHUNK_CHANNEL_DEPTH * PAIRS,
+            "every packet was parsed"
+        );
+        assert_eq!(
+            block.overflow_samples, 0,
+            "a full channel's catch-up must fit under the trim"
+        );
+        assert_eq!(
+            block.sample_buffer.len(),
+            start + CHUNK_CHANNEL_DEPTH * PAIRS,
+            "and every sample it carried is still in the buffer"
+        );
+        drop(tx);
+    }
+
+    /// Behind a full channel the link meter counts the consumer, not the
+    /// path, so the window is marked and will yield no verdict.
+    #[tokio::test]
+    async fn a_full_channel_inside_the_link_window_marks_it_consumer_limited() {
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .format(StreamFormat::Int16)
+            .build()
+            .expect("Should create HttpSource");
+        // A meter already past its settle and counting.
+        let opened = std::time::Instant::now()
+            - (crate::link_budget::LINK_PROBE_SETTLE + std::time::Duration::from_millis(100));
+        let mut check = LinkCheck::armed_at(opened);
+        if let LinkCheck::Measuring(meter) = &mut check {
+            meter.observe(opened + crate::link_budget::LINK_PROBE_SETTLE, 4);
+        }
+        block.link_check = check;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(CHUNK_CHANNEL_DEPTH);
+        for _ in 0..CHUNK_CHANNEL_DEPTH {
+            tx.try_send(Bytes::new())
+                .expect("room for a channel's depth");
+        }
+        block.chunk_rx = Some(rx);
+        let _ = block.fetch_samples(None).await;
+
+        match &block.link_check {
+            LinkCheck::Measuring(meter) => assert!(
+                meter.consumer_limited(),
+                "a sweep that found the channel full must mark the window"
+            ),
+            other => panic!("the window should still be open: {other:?}"),
+        }
+        drop(tx);
+    }
+
+    /// One sweep takes at most [`CHUNK_CHANNEL_DEPTH`] chunks, however many
+    /// are queued, which is what makes the headroom above an exact bound; the
+    /// rest wait for the next sweep.
+    #[tokio::test]
+    async fn a_sweep_takes_at_most_one_channel_depth_of_chunks() {
+        let mut block = HttpSourceBuilder::new("http://localhost:54664")
+            .format(StreamFormat::Int16)
+            .build()
+            .expect("Should create HttpSource");
+        let (tx, rx) = tokio::sync::mpsc::channel(CHUNK_CHANNEL_DEPTH * 2);
+        for _ in 0..CHUNK_CHANNEL_DEPTH + 10 {
+            tx.try_send(Bytes::new()).expect("room for every chunk");
+        }
+        block.chunk_rx = Some(rx);
+
+        let _ = block.fetch_samples(None).await;
+
+        let rx = block.chunk_rx.as_mut().expect("the stream is still open");
+        let mut left = 0;
+        while rx.try_recv().is_ok() {
+            left += 1;
+        }
+        assert_eq!(
+            left, 10,
+            "a sweep must leave everything past one channel's depth queued"
+        );
+        drop(tx);
     }
 
     /// A waiting `fetch_samples` must return when data arrives, not when the

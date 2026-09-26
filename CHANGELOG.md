@@ -28,6 +28,35 @@ All notable changes to this project will be documented in this file.
   `StreamStats::packets_lost_to_parse_errors`.
 
 ### Fixed
+- **A catch-up after a stall no longer trims what it just fetched.** One
+  `fetch_samples` sweep drained every chunk the reader task had queued — up to
+  64, about a million int16 samples — into a buffer that trimmed a few packets
+  deep, so any stall of the consumer longer than a few milliseconds discarded
+  most of what arrived during it. Measured live from bigear against a
+  Spectran V6 at 15.36 MS/s, where the trim sat at 147 456 samples (~9.6 ms):
+  with one flowgraph executor every 45 s run lost samples, 2 to 10 times; with
+  two, two runs in five. The trim now sits one sweep above the refill target
+  (`catch_up_headroom`: `CHUNK_CHANNEL_DEPTH` chunks of the largest size seen,
+  in samples, plus a carried packet), and a sweep takes at most
+  `CHUNK_CHANNEL_DEPTH` chunks, so a catch-up always fits. A consumer that falls
+  behind now backs up the chunk channel and the socket instead of being
+  trimmed, and any loss moves upstream, where the packet timestamps report it
+  as a server gap. Re-measured live, same span: one executor 1 gap in 5 runs,
+  two executors 0 in 3. The overflow warning no longer names "the first
+  moments of a stream" as the expected cause.
+
+  What changes with it, so nothing reads as a regression later:
+  `StreamStats::buffer_capacity` still reports the enforced capacity, which now
+  includes the headroom and jumps once the first chunk sizes it (about eight
+  times the old figure at 15.36 MS/s int16), so a fill ratio reads lower. A
+  consumer that stalls now reads its backlog rather than a gap: up to the buffer
+  plus the channel, about 150 ms at 15.36 MS/s, which a pipeline faster than
+  real time then catches up — including a retune that arrived behind it. The
+  buffer can grow to about 10 MB (int16) or 20 MB (float32) during a stall, on
+  top of the channel's 4 MB. And because a slow consumer now throttles the
+  reads the link-budget meter counts, a window in which a sweep found the chunk
+  channel full is marked (`ThroughputMeter::note_consumer_limited`) and yields
+  no verdict, rather than one blaming the path for the consumer.
 - **A lost packet at a high sample rate is now reported.** `DropDetector`
   flagged a gap only past a fixed 1 ms, and at 61.44 MS/s a 16 384-sample
   packet lasts 267 µs, so a whole lost packet was spliced over silently. The

@@ -467,6 +467,10 @@ pub struct ThroughputMeter {
     /// Set by the observation at or past `mark + window`, which is itself
     /// excluded from the count (see [`Self::observe`]).
     closed: bool,
+    /// Set when, inside the counting window, the reader was waiting on the
+    /// consumer rather than on the path (see [`Self::note_consumer_limited`]):
+    /// what the window counted is then the consumer's rate.
+    consumer_limited: bool,
 }
 
 impl ThroughputMeter {
@@ -491,7 +495,25 @@ impl ThroughputMeter {
             discarded_bytes: 0,
             counted_bytes: 0,
             closed: false,
+            consumer_limited: false,
         }
+    }
+
+    /// Record that at `at` the reader was waiting on the consumer: its
+    /// channel was full. Counted only inside the counting window — a full
+    /// channel during the settle period is the connect backlog, which the
+    /// settle exists to discard. A window with any such moment measured the
+    /// consumer, not the path, and its caller should not judge the path by
+    /// it.
+    pub fn note_consumer_limited(&mut self, at: Instant) {
+        if !self.closed && self.mark.is_some_and(|mark| at >= mark) {
+            self.consumer_limited = true;
+        }
+    }
+
+    /// Whether [`Self::note_consumer_limited`] fell inside the window.
+    pub fn consumer_limited(&self) -> bool {
+        self.consumer_limited
     }
 
     /// Record `bytes` received at `at`. Returns whether the measurement
@@ -1100,6 +1122,34 @@ mod tests {
             "expected the backlog to inflate this measurement, got {} B/s",
             m.byte_rate
         );
+    }
+
+    /// A full channel counts against a window only once counting has begun:
+    /// during the settle it is the connect backlog the settle discards, and
+    /// after the window closes nothing is being measured. Inside it, it marks
+    /// the window as having measured the consumer.
+    #[test]
+    fn a_full_channel_marks_only_the_counting_window() {
+        let t0 = Instant::now();
+        let settle = Duration::from_millis(500);
+        let window = Duration::from_secs(1);
+        let mut meter = ThroughputMeter::starting_at(t0, settle, window);
+
+        meter.note_consumer_limited(t0 + Duration::from_millis(100));
+        assert!(
+            !meter.consumer_limited(),
+            "inside the settle: the connect backlog"
+        );
+
+        meter.observe(t0 + settle, 1_000); // sets the mark
+        meter.note_consumer_limited(t0 + settle + Duration::from_millis(200));
+        assert!(meter.consumer_limited(), "inside the counting window");
+
+        let mut closed = ThroughputMeter::starting_at(t0, settle, window);
+        closed.observe(t0 + settle, 1_000);
+        closed.observe(t0 + settle + window, 1_000); // closes it
+        closed.note_consumer_limited(t0 + settle + window + Duration::from_millis(1));
+        assert!(!closed.consumer_limited(), "after the window closed");
     }
 
     /// A stream that delivers nothing after settle has no measurement,

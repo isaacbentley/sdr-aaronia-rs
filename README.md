@@ -123,7 +123,7 @@ continuous. Six things break the claim, and `HttpSource` knows about all six:
 | server gap | the RTSA server dropped what it could not send; seen as a jump between one packet's `endTime` and the next's `startTime` larger than a tolerance measured from the stream (half a packet, or above the observed timestamp jitter, capped at 1 ms — see `DropDetector`; not yet verified live at high rates) |
 | backward timestamp | a packet's `startTime` precedes the previous packet's `endTime` by more than the same tolerance: nothing is missing, but the two do not follow one another |
 | undecodable packet | an IQ packet, or one whose header could not be read, framed but could not be decoded; it is skipped and its neighbours kept, and the hole is a gap where it sat |
-| capacity trim | the consumer fell behind, so the oldest buffered samples were discarded to keep the buffer current |
+| capacity trim | the buffer reached its memory bound and the oldest samples were discarded. The trim sits one fetch sweep above the refill target, so a consumer that falls behind backs up the socket instead, and any loss then shows as a server gap; it is reached only by a JSON stream, whose samples have no fixed width, or if the headroom's assumptions — chunk and packet sizes, each learned before it is parsed — stop holding |
 | reconnect | the stream ended, errored, or delivered nothing for 5 s, and was reopened; the parser resets and the drop detector forgets the last timestamp (keeping its jitter calibration) |
 | retune | the device's centre frequency or sample rate changed mid-stream |
 
