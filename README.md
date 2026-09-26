@@ -1,5 +1,10 @@
 # sdr-aaronia-rs
 
+> **Moved to [Specola](https://github.com/isaacbentley/specola).** This repository now lives at
+> [`crates/sdr-aaronia`](https://github.com/isaacbentley/specola/tree/main/crates/sdr-aaronia) (package `sdr-aaronia-rs`), with its full
+> history; its tags there carry a prefix. Development continues there, and this repository is
+> no longer updated.
+
 [![Crates.io](https://img.shields.io/crates/v/sdr-aaronia-rs.svg)](https://crates.io/crates/sdr-aaronia-rs)
 [![Docs.rs](https://docs.rs/sdr-aaronia-rs/badge.svg)](https://docs.rs/sdr-aaronia-rs)
 [![CI](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/sdr-aaronia-rs/actions/workflows/ci.yml)
