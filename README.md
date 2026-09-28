@@ -58,6 +58,17 @@ Consumers:     ├── Native Rust API
                └── Python Bindings (PyO3: python-aaronia) ──► NumPy / Arrow
 ```
 
+## Listening to an analyser that is not yours
+
+A start writes to the device before it reads a sample — the RTSA block's connect/run
+switches, a tune to the requested centre and rate, a `/control` start — and the end of a
+stream writes a stop. On an analyser shared with other users, none of that is yours to do.
+`HttpSourceBuilder::listen_only(true)` skips all of it: the stream is read as the device is
+running it, the requested centre and rate only describe what to expect, the reference level
+is not pushed, no reconnect ever tunes, and the device is left running at the end. The
+stall fix below was verified live in this mode against a shared SPECTRAN V6 streaming its
+own 30.72 MS/s, the device's `/remoteconfig` identical before and after.
+
 ## Link requirements
 
 The server streams IQ at a fixed number of bytes per sample, so the span

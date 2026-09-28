@@ -2620,16 +2620,17 @@ impl HttpSourceBuilder {
         self
     }
 
-    /// Build with basic options (backward compatibility)
     /// Listen only: the device is never written to — no connect/run switch, no
     /// tune (the requested centre and rate describe what is expected, they are
     /// not pushed), no reference level, and no stop when the stream ends.
     /// For an analyser shared with others, whose settings are theirs.
+    #[must_use]
     pub fn listen_only(mut self, on: bool) -> Self {
         self.listen_only = on;
         self
     }
 
+    /// Build with basic options (backward compatibility)
     pub fn build(self) -> Result<HttpSource> {
         let mut source = HttpSource::with_advanced_options(
             self.base_url,
@@ -3900,54 +3901,81 @@ mod tests {
         );
     }
 
-    /// A listen-only source reads the device as it runs: a start writes no
-    /// connect/run switch, no tune and no control command, where a normal
-    /// start writes all three.
+    /// A listen-only source reads the device as it runs: a start and a stop
+    /// write nothing, where a normal start against the same server writes the
+    /// connect/run switches, a tune and a control command.
     #[tokio::test]
     async fn a_listen_only_start_writes_nothing_to_the_device() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/remoteconfig"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/stream"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::<u8>::new()))
-            .mount(&server)
-            .await;
-        for m in ["PUT", "POST"] {
-            Mock::given(method(m))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-                .expect(0)
-                .named(format!("no {m} while listening only"))
+        async fn server() -> MockServer {
+            let server = MockServer::start().await;
+            // A readable configuration with no block that carries `centerfreq0`: the
+            // connect/run write goes to /remoteconfig, the tune falls back to /control.
+            Mock::given(method("GET"))
+                .and(path("/remoteconfig"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "request": 0,
+                    "config": {"type": "group", "name": "remoteconfig", "label": "RemoteConfig", "flags": "", "items": []}
+                })))
                 .mount(&server)
                 .await;
+            Mock::given(method("GET"))
+                .and(path("/stream"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::<u8>::new()))
+                .mount(&server)
+                .await;
+            for m in ["PUT", "POST"] {
+                Mock::given(method(m))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                    .mount(&server)
+                    .await;
+            }
+            server
+        }
+        async fn writes(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.method != wiremock::http::Method::GET)
+                .map(|r| format!("{} {}", r.method, r.url.path()))
+                .collect()
         }
 
-        let mut block = HttpSourceBuilder::new(&server.uri())
+        // The rule's other half first: the server does take a normal start's writes.
+        let normal = server().await;
+        let mut block = HttpSourceBuilder::new(&normal.uri())
+            .center_frequency_hz(915e6)
+            .reference_level_dbm(-25.0)
+            .build()
+            .expect("Should create HttpSource");
+        let _ = block.start_stream().await;
+        block.cleanup_stream().await;
+        let wrote = writes(&normal).await;
+        assert!(
+            wrote.iter().any(|w| w == "PUT /remoteconfig")
+                && wrote.iter().any(|w| w.ends_with(" /control")),
+            "a normal start writes the switches and a tune: {wrote:?}"
+        );
+
+        let quiet = server().await;
+        let mut block = HttpSourceBuilder::new(&quiet.uri())
             .center_frequency_hz(915e6)
             .reference_level_dbm(-25.0)
             .listen_only(true)
             .build()
             .expect("Should create HttpSource");
-        let _ = block.start_stream().await;
+        let started = block.start_stream().await;
+        assert!(started.is_ok(), "the stream opens: {started:?}");
         assert!(block.initial_tune_done, "no tune is attempted later either");
         block.cleanup_stream().await;
-
-        let requests = server.received_requests().await.unwrap_or_default();
+        let wrote = writes(&quiet).await;
         assert!(
-            requests
-                .iter()
-                .all(|r| r.method == wiremock::http::Method::GET),
-            "only reads: {:?}",
-            requests
-                .iter()
-                .map(|r| format!("{} {}", r.method, r.url.path()))
-                .collect::<Vec<_>>()
+            wrote.is_empty(),
+            "listening only, nothing is written: {wrote:?}"
         );
     }
 
