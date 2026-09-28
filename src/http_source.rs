@@ -448,6 +448,10 @@ pub struct HttpSource {
     /// retune) must only reconnect the `/stream`, never re-push this
     /// source's now-stale target, which would undo that retune.
     initial_tune_done: bool,
+    /// Listen only: never write to the device. No connect/run switch, no
+    /// tune, no reference level, and no stop at the end — the stream is
+    /// read as the device is running it, for an analyser shared with others.
+    listen_only: bool,
 
     /// Where stream breaks are reported, or `None` when nobody asked.
     ///
@@ -604,6 +608,7 @@ impl HttpSource {
             shared_stats: None,
             drop_detector: DropDetector::default(),
             initial_tune_done: false,
+            listen_only: false,
             break_sink: None,
             produced: 0,
             pending_breaks: VecDeque::new(),
@@ -664,29 +669,42 @@ impl HttpSource {
             }
         }
 
-        // Configure RTSA device to enable connection and streaming
-        // Warn on the first start, where it decides what the whole run
-        // streams; a reconnect repeating the same refusal says nothing new,
-        // and a stalled or paused mission reconnects every few seconds.
-        let first_start = !self.initial_tune_done;
-        if let Err(e) = self.configure_rtsa_device().await {
-            if first_start {
-                warn!(
-                    "Could not set the RTSA block's connect/run switches ({e}); \
-                     streaming from whatever state the mission is in"
+        if self.listen_only {
+            // A shared analyser is read as it runs: nothing is written to it,
+            // on this start or any reconnect, and the tune is marked done so
+            // no later path attempts one.
+            if !self.initial_tune_done {
+                info!(
+                    "Listen only: streaming what the device is doing; no connect/run \
+                     switch, no tune, no reference level is written"
                 );
-            } else {
-                debug!("Could not set the RTSA block's connect/run switches on reconnect: {e}");
             }
-        }
+            self.initial_tune_done = true;
+        } else {
+            // Configure RTSA device to enable connection and streaming
+            // Warn on the first start, where it decides what the whole run
+            // streams; a reconnect repeating the same refusal says nothing new,
+            // and a stalled or paused mission reconnects every few seconds.
+            let first_start = !self.initial_tune_done;
+            if let Err(e) = self.configure_rtsa_device().await {
+                if first_start {
+                    warn!(
+                        "Could not set the RTSA block's connect/run switches ({e}); \
+                         streaming from whatever state the mission is in"
+                    );
+                } else {
+                    debug!("Could not set the RTSA block's connect/run switches on reconnect: {e}");
+                }
+            }
 
-        // Try to start streaming via control endpoint
-        match self.endpoints_client.control_streaming(true).await {
-            Ok(_) => info!("Started streaming via control endpoint"),
-            Err(e) => debug!(
-                "Could not control streaming (device may already be streaming): {}",
-                e
-            ),
+            // Try to start streaming via control endpoint
+            match self.endpoints_client.control_streaming(true).await {
+                Ok(_) => info!("Started streaming via control endpoint"),
+                Err(e) => debug!(
+                    "Could not control streaming (device may already be streaming): {}",
+                    e
+                ),
+            }
         }
 
         // Build the streaming URL through the shared `StreamParams`
@@ -1257,8 +1275,9 @@ impl HttpSource {
     }
 
     async fn cleanup_stream(&mut self) {
-        // Stop streaming via control endpoint to prevent device from continuing to stream
-        if self.stream_active {
+        // Stop streaming via control endpoint to prevent device from continuing to stream —
+        // unless this source only listened, in which case the device is left running.
+        if self.stream_active && !self.listen_only {
             match self.endpoints_client.control_streaming(false).await {
                 Ok(_) => info!("Stopped streaming via control endpoint"),
                 Err(e) => debug!(
@@ -2426,6 +2445,7 @@ pub struct HttpSourceBuilder {
     center_frequency_hz: f64,
     sample_rate_hz: f64,
     reference_level_dbm: Option<f64>,
+    listen_only: bool,
     buffer_size: usize,
     timeout_ms: u64,
     stream_format: StreamFormat,
@@ -2448,6 +2468,7 @@ impl HttpSourceBuilder {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
+            listen_only: false,
             center_frequency_hz: 100e6, // 100 MHz default
             sample_rate_hz: 1e6,        // 1 MS/s default
             // `None`, not a number: pushing a default reference level on
@@ -2600,6 +2621,15 @@ impl HttpSourceBuilder {
     }
 
     /// Build with basic options (backward compatibility)
+    /// Listen only: the device is never written to — no connect/run switch, no
+    /// tune (the requested centre and rate describe what is expected, they are
+    /// not pushed), no reference level, and no stop when the stream ends.
+    /// For an analyser shared with others, whose settings are theirs.
+    pub fn listen_only(mut self, on: bool) -> Self {
+        self.listen_only = on;
+        self
+    }
+
     pub fn build(self) -> Result<HttpSource> {
         let mut source = HttpSource::with_advanced_options(
             self.base_url,
@@ -2616,6 +2646,7 @@ impl HttpSourceBuilder {
         )?;
         source.shared_stats = self.shared_stats;
         source.break_sink = self.break_sink;
+        source.listen_only = self.listen_only;
         Ok(source)
     }
 }
@@ -3866,6 +3897,57 @@ mod tests {
                 .filter(|r| r.url.path() == "/control")
                 .count(),
             1,
+        );
+    }
+
+    /// A listen-only source reads the device as it runs: a start writes no
+    /// connect/run switch, no tune and no control command, where a normal
+    /// start writes all three.
+    #[tokio::test]
+    async fn a_listen_only_start_writes_nothing_to_the_device() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/remoteconfig"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::<u8>::new()))
+            .mount(&server)
+            .await;
+        for m in ["PUT", "POST"] {
+            Mock::given(method(m))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .expect(0)
+                .named(format!("no {m} while listening only"))
+                .mount(&server)
+                .await;
+        }
+
+        let mut block = HttpSourceBuilder::new(&server.uri())
+            .center_frequency_hz(915e6)
+            .reference_level_dbm(-25.0)
+            .listen_only(true)
+            .build()
+            .expect("Should create HttpSource");
+        let _ = block.start_stream().await;
+        assert!(block.initial_tune_done, "no tune is attempted later either");
+        block.cleanup_stream().await;
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.method == wiremock::http::Method::GET),
+            "only reads: {:?}",
+            requests
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.url.path()))
+                .collect::<Vec<_>>()
         );
     }
 
