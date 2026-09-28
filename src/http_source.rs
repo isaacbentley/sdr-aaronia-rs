@@ -3926,9 +3926,14 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::<u8>::new()))
                 .mount(&server)
                 .await;
+            // A write is answered as the device answers one, so the normal start's
+            // connect/run write succeeds rather than failing on its reply.
             for m in ["PUT", "POST"] {
                 Mock::given(method(m))
-                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "request": 1,
+                        "config": {"type": "group", "name": "remoteconfig", "label": "RemoteConfig", "flags": "", "items": []}
+                    })))
                     .mount(&server)
                     .await;
             }
@@ -3955,10 +3960,12 @@ mod tests {
         let _ = block.start_stream().await;
         block.cleanup_stream().await;
         let wrote = writes(&normal).await;
+        // The switches go to /remoteconfig; the tune's fallback and the streaming start
+        // both go to /control, and either is a write this server would take.
         assert!(
             wrote.iter().any(|w| w == "PUT /remoteconfig")
                 && wrote.iter().any(|w| w.ends_with(" /control")),
-            "a normal start writes the switches and a tune: {wrote:?}"
+            "a normal start writes the switches and control commands: {wrote:?}"
         );
 
         let quiet = server().await;
