@@ -79,7 +79,7 @@ waterfall and defeat any digital demodulator.
 | Real-time bandwidth | Sample rate | Needs (4 B/sample) | Link |
 |---|---|---|---|
 | up to 12.2 MHz | 15.36 MS/s | 61.4 MB/s | gigabit |
-| up to 24.5 MHz | 30.72 MS/s | 122.9 MB/s | **not gigabit** — a 1000baseT hop carries ~118 MB/s of TCP payload; 2.5GbE, or Wi-Fi 7 (measured 123 MB/s) |
+| up to 24.5 MHz | 30.72 MS/s | 122.9 MB/s | **2.5GbE** — a 1000baseT hop at a 1500-byte MTU carries ~118 MB/s of TCP payload (measured 114–116.5) |
 | up to 49.1 MHz | 61.44 MS/s | 245.8 MB/s | **2.5GbE** |
 
 **An ECO 100 needs 2.5GbE.** Its 44 MHz of real-time bandwidth only fits on
@@ -90,16 +90,20 @@ format: stay on `int16` or `float16`.
 Treat the table as a starting point. `link_budget` measures *your* path end
 to end and names the widest span that fits.
 
-The gigabit row is arithmetic, not tuning: a 1000baseT hop carries about
-118 MB/s of TCP payload at a 1500-byte MTU however the client reads, so
-30.72 MS/s at 4 bytes a sample is short by 4 % before a sample is processed.
-Measured 2026-09-28 through a USB gigabit adapter: 114–116.5 MB/s off the
-socket with nothing behind it, and the same shortfall — 28.5–29.0 MS/s with
-about 35 server skips a second, no client-side trim — through the whole
-receiver, whatever its buffering (a deeper chunk channel, a larger reservoir
-and a full-batch consumer were each tried and changed nothing). The same
-stream over a Wi-Fi 7 link read 123.3 MB/s a second once it had ramped, with
-the first five seconds at 103.
+Arithmetic can rule a link out; only a measurement rules it in. A 1000baseT
+hop at the usual 1500-byte MTU carries about 118 MB/s of TCP payload however
+the client reads, so 30.72 MS/s at 4 bytes a sample is 4 % short before a
+sample is processed (jumbo frames on every hop would lift the ceiling to
+~124 MB/s, 0.7 % above the need — untested). Measured 2026-09-28 through a USB
+gigabit adapter: 114–116.5 MB/s off the socket with nothing behind it, 5–7 %
+short, and the whole receiver delivered exactly that — 28.5–29.0 MS/s with
+about 35 server skips a second and no client-side trim — whatever its
+buffering (a deeper chunk channel, a larger reservoir and a full-batch
+consumer were each tried and changed nothing). The same stream with the
+client on a Wi-Fi 7 link read 123.3 MB/s in each one-second window once it
+had ramped, the first five seconds at 103 and hundreds of skips before it
+settled; wireless varies with the air, and a station-to-station Wi-Fi 7 path
+measured 75 MB/s (`link_budget`).
 
 ## HTTP sample conversion
 
