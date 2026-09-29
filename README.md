@@ -79,7 +79,7 @@ waterfall and defeat any digital demodulator.
 | Real-time bandwidth | Sample rate | Needs (4 B/sample) | Link |
 |---|---|---|---|
 | up to 12.2 MHz | 15.36 MS/s | 61.4 MB/s | gigabit |
-| up to 24.5 MHz | 30.72 MS/s | 122.9 MB/s | **2.5GbE** — a 1000baseT hop at a 1500-byte MTU carries ~118 MB/s of TCP payload (measured 114–116.5) |
+| up to 24.5 MHz | 30.72 MS/s | 122.9 MB/s | **2.5GbE** — a 1000baseT hop at a 1500-byte MTU carries ~118 MB/s of TCP payload (measured 114–116.5); 10GbE measured 123.2 and carried 90 s at 30.72 MS/s without a gap |
 | up to 49.1 MHz | 61.44 MS/s | 245.8 MB/s | **2.5GbE** |
 
 **An ECO 100 needs 2.5GbE.** Its 44 MHz of real-time bandwidth only fits on
@@ -103,7 +103,9 @@ consumer were each tried and changed nothing). The same stream with the
 client on a Wi-Fi 7 link read 123.3 MB/s in each one-second window once it
 had ramped, the first five seconds at 103 and hundreds of skips before it
 settled; wireless varies with the air, and a station-to-station Wi-Fi 7 path
-measured 75 MB/s (`link_budget`).
+measured 75 MB/s (`link_budget`). Over a direct 10GbE link the same receiver
+ran 90 s at 30.72 MS/s with no gap at all, the socket reading 123.0–123.5 MB/s
+from its first second.
 
 ## HTTP sample conversion
 
