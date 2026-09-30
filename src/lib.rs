@@ -54,14 +54,6 @@ pub mod http_streaming;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub mod link_budget;
-#[cfg(feature = "sdr-source")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sdr-source")))]
-pub mod sdr_source {
-    pub use orecchiette_sdr_source_rs::*;
-}
-#[cfg(feature = "sdr-source")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sdr-source")))]
-pub mod sdr_source_impl;
 #[cfg(feature = "seify")]
 #[cfg_attr(docsrs, doc(cfg(feature = "seify")))]
 pub mod seify_impl;
@@ -146,11 +138,6 @@ pub use link_budget::{
     measure_link_throughput, measure_link_throughput_with, required_byte_rate,
     required_byte_rate_for_format,
 };
-/// `SdrSource`-trait facade — wraps the unified async source so the
-/// orchestrator can dispatch through `Box<dyn SdrSource>` uniformly.
-#[cfg(feature = "sdr-source")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sdr-source")))]
-pub use sdr_source_impl::{SpectranBackend, SpectranSdrSource};
 /// Stream-break reporting, shared by every source that can lose continuity
 pub use stream_break::{RecordingBreakSink, StreamBreakSink, StreamDiscontinuity};
 /// Unified SDR Source abstraction

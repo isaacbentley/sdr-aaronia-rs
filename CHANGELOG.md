@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.12.0] - 2026-09-29
+
+### Removed
+- **The `sdr-source` feature, and with it the dependency on `orecchiette-sdr-source-rs`.**
+  `SpectranSdrSource` and `SpectranBackend` (the `SdrSource`-trait facade over the async
+  source), the `sdr_source` re-export module and the `channel_hopping` example were one
+  consumer's adapter, and they live beside that consumer now (Specola's `sdr-aaronia-source`
+  crate), so this crate stands on its own: `default` is `http`, `file` and `ffi`, and
+  `crossbeam-channel` goes with the adapter. A caller that used the facade builds the same
+  thing from `SpectranSourceBuilder` and its own trait; the code is 670 lines and GPL, take it.
+
 ### Added
 - **`HttpSource` reports where the stream broke**, not just how often.
   `HttpSourceBuilder::with_stream_breaks` takes a `StreamBreakSink` (see the

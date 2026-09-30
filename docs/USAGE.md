@@ -460,7 +460,6 @@ code you can run. CI builds them, so they stay current:
 | --- | --- |
 | HTTP IQ streaming, first samples | [`http_iq_quickstart.rs`](../examples/http_iq_quickstart.rs) |
 | Health checks, server info, input enumeration | [`device_control.rs`](../examples/device_control.rs) |
-| Frequency hopping via the `sdr-source` traits | [`channel_hopping.rs`](../examples/channel_hopping.rs) |
 | FutureSDR flowgraph with FM demodulation | [`noaa_scanner.rs`](../examples/noaa_scanner.rs) |
 | Native SDK capture and transmit | [`native_sdk_basic.rs`](../examples/native_sdk_basic.rs), [`native_sdk_transmit.rs`](../examples/native_sdk_transmit.rs) |
 | RTSA file playback and metadata inspection | [`read_rtsa_file.rs`](../examples/read_rtsa_file.rs), [`dump_metadata.rs`](../examples/dump_metadata.rs) |

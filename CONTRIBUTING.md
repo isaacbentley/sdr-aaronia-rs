@@ -78,7 +78,7 @@ git lfs pull
 cargo test --test integration_test
 ```
 
-Beyond the tiers named here, `tests/` also contains focused suites for the HTTP mock server (`http_mock_test.rs`), the HTTP sink (`http_sink_test.rs`, requires `futuresdr`), the C API (`c_api_test.rs`), the `sdr-source` implementation (`sdr_source_impl_test.rs`), RTSA negative cases (`rtsa_negative_test.rs`), CW fixtures (`test_cw_mag.rs`, `test_cw_meta.rs`), SDK library loading (`native_sdk_load.rs`), and opt-in live-hardware smoke tests (`live_smoke.rs`). All of these run as part of `cargo test` where their features and environment allow.
+Beyond the tiers named here, `tests/` also contains focused suites for the HTTP mock server (`http_mock_test.rs`), the HTTP sink (`http_sink_test.rs`, requires `futuresdr`), the C API (`c_api_test.rs`), RTSA negative cases (`rtsa_negative_test.rs`), CW fixtures (`test_cw_mag.rs`, `test_cw_meta.rs`), SDK library loading (`native_sdk_load.rs`), and opt-in live-hardware smoke tests (`live_smoke.rs`). All of these run as part of `cargo test` where their features and environment allow.
 
 ### 3. Property Tests (`tests/properties.rs`)
 

@@ -239,12 +239,12 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-# By default, includes HTTP, File, native sdr-source trait, and C FFI backend support
-sdr-aaronia-rs = "0.8"
+# By default, includes HTTP, File and C FFI backend support
+sdr-aaronia-rs = "0.12"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
 # To enable additional backends, opt into their features (e.g. native-sdk, futuresdr)
-# sdr-aaronia-rs = { version = "0.8", features = ["native-sdk", "futuresdr"] }
+# sdr-aaronia-rs = { version = "0.12", features = ["native-sdk", "futuresdr"] }
 ```
 
 HTTP reads use one timeout budget for the entire requested block and return partial data at a timeout, frequency change, sample-rate change, or detected gap. `capture_frequency_hz()` and `capture_sample_rate_hz()` describe the returned samples even when newer packets are queued. File tuning setters preserve the recording's metadata.
@@ -376,7 +376,6 @@ Functionality is grouped behind Cargo features so unused dependencies stay out o
 | `file` | Buffered RTSA file parsing. | **Yes** |
 | `native-sdk` | Links the proprietary Aaronia C++ SDK. Windows/Linux only. | No |
 | `futuresdr` | Enables the FutureSDR block API: `HttpSource`, `HttpSink`, and their builders. Implies `http`. | No |
-| `sdr-source` | Integrates `SpectranSdrSource` implementing the native `SdrSource` traits. | **Yes** |
 | `ffi` | Builds the C-API export layer. | **Yes** |
 
 ## Testing & Contributing

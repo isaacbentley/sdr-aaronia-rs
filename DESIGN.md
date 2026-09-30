@@ -69,21 +69,19 @@ Available on Windows and Linux only, behind the non-default `native-sdk` feature
 
 ## 5. Channel Hopping and Dwell Control
 
-Under the `sdr-source` feature, `SpectranSdrSource` (in `sdr_source_impl.rs`) implements the `SdrSource` trait from the external `orecchiette-sdr-source-rs` crate, which the crate re-exports as `sdr_source`. Automatic mid-stream retuning via `SourceConfig.channels_hz` is supported per backend:
+Retuning mid-stream is `SpectranSource::set_center_frequency_hz`, per backend:
 
 - **Native SDK**: re-issues `configure_iq_receiver` with the new center frequency, applying the change to the open device handle via the `main/centerfreq` configuration key. No stream restart is required.
 - **HTTP**: `SpectranSource::set_center_frequency_hz` wraps `HttpEndpointsClient::configure_capture` as a `PUT` to the license-free `/control` endpoint, always sending the complete capture tuple (center, span, reference level) with unchanged values filled from the cached config. The full tuple is required: RTSA servers silently ignore a capture `PUT` carrying only one of the two frequency fields (it returns `{"success":true}` but the device stays put — live-verified). Hopping deliberately avoids `/remoteconfig` and is not gated on the license probe. (Whether that path needs the "Remote Config" license at all is unconfirmed: a system without the license accepted `/remoteconfig` writes in testing. See docs/HTTPSPEC.md.)
 - **File**: not supported.
 
-Hop dwell deadlines come from `sdr_source::DwellController`; per-hop pacing additionally inserts a ~75 ms settle after every retune (`RETUNE_SETTLE` in `sdr_source_impl.rs`) to ride out the RTSA's apply-config latency and flush stale samples from the pipeline.
+The hop loop itself — which channel next, how long to dwell there, and the ~75 ms settle after a retune that rides out the RTSA's apply-config latency and flushes stale samples — is the consumer's. Until 0.12.0 this crate carried one behind the `sdr-source` feature (`SpectranSdrSource`, an implementation of `orecchiette-sdr-source-rs`'s `SdrSource` trait); it lives beside its consumer now (Specola's `sdr-aaronia-source`), and a caller with its own trait builds the same thing from `SpectranSourceBuilder`.
 
 ## 6. Overrun Detection and Fault Handling
 
-The HTTP reader task (spawned by `init_http_source` in `unified_source.rs`) runs a `DropDetector` over each packet's `start_time`/`end_time` metadata. A timestamp gap larger than the tolerance latches `SpectranSource::pending_overrun`, which `take_overrun()` reads and clears. `single_channel_pump` and `hop_pump` (`sdr_source_impl.rs`) call `take_overrun()` once per emitted `IqPacket`, so a drop detected anywhere since the last read surfaces as `IqPacket::overrun = true` on the next packet. This is a per-call signal, not a precise per-sample one, since drop timing is lost once chunks merge into the flat `sample_buffer`.
+The HTTP reader task (spawned by `init_http_source` in `unified_source.rs`) runs a `DropDetector` over each packet's `start_time`/`end_time` metadata. A timestamp gap larger than the tolerance latches `SpectranSource::pending_overrun`, which `take_overrun()` reads and clears. A consumer's read loop calls `take_overrun()` once per block it hands on, so a drop detected anywhere since the last read surfaces on the next block (Specola's adapter sets its `IqPacket::overrun` from it). This is a per-call signal, not a precise per-sample one, since drop timing is lost once chunks merge into the flat `sample_buffer`.
 
 The native-SDK and file backends do not populate this yet (`overrun` is always `false` for them). Native-SDK overrun detection would need the overflow/dropped warning bits from the packet `flags` field. The RX path reads and logs those at debug level, but does not yet latch them into `pending_overrun`.
-
-The Aaronia capture thread (`SpectranSdrSource::start`) is wrapped in `catch_unwind`: a panic inside the pump loop is logged rather than silently unwinding the thread.
 
 ## 7. FutureSDR Integration
 
