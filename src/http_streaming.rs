@@ -2843,10 +2843,16 @@ mod tests {
         // Microsecond-rounded Unix-epoch timestamps, whose residuals
         // between contiguous packets reach ±1 µs, over a small packet:
         // 1024 samples is 16.7 µs, so half a packet is only 8.3 µs.
+        // Each size's residual pattern repeats every three packets (1024 samples at
+        // 61.44 MS/s is exactly 1/60 000 s); 20 000 packets is the detector run long.
+        // Miri interprets a thousandfold slower and this is the one test that took the
+        // job past its limit, so under Miri 200 packets a size: the same path, sixty
+        // times over the pattern.
         const RATE: f64 = 61.44e6;
+        let packets = if cfg!(miri) { 200 } else { 20_000 };
         for n in [1024, 16_384, 65_536] {
             let mut det = DropDetector::default();
-            for k in 0..20_000 {
+            for k in 0..packets {
                 let (s, e) = wire_times(k, n, RATE);
                 det.observe(&iq_packet(s, e));
             }
