@@ -40,6 +40,18 @@ struct InvariantRow {
 const ENFORCED: &[InvariantRow] = &[
     InvariantRow {
         area: Area::Sdk,
+        invariant: "explicit sweep reference levels are finite and bounded before any write",
+        test_fn: "sweep_reference_level_is_checked_before_any_write",
+        test_file: "src/native_sdk_lifecycle_tests.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "missing explicit sweep reference metadata fails before geometry writes",
+        test_fn: "missing_explicit_sweep_reference_metadata_fails_before_writes",
+        test_file: "src/native_sdk_lifecycle_tests.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
         invariant: "Teardown attempts stop, disconnect, close; errors are not swallowed",
         test_fn: "stop_attempts_every_cleanup_stage_and_returns_first_failure",
         test_file: "src/native_sdk_lifecycle_tests.rs",

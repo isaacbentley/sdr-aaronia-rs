@@ -2205,13 +2205,50 @@ impl NativeSdkSource {
     /// > tolerance in [`Self::configure_iq_receiver`] — so verify the
     /// > resulting device state before relying on this in production.
     pub unsafe fn configure_sweepsa(&mut self, config: &SweepsaConfig) -> Result<()> {
+        unsafe { self.configure_sweepsa_with_reference_level(config, None) }
+    }
+
+    /// Configure a spectrum sweep with an optional reference level in dBm.
+    /// Existing SweepsaConfig struct literals remain compatible. An explicit
+    /// level requires ConfigInfo bounds and is validated before any writes.
+    pub unsafe fn configure_sweepsa_with_reference_level(
+        &mut self,
+        config: &SweepsaConfig,
+        reference_level_dbm: Option<f64>,
+    ) -> Result<()> {
         unsafe {
+            if reference_level_dbm.is_some_and(|level| !level.is_finite()) {
+                return Err(Error::Config("reference level must be finite".into()));
+            }
             let device = self
                 .device
                 .as_mut()
                 .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
 
             let mut root = self.client.get_config_root(device)?;
+
+            // Keep the validated node so a missing/unsupported explicit setting
+            // cannot be silently ignored after changing the sweep geometry.
+            let reference = if let Some(level) = reference_level_dbm {
+                let mut node = self
+                    .client
+                    .find_config(device, &mut root, "main/reflevel")?;
+                let info = self.client.get_config_info(device, &mut node)?;
+                let bounds = crate::capabilities::ValueRange::new(
+                    info.min_value,
+                    info.max_value,
+                    info.step_value,
+                )
+                .ok_or_else(|| Error::Config("reference level bounds are unknown".into()))?;
+                if !bounds.contains(level) {
+                    return Err(Error::Config(format!(
+                        "reference level {level} is outside {bounds:?}"
+                    )));
+                }
+                Some((node, level))
+            } else {
+                None
+            };
 
             if let Ok(mut config_node) =
                 self.client.find_config(device, &mut root, "main/startfreq")
@@ -2239,6 +2276,11 @@ impl NativeSdkSource {
                 self.client
                     .set_config_float(device, &mut config_node, config.vbw)?;
                 info!("Set sweepsa vbw to {} Hz", config.vbw);
+            }
+
+            if let Some((mut node, level)) = reference {
+                self.client.set_config_float(device, &mut node, level)?;
+                info!("Set sweepsa reference level to {} dBm", level);
             }
 
             Ok(())

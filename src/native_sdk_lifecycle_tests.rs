@@ -1,9 +1,10 @@
 //! SDK lifecycle fault injection. No Aaronia installation or USB device.
 use super::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 thread_local! {
     static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static FAIL: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    static CONFIG_AVAILABLE: Cell<bool> = const { Cell::new(false) };
 }
 fn call(name: &'static str) -> u32 {
     CALLS.with(|calls| calls.borrow_mut().push(name));
@@ -14,6 +15,7 @@ fn call(name: &'static str) -> u32 {
     }
 }
 fn reset(fail: &[&'static str]) {
+    CONFIG_AVAILABLE.with(|available| available.set(false));
     CALLS.with(|calls| calls.borrow_mut().clear());
     FAIL.with(|failed| *failed.borrow_mut() = fail.to_vec());
 }
@@ -88,7 +90,14 @@ unsafe extern "C" fn mock_config_root(
     _device: *mut AARTSAAPI_Device,
     _config: *mut AARTSAAPI_Config,
 ) -> u32 {
-    AARTSAAPI_ERROR_NOT_FOUND
+    if CONFIG_AVAILABLE.with(Cell::get) {
+        unsafe {
+            (*_config).d = std::ptr::dangling_mut::<u8>().cast();
+        }
+        AARTSAAPI_OK
+    } else {
+        AARTSAAPI_ERROR_NOT_FOUND
+    }
 }
 unsafe extern "C" fn mock_config_health(
     _device: *mut AARTSAAPI_Device,
@@ -123,14 +132,21 @@ unsafe extern "C" fn mock_config_find(
     _config: *mut AARTSAAPI_Config,
     _path: *const WideChar,
 ) -> u32 {
-    AARTSAAPI_ERROR_NOT_FOUND
+    if CONFIG_AVAILABLE.with(Cell::get) {
+        unsafe {
+            (*_config).d = std::ptr::dangling_mut::<u8>().cast();
+        }
+        AARTSAAPI_OK
+    } else {
+        AARTSAAPI_ERROR_NOT_FOUND
+    }
 }
 unsafe extern "C" fn mock_config_set_float(
     _device: *mut AARTSAAPI_Device,
     _config: *mut AARTSAAPI_Config,
     _value: f64,
 ) -> u32 {
-    AARTSAAPI_ERROR_NOT_FOUND
+    call("config_write")
 }
 unsafe extern "C" fn mock_config_set_string(
     _device: *mut AARTSAAPI_Device,
@@ -159,7 +175,15 @@ unsafe extern "C" fn mock_config_get_info(
     _config: *mut AARTSAAPI_Config,
     _info: *mut AARTSAAPI_ConfigInfo,
 ) -> u32 {
-    AARTSAAPI_ERROR_NOT_FOUND
+    if !CONFIG_AVAILABLE.with(Cell::get) {
+        return AARTSAAPI_ERROR_NOT_FOUND;
+    }
+    unsafe {
+        (*_info).min_value = -55.0;
+        (*_info).max_value = 23.0;
+        (*_info).step_value = 0.5;
+    }
+    AARTSAAPI_OK
 }
 unsafe extern "C" fn mock_config_get_float(
     _device: *mut AARTSAAPI_Device,
@@ -371,4 +395,45 @@ fn sdk_shutdown_waits_for_the_last_initialized_client() {
         second.shutdown().unwrap();
     }
     assert_eq!(calls(), vec!["init_with_path", "shutdown"]);
+}
+
+#[test]
+fn sweep_reference_level_is_checked_before_any_write() {
+    for level in [f64::NAN, f64::INFINITY, -56.0, 24.0] {
+        reset(&[]);
+        CONFIG_AVAILABLE.with(|available| available.set(true));
+        let mut source = source(false, false);
+        assert!(
+            unsafe {
+                source.configure_sweepsa_with_reference_level(&Default::default(), Some(level))
+            }
+            .is_err()
+        );
+        assert!(!calls().contains(&"config_write"));
+    }
+    reset(&[]);
+    CONFIG_AVAILABLE.with(|available| available.set(true));
+    let mut source = source(false, false);
+    unsafe {
+        source
+            .configure_sweepsa_with_reference_level(&Default::default(), Some(-50.0))
+            .unwrap();
+    }
+    assert_eq!(
+        calls()
+            .iter()
+            .filter(|&&call| call == "config_write")
+            .count(),
+        5
+    );
+}
+#[test]
+fn missing_explicit_sweep_reference_metadata_fails_before_writes() {
+    reset(&[]);
+    let mut source = source(false, false);
+    assert!(
+        unsafe { source.configure_sweepsa_with_reference_level(&Default::default(), Some(-50.0)) }
+            .is_err()
+    );
+    assert!(!calls().contains(&"config_write"));
 }

@@ -6,6 +6,14 @@ The Aaronia Real-Time Spectrum Analyzer (RTSA) Vendor Software Development Kit (
 
 > **Status & attribution.** This document is a *community-compiled* reference, **not** an official Aaronia specification. It is assembled from Aaronia's official open-source sample code, public posts on the Aaronia V6 forum, vendor SDK headers, and empirical analysis. Where these disagree, the vendor's own materials are authoritative. See [Sources and Attribution](#sources-and-attribution) for the upstream, vendor-published references.
 
+## Sweep reference level (0.13.1)
+
+Use `configure_sweepsa_with_reference_level(&config, Some(-50.0))` to apply a
+reference level in dBm. `None` preserves the previous setting, as the existing
+`configure_sweepsa` call does. Explicit levels are validated against SDK metadata
+before any sweep geometry is changed. This additive method carries Specola's
+vendor functionality without adding a field to the public `SweepsaConfig` struct.
+
 ## Current driver behavior (0.13)
 
 See [Native SDK compatibility and qualification](NATIVE_SDK_COMPATIBILITY.md)

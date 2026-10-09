@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.13.1] - 2026-10-08
+
+### Added
+- `NativeSdkSource::configure_sweepsa_with_reference_level` applies an optional
+  reference level to native spectrum sweeps, backported from Specola's vendor
+  update. Explicit levels require valid SDK bounds and are checked before any
+  configuration write; unsupported/missing settings fail instead of being ignored.
+  The existing `SweepsaConfig` layout and `configure_sweepsa` API remain compatible.
+
+
 ## [v0.13.0] - 2026-10-08
 
 ### Added
