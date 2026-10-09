@@ -92,6 +92,10 @@ sudo cmake --install soapy-aaronia/build
 | `serial` | Select a device by serial via the native-SDK backend (Windows/Linux with the Aaronia SDK; omit `url` to allow SDK auto-detection) |
 | `freq` / `rate` / `ref_level` | Initial center frequency, sample rate, reference level. `rate` snaps to the device's ladder — see [Sample rates](#sample-rates) |
 | `format` | HTTP wire format. `format=I16`, optionally with `scale=N`, is the low-bandwidth network mode |
+| `family`, `mode` | Optional native family and receive-only `raw` or `iqreceiver` mode |
+| `rf_span_hz` | Native IQ receiver RF span, Hz; separate from `rate` |
+| `receiver_clock`, `decimation` | Enabled raw SDK clock label and power-of-two factor |
+| `tx` | Explicit `true` opts into TX setup on compatible licensed native hardware |
 | `rx_channel` | `Rx1` (default), `Rx2`, or `Rx1And2` (native SDK, full V6 only) |
 | `read_timeout` | Seconds the crate's own blocking reads wait (default 30). `readStream` always uses SoapySDR's per-call `timeoutUs`, so this rarely matters here |
 | `reconnect` | `1` (default) reconnects the stream automatically after a drop; `0` restores fail-fast behaviour |
@@ -101,24 +105,25 @@ import SoapySDR
 sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
 ```
 
-## Sample rates
+## Sample rates and bandwidth
 
-`listSampleRates` reports the device's real ladder, each rung half the
-one above it. `setSampleRate` snaps a request to the nearest rung and
-logs when it has to.
+HTTP `listSampleRates` uses the reported device ladder, retaining the legacy ECO
+ladder only as an HTTP fallback. Native modes without a reported discrete ladder
+return an empty list; the requested rate is passed to mode-specific validation.
+Trust `getSampleRate` after streaming for the actual delivered IQ rate.
 
-**The rate is not the RF bandwidth.** Every sample reaches you, so a
-waterfall spans the full rate, but only the middle 80% is flat and
-calibrated — RTSA reports exactly 0.8 x Fs as the packet's frequency
-range at every rate. Set the rate whose 80% covers the span you want to
-look at: 15.36 MHz of sampling to see 12 MHz of spectrum. The edges of
-the display are real data, just rolled off.
+Native `getBandwidth` reports the RF span from acquired IQ packets (zero means
+unknown). `setBandwidth` controls span in `iqreceiver` mode, separately from rate;
+raw mode instead uses enabled clock/decimation controls. For example:
 
-The ladder comes from the device. A backend that cannot be asked falls
-back to the V6 ECO's: 61.44 MHz down to 120 kHz. A full V6 selects its
-receiver clock and reaches higher, by how much is unsettled — see [the
-note in HTTPSPEC](../docs/HTTPSPEC.md#unresolved-the-full-v6s-top-rate).
-There, `getSampleRate` while streaming is the number to trust.
+```python
+sdr = SoapySDR.Device("driver=aaronia,sdk=1,serial=YOUR_DEVICE_SERIAL,mode=iqreceiver,rf_span_hz=44000000")
+```
+
+`getBandwidthRange` reports SDK configuration bounds, which may exceed the
+model's rated bandwidth; they are not a calibration certificate. HTTP retains its
+legacy 0.8×Fs filter helper. See the
+[native mode and qualification matrix](../docs/NATIVE_SDK_COMPATIBILITY.md).
 
 ## Dual-channel RX
 
@@ -162,8 +167,8 @@ clock sources and the RX antenna. A V6 ECO gives 5.5 MHz–8 GHz and
 −55…+23 dBm.
 
 Fields fall back independently, so a device that answers about frequency
-but not gain still gets its frequency range published. The file and
-native-SDK backends report the driver's defaults throughout.
+but not gain still gets its frequency range published. Native bounds/options are queried directly from the opened SDK device. Missing
+fields remain unknown; file sources have no hardware capabilities.
 
 `setClockSource` writes `device/sclksource` on both backends: the native
 SDK via `ConfigSetString`, HTTP via a `simpleconfig` PUT that is read back
@@ -182,12 +187,11 @@ it does offer. `listClockSources` reports the device's own vocabulary.
   `format=` device argument changes network traffic. It quantises to
   int16, which costs precision on weak signals: lower the reference
   level, or stay on `CF32`.
-- **TX** is `CF32`, single channel, and reported only on a native-SDK
-  build opened by `serial=`. Over `url=` or `file=` the probe shows
-  `0 Tx`. Bursts transmit immediately; timed TX (`SOAPY_SDR_HAS_TIME`)
-  is not supported, and the whole path is hardware-unverified. The check
-  is on the build and backend, not the hardware — an ECO has no
-  transmitter but would still advertise TX if opened by serial.
+- **TX** is `CF32`, single channel, and setup is attempted only with explicit
+  `tx=true` on a native-SDK backend. Compatible licensed hardware is required;
+  a failed sink setup leaves no TX channel. Ordinary RX opens never open
+  a TX sink. Bursts transmit immediately; timed TX (`SOAPY_SDR_HAS_TIME`) is
+  unsupported, and TX remains hardware-unverified in this release.
 
 ## Time, gain, sensors
 

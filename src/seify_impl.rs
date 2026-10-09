@@ -38,6 +38,7 @@ pub struct SpectranSeifyDevice {
     source: Arc<Mutex<SpectranSource>>,
     runtime: Arc<Runtime>,
     tuning: Arc<Mutex<Tuning>>,
+    capabilities: Arc<crate::capabilities::DeviceCapabilities>,
 }
 
 impl SpectranSeifyDevice {
@@ -83,11 +84,20 @@ impl SpectranSeifyDevice {
         builder.sample_rate_hz(sample_rate_hz);
         builder.reference_level_dbm(reference_level_dbm);
 
+        builder.native_options(crate::capabilities::NativeReceiverOptions {
+            family: args.get::<String>("family").ok(),
+            mode: args.get::<String>("mode").ok(),
+            rf_span_hz: args.get::<f64>("rf_span_hz").ok(),
+            receiver_clock: args.get::<String>("receiver_clock").ok(),
+            decimation_factor: args.get::<u32>("decimation").ok(),
+        });
         let source = runtime
             .block_on(builder.build())
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
 
+        let capabilities = Arc::new(runtime.block_on(source.device_capabilities()));
         Ok(Self {
+            capabilities,
             source: Arc::new(Mutex::new(source)),
             runtime,
             tuning: Arc::new(Mutex::new(Tuning {
@@ -147,8 +157,13 @@ impl FrequencyControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        // Spectran V6 tuning range.
-        Ok(Range::new(vec![RangeItem::Interval(10.0, 6.0e9)]))
+        Ok(Range::new(
+            self.capabilities
+                .center_frequency_hz
+                .into_iter()
+                .map(|r| RangeItem::Interval(r.min, r.max))
+                .collect(),
+        ))
     }
 
     fn frequency_components(
@@ -228,14 +243,14 @@ impl SampleRateControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        // Capped at a V6 ECO's top rate, which is the IQ-mode
-        // constraint against its fixed clock (span * 1.5 <= 92.16 MHz).
-        // A full V6 selects a faster receiver clock and exceeds this;
-        // seify has no device handle here to ask, so the ceiling is the
-        // measured one rather than a guess. See
-        // `utils::iq_sample_rates_for_clock`.
-        // The floor is the ladder's lowest rung (61.44 MHz / 512).
-        Ok(Range::new(vec![RangeItem::Interval(120e3, 61.44e6)]))
+        Ok(Range::new(
+            self.capabilities
+                .sample_rates()
+                .unwrap_or_default()
+                .into_iter()
+                .map(RangeItem::Value)
+                .collect(),
+        ))
     }
 
     fn set_sample_rate(
@@ -284,8 +299,13 @@ impl GainControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        // Reference level in dBm (matches the Soapy plugin's REF gain).
-        Ok(Range::new(vec![RangeItem::Interval(-100.0, 10.0)]))
+        Ok(Range::new(
+            self.capabilities
+                .reference_level_dbm
+                .into_iter()
+                .map(|r| RangeItem::Interval(r.min, r.max))
+                .collect(),
+        ))
     }
 
     fn set_gain_element(

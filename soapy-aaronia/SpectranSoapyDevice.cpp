@@ -737,7 +737,7 @@ void SpectranSoapyDevice::setSampleRate(const int direction, const size_t channe
     // 10 MHz displayed 10 MHz while receiving 7.68.
     const double wanted = rate;
     const std::vector<double> supported = listSampleRates(SOAPY_SDR_RX, 0);
-    double snapped = supported.front();
+    double snapped = supported.empty() ? wanted : supported.front();
     for (const double candidate : supported) {
         if (std::fabs(candidate - wanted) < std::fabs(snapped - wanted)) {
             snapped = candidate;
@@ -808,6 +808,9 @@ std::vector<double> SpectranSoapyDevice::listSampleRates(const int direction, co
     if (!_sampleRates.empty()) {
         return _sampleRates;
     }
+    // A native mode without a reported discrete ladder is continuous or
+    // unknown. Do not impose the HTTP/ECO ladder on every SDK model.
+    if (_sourceType == NativeSdk || _sourceType == File) return {};
     // Fallback: the V6 ECO ladder, verified against its decimation enum.
     return {
         61.44e6,    // Full
@@ -889,27 +892,48 @@ SoapySDR::Range SpectranSoapyDevice::getGainRange(const int direction, const siz
 // ---------------------------------------------------------------------
 
 void SpectranSoapyDevice::setBandwidth(const int direction, const size_t channel, const double bw) {
-    if (bw <= 0.0) return;
-    setSampleRate(direction, channel, spectran_iq_sample_rate_for_bandwidth(bw));
+    if (bw <= 0.0 || direction != SOAPY_SDR_RX) return;
+    if (_sourceType == NativeSdk) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (spectran_source_set_rf_span_hz(_source, bw) != Success)
+            throw std::runtime_error(lastErrorOr("RF span requires native iqreceiver mode"));
+        return;
+    }
+    if (_sourceType == Http) setSampleRate(direction, channel, spectran_iq_sample_rate_for_bandwidth(bw));
 }
 
 double SpectranSoapyDevice::getBandwidth(const int direction, const size_t channel) const {
-    return spectran_usable_bandwidth_hz(getSampleRate(direction, channel));
+    if (direction != SOAPY_SDR_RX) return 0.0;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (FfiSourceInfo *info = spectran_source_get_source_info(_source)) {
+            const double span = info->bandwidth_hz;
+            spectran_source_info_free(info);
+            if (span > 0.0) return span;
+        }
+    }
+    // Only the HTTP legacy filter helper has this ratio. Native unknown = 0.
+    return _sourceType == Http ? spectran_usable_bandwidth_hz(getSampleRate(direction, channel)) : 0.0;
 }
 
 std::vector<double> SpectranSoapyDevice::listBandwidths(const int direction, const size_t channel) const {
     std::vector<double> bandwidths;
-    for (const double rate : listSampleRates(direction, channel)) {
+    if (_sourceType != Http) return bandwidths;
+    for (const double rate : listSampleRates(direction, channel))
         bandwidths.push_back(spectran_usable_bandwidth_hz(rate));
-    }
     return bandwidths;
 }
 
 SoapySDR::RangeList SpectranSoapyDevice::getBandwidthRange(const int direction, const size_t channel) const {
     SoapySDR::RangeList ranges;
-    for (const double bw : listBandwidths(direction, channel)) {
-        ranges.push_back(SoapySDR::Range(bw, bw));
+    if (_sourceType == NativeSdk && direction == SOAPY_SDR_RX) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        double minHz = 0.0, maxHz = 0.0;
+        if (spectran_source_rf_span_range(_source, &minHz, &maxHz) == Success)
+            ranges.push_back(SoapySDR::Range(minHz, maxHz));
+        return ranges;
     }
+    for (const double bw : listBandwidths(direction, channel)) ranges.push_back(SoapySDR::Range(bw, bw));
     return ranges;
 }
 

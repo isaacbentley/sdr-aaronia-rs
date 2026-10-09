@@ -104,14 +104,7 @@ impl SdkConfig {
     pub fn device_open_mode(&self) -> String {
         let family = self.device_family();
         let raw_mode = crate::native_sdk::raw_mode_for_family(family);
-        let open_mode = crate::native_sdk::split_device_type(&self.device_type, raw_mode).1;
-        // An explicit `/raw` on the ECO is the same request, spelled the
-        // V6 way; map it as `open_detected_device` does.
-        if open_mode == "spectranv6eco/raw" {
-            "spectranv6eco/iqreceiver".to_string()
-        } else {
-            open_mode
-        }
+        crate::native_sdk::split_device_type(&self.device_type, raw_mode).1
     }
 }
 
@@ -437,7 +430,7 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
-    /// The ECO has no `/raw`; its raw pipeline is `rtsa`.
+    /// ECO automatic mode is iqreceiver; explicit raw remains an explicit request.
     #[test]
     fn bare_family_opens_in_its_raw_mode() {
         let mut config = SdkConfig {
@@ -448,9 +441,9 @@ mod tests {
         config.device_type = "spectranv6eco".to_string();
         assert_eq!(config.device_family(), "spectranv6eco");
         assert_eq!(config.device_open_mode(), "spectranv6eco/iqreceiver");
-        // `/raw` spelled the V6 way maps to the ECO's name for it.
+        // Explicit raw is preserved for devices with raw/channel options.
         config.device_type = "spectranv6eco/raw".to_string();
-        assert_eq!(config.device_open_mode(), "spectranv6eco/iqreceiver");
+        assert_eq!(config.device_open_mode(), "spectranv6eco/raw");
         // Any other explicit mode is passed through untouched.
         config.device_type = "spectranv6eco/iqreceiver".to_string();
         assert_eq!(config.device_open_mode(), "spectranv6eco/iqreceiver");
@@ -482,7 +475,7 @@ mod tests {
         assert_eq!(config.device_open_mode(), "not_a_real_family/raw");
 
         // An explicit mode on an unknown family is passed through rather
-        // than rewritten — only `spectranv6eco/raw` is remapped.
+        // than rewritten.
         config.device_type = "not_a_real_family/sweepsa".to_string();
         assert_eq!(config.device_family(), "not_a_real_family");
         assert_eq!(config.device_open_mode(), "not_a_real_family/sweepsa");

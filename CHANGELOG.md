@@ -4,6 +4,60 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.13.0] - 2026-10-08
+
+### Added
+- Native IQ packet RF span and centre metadata, independent of the actual IQ
+  sample clock. Mono and dual reads preserve that geometry with carried samples.
+- Direct SDK capability queries: configuration bounds, clock/channel/decimation
+  options with their original enum indices and disabled flags, selected mode,
+  and SDK version. Missing metadata stays unknown; no RTSA app is required.
+- Receive-only `NativeReceiverOptions`: explicit family/mode, IQ receiver RF
+  span, or enabled raw clock/decimation selection. SDK configuration bounds are
+  checked before writes. They are not a hardware qualification certificate.
+- Versioned capability JSON and RF-span controls in C and Python; device-derived
+  ranges and observed RF bandwidth in seify and SoapySDR. Windows/Linux Python
+  release wheels now enable `native-sdk` (the proprietary SDK remains separate).
+- An opt-in, serial-selected `native_sdk_qualification` example for receive-only
+  span changes and repeated device stop/reopen checks.
+
+### Fixed
+- Failed SDK opens close any partially allocated device. Connect/start failures
+  attempt stop, disconnect and close while preserving the original error.
+- Stop attempts all cleanup steps, returns the first failure, clears carried IQ
+  and observed metadata, and retains a failed-close handle for a Drop retry.
+  Repeated start/stop calls are idempotent; unified restart reopens the same
+  selected serial and settings, without silently switching devices or backend.
+- SDK global initialization/shutdown reference counting is serialized across the
+  initialized-state transition.
+- IQ receiver span validation uses the opened mode's `main/spanfreq` bounds,
+  rather than the legacy V6 raw-clock constraint. Runtime native setters use the
+  same configuration path as construction.
+- Reads stop before a queued packet changes centre, IQ rate or RF span, and a
+  carry-only read does not wait for another SDK packet.
+- Native capabilities and sensors no longer come from an unrelated HTTP server.
+- Unknown SDK modes cannot reinterpret spectra as IQ or IQ as spectra.
+- SoapySDR tolerates an unknown discrete sample-rate ladder and reports native
+  bandwidth from packet metadata. An RX open no longer attempts TX setup.
+- Release publication is gated on full CI, with semver checked against the
+  previous reachable release instead of a fixed historical tag.
+
+### Migration and qualification
+- This 0.x minor release adds public config fields and SDK mode enum variants.
+  Build `SpectranConfig` with `..Default::default()` and review exhaustive mode
+  matches. Existing C struct layouts and functions are retained.
+- Explicit `spectranv6eco/raw` is preserved; automatic ECO selection remains
+  `iqreceiver`. Explicit raw clock/decimation controls replace the legacy rate
+  request; the actual delivered rate comes from IQ packets.
+- Soapy TX setup requires explicit `tx=true`, a native backend and compatible
+  licensed hardware. TX and dual-RX remain hardware-unverified here.
+- Windows ECO mono qualification passed five stop/reopen cycles at RF spans
+  44, 20, 10, 5 and 44 MHz. The 44 MHz span carried about 59.214 MS/s; the lower
+  spans carried 30, 15 and 7.5 MS/s. One initial discontinuity was reported, with
+  no additional discontinuities during this short trial. Signals was restored.
+  This is not an endurance, amplitude-calibration or all-model certification.
+  See [native SDK compatibility](docs/NATIVE_SDK_COMPATIBILITY.md).
+
 ## [v0.12.0] - 2026-09-29
 
 ### Removed

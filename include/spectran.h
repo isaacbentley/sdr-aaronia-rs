@@ -305,6 +305,13 @@ SpectranFfiError spectran_endpoints_client_control_recording(HttpEndpointsClient
 
 // --- General FFI Utilities --- //
 
+/* Additive native SDK APIs; existing struct layouts remain unchanged. */
+char *spectran_source_capabilities_json(void *source);
+SpectranFfiError spectran_source_rf_span_range(void *source, double *min_hz, double *max_hz);
+SpectranFfiError spectran_source_set_rf_span_hz(void *source, double hz);
+SpectranFfiError spectran_source_builder_native_options(SpectranSourceBuilder *builder,
+    const char *family, const char *mode, double rf_span_hz, const char *clock, uint32_t decimation);
+
 void spectran_string_free(char* s);
 // Takes the code as an int so any value is safe to pass; unknown codes
 // yield "Unknown error code".

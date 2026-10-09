@@ -14,6 +14,7 @@
 # removal passed locally, and CI promptly failed on the feature-gated
 # crates that need them.
 #
+# Also mirrors ci.yml when reused as the release validation gate.
 # Usage:
 #   scripts/ci-local.sh            # run everything (recommended pre-push)
 #   SKIP="miri hack" scripts/ci-local.sh   # skip named steps

@@ -31,6 +31,7 @@ mod sync_guide {}
 #[cfg(feature = "ffi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
 pub mod c_api;
+pub mod capabilities;
 #[cfg(feature = "file")]
 #[cfg_attr(docsrs, doc(cfg(feature = "file")))]
 pub mod decompression;
@@ -59,6 +60,7 @@ pub mod link_budget;
 pub mod seify_impl;
 /// Where the sample stream broke, and what that invalidates
 pub mod stream_break;
+pub mod stream_geometry;
 pub mod unified_sink;
 #[cfg(all(feature = "http", feature = "file"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "http", feature = "file"))))]

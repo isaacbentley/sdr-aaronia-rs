@@ -664,81 +664,7 @@ impl DeviceSensors {
     }
 }
 
-/// A numeric setting's declared bounds, as the device states them.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ValueRange {
-    pub min: f64,
-    pub max: f64,
-    /// Distance between valid values, when the device declares one.
-    pub step: Option<f64>,
-}
-
-/// What the device says about itself: its identity and the bounds it
-/// declares on the settings a client can drive.
-///
-/// Read from the two trees the RTSA HTTP surface already serves —
-/// `/remoteconfig` for the bounds, `/healthstatus` for identity and the
-/// native IQ rate — so a caller that must *advertise* the device's
-/// limits (the SoapySDR plugin publishes frequency, gain and sample-rate
-/// ranges at probe time) states what this device reports rather than a
-/// constant compiled in for one model.
-///
-/// It matters because the constants were wrong. A V6 ECO declares
-/// 5.5 MHz–8 GHz of centre frequency where the plugin advertised
-/// 10 Hz–6 GHz, and a −55…+23 dBm reference level where it advertised
-/// −100…+10 dB.
-///
-/// Every field is optional and independently so: a tree that does not
-/// carry an item leaves its field `None`, and a caller falls back for
-/// that field alone rather than discarding a whole reading.
-#[derive(Debug, Clone, Default, PartialEq)]
-#[non_exhaustive]
-pub struct DeviceCapabilities {
-    /// Human-readable model, e.g. `"SPECTRAN V6 ECO"` — `/healthstatus`
-    /// `info/devname`, else `/remoteconfig` `info/title`.
-    pub model: Option<String>,
-    /// `/healthstatus` `info/serialno`.
-    pub serial: Option<String>,
-    /// `/healthstatus` `info/version` — firmware/FPGA revisions.
-    pub version: Option<String>,
-    /// Bounds on `centerfreq0`, in Hz.
-    pub center_frequency_hz: Option<ValueRange>,
-    /// Bounds on `reflevel0`, in dBm.
-    pub reference_level_dbm: Option<ValueRange>,
-    /// How many rungs `decimation0` offers — `"Full,1 / 2,…"` counted,
-    /// so a device with a shorter ladder is not advertised ten.
-    pub decimation_steps: Option<usize>,
-    /// `/healthstatus` `status/iqsamples`: the **native**, undecimated
-    /// IQ rate, which is not the rate the stream is running at. A
-    /// measurement, so see [`Self::sample_rates`] before using it as a
-    /// ladder top.
-    pub native_iq_rate_hz: Option<f64>,
-    /// Every stream-clock source `device/sclksource` offers, in the
-    /// device's own vocabulary — `Consumer`, `Oscillator`, `GPS`,
-    /// `PPS`, `10MHz` and the three `… Provider` variants on a measured
-    /// V6 ECO. Empty when the item is absent.
-    pub clock_sources: Vec<String>,
-    /// The source `sclksource` currently selects. A device running off
-    /// a house 10 MHz reference says `10MHz` here, which is worth
-    /// reporting accurately: an operator who wired that reference up
-    /// for frequency accuracy needs to see it took.
-    pub clock_source: Option<String>,
-    /// Every GPS mode `device/gpsmode` offers that the device will
-    /// currently accept — `Disabled`, `Location`, `Time`, `Location and
-    /// Time` on a measured V6 ECO. This is what governs whether GPS
-    /// disciplines the clock and whether `gps_time_ns` ever reports a
-    /// fix; the device ships on `Disabled`, in which state GPS time
-    /// never arrives and the API looks broken. Empty when the item is
-    /// absent.
-    pub gps_modes: Vec<String>,
-    /// The GPS mode `gpsmode` currently selects.
-    pub gps_mode: Option<String>,
-    /// The RX input the device's `devicemode` names — `"RX1"` or
-    /// `"RX2"`. Read-only on a V6 ECO, which reports `RX1 LO1 SWEEP`.
-    /// `None` when the mode names no RX input (a TX-only mode) or the
-    /// item is absent.
-    pub rx_antenna: Option<String>,
-}
+pub use crate::capabilities::{DeviceCapabilities, ValueRange};
 
 impl DeviceCapabilities {
     /// Reduce a `/remoteconfig` tree and a `/healthstatus` tree to the
@@ -747,7 +673,10 @@ impl DeviceCapabilities {
     /// Either may be a tree this crate did not expect; nothing is
     /// required to be present, and what is missing stays `None`.
     pub fn from_trees(config: Option<&ConfigItem>, health: Option<&HealthStatus>) -> Self {
-        let mut caps = Self::default();
+        let mut caps = Self {
+            transport: Some("http".to_owned()),
+            ..Self::default()
+        };
 
         if let Some(config) = config {
             caps.center_frequency_hz = range_of(config, "centerfreq0");
@@ -799,26 +728,6 @@ impl DeviceCapabilities {
         }
 
         caps
-    }
-
-    /// The sample rates this device can actually be set to, highest
-    /// first, or `None` when the reading does not support an answer.
-    ///
-    /// Both halves have to come from the device for this to be worth
-    /// more than the compiled-in ladder: the top rung from
-    /// [`Self::native_iq_rate_hz`] — snapped to an exact rung, because
-    /// the reported figure is a measurement — and the depth from
-    /// [`Self::decimation_steps`], so a device offering fewer rungs is
-    /// not advertised more. Missing or unrecognised either way gives
-    /// `None`, which is the caller's signal to fall back rather than
-    /// publish a ladder the hardware will not honour.
-    pub fn sample_rates(&self) -> Option<Vec<f64>> {
-        let top = crate::utils::snap_to_ladder_top(self.native_iq_rate_hz?)?;
-        let steps = self.decimation_steps?;
-        if steps == 0 {
-            return None;
-        }
-        Some(crate::utils::iq_ladder_from_top_n(top, steps))
     }
 }
 
@@ -2792,7 +2701,13 @@ mod tests {
     #[test]
     fn capabilities_are_absent_when_nothing_can_be_read() {
         let caps = DeviceCapabilities::from_trees(None, None);
-        assert_eq!(caps, DeviceCapabilities::default());
+        assert_eq!(
+            caps,
+            DeviceCapabilities {
+                transport: Some("http".into()),
+                ..Default::default()
+            }
+        );
         assert!(caps.model.is_none());
         assert!(caps.center_frequency_hz.is_none());
         assert!(caps.reference_level_dbm.is_none());

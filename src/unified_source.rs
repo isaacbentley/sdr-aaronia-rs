@@ -210,6 +210,8 @@ where
 /// Configuration for the unified Aaronia source
 #[derive(Debug, Clone)]
 pub struct SpectranConfig {
+    /// Explicit native receive mode, RF span and raw clock/decimation.
+    pub native: crate::capabilities::NativeReceiverOptions,
     /// Centre frequency in Hz
     pub center_frequency_hz: f64,
     /// IQ **sample rate** (Fs) in Hz. The device key behind it is
@@ -275,6 +277,7 @@ pub struct SpectranConfig {
 impl Default for SpectranConfig {
     fn default() -> Self {
         Self {
+            native: Default::default(),
             center_frequency_hz: 2.44e9, // 2.44 GHz (ISM band)
             sample_rate_hz: 15.36e6,     // 15.36 MHz sample rate
             bandwidth_hz: 0.0,           // unknown until a source reports it
@@ -621,6 +624,33 @@ impl SpectranSource {
         };
 
         source.source_type = source_type.clone();
+        if config.native != crate::capabilities::NativeReceiverOptions::default()
+            && source_type != SourceType::NativeSdk
+        {
+            return Err(Error::Config(
+                "native receiver options require the native SDK backend".into(),
+            ));
+        }
+        if config
+            .native
+            .mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "raw" | "iqreceiver"))
+        {
+            return Err(Error::Config(
+                "receive mode must be raw or iqreceiver".into(),
+            ));
+        }
+        if config
+            .native
+            .family
+            .as_deref()
+            .is_some_and(|family| family.is_empty() || family.contains('/'))
+        {
+            return Err(Error::Config(
+                "native family must be a bare SDK family name".into(),
+            ));
+        }
 
         // Hardware-bound source types must respect the IQ Mode
         // constraint. File sources read pre-recorded samples and aren't
@@ -760,23 +790,27 @@ impl SpectranSource {
             // "No Spectran V6 devices found" with the device sitting
             // right there on the USB bus. Try each known family, as
             // `NativeSdkClient::detect_device_family` documents, and take
-            // the mode from whichever answered: the ECO's raw-IQ pipeline
-            // is spelled `rtsa`, not `raw`.
+            // the mode from whichever answered: the ECO's IQ receiver
+            // pipeline is spelled `iqreceiver`, not `rtsa`.
             // Enumerate every family rather than stopping at the first
             // with a device: a machine holding both a V6 and an ECO must
             // still honour a `device_serial` that names the second one.
             let mut populated = Vec::new();
-            for family in crate::native_sdk::NativeSdkClient::DEVICE_FAMILIES {
+            let families: Vec<&str> = match self.config.native.family.as_deref() {
+                Some(family) => vec![family],
+                None => crate::native_sdk::NativeSdkClient::DEVICE_FAMILIES.to_vec(),
+            };
+            for family in &families {
                 let devices = source.find_devices(family)?;
                 if !devices.is_empty() {
-                    populated.push((family, devices));
+                    populated.push((*family, devices));
                 }
             }
             if populated.is_empty() {
-                return Err(Error::Config(format!(
-                    "no Aaronia device found in any known family ({})",
-                    crate::native_sdk::NativeSdkClient::DEVICE_FAMILIES.join(", ")
-                )));
+                return Err(Error::DeviceNotFound {
+                    serial: self.config.device_serial.clone(),
+                    families: families.iter().map(|f| f.to_string()).collect(),
+                });
             }
             let (device_family, devices) = match &self.config.device_serial {
                 Some(serial) => populated
@@ -786,15 +820,20 @@ impl SpectranSource {
                             .iter()
                             .any(|d| NativeSdkSource::get_device_serial(d) == *serial)
                     })
-                    .ok_or_else(|| {
-                        Error::Config(format!("Device with serial '{}' not found", serial))
+                    .ok_or_else(|| Error::DeviceNotFound {
+                        serial: Some(serial.clone()),
+                        families: families.iter().map(|f| f.to_string()).collect(),
                     })?,
                 None => populated.swap_remove(0),
             };
 
             let open_mode = format!(
                 "{device_family}/{}",
-                crate::native_sdk::raw_mode_for_family(device_family)
+                self.config
+                    .native
+                    .mode
+                    .as_deref()
+                    .unwrap_or_else(|| crate::native_sdk::raw_mode_for_family(device_family))
             );
 
             // Select device (use specified serial or first available)
@@ -802,13 +841,26 @@ impl SpectranSource {
                 devices
                     .iter()
                     .find(|d| NativeSdkSource::get_device_serial(d) == *serial)
-                    .ok_or_else(|| {
-                        Error::Config(format!("Device with serial '{}' not found", serial))
+                    .ok_or_else(|| Error::DeviceNotFound {
+                        serial: Some(serial.clone()),
+                        families: families.iter().map(|f| f.to_string()).collect(),
                     })?
             } else {
                 &devices[0]
             };
 
+            let selected_serial = NativeSdkSource::get_device_serial(device_info);
+            if !device_info.ready() {
+                return Err(Error::DeviceNotReady {
+                    serial: selected_serial,
+                });
+            }
+            if device_info.active() {
+                return Err(Error::SdkApi {
+                    operation: "select receive device".into(),
+                    code: crate::native_sdk::SdkError::Busy,
+                });
+            }
             // `WideChar` is u16 on Windows and u32 on Linux; widen
             // through u32 first so the cast compiles on both targets.
             let serial_wide: Vec<widestring::WideChar> =
@@ -823,13 +875,17 @@ impl SpectranSource {
             // so every reconfiguration path — including retunes —
             // re-applies it automatically.
             source.open_device(&open_mode, &serial_wide)?;
-            source.configure_iq_receiver(
+            source.configure_iq_receiver_with_options(
                 self.config.center_frequency_hz,
                 self.config.sample_rate_hz,
                 self.config.reference_level_dbm,
                 self.config.receiver_channel,
+                &self.config.native,
             )?;
 
+            self.config.device_serial = Some(selected_serial);
+            self.config.native.family = Some(device_family.to_owned());
+            self.config.native.mode = Some(open_mode.split_once('/').unwrap().1.to_owned());
             self.native_source = Some(source);
         }
 
@@ -1168,6 +1224,15 @@ impl SpectranSource {
                 any(target_os = "windows", target_os = "linux")
             ))]
             SourceType::NativeSdk => {
+                if !self
+                    .native_source
+                    .as_ref()
+                    .is_some_and(|source| source.is_device_open())
+                {
+                    // Keep the old client alive until its replacement is ready,
+                    // avoiding process-wide SDK shutdown between stop and reopen.
+                    self.init_native_sdk().await?;
+                }
                 if let Some(ref mut source) = self.native_source {
                     unsafe { source.start_streaming()? };
                 }
@@ -1616,11 +1681,32 @@ impl SpectranSource {
     /// a signal appear at a centre it was never received on. A read
     /// never spans a retune, so one value describes the whole buffer.
     ///
-    /// `0.0` before any IQ packet has been parsed, and on the file and
-    /// native-SDK backends, which do not carry per-packet frequency —
-    /// callers should fall back to the commanded frequency then.
+    /// `0.0` before any IQ packet has been read, when its geometry is invalid,
+    /// and on file backends. Callers may use the configured frequency only
+    /// when they can establish that it describes these samples.
     pub fn capture_frequency_hz(&self) -> f64 {
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some(source) = &self.native_source {
+            return source.observed_center_frequency_hz().unwrap_or(0.0);
+        }
         self.last_read_frequency_hz
+    }
+
+    /// Valid RF bandwidth of the most recently returned SDK IQ. Zero means
+    /// unavailable; it is never inferred from the sample rate. HTTP and files
+    /// use the bandwidth declared in their metadata or configuration.
+    pub fn capture_bandwidth_hz(&self) -> f64 {
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some(source) = &self.native_source {
+            return source.observed_bandwidth_hz().unwrap_or(0.0);
+        }
+        self.config.bandwidth_hz
     }
 
     /// Sample rate of the most recently returned samples. HTTP reads keep
@@ -1839,6 +1925,22 @@ impl SpectranSource {
         if self.source_type == SourceType::File {
             return Ok(());
         }
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.source_type == SourceType::NativeSdk
+            && self
+                .native_source
+                .as_ref()
+                .is_some_and(|source| !source.is_device_open())
+        {
+            if !hz.is_finite() {
+                return Err(Error::Config("setting must be finite".into()));
+            }
+            self.config.center_frequency_hz = hz;
+            return Ok(());
+        }
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
@@ -1847,11 +1949,12 @@ impl SpectranSource {
             SourceType::NativeSdk => {
                 if let Some(ref mut source) = self.native_source {
                     unsafe {
-                        source.configure_iq_receiver(
+                        source.configure_iq_receiver_with_options(
                             hz,
                             self.config.sample_rate_hz,
                             self.config.reference_level_dbm,
                             self.config.receiver_channel,
+                            &self.config.native,
                         )?
                     };
                 } else {
@@ -1909,7 +2012,26 @@ impl SpectranSource {
         // runtime rate was shipped to the server unchecked, the request
         // was silently clamped device-side, and the cached value made
         // the plugin report a rate the hardware wasn't producing.
-        validate_iq_mode(hz, DEFAULT_RECEIVER_CLOCK_HZ)?;
+        if self.source_type == SourceType::Http {
+            validate_iq_mode(hz, DEFAULT_RECEIVER_CLOCK_HZ)?;
+        }
+        // Native validation uses the selected device/mode, as at construction.
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.source_type == SourceType::NativeSdk
+            && self
+                .native_source
+                .as_ref()
+                .is_some_and(|source| !source.is_device_open())
+        {
+            if !hz.is_finite() {
+                return Err(Error::Config("setting must be finite".into()));
+            }
+            self.config.sample_rate_hz = hz;
+            return Ok(());
+        }
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
@@ -1918,11 +2040,12 @@ impl SpectranSource {
             SourceType::NativeSdk => {
                 if let Some(ref mut source) = self.native_source {
                     unsafe {
-                        source.configure_iq_receiver(
+                        source.configure_iq_receiver_with_options(
                             self.config.center_frequency_hz,
                             hz,
                             self.config.reference_level_dbm,
                             self.config.receiver_channel,
+                            &self.config.native,
                         )?
                     };
                 } else {
@@ -1966,9 +2089,63 @@ impl SpectranSource {
         Ok(())
     }
 
+    /// Request native IQ receiver RF span in Hz. Returned value is the SDK's
+    /// read-back setting while open, or the queued request while stopped.
+    /// Reopen validates deferred requests before writes. This is not the
+    /// observed IQ clock or amplitude calibration.
+    pub async fn set_rf_span_hz(&mut self, hz: f64) -> Result<f64> {
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.source_type == SourceType::NativeSdk {
+            let source = self
+                .native_source
+                .as_mut()
+                .ok_or_else(|| Error::Sdk("SDK source not initialized".into()))?;
+            if !source.is_device_open() {
+                if !hz.is_finite()
+                    || hz <= 0.0
+                    || !matches!(self.config.native.mode.as_deref(), Some("iqreceiver"))
+                {
+                    return Err(Error::Config(
+                        "positive RF span requires iqreceiver mode".into(),
+                    ));
+                }
+                // Deferred request, revalidated against fresh ConfigInfo on
+                // reopen. No setting is claimed applied to a closed device.
+                self.config.native.rf_span_hz = Some(hz);
+                return Ok(hz);
+            }
+            let applied = unsafe { source.set_rf_span_hz(hz)? };
+            self.config.native.rf_span_hz = Some(applied);
+            return Ok(applied);
+        }
+        let _ = hz;
+        Err(Error::Config(
+            "explicit RF span is available on native iqreceiver mode only".into(),
+        ))
+    }
+
     /// Update the reference level (in dBm) of the running source.
     pub async fn set_reference_level_dbm(&mut self, dbm: f64) -> Result<()> {
         if self.source_type == SourceType::File {
+            return Ok(());
+        }
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.source_type == SourceType::NativeSdk
+            && self
+                .native_source
+                .as_ref()
+                .is_some_and(|source| !source.is_device_open())
+        {
+            if !dbm.is_finite() {
+                return Err(Error::Config("setting must be finite".into()));
+            }
+            self.config.reference_level_dbm = dbm;
             return Ok(());
         }
         match self.source_type {
@@ -1979,11 +2156,12 @@ impl SpectranSource {
             SourceType::NativeSdk => {
                 if let Some(ref mut source) = self.native_source {
                     unsafe {
-                        source.configure_iq_receiver(
+                        source.configure_iq_receiver_with_options(
                             self.config.center_frequency_hz,
                             self.config.sample_rate_hz,
                             dbm,
                             self.config.receiver_channel,
+                            &self.config.native,
                         )?
                     };
                 } else {
@@ -2271,7 +2449,7 @@ impl SpectranSource {
         SourceInfo {
             source_type: self.source_type.clone(),
             center_frequency_hz: pick(
-                observed.center_frequency_hz,
+                pick(observed.center_frequency_hz, self.capture_frequency_hz()),
                 self.config.center_frequency_hz,
             ),
             sample_rate_hz: pick(
@@ -2282,7 +2460,7 @@ impl SpectranSource {
                 },
                 self.config.sample_rate_hz,
             ),
-            bandwidth_hz: pick(observed.bandwidth_hz, self.config.bandwidth_hz),
+            bandwidth_hz: pick(observed.bandwidth_hz, self.capture_bandwidth_hz()),
             reference_level_dbm: self.config.reference_level_dbm,
             device_serial: self.config.device_serial.clone(),
         }
@@ -2297,13 +2475,45 @@ impl SpectranSource {
     /// for one model — the SoapySDR plugin publishes exactly these at
     /// probe time.
     ///
-    /// Answers only for the HTTP backend, and deliberately without
-    /// requiring a stream: a probe runs before anything is opened, so
-    /// when no client has been built yet this constructs a short-lived
-    /// one from the configured URL rather than returning nothing.
-    /// Everything is `None` for the file and native-SDK backends, and a
-    /// caller falls back per field.
+    /// HTTP probes use the configured server. Native probes query the opened
+    /// SDK device directly, without contacting an HTTP server. Missing fields
+    /// remain unknown; file sources have no device capabilities.
     pub async fn device_capabilities(&self) -> crate::http_endpoints::DeviceCapabilities {
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.source_type == SourceType::NativeSdk {
+            return self
+                .native_source
+                .as_ref()
+                .and_then(|source| unsafe { source.device_capabilities().ok() })
+                .map(|mut caps| {
+                    caps.serial = self.config.device_serial.clone();
+                    caps.device_mode = self
+                        .config
+                        .native
+                        .mode
+                        .as_ref()
+                        .map(|mode| {
+                            format!(
+                                "{}/{mode}",
+                                self.config.native.family.as_deref().unwrap_or("unknown")
+                            )
+                        })
+                        .or_else(|| {
+                            self.native_source
+                                .as_ref()
+                                .and_then(|source| source.open_mode())
+                                .map(|mode| format!("{mode:?}"))
+                        });
+                    caps
+                })
+                .unwrap_or_default();
+        }
+        if self.source_type != SourceType::Http {
+            return Default::default();
+        }
         use crate::http_endpoints::{AuthMethod, DeviceCapabilities, HttpEndpointsClient};
 
         if let Some(client) = &self.http_client {
@@ -2332,6 +2542,9 @@ impl SpectranSource {
     /// populated by RTSA-Suite (the HTTP server), not by the raw SDK —
     /// so exposing it there would report a device permanently at 0 °C.
     pub async fn device_sensors(&self) -> crate::http_endpoints::DeviceSensors {
+        if self.source_type != SourceType::Http {
+            return Default::default();
+        }
         use crate::http_endpoints::{AuthMethod, DeviceSensors, HttpEndpointsClient};
 
         // The native SDK has no usable sensor surface (see the doc above);
@@ -2445,6 +2658,20 @@ impl SpectranSourceBuilder {
         Self {
             config: SpectranConfig::default(),
         }
+    }
+
+    /// Set explicit native receive settings (does not enable TX).
+    pub fn native_options(
+        &mut self,
+        options: crate::capabilities::NativeReceiverOptions,
+    ) -> &mut Self {
+        self.config.native = options;
+        self
+    }
+    /// RF span request for native iqreceiver mode, separate from sample rate.
+    pub fn rf_span_hz(&mut self, hz: f64) -> &mut Self {
+        self.config.native.rf_span_hz = Some(hz);
+        self
     }
 
     /// Set the centre frequency in Hz.

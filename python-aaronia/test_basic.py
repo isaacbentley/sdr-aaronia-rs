@@ -165,3 +165,29 @@ def test_open_accepts_scale():
     with pytest.raises((ValueError, aaronia.SpectranConnectionError)):
         aaronia.open("http://127.0.0.1:1", center_frequency_hz=2.44e9, sample_rate_hz=15.36e6,
                      format="I16", scale=1e6)
+
+
+def test_explicit_native_receive_configuration():
+    cfg = aaronia.SpectranConfig()
+    assert cfg.rf_span_hz is None
+    cfg.native_family = "spectranv6eco"
+    cfg.native_mode = "iqreceiver"
+    cfg.rf_span_hz = 44e6
+    cfg.receiver_clock = "245MHz"
+    cfg.decimation_factor = 4
+    assert cfg.native_family == "spectranv6eco"
+    assert cfg.native_mode == "iqreceiver"
+    assert cfg.rf_span_hz == 44e6
+    assert cfg.receiver_clock == "245MHz"
+    assert cfg.decimation_factor == 4
+    # The RF request never overwrites sample rate.
+    assert cfg.sample_rate_hz == 15.36e6
+    cfg.rf_span_hz = None
+    assert cfg.rf_span_hz is None
+
+
+def test_metadata_requires_an_open_source():
+    source = aaronia.SpectranSource()
+    for operation in [source.capabilities, source.source_info, lambda: source.set_rf_span_hz(44e6)]:
+        with pytest.raises(aaronia.SpectranHardwareError):
+            operation()

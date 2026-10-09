@@ -6,6 +6,16 @@ The Aaronia Real-Time Spectrum Analyzer (RTSA) Vendor Software Development Kit (
 
 > **Status & attribution.** This document is a *community-compiled* reference, **not** an official Aaronia specification. It is assembled from Aaronia's official open-source sample code, public posts on the Aaronia V6 forum, vendor SDK headers, and empirical analysis. Where these disagree, the vendor's own materials are authoritative. See [Sources and Attribution](#sources-and-attribution) for the upstream, vendor-published references.
 
+## Current driver behavior (0.13)
+
+See [Native SDK compatibility and qualification](NATIVE_SDK_COMPATIBILITY.md)
+for the current configuration, lifecycle and binding contract. Older empirical
+measurements below describe their particular mode/device, not every V6 variant.
+IQ `stepFrequency` is the actual sample clock; `spanFrequency` is valid RF span;
+centre is `startFrequency + spanFrequency / 2`. The driver carries these values
+with the returned IQ, never replacing RF span with a universal clock ratio.
+SDK ConfigInfo bounds can exceed a model's rated bandwidth.
+
 ## Table of Contents
 
 - [Features and Purpose](#features-and-purpose)
@@ -53,7 +63,7 @@ The Aaronia RTSA Vendor SDK provides low-level, high-performance access to Aaron
     *   **Clock Rates** (V6): 46MHz (46.08), 61MHz (61.44), 76MHz (76.80), 92MHz (92.16), 122MHz (122.88), 184MHz (184.32), 245MHz (245.76), 492MHz (491.52) — see the full label table under [Rust Binding Notes](#rust-binding-notes)
     *   **Clock Rates** (V6 ECO): fixed at 92.16 MHz. Its top IQ rate is 61.44 MHz, which is that clock over 1.5 — easy to confuse, and confusing them records the rate as the clock
     *   **Decimation**: Full, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, 1/128, 1/256, 1/512
-    *   **IQ Mode Sample Rate**: equal to `spanfreq` (constraint: `spanfreq ≤ receiverclock / 1.5`). Measured on a V6 ECO, untested on a full V6, and not obviously consistent with Aaronia's own 245 MHz / 250 Msample figures for the V6 — see [HTTPSPEC](HTTPSPEC.md#unresolved-the-full-v6s-top-rate)
+    *   **IQ receiver sample rate**: reported by packet `stepFrequency`, separately from `spanfreq` / RF span. Lower ECO spans measured 1.5× span, with an independent ceiling at wider spans; this is not a raw-mode constraint
 *   **Health Monitoring**: Real-time device status including temperatures, sample rates, power levels, USB statistics, GPS data
 
 ## Verified Architecture
@@ -396,7 +406,7 @@ a `/2ⁿ` ladder: a 10 MHz request streams at 15.0 MS/s, 15.36 at 23.04,
 Every rung of a request→delivered sweep was ×1.5 to the third decimal.
 This crate's `sample_rate_hz` is the sample rate (the HTTP backend
 delivers exactly it), so `configure_iq_receiver` writes `rate / 1.5` on
-this mode and the caller gets the rate it named on every backend; a
+this mode as a compatibility request, subject to the observed ceiling; a
 15.36 MS/s request now measures 15.360 MS/s, and `sample_rate_hz` reports
 what the packets carry. Two more measured facts: the pipeline delivers
 ~40% of rate for ~5 s after start and flags one `TIME_DISCONTINUITY` as
@@ -405,47 +415,23 @@ it settles, then holds 100.0% with no further flags; and it sets
 which is why that flag is not treated as an overrun. `spectranv6/raw` on
 a full V6 has not been measured and is left untranslated.
 
-### IQ-mode receiver clock constraint
+### Mode-specific validation (0.13)
 
-`NativeSdkSource::configure_iq_receiver` calls
-`utils::validate_iq_mode(rate, clock)` twice, and the order matters.
+IQ receiver requests validate `main/spanfreq` against the opened mode's ConfigInfo
+before writes. They do not use a default 92 MHz raw clock as a ceiling. Explicit
+RF span avoids the legacy Fs/1.5 translation; packet geometry reports what was
+actually delivered, including the independent USB/IQ ceiling.
 
-The gate runs **before the first config write**, against the clock the
-call *leaves in place* — which is not always the one the device holds on
-entry:
+Raw modes retain the legacy default clock/rate validation for callers that do not
+request explicit raw controls. `NativeReceiverOptions.receiver_clock` and
+`decimation_factor` instead select enabled device-provided enum options; they do
+not apply the legacy 1.5× check to a wider raw pipeline. Actual rate comes from
+packets. A decimation-only request preserves the currently reported clock when
+available. Unknown capabilities remain unknown; the legacy `receiver_clock_hz()`
+fallback is not proof of the installed hardware's clock.
 
-- On `spectranv6/raw`, the function writes `device/receiverclock` itself
-  (`DEFAULT_RECEIVER_CLOCK_LABEL`, `"92MHz"`, = 92.16 MHz), so that write
-  decides the clock and the check uses it. Checking the *current* setting
-  here would pass a rate the incoming clock cannot carry: a V6 left on
-  245.76 MHz would accept 150 MS/s and then have the clock pulled down to
-  92.16 MHz underneath it.
-- On every other open mode the clock write is skipped
-  (`DeviceOpenMode::supports_raw_only_keys` is true only for `Raw`), so
-  the device keeps what it has and the check reads it live. An eco
-  exposes no such key and falls back to the 92.16 MHz default; a full V6
-  in a non-raw IQ mode may sit on a faster clock, and assuming 92.16
-  there would refuse rates it can genuinely reach.
-
-The second call runs after the writes, against the clock read back from
-`device/receiverclock` via `AARTSAAPI_ConfigGetString`. Its real job is
-to make `receiver_clock_hz()` report the device's own number rather than
-the requested one. As a check it is deliberately weak in one direction:
-the rate already fits the intended clock, so a device sitting on a
-*faster* clock than intended still passes — an ignored clock write is
-invisible here, and harmless, because a rate that fits 92.16 MHz also
-fits 245.76. What it catches is a device on a clock too slow for the
-rate, which the pre-write check had no way to know about. That error
-says the device is already configured, since unlike the pre-write refusal
-there is no prior state to restore.
-
-Both enforce `rate * 1.5 <= clock`; the pre-write one returns
-`Error::Config` from `validate_iq_mode`, the post-write one wraps it in
-an `Error::Sdk`. `utils::the_92mhz_label_is_the_default_receiver_clock`
-pins the label↔rate equality the raw-mode arm depends on.
-
-The ConfigItem labels the SDK exposes are *rounded* — `"92MHz"` is
-actually 92.16 MHz, etc. Use `receiver_clock_for_label` to convert.
+The ConfigItem labels are rounded (`"92MHz"` is 92.16 MHz). The legacy conversion
+table is retained below; explicit labels are validated against the device options.
 
 | Label    | Actual rate    | Source             |
 |----------|----------------|--------------------|

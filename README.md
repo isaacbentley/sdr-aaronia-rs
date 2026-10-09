@@ -240,11 +240,11 @@ Add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
 # By default, includes HTTP, File and C FFI backend support
-sdr-aaronia-rs = "0.12"
+sdr-aaronia-rs = "0.13"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
 # To enable additional backends, opt into their features (e.g. native-sdk, futuresdr)
-# sdr-aaronia-rs = { version = "0.12", features = ["native-sdk", "futuresdr"] }
+# sdr-aaronia-rs = { version = "0.13", features = ["native-sdk", "futuresdr"] }
 ```
 
 HTTP reads use one timeout budget for the entire requested block and return partial data at a timeout, frequency change, sample-rate change, or detected gap. `capture_frequency_hz()` and `capture_sample_rate_hz()` describe the returned samples even when newer packets are queued. File tuning setters preserve the recording's metadata.
@@ -329,6 +329,40 @@ Per-application setup is in [docs/APPS.md](docs/APPS.md). Installation,
 building from source and the wire-format trade-offs are in
 [PLUGINS.md](PLUGINS.md); pass `format=I16` to halve network bandwidth,
 which is a real wire-format change rather than a client-side conversion.
+
+### Native SDK geometry and lifecycle
+
+Enable `native-sdk` on Windows or Linux and install Aaronia's SDK separately.
+RTSA-Suite does not need to be running. `NativeReceiverOptions` selects a
+receive-only mode and an RF span independently of `sample_rate_hz`:
+
+```rust,no_run
+# #[cfg(all(feature = "http", feature = "file", feature = "native-sdk", any(target_os = "windows", target_os = "linux")))]
+# async fn example() -> sdr_aaronia_rs::Result<()> {
+use sdr_aaronia_rs::{SpectranSourceBuilder, SourceType};
+use sdr_aaronia_rs::capabilities::NativeReceiverOptions;
+let mut builder = SpectranSourceBuilder::new();
+builder.force_source_type(SourceType::NativeSdk);
+builder.device_serial("YOUR_DEVICE_SERIAL".to_owned());
+builder.native_options(NativeReceiverOptions {
+    mode: Some("iqreceiver".into()),
+    rf_span_hz: Some(44e6),
+    ..Default::default()
+});
+let mut source = builder.build().await?;
+let capabilities = source.device_capabilities().await;
+source.start_streaming().await?;
+// After reading IQ, capture_sample_rate_hz / capture_bandwidth_hz describe
+// the delivered samples. Configuration bounds do not certify RF performance.
+source.stop_streaming().await?;
+# Ok(())
+# }
+```
+
+Stop releases the device. Restart on the same unified source reopens the selected
+serial and reapplies settings. Unknown metadata stays unknown; there is no
+universal ECO/V6 bandwidth ratio. See the
+[mode and qualification matrix](docs/NATIVE_SDK_COMPATIBILITY.md) for tested scope.
 
 ### seify (Rust-native)
 

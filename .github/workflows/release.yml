@@ -43,12 +43,8 @@ jobs:
   # never actually block anything. Runs against the tagged commit, so it
   # compares the exact code about to ship against a known-good baseline.
   #
-  # Pinned to v0.2.4 rather than the default (latest crates.io release)
-  # because 0.2.6 and 0.2.7, as published, fail to build rustdoc under
-  # --all-features (missing BufferReader/CpuBufferReader imports and a
-  # Send impl in sdk_sink.rs, only fixed post-release) -- cargo-semver-checks
-  # can't diff against a baseline it can't compile. v0.2.4 predates
-  # SdkSinkBlock/the futuresdr 0.0.39 migration and builds cleanly.
+  # Compare against the previous reachable release, never an obsolete fixed
+  # baseline. The tag commit itself is excluded from the lookup.
   semver_checks:
     name: cargo-semver-checks
     needs: tag_version_guard
@@ -70,11 +66,18 @@ jobs:
         uses: taiki-e/install-action@cargo-semver-checks
 
       - name: cargo semver-checks
-        run: cargo semver-checks check-release --baseline-rev v0.2.4
+        run: |
+          baseline=$(git describe --tags --match 'v*' --abbrev=0 "$GITHUB_SHA^")
+          cargo semver-checks check-release --baseline-rev "$baseline"
+
+  validate:
+    name: Release CI
+    needs: tag_version_guard
+    uses: ./.github/workflows/ci.yml
 
   publish:
     name: Publish to crates.io
-    needs: semver_checks
+    needs: [semver_checks, validate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -111,7 +114,7 @@ jobs:
 
   build-python:
     name: Build Python wheels
-    needs: semver_checks
+    needs: [semver_checks, validate]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -136,7 +139,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --manifest-path python-aaronia/Cargo.toml --out dist
+          args: --release --features native-sdk --manifest-path python-aaronia/Cargo.toml --out dist
 
       # Source distribution: pip's fallback for platforms/pythons the
       # wheel matrix doesn't cover.
@@ -157,7 +160,7 @@ jobs:
 
   build-soapy:
     name: Build SoapySDR Plugin
-    needs: semver_checks
+    needs: [semver_checks, validate]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

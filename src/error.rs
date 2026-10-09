@@ -64,6 +64,18 @@ pub enum Error {
         code: crate::native_sdk::SdkError,
     },
 
+    /// No matching USB receiver is currently enumerated. Applications can
+    /// retry discovery within their startup deadline without string matching.
+    #[error("no Aaronia device found for serial {serial:?} in families {families:?}")]
+    DeviceNotFound {
+        serial: Option<String>,
+        families: Vec<String>,
+    },
+    /// The enumerated USB receiver is still booting. Busy/configuration errors
+    /// are separate and should not be retried as discovery failures.
+    #[error("Aaronia device {serial} is not ready")]
+    DeviceNotReady { serial: String },
+
     /// Native SDK operation failed.
     #[error("SDK error: {0}")]
     Sdk(String),

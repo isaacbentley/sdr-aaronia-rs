@@ -88,41 +88,39 @@ common fields.
 
 The
 [quickstart](https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/QUICKSTART.md)
-covers configuring the RTSA-Suite HTTP Server block, which everything
-above depends on.
+covers configuring the RTSA-Suite HTTP Server block for HTTP sources. Native SDK sources do not require that server.
 
-## Sample rates
+## Sample rate and RF span
 
-The device runs a ladder of rates rather than a continuous range: each
-rung is half the one above it. Ask for anything else and it quietly
-uses the nearest rung, leaving your program computing against a rate
-that is not in use.
+The module-level `sample_rates()` and `sample_rate_for_bandwidth()` functions
+remain legacy HTTP/ECO helpers. They are not capabilities of every native device.
+For a native IQ receiver, request RF span separately and inspect packet geometry:
 
 ```python
-aaronia.sample_rates()                  # every rate, highest first
-aaronia.sample_rate_for_bandwidth(8e6)  # 15.36e6: the lowest rate covering 8 MHz
+cfg = aaronia.SpectranConfig()
+cfg.force_native_sdk = True
+cfg.device_serial = "YOUR_DEVICE_SERIAL"
+cfg.native_mode = "iqreceiver"
+cfg.rf_span_hz = 44e6
+cfg.center_frequency_hz = 280e6
+cfg.reference_level_dbm = -50
+src = aaronia.SpectranSource()
+src.start_streaming(cfg)
+print(src.capabilities())                 # schema_version + capabilities
+samples = src.read_samples_numpy(65536)
+print(src.source_info())                  # observed rate and RF span
+src.set_rf_span_hz(20e6)
+src.stop_streaming()
 ```
 
-**Sample rate is not RF bandwidth.** You get every sample, so an FFT of
-them spans the full rate — but only the middle 80% is flat and
-calibrated. That is not an approximation: RTSA reports exactly 0.8 x Fs
-as the packet's frequency range at every rate. Outside it, data still
-arrives, attenuated and uncalibrated.
+IQ sample clock and valid RF span are distinct. The tested ECO delivered 44 MHz
+RF span at about 59.214 MS/s, and 20 MHz at 30 MS/s. Native configuration bounds
+may exceed the model's rated bandwidth. Neither those bounds nor RF span certifies
+amplitude calibration. Unknown metadata stays unknown. See the
+[qualification matrix](../docs/NATIVE_SDK_COMPATIBILITY.md).
 
-So **to see N Hz of spectrum, sample at N / 0.8**, which is what
-`sample_rate_for_bandwidth()` computes. Aaronia's data sheet is more
-conservative still — 44 MHz for the ECO against the 49.152 MHz it
-declares at full span — because the analog filter is ~1 dB down by that
-edge. The
-[quickstart](https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/QUICKSTART.md#4-troubleshooting)
-has the measurements.
-
-`sample_rates()` returns the V6 ECO's ladder, 61.44 MHz down to 120 kHz.
-A full V6 selects its receiver clock and goes higher, by how much is
-unsettled; see
-[the note in HTTPSPEC](https://github.com/isaacbentley/sdr-aaronia-rs/blob/main/docs/HTTPSPEC.md#unresolved-the-full-v6s-top-rate).
-There, trust the rate the device reports in stream metadata, which
-`diagnose()` prints.
+For HTTP only, the legacy helper uses the measured 0.8×Fs filter width and ECO
+rate ladder. Prefer `source_info()` for what the stream actually delivered.
 
 ## Choosing a wire format
 
@@ -163,6 +161,11 @@ Every field is readable and writable.
 | `file_path` | Path to a recorded `.rtsa` file; pins the file backend |
 | `device_serial` | Device selection for the native-SDK backend |
 | `force_native_sdk` | `True` pins the source to the native SDK; missing SDK is an error |
+| `native_family` | Optional bare SDK family, e.g. `"spectranv6eco"` |
+| `native_mode` | Optional receive-only `"iqreceiver"` or `"raw"` |
+| `rf_span_hz` | Optional requested native IQ receiver RF span, Hz |
+| `receiver_clock` | Optional enabled raw-mode SDK clock label |
+| `decimation_factor` | Optional raw-mode power-of-two factor |
 | `center_frequency_hz` | Center frequency, Hz |
 | `sample_rate_hz` | IQ sample rate (Fs), Hz |
 | `reference_level_dbm` | Reference level, dBm |

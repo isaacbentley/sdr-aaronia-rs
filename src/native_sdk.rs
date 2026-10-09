@@ -796,13 +796,16 @@ impl NativeSdkClient {
     /// that never initialised.
     pub unsafe fn shutdown(&self) -> Result<()> {
         unsafe {
+            // Serialize the flag transition with init as well as the count.
+            // Swapping before the lock allowed the same client to re-init
+            // while shutdown was waiting, corrupting the live-client count.
+            let mut live = SDK_LIVE_INITS.lock().unwrap_or_else(|p| p.into_inner());
             if !self
                 .initialized
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 return Ok(());
             }
-            let mut live = SDK_LIVE_INITS.lock().unwrap_or_else(|p| p.into_inner());
             *live = live.saturating_sub(1);
             if *live > 0 {
                 debug!(
@@ -988,7 +991,14 @@ impl NativeSdkClient {
                 serial_number.as_ptr(),
             );
 
-            check_res(result, "AARTSAAPI_OpenDevice")?;
+            if let Err(error) = check_res(result, "AARTSAAPI_OpenDevice") {
+                // Some SDK builds allocate a device before failing. Release
+                // that partial open too; the caller never receives its handle.
+                if !device.d.is_null() {
+                    let _ = self.close_device(handle, &mut device);
+                }
+                return Err(error);
+            }
             // Result codes without the error bit (EMPTY, RETRY, the state
             // codes) pass `check_res`; only a non-null object is success.
             if device.d.is_null() {
@@ -1435,7 +1445,7 @@ pub(crate) fn names_a_device_family(s: &str) -> bool {
 /// anywhere in the string got this wrong and passed the malformed
 /// `"spectranv6/"` straight to `AARTSAAPI_OpenDevice`. On the ECO it was
 /// worse than malformed — `"spectranv6eco/"` also slipped past the
-/// `"spectranv6eco/raw"` remap in [`crate::sdk_source::SdkConfig::device_open_mode`],
+/// automatic ECO `iqreceiver` selection in [`crate::sdk_source::SdkConfig::device_open_mode`],
 /// so the device was asked for a pipeline it does not have.
 ///
 /// A device type that names **no family** (`""`, `"/"`, `"/raw"`) is handed
@@ -1467,7 +1477,7 @@ pub(crate) fn split_device_type<'a>(device_type: &'a str, default_mode: &str) ->
 }
 
 /// The open-mode suffix that gives raw IQ on `family`: `raw` on the V6,
-/// `rtsa` on the ECO, which has no `spectranv6eco/raw`.
+/// `iqreceiver` on the ECO; its `rtsa` mode carries spectra, not IQ.
 pub(crate) fn raw_mode_for_family(family: &str) -> &'static str {
     if family == "spectranv6eco" {
         // Not `rtsa`: that is the ECO's spectrum pipeline, and IQ read
@@ -1549,6 +1559,10 @@ pub enum DeviceOpenMode {
     Raw,
     /// `spectranv6eco/iqreceiver` — IQ receiver on the ECO platform.
     EcoIqReceiver,
+    /// IQ receiver on the full V6 family.
+    IqReceiver,
+    /// ECO raw IQ mode, selected explicitly (not the automatic default).
+    EcoRaw,
     /// `spectranv6eco/rtsa` — the ECO's spectrum pipeline, which is what
     /// its `RawSpectrumEco` sample opens. It carries **no IQ**: an
     /// earlier note here claimed IQ could be read from it at ~0.4 MS/s,
@@ -1561,7 +1575,7 @@ pub enum DeviceOpenMode {
     Sweepsa,
     /// `spectranv6eco/sweepsa` — sweep spectrum analyzer on the ECO platform.
     EcoSweepsa,
-    /// Any other variant (`/iqreceiver`, `/sweepsa`, …); we only know the
+    /// Any undocumented variant; we only know the
     /// family/mode strings, not which subset of config keys they accept.
     /// Owned `String` — the earlier `&'static str` was produced with
     /// `Box::leak`, leaking one allocation per open call.
@@ -1572,7 +1586,9 @@ impl DeviceOpenMode {
     /// Parse the mode string we passed to `AARTSAAPI_OpenDevice`.
     pub fn from_open_string(s: &str) -> Self {
         match s {
-            "spectranv6/raw" => Self::Raw,
+            "spectranv6/raw" | "spectranrsa/raw" => Self::Raw,
+            "spectranv6eco/raw" => Self::EcoRaw,
+            "spectranv6/iqreceiver" => Self::IqReceiver,
             "spectranv6eco/rtsa" => Self::EcoRtsa,
             "spectranv6eco/iqreceiver" => Self::EcoIqReceiver,
             "spectranv6/sweepsa" => Self::Sweepsa,
@@ -1586,7 +1602,7 @@ impl DeviceOpenMode {
     /// applicable on this mode. Per the official samples, only `raw` mode
     /// exposes them; eco's `iqreceiver` drives a fixed pipeline.
     pub fn supports_raw_only_keys(&self) -> bool {
-        matches!(self, Self::Raw)
+        matches!(self, Self::Raw | Self::EcoRaw)
     }
 
     /// Whether this mode delivers IQ samples at all.
@@ -1596,14 +1612,14 @@ impl DeviceOpenMode {
     /// IQ returns dBm bins reinterpreted as voltages, which is plausible
     /// enough to be mistaken for a working capture — measured on a V6
     /// ECO's `rtsa`, 200k "samples" with a mean of -77 and none near
-    /// zero. An unrecognised mode is allowed through: we cannot know.
+    /// zero. Unrecognised modes are refused because their payload is unknown.
     pub fn carries_iq(&self) -> bool {
         // Exhaustive on purpose: a new variant should not inherit
         // "carries everything" by falling through a negative match.
         match self {
-            Self::Raw | Self::EcoIqReceiver => true,
+            Self::Raw | Self::EcoRaw | Self::EcoIqReceiver | Self::IqReceiver => true,
             Self::EcoRtsa | Self::Sweepsa | Self::EcoSweepsa => false,
-            Self::Other(_) => true,
+            Self::Other(_) => false,
         }
     }
 
@@ -1614,9 +1630,9 @@ impl DeviceOpenMode {
     /// two-bin frame whose bin spacing is the whole span.
     pub fn carries_spectra(&self) -> bool {
         match self {
-            Self::Raw | Self::EcoRtsa | Self::Sweepsa | Self::EcoSweepsa => true,
-            Self::EcoIqReceiver => false,
-            Self::Other(_) => true,
+            Self::Raw | Self::EcoRaw | Self::EcoRtsa | Self::Sweepsa | Self::EcoSweepsa => true,
+            Self::EcoIqReceiver | Self::IqReceiver => false,
+            Self::Other(_) => false,
         }
     }
 
@@ -1631,7 +1647,7 @@ impl DeviceOpenMode {
     /// stream 0.
     pub fn spectra_stream_index(&self) -> i32 {
         match self {
-            Self::Raw => 2,
+            Self::Raw | Self::EcoRaw => 2,
             _ => 0,
         }
     }
@@ -1672,6 +1688,9 @@ pub struct NativeSdkSource {
     /// the request. `None` until the first packet, and cleared when
     /// streaming stops.
     observed_sample_rate_hz: Option<f64>,
+    /// Valid RF width from the packet, independent of its IQ sample clock.
+    observed_bandwidth_hz: Option<f64>,
+    observed_center_frequency_hz: Option<f64>,
     /// Packets the device flagged `WARN_DROPPED` or `TIME_DISCONTINUITY`
     /// since this source was created — the native counterpart of the
     /// HTTP drop detector's gap count. Until this existed the flags were
@@ -1777,22 +1796,28 @@ impl NativeSdkSource {
     pub unsafe fn new() -> Result<Self> {
         unsafe {
             let client = Arc::new(NativeSdkClient::new()?);
-            Ok(Self {
-                client,
-                handle: None,
-                device: None,
-                open_mode: None,
-                stream_active: false,
-                device_connected: false,
-                sample_buffer: VecDeque::new(),
-                dual_sample_buffer: VecDeque::new(),
-                read_mode: None,
-                receiver_clock_hz: None,
-                observed_sample_rate_hz: None,
-                drop_events: 0,
-                overrun_pending: false,
-                last_packet_end_time_s: 0.0,
-            })
+            Ok(Self::with_client(client))
+        }
+    }
+
+    fn with_client(client: Arc<NativeSdkClient>) -> Self {
+        Self {
+            client,
+            handle: None,
+            device: None,
+            open_mode: None,
+            stream_active: false,
+            device_connected: false,
+            sample_buffer: VecDeque::new(),
+            dual_sample_buffer: VecDeque::new(),
+            read_mode: None,
+            receiver_clock_hz: None,
+            observed_sample_rate_hz: None,
+            observed_bandwidth_hz: None,
+            observed_center_frequency_hz: None,
+            drop_events: 0,
+            overrun_pending: false,
+            last_packet_end_time_s: 0.0,
         }
     }
 
@@ -2323,6 +2348,94 @@ impl NativeSdkSource {
         }
     }
 
+    /// Query this opened device's configuration metadata directly. No RTSA
+    /// application or HTTP server is involved. Missing fields stay unknown.
+    pub unsafe fn device_capabilities(&self) -> Result<crate::capabilities::DeviceCapabilities> {
+        use crate::capabilities::{DeviceCapabilities, ValueRange, sdk_options};
+        unsafe {
+            let mut device = self
+                .device
+                .ok_or_else(|| Error::Sdk("No device opened".into()))?;
+            let mut root = self.client.get_config_root(&mut device)?;
+            let range = |path: &str| -> Option<ValueRange> {
+                let mut node = self.client.find_config(&mut device, &mut root, path).ok()?;
+                let info = self.client.get_config_info(&mut device, &mut node).ok()?;
+                ValueRange::new(info.min_value, info.max_value, info.step_value)
+            };
+            let mut range = range;
+            let mut caps = DeviceCapabilities {
+                transport: Some("native-sdk".into()),
+                sdk_version: Some(self.client.get_version()),
+                center_frequency_hz: range("main/centerfreq"),
+                rf_span_hz: range("main/spanfreq"),
+                reference_level_dbm: range("main/reflevel"),
+                ..DeviceCapabilities::default()
+            };
+            let mut options = |path: &str| {
+                self.client
+                    .find_config(&mut device, &mut root, path)
+                    .ok()
+                    .and_then(|mut node| self.client.get_config_info(&mut device, &mut node).ok())
+                    .map(|info| sdk_options(&wide_to_string(&info.options), info.disabled_options))
+                    .unwrap_or_default()
+            };
+            caps.receiver_clocks = options("device/receiverclock");
+            caps.receiver_channels = options("device/receiverchannel");
+            caps.decimations = options("main/decimation");
+            caps.clock_sources = options("device/sclksource")
+                .into_iter()
+                .filter(|o| o.enabled)
+                .map(|o| o.label)
+                .collect();
+            caps.gps_modes = options("device/gpsmode")
+                .into_iter()
+                .filter(|o| o.enabled)
+                .map(|o| o.label)
+                .collect();
+            let mut text = |path: &str| {
+                self.client
+                    .find_config(&mut device, &mut root, path)
+                    .ok()
+                    .and_then(|mut node| self.client.get_config_string(&mut device, &mut node).ok())
+                    .filter(|value| !value.is_empty())
+            };
+            caps.model = text("info/devname").or_else(|| text("info/title"));
+            caps.version = text("info/version");
+            caps.clock_source = text("device/sclksource");
+            caps.gps_mode = text("device/gpsmode");
+            caps.receiver_clock = text("device/receiverclock");
+            caps.rx_antenna = text("device/receiverchannel");
+            Ok(caps)
+        }
+    }
+
+    /// Set RF bandwidth independently of IQ sample rate. This is supported by
+    /// documented IQ receiver modes, not raw clock/decimation pipelines.
+    pub unsafe fn set_rf_span_hz(&mut self, hz: f64) -> Result<f64> {
+        unsafe {
+            if !matches!(
+                self.open_mode,
+                Some(DeviceOpenMode::EcoIqReceiver | DeviceOpenMode::IqReceiver)
+            ) {
+                return Err(Error::Config(
+                    "RF span requires an iqreceiver mode; raw mode uses clock/decimation".into(),
+                ));
+            }
+            let device = self
+                .device
+                .as_mut()
+                .ok_or_else(|| Error::Sdk("No device opened".into()))?;
+            let mut root = self.client.get_config_root(device)?;
+            let mut span = self
+                .client
+                .find_config(device, &mut root, "main/spanfreq")?;
+            let info = self.client.get_config_info(device, &mut span)?;
+            crate::stream_geometry::validate_eco_span(hz, info.min_value, info.max_value)?;
+            self.client.set_config_float(device, &mut span, hz)?;
+            self.client.get_config_float(device, &mut span)
+        }
+    }
+
     /// Configure the IQ receiver pipeline: tuning, level, and — on raw
     /// mode — the receiver channel.
     ///
@@ -2342,13 +2455,98 @@ impl NativeSdkSource {
         reference_level_dbm: f64,
         channel: Option<RxChannel>,
     ) -> Result<()> {
+        self.configure_iq_receiver_with_options(
+            center_frequency_hz,
+            sample_rate_hz,
+            reference_level_dbm,
+            channel,
+            &Default::default(),
+        )
+    }
+
+    /// Configure explicit RF span or raw clock/decimation, checking all requested
+    /// values against the selected mode before the first hardware write.
+    pub unsafe fn configure_iq_receiver_with_options(
+        &mut self,
+        center_frequency_hz: f64,
+        sample_rate_hz: f64,
+        reference_level_dbm: f64,
+        channel: Option<RxChannel>,
+        options: &crate::capabilities::NativeReceiverOptions,
+    ) -> Result<()> {
         unsafe {
+            Self::require_mode(self.open_mode.as_ref(), DeviceOpenMode::carries_iq, "IQ")?;
+            let caps = self.device_capabilities()?;
+            for (name, value, bounds) in [
+                (
+                    "centre frequency",
+                    center_frequency_hz,
+                    caps.center_frequency_hz,
+                ),
+                (
+                    "reference level",
+                    reference_level_dbm,
+                    caps.reference_level_dbm,
+                ),
+            ] {
+                if !value.is_finite() || bounds.is_some_and(|bounds| !bounds.contains(value)) {
+                    return Err(Error::Config(format!(
+                        "{name} {value} is outside this device's bounds {bounds:?}"
+                    )));
+                }
+            }
+            let raw = self
+                .open_mode
+                .as_ref()
+                .is_some_and(DeviceOpenMode::supports_raw_only_keys);
+            if options.rf_span_hz.is_some() && raw {
+                return Err(Error::Config("RF span requires iqreceiver mode".into()));
+            }
+            if !raw
+                && (channel.is_some()
+                    || options.receiver_clock.is_some()
+                    || options.decimation_factor.is_some())
+            {
+                return Err(Error::Config(
+                    "channel, receiver clock and decimation require raw mode".into(),
+                ));
+            }
+            if let Some(channel) = channel {
+                require_enabled_option(
+                    &caps.receiver_channels,
+                    channel.as_config_str(),
+                    "receiver channel",
+                )?;
+            }
+            let clock_label = options
+                .receiver_clock
+                .as_deref()
+                .or_else(|| {
+                    options
+                        .decimation_factor
+                        .and(caps.receiver_clock.as_deref())
+                })
+                .unwrap_or(crate::utils::DEFAULT_RECEIVER_CLOCK_LABEL);
+            if options.receiver_clock.is_some() {
+                require_enabled_option(&caps.receiver_clocks, clock_label, "receiver clock")?;
+            }
+            if let Some(factor) = options.decimation_factor {
+                let index = decimation_index(factor)?;
+                if !caps
+                    .decimations
+                    .iter()
+                    .any(|o| o.index == index && o.enabled)
+                {
+                    return Err(Error::Config(format!(
+                        "decimation factor {factor} is absent or disabled on this device"
+                    )));
+                }
+            }
+
             let device = self
                 .device
                 .as_mut()
-                .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
-
-            // Get config root
+                .ok_or_else(|| Error::Sdk("No device opened".into()))?;
             let mut root = self.client.get_config_root(device)?;
 
             // The next four config keys are only present on `spectranv6/raw`.
@@ -2385,11 +2583,33 @@ impl NativeSdkSource {
             //   a non-raw IQ mode may legitimately be on a faster clock, and
             //   assuming 92.16 there would refuse rates it can really reach.
             let intended_clock_hz = if writes_raw_only_keys {
-                crate::utils::receiver_clock_for_label(crate::utils::DEFAULT_RECEIVER_CLOCK_LABEL)
+                crate::utils::receiver_clock_for_label(clock_label)
             } else {
                 Self::read_receiver_clock_hz(&self.client, device, &mut root)
             };
-            crate::utils::validate_iq_mode(sample_rate_hz, intended_clock_hz)?;
+            let eco_iq = matches!(
+                self.open_mode,
+                Some(DeviceOpenMode::EcoIqReceiver | DeviceOpenMode::IqReceiver)
+            );
+            let explicit_raw =
+                options.receiver_clock.is_some() || options.decimation_factor.is_some();
+            if eco_iq {
+                // ECO spanfreq is RF bandwidth. Its USB IQ rate can be capped
+                // independently; the raw-mode clock rule does not limit it.
+                let mut span = self
+                    .client
+                    .find_config(device, &mut root, "main/spanfreq")?;
+                let bounds = self.client.get_config_info(device, &mut span)?;
+                crate::stream_geometry::validate_eco_span(
+                    options
+                        .rf_span_hz
+                        .unwrap_or(sample_rate_hz / crate::utils::IQ_RATE_CLOCK_RATIO),
+                    bounds.min_value,
+                    bounds.max_value,
+                )?;
+            } else if !explicit_raw {
+                crate::utils::validate_iq_mode(sample_rate_hz, intended_clock_hz)?;
+            }
 
             // Configure center frequency
             if let Ok(mut config) = self
@@ -2414,25 +2634,29 @@ impl NativeSdkSource {
             // ECO for rate / 1.5 and the caller gets the rate it named
             // on every backend. `spectranv6/raw` is left as-is: not
             // measured here.
-            let eco_iq = self.open_mode == Some(DeviceOpenMode::EcoIqReceiver);
             let spanfreq_to_write = if eco_iq {
-                sample_rate_hz / crate::utils::IQ_RATE_CLOCK_RATIO
+                options
+                    .rf_span_hz
+                    .unwrap_or(sample_rate_hz / crate::utils::IQ_RATE_CLOCK_RATIO)
             } else {
                 sample_rate_hz
             };
-            if let Ok(mut config) = self.client.find_config(device, &mut root, "main/spanfreq") {
-                self.client
-                    .set_config_float(device, &mut config, spanfreq_to_write)?;
-                if eco_iq {
-                    info!(
-                        "Set span frequency to {} Hz (bandwidth) for a {} S/s rate",
-                        spanfreq_to_write, sample_rate_hz
-                    );
+            if !explicit_raw {
+                if let Ok(mut config) = self.client.find_config(device, &mut root, "main/spanfreq")
+                {
+                    self.client
+                        .set_config_float(device, &mut config, spanfreq_to_write)?;
+                    if eco_iq {
+                        info!(
+                            "Set span frequency to {} Hz (bandwidth) for a {} S/s rate",
+                            spanfreq_to_write, sample_rate_hz
+                        );
+                    } else {
+                        info!("Set sample rate to {} Hz", sample_rate_hz);
+                    }
                 } else {
-                    info!("Set sample rate to {} Hz", sample_rate_hz);
+                    warn!("Could not find main/spanfreq config");
                 }
-            } else {
-                warn!("Could not find main/spanfreq config");
             }
 
             // Configure reference level
@@ -2484,15 +2708,9 @@ impl NativeSdkSource {
                     self.client
                         .find_config(device, &mut root, "device/receiverclock")
                 {
-                    self.client.set_config_string(
-                        device,
-                        &mut config,
-                        crate::utils::DEFAULT_RECEIVER_CLOCK_LABEL,
-                    )?;
-                    info!(
-                        "Set receiver clock to {}",
-                        crate::utils::DEFAULT_RECEIVER_CLOCK_LABEL
-                    );
+                    self.client
+                        .set_config_string(device, &mut config, clock_label)?;
+                    info!("Set receiver clock to {}", clock_label);
                 } else {
                     debug!("device/receiverclock not found (may be V6 ECO with fixed clock)");
                 }
@@ -2524,17 +2742,28 @@ impl NativeSdkSource {
             // rate that fits 92.16 MHz also fits 245.76. What it catches is
             // a device on a clock too slow for the rate, which the pre-write
             // check could not have known about.
-            crate::utils::validate_iq_mode(sample_rate_hz, actual_clock_hz).map_err(|e| {
-                Error::Sdk(format!(
-                    "device reports a {:.2} MHz receiver clock, too slow for the \
+            if !eco_iq && !explicit_raw {
+                crate::utils::validate_iq_mode(sample_rate_hz, actual_clock_hz).map_err(|e| {
+                    Error::Sdk(format!(
+                        "device reports a {:.2} MHz receiver clock, too slow for the \
                      requested rate: {e}. The device is already configured at this \
                      point, with no prior state to restore; re-configure it at \
                      {:.3} MS/s or less.",
-                    actual_clock_hz / 1e6,
-                    actual_clock_hz / crate::utils::IQ_RATE_CLOCK_RATIO / 1e6,
-                ))
-            })?;
-
+                        actual_clock_hz / 1e6,
+                        actual_clock_hz / crate::utils::IQ_RATE_CLOCK_RATIO / 1e6,
+                    ))
+                })?;
+            }
+            if let Some(factor) = options.decimation_factor {
+                let mut node = self
+                    .client
+                    .find_config(device, &mut root, "main/decimation")?;
+                self.client.set_config_integer(
+                    device,
+                    &mut node,
+                    decimation_index(factor)? as i64,
+                )?;
+            }
             info!("IQ Receiver configuration completed");
             Ok(())
         }
@@ -2592,19 +2821,29 @@ impl NativeSdkSource {
 
     pub unsafe fn start_streaming(&mut self) -> Result<()> {
         unsafe {
+            if self.stream_active {
+                return Ok(());
+            }
             let device = self
                 .device
                 .as_mut()
                 .ok_or_else(|| Error::Sdk("No device opened".to_string()))?;
 
-            // Connect to device
-            self.client.connect_device(device)?;
+            // Mark attempted ownership before calls: even a failed async
+            // connect/start may have acquired USB resources that need cleanup.
+            self.device_connected = true;
+            if let Err(error) = self.client.connect_device(device) {
+                let _ = self.stop_streaming();
+                return Err(error);
+            }
             self.device_connected = true;
 
             // Start device
-            self.client.start_device(device)?;
-
             self.stream_active = true;
+            if let Err(error) = self.client.start_device(device) {
+                let _ = self.stop_streaming();
+                return Err(error);
+            }
             info!("Streaming started successfully");
             Ok(())
         }
@@ -2621,6 +2860,16 @@ impl NativeSdkSource {
     /// The sample rate the device reports in its packets, once one has
     /// been read — see the field for why this, not the configured span,
     /// is the number to trust. `None` before the first packet.
+    /// Usable RF width declared by the SDK packet, distinct from its IQ rate.
+    pub fn observed_bandwidth_hz(&self) -> Option<f64> {
+        self.observed_bandwidth_hz
+    }
+
+    /// Centre reported by the most recently returned IQ, not the command.
+    pub fn observed_center_frequency_hz(&self) -> Option<f64> {
+        self.observed_center_frequency_hz
+    }
+
     pub fn observed_sample_rate_hz(&self) -> Option<f64> {
         self.observed_sample_rate_hz
     }
@@ -2867,7 +3116,7 @@ impl NativeSdkSource {
             if from_carry > 0 {
                 buffer.extend(self.sample_buffer.drain(0..from_carry));
             }
-            if remaining == 0 {
+            if remaining == 0 || from_carry > 0 {
                 // Fully satisfied from carry-over (or `max_samples == 0`).
                 // Return without polling so a caller draining a backlog never
                 // eats a `READ_POLL_DEADLINE` stall for samples it already
@@ -2903,6 +3152,7 @@ impl NativeSdkSource {
             // in hand": a caller draining a backlog must not sleep out
             // the poll budget for a packet that is not there.
             let mut got_packet = from_carry > 0;
+            let mut read_geometry = None;
 
             while remaining > 0 {
                 let packet = match self.client.get_packet(device, 0, 0)? {
@@ -2921,6 +3171,17 @@ impl NativeSdkSource {
                         continue;
                     }
                 };
+                let geometry = crate::stream_geometry::IqGeometry::from_packet(
+                    packet.start_frequency,
+                    packet.step_frequency,
+                    packet.span_frequency,
+                );
+                // Leave the first packet of a new geometry in the SDK queue.
+                // Each returned buffer, including a carried packet tail, has
+                // one frequency mapping. Do not relabel old IQ with new metadata.
+                if got_packet && read_geometry != geometry {
+                    break;
+                }
                 got_packet = true;
                 // `stride` is "floats from sample to sample". A tightly packed
                 // IQ pair is 2; interleaved multi-channel layouts are a small
@@ -3053,9 +3314,11 @@ impl NativeSdkSource {
                     }
                     samples_read += to_caller;
                     remaining -= to_caller;
-                    if packet.step_frequency > 0.0 {
-                        self.observed_sample_rate_hz = Some(packet.step_frequency);
-                    }
+                    self.observed_sample_rate_hz = geometry.map(|g| g.sample_rate_hz);
+                    self.observed_bandwidth_hz = geometry.and_then(|g| g.bandwidth_hz);
+                    self.observed_center_frequency_hz =
+                        geometry.and_then(|g| g.center_frequency_hz);
+                    read_geometry = geometry;
                     if packet.end_time > 0.0 {
                         self.last_packet_end_time_s = packet.end_time;
                     }
@@ -3169,7 +3432,7 @@ impl NativeSdkSource {
                     rx2.push(b);
                 }
             }
-            if remaining == 0 {
+            if remaining == 0 || from_carry > 0 {
                 return Ok(from_carry);
             }
 
@@ -3188,6 +3451,7 @@ impl NativeSdkSource {
             // caller draining a backlog never sleeps out the deadline.
             let mut remaining = remaining;
             let mut got_packet = from_carry > 0;
+            let mut read_geometry = None;
 
             while remaining > 0 {
                 let packet = match self.client.get_packet(device, 0, 0)? {
@@ -3205,6 +3469,17 @@ impl NativeSdkSource {
                         continue;
                     }
                 };
+                let geometry = crate::stream_geometry::IqGeometry::from_packet(
+                    packet.start_frequency,
+                    packet.step_frequency,
+                    packet.span_frequency,
+                );
+                // Leave the first packet of a new geometry in the SDK queue.
+                // Each returned buffer, including a carried packet tail, has
+                // one frequency mapping. Do not relabel old IQ with new metadata.
+                if got_packet && read_geometry != geometry {
+                    break;
+                }
                 got_packet = true;
                 if !packet.fp32.is_null() && packet.num > 0 {
                     // Same corruption backstop as `read_samples`; the
@@ -3298,9 +3573,11 @@ impl NativeSdkSource {
                     }
                     pairs_read += to_caller;
                     remaining -= to_caller;
-                    if packet.step_frequency > 0.0 {
-                        self.observed_sample_rate_hz = Some(packet.step_frequency);
-                    }
+                    self.observed_sample_rate_hz = geometry.map(|g| g.sample_rate_hz);
+                    self.observed_bandwidth_hz = geometry.and_then(|g| g.bandwidth_hz);
+                    self.observed_center_frequency_hz =
+                        geometry.and_then(|g| g.center_frequency_hz);
+                    read_geometry = geometry;
                     if packet.end_time > 0.0 {
                         self.last_packet_end_time_s = packet.end_time;
                     }
@@ -3400,45 +3677,49 @@ impl NativeSdkSource {
         })
     }
 
+    /// Stop, disconnect and close the device, including partially started
+    /// sessions. Every cleanup stage is attempted; the first failure is returned.
+    /// Reopening requires `open_device` and configuration again. The unified
+    /// source performs that automatically on its next `start_streaming`.
     pub unsafe fn stop_streaming(&mut self) -> Result<()> {
         unsafe {
-            if self.stream_active {
-                if let Some(device) = self.device.as_mut() {
-                    // Stop device
-                    if let Err(e) = self.client.stop_device(device) {
-                        error!("Failed to stop device: {}", e);
-                    }
+            let mut first_error = None;
+            if let Some(device) = self.device.as_mut() {
+                if self.stream_active {
+                    retain_cleanup_error(&mut first_error, self.client.stop_device(device));
                 }
-                self.stream_active = false;
+                if self.device_connected {
+                    retain_cleanup_error(&mut first_error, self.client.disconnect_device(device));
+                }
             }
-            // A new streaming session must not serve samples captured
-            // under the previous configuration, and gets a fresh choice
-            // of read path.
+            self.stream_active = false;
+            self.device_connected = false;
             self.sample_buffer.clear();
             self.dual_sample_buffer.clear();
             self.read_mode = None;
             self.observed_sample_rate_hz = None;
-
-            if self.device_connected {
-                if let Some(device) = self.device.as_mut() {
-                    // Disconnect device
-                    if let Err(e) = self.client.disconnect_device(device) {
-                        error!("Failed to disconnect device: {}", e);
-                    }
-                }
-                self.device_connected = false;
-            }
-
+            self.observed_bandwidth_hz = None;
+            self.observed_center_frequency_hz = None;
+            self.last_packet_end_time_s = 0.0;
+            self.overrun_pending = false;
             if let (Some(mut device), Some(handle)) = (self.device.take(), self.handle.as_mut()) {
-                // Close device
-                if let Err(e) = self.client.close_device(handle, &mut device) {
-                    error!("Error closing device during drop: {}", e);
+                let closed = self.client.close_device(handle, &mut device);
+                if closed.is_err() {
+                    // Retain ownership for Drop's last cleanup attempt.
+                    self.device = Some(device);
                 }
+                retain_cleanup_error(&mut first_error, closed);
             }
-
-            info!("Streaming stopped");
-            Ok(())
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
+    }
+
+    /// Whether a native device handle remains open (independent of streaming).
+    pub fn is_device_open(&self) -> bool {
+        self.device.is_some()
     }
 
     pub fn get_device_serial(device_info: &AARTSAAPI_DeviceInfo) -> String {
@@ -3488,6 +3769,42 @@ impl Drop for NativeSdkSource {
             {
                 error!("Error closing handle during drop: {}", e);
             }
+        }
+    }
+}
+
+fn require_enabled_option(
+    options: &[crate::capabilities::ConfigOption],
+    value: &str,
+    name: &str,
+) -> Result<()> {
+    if options
+        .iter()
+        .any(|option| option.label == value && option.enabled)
+    {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "{name} {value:?} is absent or disabled on this device"
+        )))
+    }
+}
+fn decimation_index(factor: u32) -> Result<usize> {
+    if factor.is_power_of_two() {
+        Ok(factor.trailing_zeros() as usize)
+    } else {
+        Err(Error::Config(
+            "raw decimation must be a positive power of two".into(),
+        ))
+    }
+}
+
+// Keep cleanup best-effort without turning a failed stop into success.
+fn retain_cleanup_error(first: &mut Option<Error>, result: Result<()>) {
+    if let Err(error) = result {
+        warn!(%error, "SDK cleanup stage failed");
+        if first.is_none() {
+            *first = Some(error);
         }
     }
 }
@@ -3906,12 +4223,10 @@ mod tests {
             );
         }
 
-        // An unrecognised mode is allowed through both ways: we do not
-        // know what it carries, and refusing would break a mode this
-        // build has simply never heard of.
+        // Unknown payloads must not silently become IQ or spectra.
         let unknown = DeviceOpenMode::Other("spectranv6/somethingnew".to_string());
-        assert!(unknown.carries_iq());
-        assert!(unknown.carries_spectra());
+        assert!(!unknown.carries_iq());
+        assert!(!unknown.carries_spectra());
     }
 
     /// The guard refuses only the combinations that would return the
@@ -4049,6 +4364,25 @@ mod tests {
         assert!(!handle.d.is_null() || handle.d.is_null()); // Basic null check test
         assert!(!device.d.is_null() || device.d.is_null());
         assert!(!config.d.is_null() || config.d.is_null());
+    }
+
+    #[test]
+    fn unknown_modes_are_not_reinterpreted_as_iq_or_spectra() {
+        let mode = DeviceOpenMode::from_open_string("spectranv6/unknown");
+        assert!(!mode.carries_iq());
+        assert!(!mode.carries_spectra());
+        assert!(DeviceOpenMode::from_open_string("spectranv6eco/raw").supports_raw_only_keys());
+        assert!(DeviceOpenMode::from_open_string("spectranv6/iqreceiver").carries_iq());
+    }
+    #[test]
+    fn absent_and_disabled_device_options_are_rejected() {
+        let options = crate::capabilities::sdk_options("Rx1;Rx2;Rx12", 1 << 1);
+        assert!(require_enabled_option(&options, "Rx1", "channel").is_ok());
+        assert!(require_enabled_option(&options, "Rx2", "channel").is_err());
+        assert!(require_enabled_option(&options, "Rx3", "channel").is_err());
+        assert!(decimation_index(0).is_err());
+        assert!(decimation_index(3).is_err());
+        assert_eq!(decimation_index(512).unwrap(), 9);
     }
 
     #[test]
@@ -4305,6 +4639,8 @@ mod tests {
             read_mode: None,
             receiver_clock_hz: None,
             observed_sample_rate_hz: None,
+            observed_bandwidth_hz: None,
+            observed_center_frequency_hz: None,
             drop_events: 0,
             overrun_pending: false,
             last_packet_end_time_s: 0.0,
@@ -4390,3 +4726,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "native_sdk_lifecycle_tests.rs"]
+mod lifecycle_tests;

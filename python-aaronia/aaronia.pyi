@@ -59,6 +59,13 @@ class SpectranConfig:
     device_serial: Optional[str]
     force_native_sdk: bool
 
+    # Explicit native receive configuration (device-validated at startup).
+    native_family: Optional[str]
+    native_mode: Optional[str]
+    rf_span_hz: Optional[float]
+    receiver_clock: Optional[str]
+    decimation_factor: Optional[int]
+
     # RF parameters.
     center_frequency_hz: float
     """Center frequency in Hz."""
@@ -139,6 +146,15 @@ class SpectranSource:
 
     def stop_streaming(self) -> None:
         """Stop streaming and release the backend."""
+
+    def capabilities(self) -> dict[str, Any]:
+        """Versioned device capability result; absent metadata remains null."""
+
+    def source_info(self) -> dict[str, Any]:
+        """Actual geometry of the last returned buffer; zero RF width = unknown."""
+
+    def set_rf_span_hz(self, hz: float) -> float:
+        """Set native IQ receiver RF span, independently of IQ sample rate."""
 
     def read_samples_numpy(self, count: int) -> npt.NDArray[np.complex64]:
         """Read up to ``count`` IQ samples into a NumPy ``complex64`` array.

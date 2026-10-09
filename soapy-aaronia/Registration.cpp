@@ -1,6 +1,7 @@
 #include "SpectranSoapyDevice.hpp"
 #include <SoapySDR/Registry.hpp>
 #include <SoapySDR/Logger.hpp>
+#include <cmath>
 
 // Whether the args ask for the native SDK: a serial names an SDK device,
 // and `sdk` must be truthy — `sdk=false` is a request *not* to use it, so
@@ -199,6 +200,18 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         spectran_source_builder_auto_reconnect(builder, enabled);
     }
 
+    const auto nativeArg = [&](const char *name) -> const char * {
+        return args.count(name) ? args.at(name).c_str() : nullptr;
+    };
+    if (args.count("family") || args.count("mode") || args.count("rf_span_hz") || args.count("receiver_clock") || args.count("decimation")) {
+        const double span = args.count("rf_span_hz") ? parseArgDouble(args, "rf_span_hz") : 0.0;
+        const double factor = args.count("decimation") ? parseArgDouble(args, "decimation") : 0.0;
+        if (factor < 0.0 || factor > 4294967295.0 || std::floor(factor) != factor)
+            throw std::runtime_error("decimation must be an unsigned integer factor");
+        const uint32_t decimation = static_cast<uint32_t>(factor);
+        if (spectran_source_builder_native_options(builder, nativeArg("family"), nativeArg("mode"), span, nativeArg("receiver_clock"), decimation) != Success)
+            throw std::runtime_error("invalid native receiver options");
+    }
     SourceGuard source(spectran_source_build(builder));
     if (!source.p) {
         char* msg = spectran_last_error();
@@ -222,7 +235,8 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
     // query this crate does not yet make.
     bool txPossible = false;
     if (FfiSourceInfo* info = spectran_source_get_source_info(source.p)) {
-        txPossible = info->source_type == NativeSdk;
+        // Receive discovery must never open a transmitter as a side effect.
+        txPossible = info->source_type == NativeSdk && args.count("tx") && args.at("tx") == "true";
         spectran_source_info_free(info);
     }
     SinkGuard sink(nullptr);

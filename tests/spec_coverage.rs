@@ -39,6 +39,66 @@ struct InvariantRow {
 
 const ENFORCED: &[InvariantRow] = &[
     InvariantRow {
+        area: Area::Sdk,
+        invariant: "Teardown attempts stop, disconnect, close; errors are not swallowed",
+        test_fn: "stop_attempts_every_cleanup_stage_and_returns_first_failure",
+        test_file: "src/native_sdk_lifecycle_tests.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "Failed startup releases partial device ownership",
+        test_fn: "failed_start_releases_partial_connection",
+        test_file: "src/native_sdk_lifecycle_tests.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "An opened device is closed even if streaming never starts",
+        test_fn: "drop_closes_an_open_device_that_never_started",
+        test_file: "src/native_sdk_lifecycle_tests.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "Process-wide SDK shutdown waits for the last initialized client",
+        test_fn: "sdk_shutdown_waits_for_the_last_initialized_client",
+        test_file: "src/native_sdk_lifecycle_tests.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "Disabled SDK options preserve their original enum indices",
+        test_fn: "disabled_sdk_options_keep_their_indices",
+        test_file: "src/capabilities.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "Undocumented payload modes cannot be interpreted as IQ",
+        test_fn: "unknown_modes_are_not_reinterpreted_as_iq_or_spectra",
+        test_file: "src/native_sdk.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "IQ sample clock and valid RF width are independent; centre is start + span / 2",
+        test_fn: "observed_usb_rate_does_not_replace_rf_width_or_shift_the_center",
+        test_file: "src/stream_geometry.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "RF geometry supports distinct model widths without a universal 44 MHz ratio",
+        test_fn: "geometry_is_not_limited_to_one_spectran_model",
+        test_file: "src/stream_geometry.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "Malformed RF metadata remains unknown",
+        test_fn: "invalid_geometry_remains_unknown",
+        test_file: "src/stream_geometry.rs",
+    },
+    InvariantRow {
+        area: Area::Sdk,
+        invariant: "ECO IQ span is validated against device-reported bounds",
+        test_fn: "eco_bounds_come_from_the_device",
+        test_file: "src/stream_geometry.rs",
+    },
+    InvariantRow {
         area: Area::FileFormat,
         invariant: "DSFH::mCreationTime stored in microseconds is normalised to seconds",
         test_fn: "prop_creation_time_normalization",
@@ -258,24 +318,23 @@ fn spec_coverage_summary() {
     println!("============================================");
 }
 
-/// Defensive check: no area accumulates an absurd number of rows
-/// without explicit intent. Catches accidental double-claim — pick one
-/// row as the canonical owner if the invariants overlap.
+/// Each invariant and enforcing test has one canonical inventory row. Check
+/// actual duplicate claims rather than imposing a count ceiling on an area.
 #[test]
 fn spec_coverage_has_no_unintentional_duplicates() {
-    use std::collections::HashMap;
-    let mut by_area: HashMap<Area, Vec<&'static str>> = HashMap::new();
+    use std::collections::HashSet;
+    let mut invariants = HashSet::new();
+    let mut tests = HashSet::new();
     for row in ENFORCED {
-        by_area.entry(row.area).or_default().push(row.test_fn);
-    }
-    for (area, tests) in &by_area {
-        // Loose upper bound; tighten if drift becomes a problem.
         assert!(
-            tests.len() <= 16,
-            "area {} has {} tests claiming it: {:?} — sanity-check whether the rows are all needed",
-            area.name(),
-            tests.len(),
-            tests
+            invariants.insert((row.area, row.invariant)),
+            "duplicate invariant: {}",
+            row.invariant
+        );
+        assert!(
+            tests.insert((row.test_file, row.test_fn)),
+            "duplicate enforcing test: {}",
+            row.test_fn
         );
     }
 }

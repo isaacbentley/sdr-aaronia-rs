@@ -1786,6 +1786,139 @@ pub unsafe extern "C" fn spectran_endpoints_client_control_recording(
     }
 }
 
+/// Versioned native/HTTP capability JSON. Does not change the existing C
+/// capability struct layout. Free the result with spectran_string_free.
+/// # Safety
+/// ptr must be a live source, used exclusively for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_source_capabilities_json(ptr: *mut c_void) -> *mut c_char {
+    clear_last_error();
+    if ptr.is_null() {
+        set_last_error("Null source");
+        return std::ptr::null_mut();
+    }
+    let source = unsafe { &*(ptr as *mut SpectranSource) };
+    match ffi_block_on(source.device_capabilities())
+        .and_then(|caps| caps.to_json().map_err(|e| e.to_string()))
+        .and_then(|json| CString::new(json).map_err(|e| e.to_string()))
+    {
+        Ok(json) => json.into_raw(),
+        Err(error) => {
+            set_last_error(error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Native IQ receiver span bounds. Missing metadata is an error, not a guessed
+/// model limit. Does not perform configuration writes.
+/// # Safety
+/// ptr must be a live source; min_hz/max_hz must point to writable doubles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_source_rf_span_range(
+    ptr: *mut c_void,
+    min_hz: *mut f64,
+    max_hz: *mut f64,
+) -> SpectranFfiError {
+    clear_last_error();
+    if ptr.is_null() || min_hz.is_null() || max_hz.is_null() {
+        return SpectranFfiError::InternalError;
+    }
+    let source = unsafe { &*(ptr as *mut SpectranSource) };
+    match ffi_block_on(source.device_capabilities()) {
+        Ok(caps) => match caps.rf_span_hz {
+            Some(range) => {
+                unsafe {
+                    *min_hz = range.min;
+                    *max_hz = range.max;
+                }
+                SpectranFfiError::Success
+            }
+            None => {
+                set_last_error("RF span bounds are unknown");
+                SpectranFfiError::InternalError
+            }
+        },
+        Err(error) => {
+            set_last_error(error);
+            SpectranFfiError::RuntimeContext
+        }
+    }
+}
+
+/// Set an explicit native IQ receiver RF span. Sample rate remains independent.
+/// # Safety
+/// ptr must be a live source, used exclusively for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_source_set_rf_span_hz(
+    ptr: *mut c_void,
+    hz: f64,
+) -> SpectranFfiError {
+    clear_last_error();
+    if ptr.is_null() {
+        return SpectranFfiError::InternalError;
+    }
+    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+    match ffi_block_on(source.set_rf_span_hz(hz)) {
+        Ok(Ok(_)) => SpectranFfiError::Success,
+        Ok(Err(error)) => {
+            set_last_error(error.to_string());
+            SpectranFfiError::InternalError
+        }
+        Err(error) => {
+            set_last_error(error);
+            SpectranFfiError::RuntimeContext
+        }
+    }
+}
+
+/// Native-only builder settings. NULL strings and zero span/decimation mean
+/// unset. These settings are checked against the opened device before writes.
+/// # Safety
+/// builder must be live; strings must be NULL or valid NUL-terminated UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_source_builder_native_options(
+    builder: *mut SpectranSourceBuilder,
+    family: *const c_char,
+    mode: *const c_char,
+    rf_span_hz: f64,
+    clock: *const c_char,
+    decimation: u32,
+) -> SpectranFfiError {
+    clear_last_error();
+    let Some(builder) = (unsafe { builder.as_mut() }) else {
+        return SpectranFfiError::InternalError;
+    };
+    let text = |value: *const c_char| -> std::result::Result<Option<String>, std::str::Utf8Error> {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .map(|s| Some(s.to_owned()))
+        }
+    };
+    let result = (|| {
+        Ok::<_, std::str::Utf8Error>(crate::capabilities::NativeReceiverOptions {
+            family: text(family)?,
+            mode: text(mode)?,
+            receiver_clock: text(clock)?,
+            rf_span_hz: (rf_span_hz != 0.0).then_some(rf_span_hz),
+            decimation_factor: (decimation != 0).then_some(decimation),
+        })
+    })();
+    match result {
+        Ok(options) => {
+            builder.native_options(options);
+            SpectranFfiError::Success
+        }
+        Err(error) => {
+            set_last_error(error.to_string());
+            SpectranFfiError::InternalError
+        }
+    }
+}
+
 // --- General FFI Utilities --- //
 
 /// Free a heap-allocated C string previously handed out by this library

@@ -124,6 +124,51 @@ impl PySpectranConfig {
         }
     }
 
+    #[setter]
+    fn set_native_family(&mut self, value: Option<String>) {
+        self.inner.native.family = value;
+    }
+    #[getter]
+    fn get_native_family(&self) -> Option<String> {
+        self.inner.native.family.clone()
+    }
+
+    #[setter]
+    fn set_native_mode(&mut self, value: Option<String>) {
+        self.inner.native.mode = value;
+    }
+    #[getter]
+    fn get_native_mode(&self) -> Option<String> {
+        self.inner.native.mode.clone()
+    }
+
+    #[setter]
+    fn set_rf_span_hz(&mut self, value: Option<f64>) {
+        self.inner.native.rf_span_hz = value;
+    }
+    #[getter]
+    fn get_rf_span_hz(&self) -> Option<f64> {
+        self.inner.native.rf_span_hz
+    }
+
+    #[setter]
+    fn set_receiver_clock(&mut self, value: Option<String>) {
+        self.inner.native.receiver_clock = value;
+    }
+    #[getter]
+    fn get_receiver_clock(&self) -> Option<String> {
+        self.inner.native.receiver_clock.clone()
+    }
+
+    #[setter]
+    fn set_decimation_factor(&mut self, value: Option<u32>) {
+        self.inner.native.decimation_factor = value;
+    }
+    #[getter]
+    fn get_decimation_factor(&self) -> Option<u32> {
+        self.inner.native.decimation_factor
+    }
+
     /// HTTP wire format: "F32", "F16", or "I16". Unknown values raise
     /// `ValueError` instead of silently defaulting.
     #[setter]
@@ -486,6 +531,47 @@ impl PySpectranSource {
             .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
         let rt = self.rt.clone();
         py.detach(|| rt.block_on(source.set_sample_rate_hz(rate_hz)))
+            .map_err(map_aaronia_err)
+    }
+
+    /// Device-provided native/HTTP capabilities, with schema version and
+    /// explicit nulls for unknown values. Blocking SDK work releases the GIL.
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
+        let rt = self.rt.clone();
+        let json = py
+            .detach(|| rt.block_on(source.device_capabilities()).to_json())
+            .map_err(map_aaronia_err)?;
+        py.import("json")?.call_method1("loads", (json,))
+    }
+
+    /// Actual sample geometry from the last returned buffer. RF width zero
+    /// means unknown and is independent of sample_rate_hz.
+    fn source_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
+        let info = source.source_info();
+        let result = pyo3::types::PyDict::new(py);
+        result.set_item("sample_rate_hz", info.sample_rate_hz)?;
+        result.set_item("bandwidth_hz", info.bandwidth_hz)?;
+        result.set_item("center_frequency_hz", info.center_frequency_hz)?;
+        result.set_item("device_serial", info.device_serial)?;
+        Ok(result)
+    }
+
+    /// Set native IQ receiver RF span independently of IQ sample rate.
+    fn set_rf_span_hz(&mut self, py: Python<'_>, hz: f64) -> PyResult<f64> {
+        let source = self
+            .source
+            .as_mut()
+            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
+        let rt = self.rt.clone();
+        py.detach(|| rt.block_on(source.set_rf_span_hz(hz)))
             .map_err(map_aaronia_err)
     }
 
