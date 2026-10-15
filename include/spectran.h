@@ -218,12 +218,11 @@ SpectranFfiError spectran_source_set_clock_source(SpectranSource* source, const 
 FfiSourceInfo* spectran_source_get_source_info(SpectranSource* source);
 void spectran_source_info_free(FfiSourceInfo* info);
 
-// Read the device's declared capabilities. BLOCKING: two control-plane
-// GETs, so call it once and cache. Returns NULL only for a null source
-// or when called from a current-thread tokio runtime; a device that
-// cannot be asked yields a struct with every field absent. Answers for
-// the HTTP backend — file and native-SDK sources report nothing, having
-// no equivalent surface to ask.
+// Read the device's declared capabilities. BLOCKING: control-plane or
+// SDK queries, so call it once and cache. Returns NULL only for a null
+// source or when called from a current-thread tokio runtime; a device
+// that cannot be asked yields a struct with every field absent. Answers
+// for both the HTTP and native-SDK backends; file sources report nothing.
 FfiDeviceCapabilities* spectran_source_get_capabilities(SpectranSource* source);
 void spectran_source_capabilities_free(FfiDeviceCapabilities* caps);
 

@@ -250,7 +250,7 @@ pub struct SpectranConfig {
     pub receiver_channel: Option<RxChannel>,
     /// How long a blocking read waits for samples before returning
     /// [`Error::Io`] with [`std::io::ErrorKind::TimedOut`]. Applies to
-    /// [`SpectranSource::read_samples`] on HTTP sources; the
+    /// [`SpectranSource::read_samples`] on HTTP and native-SDK sources; the
     /// deadline-taking reads ([`SpectranSource::read_samples_deadline`],
     /// and therefore the SoapySDR/seify paths) use their caller's
     /// timeout instead.
@@ -475,14 +475,9 @@ pub struct SpectranSource {
     /// dropped receiver is finally noticed.
     http_task: Option<tokio::task::JoinHandle<()>>,
     /// Latches `true` when a received HTTP chunk carried a detected
-    /// drop, until [`Self::take_overrun`] reads and clears it. A flat
-    /// per-call drop signal rather than a precise per-sample one: once
-    /// chunks are merged into `sample_buffer`, the exact boundary a
-    /// drop occurred at is no longer recoverable, so any drop observed
-    /// since the last check is reported on the next `read_samples`
-    /// call. Only the HTTP backend populates this today; the native
-    /// SDK and file backends always report `false` (see
-    /// [`Self::take_overrun`]).
+    /// drop, until [`Self::take_overrun`] reads and clears it.
+    /// Both the HTTP and native-SDK backends populate overrun detection
+    /// (see [`Self::take_overrun`]).
     pending_overrun: bool,
     /// Cumulative number of drops reported by the `DropDetector`.
     cumulative_drops: u64,
@@ -1030,17 +1025,19 @@ impl SpectranSource {
                                     let cfg = &packet.sdr_config;
                                     let mut obs =
                                         observed_for_task.lock().unwrap_or_else(|p| p.into_inner());
-                                    if cfg.sample_rate_hz > 0.0 {
+                                    if cfg.sample_rate_hz.is_finite() && cfg.sample_rate_hz > 0.0 {
                                         obs.sample_rate_hz = cfg.sample_rate_hz;
                                         rate_bits_for_task.store(
                                             cfg.sample_rate_hz.to_bits(),
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
                                     }
-                                    if cfg.center_frequency_hz > 0.0 {
+                                    if cfg.center_frequency_hz.is_finite()
+                                        && cfg.center_frequency_hz > 0.0
+                                    {
                                         obs.center_frequency_hz = cfg.center_frequency_hz;
                                     }
-                                    if cfg.bandwidth_hz > 0.0 {
+                                    if cfg.bandwidth_hz.is_finite() && cfg.bandwidth_hz > 0.0 {
                                         obs.bandwidth_hz = cfg.bandwidth_hz;
                                     }
                                 }
@@ -1053,7 +1050,9 @@ impl SpectranSource {
                                     crate::http_streaming::DropResult::Drop { .. }
                                         | crate::http_streaming::DropResult::Backward { .. }
                                 ) || std::mem::take(&mut flag_overrun_after_gap);
-                                let timestamp_ns = (packet.metadata.start_time * 1e9) as i64;
+                                let timestamp_ns =
+                                    crate::utils::epoch_seconds_to_nanos(packet.metadata.start_time)
+                                        .unwrap_or(0);
                                 let cumulative_drops = drop_detector.drops();
                                 // The capture frequency rides with the
                                 // samples it belongs to. Reading it from
@@ -1616,13 +1615,8 @@ impl SpectranSource {
                 any(target_os = "windows", target_os = "linux")
             ))]
             SourceType::NativeSdk => {
-                if let Some(ref mut source) = self.native_source {
-                    unsafe { source.read_samples(buffer, max_samples) }
-                } else {
-                    Err(Error::Config(
-                        "Native SDK source not initialized".to_string(),
-                    ))
-                }
+                self.read_samples_deadline(buffer, max_samples, self.config.read_timeout)
+                    .await
             }
             #[cfg(not(all(
                 feature = "native-sdk",
@@ -1660,9 +1654,9 @@ impl SpectranSource {
     }
 
     /// Read and clear whether a drop was detected since the last call.
-    /// Currently only the HTTP backend populates this (via the reader
-    /// task's `DropDetector`, watching for timestamp gaps between
-    /// packets); file and native-SDK backends always return `false`.
+    /// Both the HTTP backend (via the reader task's `DropDetector`) and
+    /// the native-SDK backend (via `AARTSAAPI_PACKET_STREAM_DROP` flags)
+    /// populate this; file sources always return `false`.
     /// Callers (e.g. `SdrSource` implementations) call this once per
     /// `read_samples` to tag the resulting `IqPacket::overrun`.
     pub fn take_overrun(&mut self) -> bool {
@@ -1925,6 +1919,9 @@ impl SpectranSource {
         if self.source_type == SourceType::File {
             return Ok(());
         }
+        if !hz.is_finite() || hz <= 0.0 {
+            return Err(Error::Config("setting must be positive and finite".into()));
+        }
         #[cfg(all(
             feature = "native-sdk",
             any(target_os = "windows", target_os = "linux")
@@ -1935,9 +1932,6 @@ impl SpectranSource {
                 .as_ref()
                 .is_some_and(|source| !source.is_device_open())
         {
-            if !hz.is_finite() {
-                return Err(Error::Config("setting must be finite".into()));
-            }
             self.config.center_frequency_hz = hz;
             return Ok(());
         }
@@ -2029,6 +2023,8 @@ impl SpectranSource {
             if !hz.is_finite() {
                 return Err(Error::Config("setting must be finite".into()));
             }
+            self.config.native.rf_span_hz = None;
+            self.config.native.decimation_factor = None;
             self.config.sample_rate_hz = hz;
             return Ok(());
         }
@@ -2039,15 +2035,19 @@ impl SpectranSource {
             ))]
             SourceType::NativeSdk => {
                 if let Some(ref mut source) = self.native_source {
+                    let mut options = self.config.native.clone();
+                    options.rf_span_hz = None;
+                    options.decimation_factor = None;
                     unsafe {
                         source.configure_iq_receiver_with_options(
                             self.config.center_frequency_hz,
                             hz,
                             self.config.reference_level_dbm,
                             self.config.receiver_channel,
-                            &self.config.native,
+                            &options,
                         )?
                     };
+                    self.config.native = options;
                 } else {
                     return Err(Error::Config(
                         "Native SDK source not initialized".to_string(),
@@ -2132,6 +2132,9 @@ impl SpectranSource {
         if self.source_type == SourceType::File {
             return Ok(());
         }
+        if !dbm.is_finite() {
+            return Err(Error::Config("setting must be finite".into()));
+        }
         #[cfg(all(
             feature = "native-sdk",
             any(target_os = "windows", target_os = "linux")
@@ -2142,9 +2145,6 @@ impl SpectranSource {
                 .as_ref()
                 .is_some_and(|source| !source.is_device_open())
         {
-            if !dbm.is_finite() {
-                return Err(Error::Config("setting must be finite".into()));
-            }
             self.config.reference_level_dbm = dbm;
             return Ok(());
         }
@@ -2491,21 +2491,17 @@ impl SpectranSource {
                 .map(|mut caps| {
                     caps.serial = self.config.device_serial.clone();
                     caps.device_mode = self
-                        .config
-                        .native
-                        .mode
+                        .native_source
                         .as_ref()
-                        .map(|mode| {
-                            format!(
-                                "{}/{mode}",
-                                self.config.native.family.as_deref().unwrap_or("unknown")
-                            )
-                        })
+                        .and_then(|source| source.open_mode())
+                        .map(|mode| mode.as_open_string().to_string())
                         .or_else(|| {
-                            self.native_source
-                                .as_ref()
-                                .and_then(|source| source.open_mode())
-                                .map(|mode| format!("{mode:?}"))
+                            self.config.native.mode.as_ref().map(|mode| {
+                                format!(
+                                    "{}/{mode}",
+                                    self.config.native.family.as_deref().unwrap_or("unknown")
+                                )
+                            })
                         });
                     caps
                 })

@@ -19,7 +19,7 @@ class SoapyAaronia < Formula
   # is nothing to build here and no Rust toolchain to depend on.
   on_macos do
     on_arm do
-      url "https://github.com/isaacbentley/sdr-aaronia-rs/releases/download/v#{version}/SoapyAaronia-#{version}-macos-arm64.tar.gz"
+      url "https://github.com/isaacbentley/sdr-aaronia-rs/releases/download/v#{version}/SoapyAaronia-#{version}-macos-arm64.dmg"
       sha256 "REPLACE_WITH_SHA256_OF_MACOS_ARM64_ARCHIVE"
     end
   end

@@ -2194,7 +2194,10 @@ impl RtsaSource {
                                             return Err(Error::FileFormat {
                                                 offset: 0,
                                                 reason: format!(
-                                                    "compressed DSPT_SPECTRA chunk at 0x{:08X}:                                                  in-band decompression is unsupported                                                  (proprietary format); export the file                                                  uncompressed via RTSAFileTool",
+                                                    "compressed DSPT_SPECTRA chunk at 0x{:08X}: \
+                                                     in-band decompression is unsupported \
+                                                     (proprietary format); export the file \
+                                                     uncompressed via RTSAFileTool",
                                                     offset
                                                 ),
                                             });
@@ -2579,6 +2582,12 @@ impl DsfhChunk {
 impl StrmChunk {
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32) -> Result<Self> {
         const HEADER_SIZE: u32 = 24;
+        if _size < HEADER_SIZE + 16 {
+            return Err(Error::FileFormat {
+                offset: 0,
+                reason: format!("STRM chunk size {_size} is smaller than minimum (40)"),
+            });
+        }
         let stream_id = reader.read_u64::<LittleEndian>()?;
         let start_time = reader.read_f64::<LittleEndian>()?;
         let stream_offset = reader.read_i64::<LittleEndian>()?;
@@ -2642,6 +2651,14 @@ impl SampChunk {
     }
 
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32, header_size: u16) -> Result<Self> {
+        if _size < 64 || header_size < 64 || (header_size as u32) > _size {
+            return Err(Error::FileFormat {
+                offset: 0,
+                reason: format!(
+                    "SAMP chunk size {_size} / header_size {header_size} is invalid (minimum 64)"
+                ),
+            });
+        }
         let stream_id = reader.read_u64::<LittleEndian>()?;
         let sub_stream_id = reader.read_u32::<LittleEndian>()?;
         let sample_type = DspStreamSampleType::try_from(reader.read_u8()?)?;
@@ -2687,6 +2704,12 @@ impl SampChunk {
 impl SstrChunk {
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32) -> Result<Self> {
         const HEADER_SIZE: u32 = 224;
+        if _size < HEADER_SIZE + 16 {
+            return Err(Error::FileFormat {
+                offset: 0,
+                reason: format!("SSTR chunk size {_size} is smaller than minimum (240)"),
+            });
+        }
         let stream_id = reader.read_u64::<LittleEndian>()?;
         let sub_stream_id = reader.read_u32::<LittleEndian>()?;
         reader.seek(SeekFrom::Current(4))?;
@@ -2773,6 +2796,12 @@ impl AntaChunk {
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32) -> Result<Self> {
         // Fixed fields: 8 + 8 + 128 + 8 + 8 + 4 + 4 + 64 + 16 = 248.
         const HEADER_SIZE: u32 = 248;
+        if _size < HEADER_SIZE + 16 {
+            return Err(Error::FileFormat {
+                offset: 0,
+                reason: format!("ANTA chunk size {_size} is smaller than minimum (264)"),
+            });
+        }
         let antenna_id = reader.read_u64::<LittleEndian>()?;
         let antenna_offset = reader.read_i64::<LittleEndian>()?;
         let mut name = [0u8; 128];
@@ -2857,6 +2886,12 @@ impl MdttChunk {
 
     fn read_from<R: Read + Seek>(reader: &mut R, size: u32) -> Result<Self> {
         const HEADER_SIZE: u32 = 16;
+        if size < HEADER_SIZE + 16 {
+            return Err(Error::FileFormat {
+                offset: 0,
+                reason: format!("MDTT chunk size {size} is smaller than minimum (32)"),
+            });
+        }
         let metadata_id = reader.read_u64::<LittleEndian>()?;
         let metadata_offset = reader.read_i64::<LittleEndian>()?;
 

@@ -262,6 +262,10 @@ impl PySpectranConfig {
         self.inner.http_base_url = url.clone();
         if url.is_some() {
             self.inner.force_source_type = Some(sdr_aaronia_rs::unified_source::SourceType::Http);
+        } else if self.inner.force_source_type
+            == Some(sdr_aaronia_rs::unified_source::SourceType::Http)
+        {
+            self.inner.force_source_type = None;
         }
     }
 
@@ -277,6 +281,10 @@ impl PySpectranConfig {
         self.inner.file_path = path.clone();
         if path.is_some() {
             self.inner.force_source_type = Some(sdr_aaronia_rs::unified_source::SourceType::File);
+        } else if self.inner.force_source_type
+            == Some(sdr_aaronia_rs::unified_source::SourceType::File)
+        {
+            self.inner.force_source_type = None;
         }
     }
 
@@ -406,6 +414,14 @@ struct PySpectranSource {
     read_scratch: Vec<Complex32>,
 }
 
+impl Drop for PySpectranSource {
+    fn drop(&mut self) {
+        if let Some(mut source) = self.source.take() {
+            let _ = self.rt.block_on(source.stop_streaming());
+        }
+    }
+}
+
 impl PySpectranSource {
     /// Clear the scratch, read up to `count` samples (GIL released),
     /// and return how many landed in `self.read_scratch[..n]`.
@@ -443,11 +459,15 @@ impl PySpectranSource {
     /// Connect to the backend selected by `config` and start streaming.
     /// Blocking (GIL released).
     fn start_streaming(&mut self, py: Python<'_>, config: &PySpectranConfig) -> PyResult<()> {
+        let prev = self.source.take();
         let rt = self.rt.clone();
         let config_inner = config.inner.clone();
         let source = py
             .detach(|| {
                 rt.block_on(async {
+                    if let Some(mut old) = prev {
+                        let _ = old.stop_streaming().await;
+                    }
                     let mut source = SpectranSource::new(config_inner).await?;
                     source.start_streaming().await?;
                     Ok::<_, AaroniaError>(source)
@@ -678,8 +698,9 @@ impl PySpectranSource {
         Ok(source.cumulative_drops())
     }
 
-    /// Timestamp (epoch ns) of the most recently received network
-    /// block. HTTP backend only; 0 when unavailable.
+    /// Timestamp (epoch ns) of the most recently received sample
+    /// block. Supported by the HTTP and native-SDK backends; 0 when
+    /// unavailable.
     fn last_timestamp_ns(&self) -> PyResult<i64> {
         let source = self
             .source

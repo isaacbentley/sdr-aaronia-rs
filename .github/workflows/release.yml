@@ -135,11 +135,19 @@ jobs:
       # python-aaronia builds abi3 wheels (pyo3 abi3-py39), so one
       # wheel per OS/arch covers CPython >= 3.9; the interpreter above
       # is only the build host.
-      - name: Build wheels
+      - name: Build wheels (Linux / Windows)
+        if: runner.os != 'macOS'
         uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release --features native-sdk --manifest-path python-aaronia/Cargo.toml --out dist
+
+      - name: Build wheels (macOS)
+        if: runner.os == 'macOS'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --manifest-path python-aaronia/Cargo.toml --out dist
 
       # Source distribution: pip's fallback for platforms/pythons the
       # wheel matrix doesn't cover.
@@ -323,6 +331,8 @@ jobs:
           cd soapy-aaronia/dist
           if [ "$RUNNER_OS" == "Windows" ]; then
             7z a -tzip "${stage}.zip" "$stage" >/dev/null
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            hdiutil create -volname "${stage}" -srcfolder "$stage" -ov -format UDZO "${stage}.dmg"
           else
             tar czf "${stage}.tar.gz" "$stage"
           fi
@@ -334,6 +344,7 @@ jobs:
           name: soapy-plugin-${{ matrix.os }}
           path: |
             soapy-aaronia/dist/*.zip
+            soapy-aaronia/dist/*.dmg
             soapy-aaronia/dist/*.tar.gz
 
   github-release:
@@ -379,7 +390,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           mkdir -p formula
-          mac="artifacts/SoapyAaronia-${version}-macos-arm64.tar.gz"
+          mac="artifacts/SoapyAaronia-${version}-macos-arm64.dmg"
           linux="artifacts/SoapyAaronia-${version}-linux-x86_64.tar.gz"
           for f in "$mac" "$linux"; do
             if [ ! -f "$f" ]; then
@@ -408,11 +419,11 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          # *.tar.gz covers both the Python sdist and the Unix plugin
-          # archives; the two never collide because the plugin archives
-          # are named SoapyAaronia-<version>-<os>-<arch>.
+          # *.tar.gz covers both the Python sdist and the Linux plugin
+          # archive; macOS ships as *.dmg and Windows as *.zip.
           files: |
             artifacts/*.whl
+            artifacts/*.dmg
             artifacts/*.tar.gz
             artifacts/*.zip
           body_path: release-notes.md

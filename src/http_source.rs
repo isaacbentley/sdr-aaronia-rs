@@ -1486,7 +1486,7 @@ impl HttpSource {
             // only (everything else was skipped above): a spectra header's
             // range is the displayed span, and a marker declares none.
             let center_hz = packet.sdr_config.center_frequency_hz;
-            if center_hz > 0.0 {
+            if center_hz.is_finite() && center_hz > 0.0 {
                 self.current_frequency = center_hz;
             }
 
@@ -1499,8 +1499,11 @@ impl HttpSource {
             // link check into restarting on every interleaved packet and
             // hand it a nonsense yardstick on non-IQ-dominated streams.
             let inferred_rate = packet.sdr_config.sample_rate_hz;
-            self.note_device_rate(inferred_rate);
-            if inferred_rate > 0.0
+            if inferred_rate.is_finite() {
+                self.note_device_rate(inferred_rate);
+            }
+            if inferred_rate.is_finite()
+                && inferred_rate > 0.0
                 && (self.current_sample_rate <= 0.0
                     || rate_moved(self.current_sample_rate, inferred_rate))
             {
@@ -2128,7 +2131,7 @@ impl HttpSource {
             reference_level_dbm: self.reference_level_dbm,
         };
 
-        match self.endpoints_client.apply_capture_config(&request).await {
+        let need_control_fallback = match self.endpoints_client.apply_capture_config(&request).await {
             Ok(applied) => {
                 info!(
                     "RTSA device reports center={:?} Hz, decimation={:?}, \
@@ -2142,24 +2145,35 @@ impl HttpSource {
                 // Compare against what was asked for. Tuning is snapped by the
                 // hardware, so an exact match is not required — but a value
                 // that did not move at all means the write was accepted and
-                // discarded, which is the failure this read-back exists to
-                // catch.
+                // discarded (e.g. when the RTSA-Suite /remoteconfig endpoint is
+                // unlicensed: https://aaronia.com/en/software-licence-remote-config),
+                // which is the failure this read-back exists to catch.
+                let mut did_not_take = false;
                 if let (Some(want), Some(got)) =
                     (request.center_frequency_hz, applied.center_frequency_hz)
                     && (want - got).abs() > 1e3
                 {
                     warn!(
-                        "Centre frequency did not take: asked {:.6} MHz, device reports {:.6} MHz",
+                        "Centre frequency did not take via /remoteconfig (asked {:.6} MHz, \
+                         device reports {:.6} MHz; note that /remoteconfig requires a license: \
+                         https://aaronia.com/en/software-licence-remote-config)",
                         want / 1e6,
                         got / 1e6
                     );
+                    did_not_take = true;
                 }
                 if let (Some(want), Some(got)) =
                     (request.decimation_index, applied.decimation_index)
                     && want != got
                 {
-                    warn!("Span did not take: asked decimation index {want}, device reports {got}");
+                    warn!(
+                        "Span did not take via /remoteconfig (asked decimation index {want}, \
+                         device reports {got}; note that /remoteconfig requires a license: \
+                         https://aaronia.com/en/software-licence-remote-config)"
+                    );
+                    did_not_take = true;
                 }
+                did_not_take
             }
             Err(e) => {
                 // No block carrying `centerfreq0` (an IQ-demodulator mission
@@ -2174,35 +2188,58 @@ impl HttpSource {
                     "Could not tune via /remoteconfig ({e}); falling back to the \
                      unverified /control capture command"
                 );
-                // Only what was asked for, as the `/remoteconfig` request
-                // above does: an unset (non-positive) centre or span is
-                // omitted, not sent as a command to tune to 0 Hz.
-                let control = crate::http_endpoints::CaptureControl {
-                    frequency_center_hz: (center_hz > 0.0).then_some(center_hz),
-                    frequency_span_hz: (rate_hz > 0.0).then_some(rate_hz),
-                    reference_level_dbm: self.reference_level_dbm.map(|dbm| dbm as f32),
-                    control_type: crate::http_endpoints::ControlType::Capture,
-                    ..Default::default()
-                };
-                if control.frequency_center_hz.is_none()
-                    && control.frequency_span_hz.is_none()
-                    && control.reference_level_dbm.is_none()
-                {
-                    return;
-                }
-                let fallback = self.endpoints_client.configure_capture(control).await;
-                match fallback {
-                    Ok(_) => info!(
-                        "/control capture accepted (unverified: the server answers \
-                         success whether or not a block applied it)"
-                    ),
-                    Err(e) => warn!(
-                        "/control capture also failed: {e}. Streaming from whatever \
-                         the device is currently tuned to."
-                    ),
-                }
+                true
+            }
+        };
+
+        if need_control_fallback {
+            // Only what was asked for, as the `/remoteconfig` request
+            // above does: an unset (non-positive) centre or span is
+            // omitted, not sent as a command to tune to 0 Hz.
+            let control = crate::http_endpoints::CaptureControl {
+                frequency_center_hz: (center_hz > 0.0).then_some(center_hz),
+                frequency_span_hz: (rate_hz > 0.0).then_some(rate_hz),
+                reference_level_dbm: self.reference_level_dbm.map(|dbm| dbm as f32),
+                control_type: crate::http_endpoints::ControlType::Capture,
+                ..Default::default()
+            };
+            if control.frequency_center_hz.is_none()
+                && control.frequency_span_hz.is_none()
+                && control.reference_level_dbm.is_none()
+            {
+                return;
+            }
+            let fallback = self.endpoints_client.configure_capture(control).await;
+            match fallback {
+                Ok(_) => info!(
+                    "/control capture accepted (unverified: the server answers \
+                     success whether or not a block applied it)"
+                ),
+                Err(e) => warn!(
+                    "/control capture also failed: {e}. Streaming from whatever \
+                     the device is currently tuned to."
+                ),
             }
         }
+    }
+}
+
+struct WithTokioHandle<F> {
+    handle: Option<tokio::runtime::Handle>,
+    future: F,
+}
+
+impl<F: std::future::Future> std::future::Future for WithTokioHandle<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: `future` is structurally pinned and never moved out of `self`.
+        let this = unsafe { self.get_unchecked_mut() };
+        let _guard = this.handle.as_ref().map(|h| h.enter());
+        unsafe { std::pin::Pin::new_unchecked(&mut this.future) }.poll(cx)
     }
 }
 
@@ -2213,12 +2250,16 @@ impl Kernel for HttpSource {
         _meta: &mut futuresdr::runtime::BlockMeta,
     ) -> anyhow::Result<()> {
         info!("HttpSource: INITIALIZED - Starting HTTP stream connection");
+        // Enter the Tokio runtime context on each poll via `WithTokioHandle`
+        // rather than calling `block_on`: `init` is an `async fn` whose future
+        // must be `Send`, and `block_on` panics when the caller's executor is
+        // itself a Tokio runtime.
         let handle = self.tokio_handle.clone();
-        if let Some(handle) = handle {
-            handle.block_on(async { self.start_stream().await })?;
-        } else {
-            self.start_stream().await?;
+        WithTokioHandle {
+            handle,
+            future: self.start_stream(),
         }
+        .await?;
         info!("HttpSource: HTTP streaming connection established successfully");
         Ok(())
     }
@@ -2249,8 +2290,9 @@ impl Kernel for HttpSource {
             // chunk, via `get_stream_stats`.)
             self.link_check = LinkCheck::Unmeasured;
             let handle = self.tokio_handle.clone();
-            if let Some(h) = handle {
-                h.block_on(async {
+            WithTokioHandle {
+                handle,
+                future: async {
                     self.cleanup_stream().await;
                     self.stream_active = false;
                     self.sample_buffer.clear();
@@ -2261,19 +2303,9 @@ impl Kernel for HttpSource {
                             e
                         );
                     }
-                });
-            } else {
-                self.cleanup_stream().await;
-                self.stream_active = false;
-                self.sample_buffer.clear();
-                self.note_buffer_cleared();
-                if let Err(e) = self.start_stream().await {
-                    warn!(
-                        "Failed to restart stream during configuration change: {}",
-                        e
-                    );
-                }
+                },
             }
+            .await;
         }
 
         {
@@ -2343,11 +2375,11 @@ impl Kernel for HttpSource {
                 None
             };
             let handle = self.tokio_handle.clone();
-            let fetch_res = if let Some(handle) = handle {
-                handle.block_on(async { self.fetch_samples(wait).await })
-            } else {
-                self.fetch_samples(wait).await
-            };
+            let fetch_res = WithTokioHandle {
+                handle,
+                future: self.fetch_samples(wait),
+            }
+            .await;
 
             match fetch_res {
                 Ok(fetched) => {
@@ -2370,19 +2402,18 @@ impl Kernel for HttpSource {
                     // reconnect needs. `cleanup_stream` aborts it, and is
                     // idempotent when the StreamClosed path already ran it.
                     let handle = self.tokio_handle.clone();
-                    if let Some(h) = handle {
-                        h.block_on(async { self.cleanup_stream().await });
-                    } else {
-                        self.cleanup_stream().await;
+                    WithTokioHandle {
+                        handle: handle.clone(),
+                        future: self.cleanup_stream(),
                     }
+                    .await;
                     // Try to reconnect after a delay
                     futures_timer::Delay::new(std::time::Duration::from_millis(1000)).await;
-                    let handle = self.tokio_handle.clone();
-                    let reconnect_res = if let Some(handle) = handle {
-                        handle.block_on(async { self.start_stream().await })
-                    } else {
-                        self.start_stream().await
-                    };
+                    let reconnect_res = WithTokioHandle {
+                        handle,
+                        future: self.start_stream(),
+                    }
+                    .await;
                     if let Err(reconnect_err) = reconnect_res {
                         warn!("Failed to reconnect: {}", reconnect_err);
                     }

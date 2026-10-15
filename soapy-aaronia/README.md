@@ -20,7 +20,7 @@ it:
 | Platform | Archive |
 | --- | --- |
 | Linux x86-64 | `SoapyAaronia-<version>-linux-x86_64.tar.gz` |
-| macOS (Apple silicon) | `SoapyAaronia-<version>-macos-arm64.tar.gz` |
+| macOS (Apple silicon) | `SoapyAaronia-<version>-macos-arm64.dmg` |
 | Windows x86-64 | `SoapyAaronia-<version>-windows-x86_64.zip` |
 
 The Linux module is built on Ubuntu 24.04 and needs glibc 2.38 or

@@ -1597,6 +1597,20 @@ impl DeviceOpenMode {
         }
     }
 
+    /// Canonical `family/mode` string corresponding to this open mode.
+    pub fn as_open_string(&self) -> &str {
+        match self {
+            Self::Raw => "spectranv6/raw",
+            Self::EcoRaw => "spectranv6eco/raw",
+            Self::IqReceiver => "spectranv6/iqreceiver",
+            Self::EcoRtsa => "spectranv6eco/rtsa",
+            Self::EcoIqReceiver => "spectranv6eco/iqreceiver",
+            Self::Sweepsa => "spectranv6/sweepsa",
+            Self::EcoSweepsa => "spectranv6eco/sweepsa",
+            Self::Other(s) => s.as_str(),
+        }
+    }
+
     /// Whether the `device/receiverchannel`, `device/outputformat`,
     /// `device/receiverclock`, and `main/decimation` config keys are
     /// applicable on this mode. Per the official samples, only `raw` mode
@@ -2408,6 +2422,10 @@ impl NativeSdkSource {
             let mut caps = DeviceCapabilities {
                 transport: Some("native-sdk".into()),
                 sdk_version: Some(self.client.get_version()),
+                device_mode: self
+                    .open_mode
+                    .as_ref()
+                    .map(|mode| mode.as_open_string().to_string()),
                 center_frequency_hz: range("main/centerfreq"),
                 rf_span_hz: range("main/spanfreq"),
                 reference_level_dbm: range("main/reflevel"),
@@ -2806,6 +2824,11 @@ impl NativeSdkSource {
                     decimation_index(factor)? as i64,
                 )?;
             }
+            // Drop any carried-over samples from before this reconfiguration/retune
+            // so the next read does not hand back stale samples from the previous
+            // frequency or sample rate.
+            self.sample_buffer.clear();
+            self.dual_sample_buffer.clear();
             info!("IQ Receiver configuration completed");
             Ok(())
         }
@@ -2931,7 +2954,7 @@ impl NativeSdkSource {
     /// End time of the most recent packet in nanoseconds since the
     /// epoch, or 0 before any packet.
     pub fn last_timestamp_ns(&self) -> i64 {
-        (self.last_packet_end_time_s * 1e9) as i64
+        crate::utils::epoch_seconds_to_nanos(self.last_packet_end_time_s).unwrap_or(0)
     }
 
     /// The receiver clock in Hz, once the device has been configured.
@@ -3015,7 +3038,8 @@ impl NativeSdkSource {
                 let total = frames.checked_mul(bins).filter(|n| *n <= MAX_VALUES);
                 let Some(total) = total else {
                     return Err(Error::Sdk(format!(
-                        "spectra packet claims {frames} frames of {bins} bins,                          which exceeds the {MAX_VALUES}-value limit"
+                        "spectra packet claims {frames} frames of {bins} bins, \
+                         which exceeds the {MAX_VALUES}-value limit"
                     )));
                 };
                 // `stride` is floats from frame to frame; `size` is the
@@ -3218,13 +3242,6 @@ impl NativeSdkSource {
                     packet.step_frequency,
                     packet.span_frequency,
                 );
-                // Leave the first packet of a new geometry in the SDK queue.
-                // Each returned buffer, including a carried packet tail, has
-                // one frequency mapping. Do not relabel old IQ with new metadata.
-                if got_packet && read_geometry != geometry {
-                    break;
-                }
-                got_packet = true;
                 // `stride` is "floats from sample to sample". A tightly packed
                 // IQ pair is 2; interleaved multi-channel layouts are a small
                 // multiple. Accept only that range: a stride < 2 is a non-IQ
@@ -3236,6 +3253,16 @@ impl NativeSdkSource {
                 // not a tight spec bound.
                 const MAX_IQ_STRIDE: i64 = 4096;
                 let valid_iq_stride = (2..=MAX_IQ_STRIDE).contains(&packet.stride);
+                let has_valid_samples =
+                    !packet.fp32.is_null() && packet.num > 0 && valid_iq_stride;
+                // Leave the first packet of a new geometry in the SDK queue.
+                // Each returned buffer, including a carried packet tail, has
+                // one frequency mapping. Do not relabel old IQ with new metadata.
+                // Only check geometry once we already have valid samples in hand
+                // and the incoming packet also carries valid samples.
+                if got_packet && has_valid_samples && read_geometry != geometry {
+                    break;
+                }
                 if !packet.fp32.is_null() && packet.num > 0 && !valid_iq_stride {
                     // Consume it without mis-reading pairs out of it. Its
                     // samples are lost as surely as a `WARN_DROPPED`
@@ -3285,7 +3312,8 @@ impl NativeSdkSource {
                         packet.flags & tx_flags::TIME_DISCONTINUITY != 0,
                     );
                 }
-                if !packet.fp32.is_null() && packet.num > 0 && valid_iq_stride {
+                if has_valid_samples {
+                    got_packet = true;
                     const MAX_SAMPLES: usize = 1 << 24;
                     // Bound-check `packet.num` *before* multiplying so a garbage
                     // or hostile count can't overflow the `i64` multiply itself.
@@ -3516,14 +3544,15 @@ impl NativeSdkSource {
                     packet.step_frequency,
                     packet.span_frequency,
                 );
+                let has_valid_samples = !packet.fp32.is_null() && packet.num > 0;
                 // Leave the first packet of a new geometry in the SDK queue.
                 // Each returned buffer, including a carried packet tail, has
                 // one frequency mapping. Do not relabel old IQ with new metadata.
-                if got_packet && read_geometry != geometry {
+                if got_packet && has_valid_samples && read_geometry != geometry {
                     break;
                 }
-                got_packet = true;
-                if !packet.fp32.is_null() && packet.num > 0 {
+                if has_valid_samples {
+                    got_packet = true;
                     // Same corruption backstop as `read_samples`; the
                     // dual lower bound (4 floats per sample) is enforced
                     // by `deinterleave_dual_iq` with a clearer error.

@@ -127,12 +127,22 @@ impl HttpSink {
         auth_method: AuthMethod,
         streaming_delay: f64,
     ) -> Result<Self> {
+        if !sample_rate_hz.is_finite() || sample_rate_hz <= 0.0 {
+            return Err(crate::Error::Config(
+                "sample_rate_hz must be positive and finite".to_string(),
+            ));
+        }
+        if !center_frequency_hz.is_finite() || center_frequency_hz <= 0.0 {
+            return Err(crate::Error::Config(
+                "center_frequency_hz must be positive and finite".to_string(),
+            ));
+        }
         let buffer_size = buffer_size.max(1);
         let endpoints_client = HttpEndpointsClient::new(base_url, auth_method)?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs_f64();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<f32>, f64, f64)>(16);

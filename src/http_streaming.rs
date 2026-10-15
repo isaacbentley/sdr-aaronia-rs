@@ -368,21 +368,29 @@ impl PacketMetadata {
     /// start and end times) from producing Inf/NaN.
     pub fn sample_rate_hz(&self) -> f64 {
         let duration = self.end_time - self.start_time;
-        self.sample_frequency.unwrap_or(if duration > 0.0 {
+        let rate = self.sample_frequency.unwrap_or(if duration.is_finite() && duration > 0.0 {
             self.samples as f64 / duration
         } else {
             0.0
-        })
+        });
+        if rate.is_finite() && rate > 0.0 {
+            rate
+        } else {
+            0.0
+        }
     }
 }
 
 impl StreamingSdrConfig {
     /// Create SDR config from packet metadata
     pub fn from_metadata(metadata: &PacketMetadata) -> Self {
-        let center_frequency_hz = (metadata.start_frequency + metadata.end_frequency) / 2.0;
-        let bandwidth_hz = metadata.end_frequency - metadata.start_frequency;
+        let raw_center = (metadata.start_frequency + metadata.end_frequency) / 2.0;
+        let center_frequency_hz = if raw_center.is_finite() { raw_center } else { 0.0 };
+        let raw_bw = metadata.end_frequency - metadata.start_frequency;
+        let bandwidth_hz = if raw_bw.is_finite() && raw_bw >= 0.0 { raw_bw } else { 0.0 };
         let duration = metadata.end_time - metadata.start_time;
-        let duration_ms = duration * 1000.0;
+        let raw_duration_ms = duration * 1000.0;
+        let duration_ms = if raw_duration_ms.is_finite() { raw_duration_ms } else { 0.0 };
         let sample_rate_hz = metadata.sample_rate_hz();
         let antenna_name = metadata
             .antenna
@@ -1396,9 +1404,9 @@ impl StreamParser {
                 .0
                 .iter()
                 .map(|chunk| {
-                    let i_raw = f16::from_le_bytes([chunk[0], chunk[1]]);
-                    let q_raw = f16::from_le_bytes([chunk[2], chunk[3]]);
-                    Complex32::new(i_raw.to_f32(), q_raw.to_f32())
+                    let i = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+                    let q = f16::from_le_bytes([chunk[2], chunk[3]]).to_f32();
+                    Complex32::new(i, q)
                 })
                 .collect())
         }
@@ -1516,14 +1524,14 @@ impl StreamParser {
             }
             StreamFormat::Float16 => {
                 for chunk in data_to_parse.as_chunks::<2>().0 {
-                    let val_raw = f16::from_le_bytes([chunk[0], chunk[1]]);
-                    samples.push(Complex32::new(val_raw.to_f32(), 0.0));
+                    let val = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+                    samples.push(Complex32::new(if val.is_finite() { val } else { 0.0 }, 0.0));
                 }
             }
             StreamFormat::Float32 => {
                 for chunk in data_to_parse.as_chunks::<4>().0 {
                     let val = f32::from_le_bytes(*chunk);
-                    samples.push(Complex32::new(val, 0.0));
+                    samples.push(Complex32::new(if val.is_finite() { val } else { 0.0 }, 0.0));
                 }
             }
             StreamFormat::Json => {
@@ -1572,7 +1580,10 @@ impl StreamParser {
                     .map(|v| {
                         v.as_f64()
                             .ok_or_else(|| Error::Protocol("Invalid sample value".to_string()))
-                            .map(|f| f as f32)
+                            .map(|f| {
+                                let f = f as f32;
+                                if f.is_finite() { f } else { 0.0 }
+                            })
                     })
                     .collect();
 
@@ -1591,7 +1602,10 @@ impl StreamParser {
                             let val = value.as_f64().ok_or_else(|| {
                                 Error::Protocol("Invalid spectrum value".to_string())
                             })? as f32;
-                            samples.push(Complex32::new(val, 0.0));
+                            samples.push(Complex32::new(
+                                if val.is_finite() { val } else { 0.0 },
+                                0.0,
+                            ));
                         }
                     }
                 }
@@ -1605,7 +1619,10 @@ impl StreamParser {
                         .as_f64()
                         .ok_or_else(|| Error::Protocol("Invalid value".to_string()))?
                         as f32;
-                    samples.push(Complex32::new(val, 0.0));
+                    samples.push(Complex32::new(
+                        if val.is_finite() { val } else { 0.0 },
+                        0.0,
+                    ));
                 }
                 Ok(samples)
             }

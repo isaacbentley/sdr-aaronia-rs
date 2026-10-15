@@ -531,10 +531,9 @@ bool SpectranSoapyDevice::hasHardwareTime(const std::string &what) const {
         // and readStream already answers it per buffer, which is the
         // signal that governs the data an application actually stamps.
         //
-        // HTTP only: the timestamp is read from the RTSA packet header,
-        // and the file and native-SDK sources never set one — answering
-        // true for them is the 1970 bug again, on two backends.
-        return _sourceType == Http;
+        // HTTP and Native-SDK both read timestamps from packet headers;
+        // file sources never set one.
+        return _sourceType == Http || _sourceType == NativeSdk;
     }
     return false;
 }

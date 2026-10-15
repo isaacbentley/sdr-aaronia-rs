@@ -30,6 +30,16 @@ struct Tuning {
     reference_level_dbm: f64,
 }
 
+fn block_on<F: std::future::Future>(runtime: &Runtime, fut: F) -> F::Output {
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| runtime.block_on(fut))
+    } else {
+        runtime.block_on(fut)
+    }
+}
+
 /// Seify device wrapper around [`SpectranSource`]. `Clone` shares the
 /// underlying source/runtime/tuning (required by seify's
 /// `Device::from_impl`).
@@ -91,11 +101,10 @@ impl SpectranSeifyDevice {
             receiver_clock: args.get::<String>("receiver_clock").ok(),
             decimation_factor: args.get::<u32>("decimation").ok(),
         });
-        let source = runtime
-            .block_on(builder.build())
+        let source = block_on(&runtime, builder.build())
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
 
-        let capabilities = Arc::new(runtime.block_on(source.device_capabilities()));
+        let capabilities = Arc::new(block_on(&runtime, source.device_capabilities()));
         Ok(Self {
             capabilities,
             source: Arc::new(Mutex::new(source)),
@@ -146,7 +155,12 @@ impl FrequencyControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(self.tuning.lock().unwrap().center_frequency_hz)
+        Ok(self
+            .source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .source_info()
+            .center_frequency_hz)
     }
 
     fn frequency_range(
@@ -212,11 +226,13 @@ impl FrequencyControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        let mut source = self.source.lock().unwrap();
-        self.runtime
-            .block_on(source.set_center_frequency_hz(frequency))
+        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+        block_on(&self.runtime, source.set_center_frequency_hz(frequency))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
-        self.tuning.lock().unwrap().center_frequency_hz = frequency;
+        self.tuning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .center_frequency_hz = frequency;
         Ok(())
     }
 }
@@ -232,7 +248,11 @@ impl SampleRateControl for SpectranSeifyDevice {
         }
         // The rate the device streams, once packets flow, not the one
         // asked for: the device snaps requests to its ladder.
-        Ok(self.source.lock().unwrap().sample_rate_hz())
+        Ok(self
+            .source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sample_rate_hz())
     }
 
     fn get_sample_rate_range(
@@ -262,11 +282,13 @@ impl SampleRateControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        let mut source = self.source.lock().unwrap();
-        self.runtime
-            .block_on(source.set_sample_rate_hz(rate))
+        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+        block_on(&self.runtime, source.set_sample_rate_hz(rate))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
-        self.tuning.lock().unwrap().sample_rate_hz = rate;
+        self.tuning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sample_rate_hz = rate;
         Ok(())
     }
 }
@@ -280,7 +302,12 @@ impl GainControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(Some(self.tuning.lock().unwrap().reference_level_dbm))
+        Ok(Some(
+            self.tuning
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reference_level_dbm,
+        ))
     }
 
     fn gain_elements(
@@ -345,11 +372,13 @@ impl GainControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        let mut source = self.source.lock().unwrap();
-        self.runtime
-            .block_on(source.set_reference_level_dbm(gain))
+        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+        block_on(&self.runtime, source.set_reference_level_dbm(gain))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
-        self.tuning.lock().unwrap().reference_level_dbm = gain;
+        self.tuning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reference_level_dbm = gain;
         Ok(())
     }
 }
@@ -397,17 +426,15 @@ impl RxStreamer for SpectranSeifyRxStreamer {
     }
 
     fn activate_at(&mut self, _time_ns: Option<i64>) -> std::result::Result<(), seify::Error> {
-        let mut source = self.source.lock().unwrap();
-        self.runtime
-            .block_on(source.start_streaming())
+        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+        block_on(&self.runtime, source.start_streaming())
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
         Ok(())
     }
 
     fn deactivate_at(&mut self, _time_ns: Option<i64>) -> std::result::Result<(), seify::Error> {
-        let mut source = self.source.lock().unwrap();
-        self.runtime
-            .block_on(source.stop_streaming())
+        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+        block_on(&self.runtime, source.stop_streaming())
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
         Ok(())
     }
@@ -425,7 +452,7 @@ impl RxStreamer for SpectranSeifyRxStreamer {
         if buffers.is_empty() {
             return Ok(0);
         }
-        let mut source = self.source.lock().unwrap();
+        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
         let buf = &mut buffers[0];
 
         // Honour the caller's timeout (a non-positive value gets a
@@ -441,9 +468,10 @@ impl RxStreamer for SpectranSeifyRxStreamer {
         // per read — this runs at the stream rate.
         let mut temp = source.take_scratch();
         temp.reserve(buf.len());
-        let outcome =
-            self.runtime
-                .block_on(source.read_samples_deadline(&mut temp, buf.len(), timeout));
+        let outcome = block_on(
+            &self.runtime,
+            source.read_samples_deadline(&mut temp, buf.len(), timeout),
+        );
         let read = match outcome {
             Ok(read) => read,
             Err(e) => {

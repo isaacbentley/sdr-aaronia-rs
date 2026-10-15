@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.13.2] - 2026-10-15
+
+### Fixed
+- `HttpEndpointsClient` now configures `.no_proxy()` on `reqwest::Client`, preventing corporate/system `HTTP_PROXY` environment variables from hijacking localhost or LAN RTSA-Suite connections.
+- `HttpSource` (`FutureSDR` block) wraps its async `init`/`work` bodies in a poll-scoped Tokio context guard (`WithTokioHandle`) instead of calling `Handle::block_on`, preventing nested runtime panics when driven inside a Tokio worker thread.
+- `HttpSource::apply_initial_tune` now falls back to `/control` (`configure_capture`) when `/remoteconfig` returns HTTP 200 without applying `center_frequency_hz` or `decimation_index` (unlicensed `/remoteconfig`; see https://aaronia.com/en/software-licence-remote-config) as well as on transport errors.
+- Guarded HTTP streaming metadata and sample payloads (`float16`, `float32`, spectrum, and JSON paths) against non-finite (`NaN`/`±Inf`) values so corrupt headers or sample words cannot poison downstream DSP state or observed stream geometry.
+- `NativeSdkSource` now clears carry-over sample buffers on `configure_iq_receiver_with_options`, uses precision-preserving `epoch_seconds_to_nanos` for `last_timestamp_ns`, populates `device_mode` in `device_capabilities`, and prevents empty or invalid-stride packets from prematurely latching `got_packet` during deadline reads.
+- `SpectranSource::read_samples` now honours `config.read_timeout` on the `NativeSdk` backend via `read_samples_deadline`, validates finite tuning inputs across all backends, and clears stale `rf_span_hz`/`decimation_factor` overrides when `set_sample_rate_hz` is called.
+- Hardened RTSA chunk parsers (`STRM`, `SAMP`, `SSTR`, `ANTA`, `MDTT`) with minimum header size checks to reject truncated chunk headers before seeking.
+- `SpectranSeifyDevice` now uses `tokio::task::block_in_place` when called from a multi-thread Tokio runtime, recovers poisoned mutex locks, and reports observed file/stream frequencies in `frequency()`.
+- `python-aaronia` now clears `force_source_type` when `http_base_url` or `file_path` is reset to `None`, and stops any active stream on `start_streaming` re-entry or `Drop`.
+- macOS SoapySDR release artifacts are now packaged as `.dmg` disk images instead of `.tar.gz`, and macOS Python wheels build cleanly without the Linux/Windows-only `native-sdk` feature.
+
 ## [v0.13.1] - 2026-10-08
 
 ### Added

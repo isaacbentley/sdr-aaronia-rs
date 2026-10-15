@@ -112,6 +112,11 @@ pub(crate) fn rtsa_client_builder(connect_timeout: std::time::Duration) -> reqwe
         // measure and blame on the path. The adaptive window sizes itself
         // to the bandwidth-delay product instead.
         .http2_adaptive_window(true)
+        // RTSA-Suite servers sit on localhost or the operator's direct LAN;
+        // routing loopback/LAN control or `/stream` requests through an
+        // ambient HTTP_PROXY/ALL_PROXY breaks local connections and adds
+        // proxy buffering to real-time IQ streams.
+        .no_proxy()
 }
 
 /// Validate a base URL before any RTSA connection is opened: parseable,
