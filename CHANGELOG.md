@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.13.3] - 2026-11-10
+
+### Added
+- `SpectranSource::new_with_options`, `SpectranSourceBuilder::listen_only`, `spectran_source_builder_listen_only`, SoapySDR `listen_only` device arg, and Python `SpectranSource.listen_only` to connect to HTTP streams without issuing `/remoteconfig` or `/control` tuning writes.
+- `SdkSink` and `SpectranSink` serial selection (`device_serial` / `spectran_sink_builder_device_serial`) plus C ABI TX controls (`spectran_sink_set_center_frequency_hz`, `spectran_sink_set_sample_rate_hz`, `spectran_sink_set_trans_gain_db`, `spectran_sink_get_master_stream_time_ns`) and full SoapySDR TX frequency, sample-rate, gain, serial, and burst-timestamp support.
+- `AARONIA_NATIVE_SDK=ON` enabled by default on 64-bit Linux and Windows SoapySDR builds (including CI and release artifacts), and crate-root re-exports completed across `sdr-aaronia-rs`.
+
+### Fixed
+- Wrapped all 48 `extern "C" spectran_*` entry points in `catch_unwind`, made `FFI_RUNTIME` initialization fallible and `LocalSet`-safe, saturated `Instant` read deadlines, and tightened `SpectranSource *` pointer typing and alignment checks in `include/spectran.h` and `src/c_api.rs`.
+- Serialized concurrent `&self` C++ config-tree queries on `NativeSdk` via `device_query_lock`, bounded `num * stride` and validated `fp32` alignment and negative `packet.size` in `read_samples_within`, guarded null config nodes and NUL-terminated device serials, preserved SDK refcounts and intentionally leaked `libloading::Library` on failed teardown, rolled back partial device/packet state on errors, supported `iqtransceiver` RX mode, and reset carry buffers on `set_rf_span_hz`.
+- Replaced `PySpectranSource` `RefCell` state with a `Mutex` acquired exclusively inside `py.detach(...)` and detached the GIL with a bounded `shutdown_timeout` in `Drop`, eliminating re-entrant borrow panics, `pyo3-log` ABBA GIL deadlocks, and runtime teardown hangs; declared `numpy` and optional `pyarrow` dependencies in `python-aaronia/pyproject.toml`.
+- Eliminated the `StreamParser::skip_bytes` black-hole DoS when binary packet headers exceed `MAX_BINARY_PAYLOAD` by resynchronizing via `find_next_header`, sanitized `NaN`/`±Inf` binary floats to `0.0`, trimmed trailing URL slashes, validated `http`/`https` schemes, skipped redundant `/remoteconfig` writes + 500 ms sleeps on HTTP reconnect, dynamically discovered `Block_*` nodes while tolerating unlicensed `/remoteconfig`, and supported wideband V6 HTTP sample rates.
+- Flushed queued HTTP TX batches before `FutureSDR` sink teardown instead of aborting in-flight frames, and fixed `SdkSinkBlock` zero-burst livelocks, monotonic burst timestamp scheduling, and `io.call_again` signaling.
+- Added single-wavelet-block decompression support for compressed `.rtsa` `Spectra` chunks, pinned default multi-substream file cursor reads/seeks to the primary sub-stream, skipped non-IQ `Spectra` chunks in `SpectranSource` file reads, and stepped up out of `<install>/sdk` when locating RTSA XML configs and `RTSAFileTool`.
+- Mounted `.dmg` disk images via `hdiutil` in `packaging/homebrew/soapy-aaronia.rb` with architecture guards and dynamic SoapySDR module ABI detection.
+- Updated `rustls` (`0.23.46`), `rustls-webpki` (`0.103.16`), `tokio` (`1.54.1`), `webpki-root-certs` (`1.0.12`), and `async-executor` (`1.14.1`) in `Cargo.lock` to resolve RustSec advisories and yanked crate entries.
+
 ## [v0.13.2] - 2026-10-15
 
 ### Fixed
