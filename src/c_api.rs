@@ -38,6 +38,33 @@ fn clear_last_error() {
     LAST_ERROR.with(|e| *e.borrow_mut() = None);
 }
 
+/// Extract a human-readable message from an arbitrary Rust panic payload.
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+/// Catch any Rust panic before it can unwind across an `extern "C"` boundary
+/// (which is immediate undefined behaviour / process abort in Rust). Records
+/// the panic in thread-local `LAST_ERROR` and returns `fallback`.
+fn catch_ffi<T>(fn_name: &str, fallback: T, f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(payload) => {
+            let msg = panic_payload_message(payload);
+            let _ = std::panic::catch_unwind(|| {
+                set_last_error(format!("{fn_name}: caught Rust panic: {msg}"));
+            });
+            fallback
+        }
+    }
+}
+
 /// Return the last error message recorded on the calling thread, or
 /// `NULL` if no error has been recorded since the last successful
 /// call. Ownership of the returned string transfers to the caller —
@@ -51,28 +78,34 @@ fn clear_last_error() {
 /// returned pointer transfers ownership to the caller.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_last_error() -> *mut c_char {
-    LAST_ERROR.with(|e| match e.borrow().as_ref() {
-        Some(msg) => CString::new(msg.as_str())
-            .map(|s| s.into_raw())
-            .unwrap_or(ptr::null_mut()),
-        None => ptr::null_mut(),
+    std::panic::catch_unwind(|| {
+        LAST_ERROR.with(|e| match e.borrow().as_ref() {
+            Some(msg) => CString::new(msg.as_str())
+                .map(|s| s.into_raw())
+                .unwrap_or(ptr::null_mut()),
+            None => ptr::null_mut(),
+        })
     })
+    .unwrap_or(ptr::null_mut())
 }
 
 /// Internal multi-threaded tokio runtime used by the C FFI when the calling
 /// thread does not have an active runtime. C consumers do not have to drive
 /// tokio themselves; the first FFI entry point lazily builds this runtime and
 /// every subsequent call reuses it.
-static FFI_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static FFI_RUNTIME: OnceLock<std::result::Result<Runtime, String>> = OnceLock::new();
 
-fn ffi_runtime() -> &'static Runtime {
-    FFI_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("aaronia-ffi")
-            .build()
-            .expect("failed to construct internal tokio runtime for aaronia C FFI")
-    })
+fn ffi_runtime() -> std::result::Result<&'static Runtime, String> {
+    FFI_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("aaronia-ffi")
+                .build()
+                .map_err(|e| format!("failed to construct internal tokio runtime: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// Drive `fut` to completion for a synchronous FFI entry point.
@@ -84,15 +117,37 @@ fn ffi_runtime() -> &'static Runtime {
 ///
 /// - Outside any runtime: block on the bundled FFI runtime (the common
 ///   case for C callers).
-/// - Inside a multi-threaded runtime: wrap in `block_in_place` so the
-///   worker thread may legally block, and reuse the caller's runtime.
+/// - Inside a multi-threaded runtime worker: wrap in `block_in_place` so the
+///   worker thread may legally block, and reuse the caller's runtime. If
+///   `block_in_place` is disallowed (e.g. inside a `LocalSet` or `block_on`
+///   root task), translate that refusal into `Err(...)` instead of panicking.
 /// - Inside a current-thread runtime: there is no sound way to block
 ///   without deadlocking the reactor — return an error the FFI shims
 ///   translate into their failure value instead of aborting.
 fn ffi_block_on<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
+            let mut fut_opt = Some(fut);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| {
+                    let f = fut_opt.take().expect("future taken once");
+                    handle.block_on(f)
+                })
+            })) {
+                Ok(out) => Ok(out),
+                Err(payload) => {
+                    if fut_opt.is_some() {
+                        // `block_in_place` refused before entering our closure
+                        // (for instance inside a `LocalSet` or `block_on` root).
+                        Err("FFI entry point called from within a tokio context where \
+                             block_in_place is disallowed (such as a LocalSet or block_on \
+                             root task). Call from a plain thread or spawned worker task."
+                            .to_string())
+                    } else {
+                        std::panic::resume_unwind(payload)
+                    }
+                }
+            }
         }
         Ok(_) => Err(
             "FFI entry point called from within a current-thread tokio runtime; \
@@ -100,7 +155,7 @@ fn ffi_block_on<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
              thread (or a multi-threaded runtime) instead."
                 .to_string(),
         ),
-        Err(_) => Ok(ffi_runtime().block_on(fut)),
+        Err(_) => Ok(ffi_runtime()?.block_on(fut)),
     }
 }
 
@@ -209,7 +264,9 @@ pub struct FfiSourceInfo {
 /// Create a Spectran source builder.
 #[unsafe(no_mangle)]
 pub extern "C" fn spectran_source_builder_new() -> *mut SpectranSourceBuilder {
-    Box::into_raw(Box::new(SpectranSourceBuilder::new()))
+    catch_ffi("spectran_source_builder_new", ptr::null_mut(), || {
+        Box::into_raw(Box::new(SpectranSourceBuilder::new()))
+    })
 }
 
 /// Free a builder previously returned by [`spectran_source_builder_new`].
@@ -222,14 +279,14 @@ pub extern "C" fn spectran_source_builder_new() -> *mut SpectranSourceBuilder {
 /// behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_builder_free(builder: *mut SpectranSourceBuilder) {
-    unsafe {
-        if !builder.is_null() {
+    catch_ffi("spectran_source_builder_free", (), || unsafe {
+        if !builder.is_null() && builder.is_aligned() {
             // SAFETY: per the function-level contract, the caller guarantees the
             // pointer originated from `spectran_source_builder_new` and has not
             // been freed.
             drop(Box::from_raw(builder));
         }
-    }
+    });
 }
 
 /// Set the IQ-mode center frequency on the builder, in Hz.
@@ -244,11 +301,17 @@ pub unsafe extern "C" fn spectran_source_builder_center_frequency_hz(
     builder: *mut SpectranSourceBuilder,
     hz: f64,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut() {
-            builder.center_frequency_hz(hz);
-        }
-    }
+    catch_ffi(
+        "spectran_source_builder_center_frequency_hz",
+        (),
+        || unsafe {
+            if builder.is_aligned()
+                && let Some(builder) = builder.as_mut()
+            {
+                builder.center_frequency_hz(hz);
+            }
+        },
+    );
 }
 
 /// Set the IQ-mode span frequency on the builder, in Hz.
@@ -263,11 +326,13 @@ pub unsafe extern "C" fn spectran_source_builder_sample_rate_hz(
     builder: *mut SpectranSourceBuilder,
     hz: f64,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut() {
+    catch_ffi("spectran_source_builder_sample_rate_hz", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
+        {
             builder.sample_rate_hz(hz);
         }
-    }
+    });
 }
 
 /// Set the IQ-mode reference level on the builder, in dBm.
@@ -282,11 +347,17 @@ pub unsafe extern "C" fn spectran_source_builder_reference_level_dbm(
     builder: *mut SpectranSourceBuilder,
     dbm: f64,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut() {
-            builder.reference_level_dbm(dbm);
-        }
-    }
+    catch_ffi(
+        "spectran_source_builder_reference_level_dbm",
+        (),
+        || unsafe {
+            if builder.is_aligned()
+                && let Some(builder) = builder.as_mut()
+            {
+                builder.reference_level_dbm(dbm);
+            }
+        },
+    );
 }
 
 /// Configure the builder to use an HTTP source at the given base URL.
@@ -302,14 +373,15 @@ pub unsafe extern "C" fn spectran_source_builder_http_source(
     builder: *mut SpectranSourceBuilder,
     base_url: *const c_char,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut()
+    catch_ffi("spectran_source_builder_http_source", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
             && !base_url.is_null()
         {
             let url = CStr::from_ptr(base_url).to_string_lossy().into_owned();
             builder.http_source(url);
         }
-    }
+    });
 }
 
 /// Configure the builder to read from an RTSA file at the given path.
@@ -325,14 +397,15 @@ pub unsafe extern "C" fn spectran_source_builder_file_source(
     builder: *mut SpectranSourceBuilder,
     file_path: *const c_char,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut()
+    catch_ffi("spectran_source_builder_file_source", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
             && !file_path.is_null()
         {
             let path = CStr::from_ptr(file_path).to_string_lossy().into_owned();
             builder.file_source(path);
         }
-    }
+    });
 }
 
 /// Select a device by serial number (native-SDK backend). See
@@ -347,14 +420,15 @@ pub unsafe extern "C" fn spectran_source_builder_device_serial(
     builder: *mut SpectranSourceBuilder,
     serial: *const c_char,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut()
+    catch_ffi("spectran_source_builder_device_serial", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
             && !serial.is_null()
         {
             let serial = CStr::from_ptr(serial).to_string_lossy().into_owned();
             builder.device_serial(serial);
         }
-    }
+    });
 }
 
 /// Pin the source to one backend instead of auto-detecting.
@@ -379,29 +453,39 @@ pub unsafe extern "C" fn spectran_source_builder_force_source_type(
     builder: *mut SpectranSourceBuilder,
     source_type: std::os::raw::c_int,
 ) {
-    let source_type = match CSpectranSourceType::try_from(source_type) {
-        Ok(source_type) => source_type,
-        Err(unknown) => {
-            tracing::warn!(
-                "spectran_source_builder_force_source_type: unknown source type {unknown}; ignored"
-            );
-            return;
+    catch_ffi("spectran_source_builder_force_source_type", (), || {
+        let source_type = match CSpectranSourceType::try_from(source_type) {
+            Ok(source_type) => source_type,
+            Err(unknown) => {
+                tracing::warn!(
+                    "spectran_source_builder_force_source_type: unknown source type {unknown}; ignored"
+                );
+                return;
+            }
+        };
+        unsafe {
+            if builder.is_aligned()
+                && let Some(builder) = builder.as_mut()
+            {
+                builder.force_source_type(source_type.into());
+            }
         }
-    };
-    unsafe {
-        if let Some(builder) = builder.as_mut() {
-            builder.force_source_type(source_type.into());
-        }
-    }
+    });
 }
 
-/// Whether the Aaronia native SDK library is present on this machine, by
-/// the same search [`spectran_source_build`] uses — so a caller can offer
-/// the SDK only where forcing it would not fail. Answers without loading
-/// the library.
+/// Whether the Aaronia native SDK backend is both compiled into this binary
+/// and present on disk, by the same check [`spectran_source_build`] uses —
+/// so a caller can offer the SDK only where forcing it would not fail.
+/// Answers without loading the library.
 #[unsafe(no_mangle)]
 pub extern "C" fn spectran_sdk_installed() -> bool {
-    crate::detection::is_sdk_installed()
+    catch_ffi("spectran_sdk_installed", false, || {
+        cfg!(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
+        )) && crate::detection::is_sdk_installed()
+    })
 }
 
 /// Alias-free bandwidth delivered at an IQ sample rate, Hz. Smaller than
@@ -410,7 +494,9 @@ pub extern "C" fn spectran_sdk_installed() -> bool {
 /// `getSampleRate` reports, so it need not track a rate itself.
 #[unsafe(no_mangle)]
 pub extern "C" fn spectran_usable_bandwidth_hz(sample_rate_hz: f64) -> f64 {
-    crate::usable_bandwidth_hz(sample_rate_hz)
+    catch_ffi("spectran_usable_bandwidth_hz", 0.0, || {
+        crate::usable_bandwidth_hz(sample_rate_hz)
+    })
 }
 
 /// The IQ sample rate whose alias-free bandwidth covers `bandwidth_hz`,
@@ -419,7 +505,9 @@ pub extern "C" fn spectran_usable_bandwidth_hz(sample_rate_hz: f64) -> f64 {
 /// drives the already-verified `setSampleRate`. Stateless.
 #[unsafe(no_mangle)]
 pub extern "C" fn spectran_iq_sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
-    crate::iq_sample_rate_for_bandwidth(bandwidth_hz)
+    catch_ffi("spectran_iq_sample_rate_for_bandwidth", 0.0, || {
+        crate::iq_sample_rate_for_bandwidth(bandwidth_hz)
+    })
 }
 
 /// Select the RX channel(s) for native-SDK captures: 0 = Rx1 (default),
@@ -433,8 +521,10 @@ pub unsafe extern "C" fn spectran_source_builder_receiver_channel(
     builder: *mut SpectranSourceBuilder,
     channel: i32,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut() {
+    catch_ffi("spectran_source_builder_receiver_channel", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
+        {
             let rx = match channel {
                 0 => crate::utils::RxChannel::Rx1,
                 1 => crate::utils::RxChannel::Rx2,
@@ -443,7 +533,7 @@ pub unsafe extern "C" fn spectran_source_builder_receiver_channel(
             };
             builder.receiver_channel(rx);
         }
-    }
+    });
 }
 
 /// Select the HTTP wire format: "F32", "F16", or "I16" (the genuine
@@ -458,8 +548,9 @@ pub unsafe extern "C" fn spectran_source_builder_stream_format(
     builder: *mut SpectranSourceBuilder,
     format: *const c_char,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut()
+    catch_ffi("spectran_source_builder_stream_format", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
             && !format.is_null()
         {
             let fmt = match CStr::from_ptr(format).to_string_lossy().as_ref() {
@@ -470,7 +561,7 @@ pub unsafe extern "C" fn spectran_source_builder_stream_format(
             };
             builder.stream_format(fmt);
         }
-    }
+    });
 }
 
 /// Set the server-side integer encode multiplier for integer wire
@@ -483,11 +574,13 @@ pub unsafe extern "C" fn spectran_source_builder_stream_scale(
     builder: *mut SpectranSourceBuilder,
     scale: f64,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut() {
+    catch_ffi("spectran_source_builder_stream_scale", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
+        {
             builder.stream_scale(scale);
         }
-    }
+    });
 }
 
 /// Set how long a blocking read waits for samples before returning the
@@ -503,13 +596,14 @@ pub unsafe extern "C" fn spectran_source_builder_read_timeout_us(
     builder: *mut SpectranSourceBuilder,
     timeout_us: u64,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut()
+    catch_ffi("spectran_source_builder_read_timeout_us", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
             && timeout_us > 0
         {
             builder.read_timeout(std::time::Duration::from_micros(timeout_us));
         }
-    }
+    });
 }
 
 /// Enable (`true`, the default) or disable automatic reconnection of the
@@ -524,11 +618,33 @@ pub unsafe extern "C" fn spectran_source_builder_auto_reconnect(
     builder: *mut SpectranSourceBuilder,
     enabled: bool,
 ) {
-    unsafe {
-        if let Some(builder) = builder.as_mut() {
+    catch_ffi("spectran_source_builder_auto_reconnect", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
+        {
             builder.auto_reconnect(enabled);
         }
-    }
+    });
+}
+
+/// Enable or disable HTTP listen-only mode on the builder. When `true`,
+/// the source never writes to `/control` or `/remoteconfig`, allowing
+/// passive attachment to shared or unlicensed RTSA servers.
+///
+/// # Safety
+/// `builder` must be a live pointer from [`spectran_source_builder_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_source_builder_listen_only(
+    builder: *mut SpectranSourceBuilder,
+    enabled: bool,
+) {
+    catch_ffi("spectran_source_builder_listen_only", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(builder) = builder.as_mut()
+        {
+            builder.listen_only(enabled);
+        }
+    });
 }
 
 /// Consume the builder and asynchronously build a `SpectranSource`. Returns
@@ -542,24 +658,26 @@ pub unsafe extern "C" fn spectran_source_builder_auto_reconnect(
 /// retains ownership and must still free it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_build(builder: *mut SpectranSourceBuilder) -> *mut c_void {
-    clear_last_error();
-    if builder.is_null() {
-        set_last_error("spectran_source_build: builder pointer is null");
-        return std::ptr::null_mut();
-    }
-    let builder = unsafe { &*builder };
+    catch_ffi("spectran_source_build", std::ptr::null_mut(), || {
+        clear_last_error();
+        if builder.is_null() || !builder.is_aligned() {
+            set_last_error("spectran_source_build: builder pointer is null or unaligned");
+            return std::ptr::null_mut();
+        }
+        let builder = unsafe { &*builder };
 
-    match ffi_block_on(builder.build()) {
-        Ok(Ok(s)) => Box::into_raw(Box::new(s)) as *mut c_void,
-        Ok(Err(e)) => {
-            set_last_error(format!("spectran_source_build failed: {}", e));
-            std::ptr::null_mut()
+        match ffi_block_on(builder.build()) {
+            Ok(Ok(s)) => Box::into_raw(Box::new(s)) as *mut c_void,
+            Ok(Err(e)) => {
+                set_last_error(format!("spectran_source_build failed: {}", e));
+                std::ptr::null_mut()
+            }
+            Err(ctx) => {
+                set_last_error(format!("spectran_source_build: {}", ctx));
+                std::ptr::null_mut()
+            }
         }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_build: {}", ctx));
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 // --- SpectranSource FFI --- //
@@ -572,20 +690,26 @@ pub unsafe extern "C" fn spectran_source_build(builder: *mut SpectranSourceBuild
 /// the pointer must not be used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_free(ptr: *mut c_void) {
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: per the function-level contract, the caller guarantees the
-    // pointer originated from `spectran_source_build` and has not been freed.
-    unsafe {
-        drop(Box::from_raw(ptr as *mut SpectranSource));
-    }
+    catch_ffi("spectran_source_free", (), || {
+        let src = ptr as *mut SpectranSource;
+        if src.is_null() || !src.is_aligned() {
+            return;
+        }
+        // SAFETY: per the function-level contract, the caller guarantees the
+        // pointer originated from `spectran_source_build` and has not been freed.
+        unsafe {
+            drop(Box::from_raw(src));
+        }
+    });
 }
 
 /// Cap on the up-front reservation for a read. The caller's `len` is
 /// untrusted, and `Vec::with_capacity(usize::MAX)` would abort the host
 /// process; larger reads still work, the buffer grows.
 const READ_RESERVE_CAP: usize = 1 << 22;
+
+const _: () = assert!(std::mem::size_of::<FfiComplex>() == std::mem::size_of::<Complex32>());
+const _: () = assert!(std::mem::align_of::<FfiComplex>() == std::mem::align_of::<Complex32>());
 
 /// Read up to `len` IQ samples into the caller-provided `buffer`. Returns
 /// the number of samples written, or a negative error code.
@@ -602,59 +726,63 @@ pub unsafe extern "C" fn spectran_source_read_samples(
     buffer: *mut FfiComplex,
     len: usize,
 ) -> isize {
-    clear_last_error();
-    if ptr.is_null() || buffer.is_null() {
-        set_last_error("spectran_source_read_samples: source or buffer pointer is null");
-        return -1; // Null pointer error
-    }
+    catch_ffi("spectran_source_read_samples", -1, || {
+        clear_last_error();
+        if ptr.is_null() || buffer.is_null() {
+            set_last_error("spectran_source_read_samples: source or buffer pointer is null");
+            return -1;
+        }
+        if !buffer.is_aligned() {
+            set_last_error("spectran_source_read_samples: buffer pointer is not aligned");
+            return -1;
+        }
+        let src_ptr = ptr as *mut SpectranSource;
+        if !src_ptr.is_aligned() {
+            set_last_error("spectran_source_read_samples: source pointer is not aligned");
+            return -1;
+        }
 
-    // SAFETY: ptr is verified non-null above and was created by Box::into_raw in spectran_source_build.
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+        // SAFETY: src_ptr is verified non-null and aligned above and was created by Box::into_raw in spectran_source_build.
+        let source = unsafe { &mut *src_ptr };
 
-    let mut temp_samples = Vec::with_capacity(len.min(READ_RESERVE_CAP));
-    let samples_result = ffi_block_on(source.read_samples(&mut temp_samples, len));
+        let mut temp_samples = Vec::with_capacity(len.min(READ_RESERVE_CAP));
+        let samples_result = ffi_block_on(source.read_samples(&mut temp_samples, len));
 
-    match samples_result {
-        Ok(Ok(samples_to_copy)) => {
-            // Clamp to both the caller's requested capacity (`len`) and
-            // the actual number of samples `read_samples` populated
-            // (`temp_samples.len()`) — trusting `samples_to_copy` alone
-            // would let a future miscounting bug in any `read_samples`
-            // implementation read past `temp_samples`'s real allocation.
-            let samples_to_copy = samples_to_copy.min(len).min(temp_samples.len());
-            // SAFETY: buffer is verified non-null above and caller guarantees it points to at least `len` FfiComplex elements.
-            // `Complex32` (`num_complex::Complex<f32>`) and `FfiComplex`
-            // are both `{re: f32, im: f32}` in memory, so this
-            // reinterpret cast is sound; the assert guards against a
-            // future representation change silently breaking it.
-            const _: () =
-                assert!(std::mem::size_of::<FfiComplex>() == std::mem::size_of::<Complex32>());
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    temp_samples.as_ptr() as *const FfiComplex,
-                    buffer,
-                    samples_to_copy,
-                );
+        match samples_result {
+            Ok(Ok(samples_to_copy)) => {
+                // Clamp to both the caller's requested capacity (`len`) and
+                // the actual number of samples `read_samples` populated
+                // (`temp_samples.len()`) — trusting `samples_to_copy` alone
+                // would let a future miscounting bug in any `read_samples`
+                // implementation read past `temp_samples`'s real allocation.
+                let samples_to_copy = samples_to_copy.min(len).min(temp_samples.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        temp_samples.as_ptr() as *const FfiComplex,
+                        buffer,
+                        samples_to_copy,
+                    );
+                }
+                samples_to_copy as isize
             }
-            samples_to_copy as isize
-        }
-        Ok(Err(e)) => {
-            set_last_error(format!("spectran_source_read_samples failed: {}", e));
-            // Timeout maps to this API's private -3 convention (documented
-            // in spectran.h); the SoapySDR plugin translates -3 to
-            // SOAPY_SDR_TIMEOUT on its side.
-            if let crate::Error::Io(ref io_err) = e
-                && io_err.kind() == std::io::ErrorKind::TimedOut
-            {
-                return -3;
+            Ok(Err(e)) => {
+                set_last_error(format!("spectran_source_read_samples failed: {}", e));
+                // Timeout maps to this API's private -3 convention (documented
+                // in spectran.h); the SoapySDR plugin translates -3 to
+                // SOAPY_SDR_TIMEOUT on its side.
+                if let crate::Error::Io(ref io_err) = e
+                    && io_err.kind() == std::io::ErrorKind::TimedOut
+                {
+                    return -3;
+                }
+                -1
             }
-            -1 // Generic stream error
+            Err(ctx) => {
+                set_last_error(format!("spectran_source_read_samples: {}", ctx));
+                -1
+            }
         }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_read_samples: {}", ctx));
-            -1 // Generic stream error
-        }
-    }
+    })
 }
 
 /// Deadline-bounded variant of [`spectran_source_read_samples`] for
@@ -674,63 +802,74 @@ pub unsafe extern "C" fn spectran_source_read_samples_timeout(
     len: usize,
     timeout_us: u64,
 ) -> isize {
-    clear_last_error();
-    if ptr.is_null() || buffer.is_null() {
-        set_last_error("spectran_source_read_samples_timeout: source or buffer pointer is null");
-        return -1;
-    }
-
-    // SAFETY: ptr is verified non-null above and was created by
-    // Box::into_raw in spectran_source_build.
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
-
-    // The source's reusable staging buffer, not a fresh Vec per call:
-    // this is the SoapySDR readStream path, called hundreds of times a
-    // second with 512 KiB requests at full rate.
-    let mut temp_samples = source.take_scratch();
-    temp_samples.reserve(len.min(READ_RESERVE_CAP));
-    let timeout = std::time::Duration::from_micros(timeout_us);
-    let samples_result =
-        ffi_block_on(source.read_samples_deadline(&mut temp_samples, len, timeout));
-
-    let result = match samples_result {
-        Ok(Ok(samples_to_copy)) => {
-            let samples_to_copy = samples_to_copy.min(len).min(temp_samples.len());
-            // SAFETY: identical layout argument as in
-            // `spectran_source_read_samples` above.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    temp_samples.as_ptr() as *const FfiComplex,
-                    buffer,
-                    samples_to_copy,
-                );
-            }
-            samples_to_copy as isize
+    catch_ffi("spectran_source_read_samples_timeout", -1, || {
+        clear_last_error();
+        if ptr.is_null() || buffer.is_null() {
+            set_last_error(
+                "spectran_source_read_samples_timeout: source or buffer pointer is null",
+            );
+            return -1;
         }
-        Ok(Err(e)) => {
-            set_last_error(format!(
-                "spectran_source_read_samples_timeout failed: {}",
-                e
-            ));
-            // Yield the code rather than `return`ing it: an early
-            // return here skipped `return_scratch`, so every timeout
-            // dropped the staging buffer and the next read reallocated
-            // it — the allocation this path exists to avoid.
-            if let crate::Error::Io(ref io_err) = e
-                && io_err.kind() == std::io::ErrorKind::TimedOut
-            {
-                -3
-            } else {
+        if !buffer.is_aligned() {
+            set_last_error("spectran_source_read_samples_timeout: buffer pointer is not aligned");
+            return -1;
+        }
+        let src_ptr = ptr as *mut SpectranSource;
+        if !src_ptr.is_aligned() {
+            set_last_error("spectran_source_read_samples_timeout: source pointer is not aligned");
+            return -1;
+        }
+
+        // SAFETY: src_ptr is verified non-null and aligned above and was created by
+        // Box::into_raw in spectran_source_build.
+        let source = unsafe { &mut *src_ptr };
+
+        // The source's reusable staging buffer, not a fresh Vec per call:
+        // this is the SoapySDR readStream path, called hundreds of times a
+        // second with 512 KiB requests at full rate.
+        let mut temp_samples = source.take_scratch();
+        temp_samples.reserve(len.min(READ_RESERVE_CAP));
+        let timeout = std::time::Duration::from_micros(timeout_us);
+        let samples_result =
+            ffi_block_on(source.read_samples_deadline(&mut temp_samples, len, timeout));
+
+        let result = match samples_result {
+            Ok(Ok(samples_to_copy)) => {
+                let samples_to_copy = samples_to_copy.min(len).min(temp_samples.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        temp_samples.as_ptr() as *const FfiComplex,
+                        buffer,
+                        samples_to_copy,
+                    );
+                }
+                samples_to_copy as isize
+            }
+            Ok(Err(e)) => {
+                set_last_error(format!(
+                    "spectran_source_read_samples_timeout failed: {}",
+                    e
+                ));
+                // Yield the code rather than `return`ing it: an early
+                // return here skipped `return_scratch`, so every timeout
+                // dropped the staging buffer and the next read reallocated
+                // it — the allocation this path exists to avoid.
+                if let crate::Error::Io(ref io_err) = e
+                    && io_err.kind() == std::io::ErrorKind::TimedOut
+                {
+                    -3
+                } else {
+                    -1
+                }
+            }
+            Err(ctx) => {
+                set_last_error(format!("spectran_source_read_samples_timeout: {}", ctx));
                 -1
             }
-        }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_read_samples_timeout: {}", ctx));
-            -1
-        }
-    };
-    source.return_scratch(temp_samples);
-    result
+        };
+        source.return_scratch(temp_samples);
+        result
+    })
 }
 
 /// Read up to `len` (Rx1, Rx2) sample *pairs* from a dual-channel
@@ -749,33 +888,44 @@ pub unsafe extern "C" fn spectran_source_read_samples_dual(
     rx2: *mut FfiComplex,
     len: usize,
 ) -> isize {
-    clear_last_error();
-    if ptr.is_null() || rx1.is_null() || rx2.is_null() {
-        set_last_error("spectran_source_read_samples_dual: null pointer");
-        return -1;
-    }
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+    catch_ffi("spectran_source_read_samples_dual", -1, || {
+        clear_last_error();
+        if ptr.is_null() || rx1.is_null() || rx2.is_null() {
+            set_last_error("spectran_source_read_samples_dual: null pointer");
+            return -1;
+        }
+        if !rx1.is_aligned() || !rx2.is_aligned() {
+            set_last_error("spectran_source_read_samples_dual: rx buffer pointer is not aligned");
+            return -1;
+        }
+        let src_ptr = ptr as *mut SpectranSource;
+        if !src_ptr.is_aligned() {
+            set_last_error("spectran_source_read_samples_dual: source pointer is not aligned");
+            return -1;
+        }
+        let source = unsafe { &mut *src_ptr };
 
-    let mut buf1 = Vec::with_capacity(len.min(READ_RESERVE_CAP));
-    let mut buf2 = Vec::with_capacity(len.min(READ_RESERVE_CAP));
-    match ffi_block_on(source.read_samples_dual(&mut buf1, &mut buf2, len)) {
-        Ok(Ok(pairs)) => {
-            let pairs = pairs.min(len).min(buf1.len()).min(buf2.len());
-            unsafe {
-                std::ptr::copy_nonoverlapping(buf1.as_ptr() as *const FfiComplex, rx1, pairs);
-                std::ptr::copy_nonoverlapping(buf2.as_ptr() as *const FfiComplex, rx2, pairs);
+        let mut buf1 = Vec::with_capacity(len.min(READ_RESERVE_CAP));
+        let mut buf2 = Vec::with_capacity(len.min(READ_RESERVE_CAP));
+        match ffi_block_on(source.read_samples_dual(&mut buf1, &mut buf2, len)) {
+            Ok(Ok(pairs)) => {
+                let pairs = pairs.min(len).min(buf1.len()).min(buf2.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(buf1.as_ptr() as *const FfiComplex, rx1, pairs);
+                    std::ptr::copy_nonoverlapping(buf2.as_ptr() as *const FfiComplex, rx2, pairs);
+                }
+                pairs as isize
             }
-            pairs as isize
+            Ok(Err(e)) => {
+                set_last_error(format!("spectran_source_read_samples_dual failed: {}", e));
+                -1
+            }
+            Err(ctx) => {
+                set_last_error(format!("spectran_source_read_samples_dual: {}", ctx));
+                -1
+            }
         }
-        Ok(Err(e)) => {
-            set_last_error(format!("spectran_source_read_samples_dual failed: {}", e));
-            -1
-        }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_read_samples_dual: {}", ctx));
-            -1
-        }
-    }
+    })
 }
 
 /// Deadline-bounded variant of [`spectran_source_read_samples_dual`],
@@ -799,29 +949,40 @@ pub unsafe extern "C" fn spectran_source_read_samples_dual_timeout(
     len: usize,
     timeout_us: u64,
 ) -> isize {
-    clear_last_error();
-    if ptr.is_null() || rx1.is_null() || rx2.is_null() {
-        set_last_error("spectran_source_read_samples_dual_timeout: null pointer");
-        return -1;
-    }
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+    catch_ffi("spectran_source_read_samples_dual_timeout", -1, || {
+        clear_last_error();
+        if ptr.is_null() || rx1.is_null() || rx2.is_null() {
+            set_last_error("spectran_source_read_samples_dual_timeout: null pointer");
+            return -1;
+        }
+        if !rx1.is_aligned() || !rx2.is_aligned() {
+            set_last_error(
+                "spectran_source_read_samples_dual_timeout: rx buffer pointer is not aligned",
+            );
+            return -1;
+        }
+        let src_ptr = ptr as *mut SpectranSource;
+        if !src_ptr.is_aligned() {
+            set_last_error(
+                "spectran_source_read_samples_dual_timeout: source pointer is not aligned",
+            );
+            return -1;
+        }
+        let source = unsafe { &mut *src_ptr };
 
-    // The reusable staging pair, not two fresh Vecs per call: this is
-    // the SoapySDR readStream path, for the same reason
-    // `spectran_source_read_samples_timeout` takes the mono scratch.
-    let (mut buf1, mut buf2) = source.take_dual_scratch();
-    buf1.reserve(len.min(READ_RESERVE_CAP));
-    buf2.reserve(len.min(READ_RESERVE_CAP));
-    let timeout = std::time::Duration::from_micros(timeout_us);
+        // The reusable staging pair, not two fresh Vecs per call: this is
+        // the SoapySDR readStream path, for the same reason
+        // `spectran_source_read_samples_timeout` takes the mono scratch.
+        let (mut buf1, mut buf2) = source.take_dual_scratch();
+        buf1.reserve(len.min(READ_RESERVE_CAP));
+        buf2.reserve(len.min(READ_RESERVE_CAP));
+        let timeout = std::time::Duration::from_micros(timeout_us);
 
-    let result =
-        match ffi_block_on(source.read_samples_dual_deadline(&mut buf1, &mut buf2, len, timeout)) {
+        let result = match ffi_block_on(
+            source.read_samples_dual_deadline(&mut buf1, &mut buf2, len, timeout),
+        ) {
             Ok(Ok(pairs)) => {
                 let pairs = pairs.min(len).min(buf1.len()).min(buf2.len());
-                // SAFETY: identical layout argument as in
-                // `spectran_source_read_samples_dual` above; `pairs` is
-                // clamped to both the caller's `len` and each buffer's own
-                // length, so neither copy can overrun.
                 unsafe {
                     std::ptr::copy_nonoverlapping(buf1.as_ptr() as *const FfiComplex, rx1, pairs);
                     std::ptr::copy_nonoverlapping(buf2.as_ptr() as *const FfiComplex, rx2, pairs);
@@ -849,8 +1010,9 @@ pub unsafe extern "C" fn spectran_source_read_samples_dual_timeout(
                 -1
             }
         };
-    source.return_dual_scratch(buf1, buf2);
-    result
+        source.return_dual_scratch(buf1, buf2);
+        result
+    })
 }
 
 /// Read and clear the latched overrun flag from the source.
@@ -860,11 +1022,14 @@ pub unsafe extern "C" fn spectran_source_read_samples_dual_timeout(
 ///   and not yet freed; null returns `false`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_take_overrun(ptr: *mut c_void) -> bool {
-    if ptr.is_null() {
-        return false;
-    }
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
-    source.take_overrun()
+    catch_ffi("spectran_source_take_overrun", false, || {
+        let src_ptr = ptr as *mut SpectranSource;
+        if src_ptr.is_null() || !src_ptr.is_aligned() {
+            return false;
+        }
+        let source = unsafe { &mut *src_ptr };
+        source.take_overrun()
+    })
 }
 
 /// Get the cumulative number of dropped packets.
@@ -874,11 +1039,14 @@ pub unsafe extern "C" fn spectran_source_take_overrun(ptr: *mut c_void) -> bool 
 ///   and not yet freed; null returns `0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_get_cumulative_drops(ptr: *mut c_void) -> u64 {
-    if ptr.is_null() {
-        return 0;
-    }
-    let source = unsafe { &*(ptr as *mut SpectranSource) };
-    source.cumulative_drops()
+    catch_ffi("spectran_source_get_cumulative_drops", 0, || {
+        let src_ptr = ptr as *const SpectranSource;
+        if src_ptr.is_null() || !src_ptr.is_aligned() {
+            return 0;
+        }
+        let source = unsafe { &*src_ptr };
+        source.cumulative_drops()
+    })
 }
 
 /// Get the hardware timestamp of the last received block (in nanoseconds since epoch).
@@ -888,11 +1056,14 @@ pub unsafe extern "C" fn spectran_source_get_cumulative_drops(ptr: *mut c_void) 
 ///   and not yet freed; null returns `0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_get_last_timestamp_ns(ptr: *mut c_void) -> i64 {
-    if ptr.is_null() {
-        return 0;
-    }
-    let source = unsafe { &*(ptr as *mut SpectranSource) };
-    source.last_timestamp_ns()
+    catch_ffi("spectran_source_get_last_timestamp_ns", 0, || {
+        let src_ptr = ptr as *const SpectranSource;
+        if src_ptr.is_null() || !src_ptr.is_aligned() {
+            return 0;
+        }
+        let source = unsafe { &*src_ptr };
+        source.last_timestamp_ns()
+    })
 }
 
 /// Get the current GPS time in nanoseconds since the Unix epoch, if
@@ -922,19 +1093,25 @@ pub unsafe extern "C" fn spectran_source_get_gps_time_ns(
     ptr: *mut c_void,
     out_gps_time_ns: *mut i64,
 ) -> bool {
-    if ptr.is_null() {
-        return false;
-    }
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
-    match source.gps_time_ns() {
-        Some(nanos) => {
-            if !out_gps_time_ns.is_null() {
-                unsafe { *out_gps_time_ns = nanos };
-            }
-            true
+    catch_ffi("spectran_source_get_gps_time_ns", false, || {
+        let src_ptr = ptr as *mut SpectranSource;
+        if src_ptr.is_null() || !src_ptr.is_aligned() {
+            return false;
         }
-        None => false,
-    }
+        if !out_gps_time_ns.is_null() && !out_gps_time_ns.is_aligned() {
+            return false;
+        }
+        let source = unsafe { &mut *src_ptr };
+        match source.gps_time_ns() {
+            Some(nanos) => {
+                if !out_gps_time_ns.is_null() {
+                    unsafe { *out_gps_time_ns = nanos };
+                }
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 /// Get the device's master stream clock in nanoseconds since the Unix
@@ -962,19 +1139,25 @@ pub unsafe extern "C" fn spectran_source_get_master_stream_time_ns(
     ptr: *mut c_void,
     out_time_ns: *mut i64,
 ) -> bool {
-    if ptr.is_null() {
-        return false;
-    }
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
-    match source.master_stream_time_ns() {
-        Some(nanos) => {
-            if !out_time_ns.is_null() {
-                unsafe { *out_time_ns = nanos };
-            }
-            true
+    catch_ffi("spectran_source_get_master_stream_time_ns", false, || {
+        let src_ptr = ptr as *mut SpectranSource;
+        if src_ptr.is_null() || !src_ptr.is_aligned() {
+            return false;
         }
-        None => false,
-    }
+        if !out_time_ns.is_null() && !out_time_ns.is_aligned() {
+            return false;
+        }
+        let source = unsafe { &mut *src_ptr };
+        match source.master_stream_time_ns() {
+            Some(nanos) => {
+                if !out_time_ns.is_null() {
+                    unsafe { *out_time_ns = nanos };
+                }
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 /// Start streaming on the source. Returns a `SpectranFfiError`.
@@ -984,25 +1167,34 @@ pub unsafe extern "C" fn spectran_source_get_master_stream_time_ns(
 /// not yet freed; null returns [`SpectranFfiError::NullPointer`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_start_streaming(ptr: *mut c_void) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("spectran_source_start_streaming: source pointer is null");
-        return SpectranFfiError::NullPointer;
-    }
+    catch_ffi(
+        "spectran_source_start_streaming",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *mut SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_source_start_streaming: source pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
 
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+            let source = unsafe { &mut *src_ptr };
 
-    match ffi_block_on(source.start_streaming()) {
-        Ok(Ok(())) => SpectranFfiError::Success,
-        Ok(Err(e)) => {
-            set_last_error(format!("spectran_source_start_streaming failed: {}", e));
-            SpectranFfiError::InternalError
-        }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_start_streaming: {}", ctx));
-            SpectranFfiError::RuntimeContext
-        }
-    }
+            match ffi_block_on(source.start_streaming()) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!("spectran_source_start_streaming failed: {}", e));
+                    SpectranFfiError::InternalError
+                }
+                Err(ctx) => {
+                    set_last_error(format!("spectran_source_start_streaming: {}", ctx));
+                    SpectranFfiError::RuntimeContext
+                }
+            }
+        },
+    )
 }
 
 /// Stop streaming on the source. Returns a `SpectranFfiError`.
@@ -1012,25 +1204,34 @@ pub unsafe extern "C" fn spectran_source_start_streaming(ptr: *mut c_void) -> Sp
 /// not yet freed; null returns [`SpectranFfiError::NullPointer`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_stop_streaming(ptr: *mut c_void) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("spectran_source_stop_streaming: source pointer is null");
-        return SpectranFfiError::NullPointer;
-    }
+    catch_ffi(
+        "spectran_source_stop_streaming",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *mut SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_source_stop_streaming: source pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
 
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+            let source = unsafe { &mut *src_ptr };
 
-    match ffi_block_on(source.stop_streaming()) {
-        Ok(Ok(())) => SpectranFfiError::Success,
-        Ok(Err(e)) => {
-            set_last_error(format!("spectran_source_stop_streaming failed: {}", e));
-            SpectranFfiError::InternalError
-        }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_stop_streaming: {}", ctx));
-            SpectranFfiError::RuntimeContext
-        }
-    }
+            match ffi_block_on(source.stop_streaming()) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!("spectran_source_stop_streaming failed: {}", e));
+                    SpectranFfiError::InternalError
+                }
+                Err(ctx) => {
+                    set_last_error(format!("spectran_source_stop_streaming: {}", ctx));
+                    SpectranFfiError::RuntimeContext
+                }
+            }
+        },
+    )
 }
 
 /// Set the center frequency (in Hz) on a live source.
@@ -1042,28 +1243,37 @@ pub unsafe extern "C" fn spectran_source_set_center_frequency_hz(
     ptr: *mut c_void,
     hz: f64,
 ) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("spectran_source_set_center_frequency_hz: source pointer is null");
-        return SpectranFfiError::NullPointer;
-    }
+    catch_ffi(
+        "spectran_source_set_center_frequency_hz",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *mut SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_source_set_center_frequency_hz: source pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
 
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+            let source = unsafe { &mut *src_ptr };
 
-    match ffi_block_on(source.set_center_frequency_hz(hz)) {
-        Ok(Ok(())) => SpectranFfiError::Success,
-        Ok(Err(e)) => {
-            set_last_error(format!(
-                "spectran_source_set_center_frequency_hz failed: {}",
-                e
-            ));
-            SpectranFfiError::InternalError
-        }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_set_center_frequency_hz: {}", ctx));
-            SpectranFfiError::RuntimeContext
-        }
-    }
+            match ffi_block_on(source.set_center_frequency_hz(hz)) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!(
+                        "spectran_source_set_center_frequency_hz failed: {}",
+                        e
+                    ));
+                    SpectranFfiError::InternalError
+                }
+                Err(ctx) => {
+                    set_last_error(format!("spectran_source_set_center_frequency_hz: {}", ctx));
+                    SpectranFfiError::RuntimeContext
+                }
+            }
+        },
+    )
 }
 
 /// Set the span frequency / sample rate (in Hz) on a live source.
@@ -1075,25 +1285,34 @@ pub unsafe extern "C" fn spectran_source_set_sample_rate_hz(
     ptr: *mut c_void,
     hz: f64,
 ) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("spectran_source_set_sample_rate_hz: source pointer is null");
-        return SpectranFfiError::NullPointer;
-    }
+    catch_ffi(
+        "spectran_source_set_sample_rate_hz",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *mut SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_source_set_sample_rate_hz: source pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
 
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+            let source = unsafe { &mut *src_ptr };
 
-    match ffi_block_on(source.set_sample_rate_hz(hz)) {
-        Ok(Ok(())) => SpectranFfiError::Success,
-        Ok(Err(e)) => {
-            set_last_error(format!("spectran_source_set_sample_rate_hz failed: {}", e));
-            SpectranFfiError::InternalError
-        }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_set_sample_rate_hz: {}", ctx));
-            SpectranFfiError::RuntimeContext
-        }
-    }
+            match ffi_block_on(source.set_sample_rate_hz(hz)) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!("spectran_source_set_sample_rate_hz failed: {}", e));
+                    SpectranFfiError::InternalError
+                }
+                Err(ctx) => {
+                    set_last_error(format!("spectran_source_set_sample_rate_hz: {}", ctx));
+                    SpectranFfiError::RuntimeContext
+                }
+            }
+        },
+    )
 }
 
 /// Set the reference level (in dBm) on a live source.
@@ -1105,28 +1324,37 @@ pub unsafe extern "C" fn spectran_source_set_reference_level_dbm(
     ptr: *mut c_void,
     dbm: f64,
 ) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("spectran_source_set_reference_level_dbm: source pointer is null");
-        return SpectranFfiError::NullPointer;
-    }
+    catch_ffi(
+        "spectran_source_set_reference_level_dbm",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *mut SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_source_set_reference_level_dbm: source pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
 
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
+            let source = unsafe { &mut *src_ptr };
 
-    match ffi_block_on(source.set_reference_level_dbm(dbm)) {
-        Ok(Ok(())) => SpectranFfiError::Success,
-        Ok(Err(e)) => {
-            set_last_error(format!(
-                "spectran_source_set_reference_level_dbm failed: {}",
-                e
-            ));
-            SpectranFfiError::InternalError
-        }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_set_reference_level_dbm: {}", ctx));
-            SpectranFfiError::RuntimeContext
-        }
-    }
+            match ffi_block_on(source.set_reference_level_dbm(dbm)) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!(
+                        "spectran_source_set_reference_level_dbm failed: {}",
+                        e
+                    ));
+                    SpectranFfiError::InternalError
+                }
+                Err(ctx) => {
+                    set_last_error(format!("spectran_source_set_reference_level_dbm: {}", ctx));
+                    SpectranFfiError::RuntimeContext
+                }
+            }
+        },
+    )
 }
 
 /// Set the device's stream clock source — the frequency/timing reference
@@ -1144,38 +1372,47 @@ pub unsafe extern "C" fn spectran_source_set_clock_source(
     ptr: *mut c_void,
     source: *const c_char,
 ) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("spectran_source_set_clock_source: source pointer is null");
-        return SpectranFfiError::NullPointer;
-    }
-    if source.is_null() {
-        set_last_error("spectran_source_set_clock_source: clock-source string is null");
-        return SpectranFfiError::NullPointer;
-    }
-    let clock_source = match unsafe { CStr::from_ptr(source) }.to_str() {
-        Ok(s) => s,
-        Err(e) => {
-            set_last_error(format!(
-                "spectran_source_set_clock_source: clock source is not valid UTF-8: {}",
-                e
-            ));
-            return SpectranFfiError::InvalidString;
-        }
-    };
+    catch_ffi(
+        "spectran_source_set_clock_source",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *mut SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_source_set_clock_source: source pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
+            if source.is_null() {
+                set_last_error("spectran_source_set_clock_source: clock-source string is null");
+                return SpectranFfiError::NullPointer;
+            }
+            let clock_source = match unsafe { CStr::from_ptr(source) }.to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    set_last_error(format!(
+                        "spectran_source_set_clock_source: clock source is not valid UTF-8: {}",
+                        e
+                    ));
+                    return SpectranFfiError::InvalidString;
+                }
+            };
 
-    let source_ref = unsafe { &mut *(ptr as *mut SpectranSource) };
-    match ffi_block_on(source_ref.set_clock_source(clock_source)) {
-        Ok(Ok(())) => SpectranFfiError::Success,
-        Ok(Err(e)) => {
-            set_last_error(format!("spectran_source_set_clock_source failed: {}", e));
-            SpectranFfiError::InternalError
-        }
-        Err(ctx) => {
-            set_last_error(format!("spectran_source_set_clock_source: {}", ctx));
-            SpectranFfiError::RuntimeContext
-        }
-    }
+            let source_ref = unsafe { &mut *src_ptr };
+            match ffi_block_on(source_ref.set_clock_source(clock_source)) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!("spectran_source_set_clock_source failed: {}", e));
+                    SpectranFfiError::InternalError
+                }
+                Err(ctx) => {
+                    set_last_error(format!("spectran_source_set_clock_source: {}", ctx));
+                    SpectranFfiError::RuntimeContext
+                }
+            }
+        },
+    )
 }
 
 /// Return a heap-allocated [`FfiSourceInfo`] describing the source. The
@@ -1187,31 +1424,38 @@ pub unsafe extern "C" fn spectran_source_set_clock_source(
 /// not yet freed; null returns `NULL`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_get_source_info(ptr: *mut c_void) -> *mut FfiSourceInfo {
-    if ptr.is_null() {
-        return std::ptr::null_mut();
-    }
+    catch_ffi(
+        "spectran_source_get_source_info",
+        std::ptr::null_mut(),
+        || {
+            let src_ptr = ptr as *const SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                return std::ptr::null_mut();
+            }
 
-    let source = unsafe { &*(ptr as *mut SpectranSource) };
-    let info = source.source_info();
+            let source = unsafe { &*src_ptr };
+            let info = source.source_info();
 
-    let device_serial = if let Some(serial) = info.device_serial {
-        CString::new(serial)
-            .unwrap_or_else(|_| CString::new("invalid").unwrap())
-            .into_raw()
-    } else {
-        std::ptr::null()
-    };
+            let device_serial = if let Some(serial) = info.device_serial {
+                CString::new(serial)
+                    .unwrap_or_else(|_| CString::new("invalid").unwrap())
+                    .into_raw()
+            } else {
+                std::ptr::null()
+            };
 
-    let ffi_info = Box::new(FfiSourceInfo {
-        source_type: info.source_type.into(),
-        center_frequency_hz: info.center_frequency_hz,
-        sample_rate_hz: info.sample_rate_hz,
-        bandwidth_hz: info.bandwidth_hz,
-        reference_level_dbm: info.reference_level_dbm,
-        device_serial,
-    });
+            let ffi_info = Box::new(FfiSourceInfo {
+                source_type: info.source_type.into(),
+                center_frequency_hz: info.center_frequency_hz,
+                sample_rate_hz: info.sample_rate_hz,
+                bandwidth_hz: info.bandwidth_hz,
+                reference_level_dbm: info.reference_level_dbm,
+                device_serial,
+            });
 
-    Box::into_raw(ffi_info)
+            Box::into_raw(ffi_info)
+        },
+    )
 }
 
 /// Free a source-info struct previously returned by
@@ -1223,15 +1467,17 @@ pub unsafe extern "C" fn spectran_source_get_source_info(ptr: *mut c_void) -> *m
 /// this call the pointer must not be used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_info_free(ptr: *mut FfiSourceInfo) {
-    if ptr.is_null() {
-        return;
-    }
-    let info = unsafe { Box::from_raw(ptr) };
-    if !info.device_serial.is_null() {
-        unsafe {
-            drop(CString::from_raw(info.device_serial as *mut c_char));
+    catch_ffi("spectran_source_info_free", (), || {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return;
         }
-    }
+        let info = unsafe { Box::from_raw(ptr) };
+        if !info.device_serial.is_null() {
+            unsafe {
+                drop(CString::from_raw(info.device_serial as *mut c_char));
+            }
+        }
+    });
 }
 
 /// What the device reports about itself, flattened for C.
@@ -1293,8 +1539,8 @@ pub struct FfiDeviceCapabilities {
 /// populated struct whose fields are all absent, so a caller falls back
 /// per field rather than on the whole reading.
 ///
-/// Answers for the HTTP backend. The file and native-SDK backends
-/// report everything absent — they have no equivalent surface to ask.
+/// Answers for both the HTTP and native-SDK backends; file sources
+/// report everything absent.
 ///
 /// # Safety
 /// `ptr` must be a live pointer from [`spectran_source_build`], not used
@@ -1304,74 +1550,89 @@ pub struct FfiDeviceCapabilities {
 pub unsafe extern "C" fn spectran_source_get_capabilities(
     ptr: *mut c_void,
 ) -> *mut FfiDeviceCapabilities {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("Null pointer".to_string());
-        return std::ptr::null_mut();
-    }
-    let source = unsafe { &*(ptr as *mut SpectranSource) };
-    let caps = match ffi_block_on(source.device_capabilities()) {
-        Ok(caps) => caps,
-        Err(e) => {
-            set_last_error(e);
-            return std::ptr::null_mut();
-        }
-    };
+    catch_ffi(
+        "spectran_source_get_capabilities",
+        std::ptr::null_mut(),
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *const SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_source_get_capabilities: null or unaligned source pointer",
+                );
+                return std::ptr::null_mut();
+            }
+            let source = unsafe { &*src_ptr };
+            let caps = match ffi_block_on(source.device_capabilities()) {
+                Ok(caps) => caps,
+                Err(e) => {
+                    set_last_error(e);
+                    return std::ptr::null_mut();
+                }
+            };
 
-    // A string the device did not report becomes NULL, not "": the
-    // caller has to be able to keep its own default for that field.
-    let owned = |value: Option<String>| -> *const c_char {
-        value
-            .and_then(|s| CString::new(s).ok())
-            .map_or(std::ptr::null(), |s| s.into_raw() as *const c_char)
-    };
+            // A string the device did not report becomes NULL, not "": the
+            // caller has to be able to keep its own default for that field.
+            let owned = |value: Option<String>| -> *const c_char {
+                value
+                    .and_then(|s| CString::new(s).ok())
+                    .map_or(std::ptr::null(), |s| s.into_raw() as *const c_char)
+            };
 
-    let (sample_rates, sample_rate_count) = match caps.sample_rates() {
-        Some(rates) if !rates.is_empty() => {
-            let boxed = rates.into_boxed_slice();
-            let len = boxed.len();
-            (Box::into_raw(boxed) as *const f64, len)
-        }
-        _ => (std::ptr::null(), 0),
-    };
+            let (sample_rates, sample_rate_count) = match caps.sample_rates() {
+                Some(rates) if !rates.is_empty() => {
+                    let boxed = rates.into_boxed_slice();
+                    let len = boxed.len();
+                    (Box::into_raw(boxed) as *const f64, len)
+                }
+                _ => (std::ptr::null(), 0),
+            };
 
-    // An array of owned C strings, one slot per option. A slot is NULL
-    // when the name could not be made into a C string (an interior NUL),
-    // so callers check each entry — the C++ plugin does.
-    let (clock_sources, clock_source_count) = if caps.clock_sources.is_empty() {
-        (std::ptr::null(), 0)
-    } else {
-        let ptrs: Vec<*const c_char> = caps
-            .clock_sources
-            .iter()
-            .map(|s| owned(Some(s.clone())))
-            .collect();
-        let len = ptrs.len();
-        (
-            Box::into_raw(ptrs.into_boxed_slice()) as *const *const c_char,
-            len,
-        )
-    };
+            // An array of owned C strings, one slot per option. A slot is NULL
+            // when the name could not be made into a C string (an interior NUL),
+            // so callers check each entry — the C++ plugin does.
+            let (clock_sources, clock_source_count) = if caps.clock_sources.is_empty() {
+                (std::ptr::null(), 0)
+            } else {
+                let ptrs: Vec<*const c_char> = caps
+                    .clock_sources
+                    .iter()
+                    .map(|s| owned(Some(s.clone())))
+                    .collect();
+                let len = ptrs.len();
+                (
+                    Box::into_raw(ptrs.into_boxed_slice()) as *const *const c_char,
+                    len,
+                )
+            };
 
-    Box::into_raw(Box::new(FfiDeviceCapabilities {
-        clock_source_count,
-        clock_sources,
-        clock_source: owned(caps.clock_source),
-        rx_antenna: owned(caps.rx_antenna),
-        model: owned(caps.model),
-        serial: owned(caps.serial),
-        version: owned(caps.version),
-        has_center_frequency: caps.center_frequency_hz.is_some(),
-        center_frequency_min_hz: caps.center_frequency_hz.map_or(0.0, |r| r.min),
-        center_frequency_max_hz: caps.center_frequency_hz.map_or(0.0, |r| r.max),
-        center_frequency_step_hz: caps.center_frequency_hz.and_then(|r| r.step).unwrap_or(0.0),
-        has_reference_level: caps.reference_level_dbm.is_some(),
-        reference_level_min_dbm: caps.reference_level_dbm.map_or(0.0, |r| r.min),
-        reference_level_max_dbm: caps.reference_level_dbm.map_or(0.0, |r| r.max),
-        reference_level_step_db: caps.reference_level_dbm.and_then(|r| r.step).unwrap_or(0.0),
-        sample_rate_count,
-        sample_rates,
-    }))
+            Box::into_raw(Box::new(FfiDeviceCapabilities {
+                clock_source_count,
+                clock_sources,
+                clock_source: owned(caps.clock_source),
+                rx_antenna: owned(caps.rx_antenna),
+                model: owned(caps.model),
+                serial: owned(caps.serial),
+                version: owned(caps.version),
+                has_center_frequency: caps.center_frequency_hz.is_some(),
+                center_frequency_min_hz: caps.center_frequency_hz.map_or(0.0, |r| r.min),
+                center_frequency_max_hz: caps.center_frequency_hz.map_or(0.0, |r| r.max),
+                center_frequency_step_hz: caps
+                    .center_frequency_hz
+                    .and_then(|r| r.step)
+                    .unwrap_or(0.0),
+                has_reference_level: caps.reference_level_dbm.is_some(),
+                reference_level_min_dbm: caps.reference_level_dbm.map_or(0.0, |r| r.min),
+                reference_level_max_dbm: caps.reference_level_dbm.map_or(0.0, |r| r.max),
+                reference_level_step_db: caps
+                    .reference_level_dbm
+                    .and_then(|r| r.step)
+                    .unwrap_or(0.0),
+                sample_rate_count,
+                sample_rates,
+            }))
+        },
+    )
 }
 
 /// Free a capabilities struct from [`spectran_source_get_capabilities`],
@@ -1384,45 +1645,47 @@ pub unsafe extern "C" fn spectran_source_get_capabilities(
 /// used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_capabilities_free(ptr: *mut FfiDeviceCapabilities) {
-    if ptr.is_null() {
-        return;
-    }
-    let caps = unsafe { Box::from_raw(ptr) };
-    for s in [
-        caps.model,
-        caps.serial,
-        caps.version,
-        caps.clock_source,
-        caps.rx_antenna,
-    ] {
-        if !s.is_null() {
-            unsafe { drop(CString::from_raw(s as *mut c_char)) };
+    catch_ffi("spectran_source_capabilities_free", (), || {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return;
         }
-    }
-    if !caps.clock_sources.is_null() {
-        // Two levels: each string, then the array of pointers itself.
-        let ptrs = unsafe {
-            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                caps.clock_sources as *mut *const c_char,
-                caps.clock_source_count,
-            ))
-        };
-        for s in ptrs.iter() {
+        let caps = unsafe { Box::from_raw(ptr) };
+        for s in [
+            caps.model,
+            caps.serial,
+            caps.version,
+            caps.clock_source,
+            caps.rx_antenna,
+        ] {
             if !s.is_null() {
-                unsafe { drop(CString::from_raw(*s as *mut c_char)) };
+                unsafe { drop(CString::from_raw(s as *mut c_char)) };
             }
         }
-    }
-    if !caps.sample_rates.is_null() {
-        // Reconstitute the same fat pointer `into_raw` split apart;
-        // freeing it as a single `f64` would leak all but the first.
-        unsafe {
-            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                caps.sample_rates as *mut f64,
-                caps.sample_rate_count,
-            )));
+        if !caps.clock_sources.is_null() {
+            // Two levels: each string, then the array of pointers itself.
+            let ptrs = unsafe {
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    caps.clock_sources as *mut *const c_char,
+                    caps.clock_source_count,
+                ))
+            };
+            for s in ptrs.iter() {
+                if !s.is_null() {
+                    unsafe { drop(CString::from_raw(*s as *mut c_char)) };
+                }
+            }
         }
-    }
+        if !caps.sample_rates.is_null() {
+            // Reconstitute the same fat pointer `into_raw` split apart;
+            // freeing it as a single `f64` would leak all but the first.
+            unsafe {
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    caps.sample_rates as *mut f64,
+                    caps.sample_rate_count,
+                )));
+            }
+        }
+    });
 }
 
 /// The device's live sensors, filled by [`spectran_source_get_sensors`].
@@ -1449,14 +1712,10 @@ pub struct FfiDeviceSensors {
 
 /// Read the device's live sensors into `out`.
 ///
-/// An HTTP-backend feature: a `/healthstatus` GET filled onto
-/// `FfiDeviceSensors`. Returns `true` when the read completed; individual
-/// fields are `NaN` where the device omits them, and the file and
-/// native-SDK backends complete with every field `NaN` (the raw SDK's own
-/// health tree reads all zeros — see [`SpectranSource::device_sensors`]).
-/// Returns `false`, leaving `out` untouched, only for a null pointer or
-/// when called from a current-thread tokio runtime (where the blocking
-/// GET would deadlock).
+/// Returns `true` when the read completed; individual fields are `NaN`
+/// where the device omits them. Returns `false`, leaving `out` untouched,
+/// only for a null/unaligned pointer or when called from a current-thread
+/// tokio runtime (where the blocking GET would deadlock).
 ///
 /// Blocking: one `/healthstatus` GET on the HTTP backend.
 ///
@@ -1469,37 +1728,40 @@ pub unsafe extern "C" fn spectran_source_get_sensors(
     ptr: *mut c_void,
     out: *mut FfiDeviceSensors,
 ) -> bool {
-    clear_last_error();
-    if ptr.is_null() || out.is_null() {
-        set_last_error("Null pointer".to_string());
-        return false;
-    }
-    let source = unsafe { &*(ptr as *mut SpectranSource) };
-    let sensors = match ffi_block_on(source.device_sensors()) {
-        Ok(s) => s,
-        Err(e) => {
-            set_last_error(e);
+    catch_ffi("spectran_source_get_sensors", false, || {
+        clear_last_error();
+        let src_ptr = ptr as *const SpectranSource;
+        if src_ptr.is_null() || !src_ptr.is_aligned() || out.is_null() || !out.is_aligned() {
+            set_last_error("spectran_source_get_sensors: null or unaligned pointer");
             return false;
         }
-    };
-    let f = |v: Option<f64>| v.unwrap_or(f64::NAN);
-    unsafe {
-        *out = FfiDeviceSensors {
-            fpga_temp_c: f(sensors.fpga_temp_c),
-            frontend_temp_c: f(sensors.frontend_temp_c),
-            board_power_w: f(sensors.board_power_w),
-            adc_range_db: f(sensors.adc_range_db),
-            usb_buffer_fill: f(sensors.usb_buffer_fill),
-            dsp_buffer_fill: f(sensors.dsp_buffer_fill),
-            errors_per_second: f(sensors.errors_per_second),
-            usb_overflows_per_second: f(sensors.usb_overflows_per_second),
-            dsp_overflows_per_second: f(sensors.dsp_overflows_per_second),
-            gps_satellites: f(sensors.gps_satellites),
-            gps_latitude: f(sensors.gps_latitude),
-            gps_longitude: f(sensors.gps_longitude),
+        let source = unsafe { &*src_ptr };
+        let sensors = match ffi_block_on(source.device_sensors()) {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(e);
+                return false;
+            }
         };
-    }
-    true
+        let f = |v: Option<f64>| v.unwrap_or(f64::NAN);
+        unsafe {
+            *out = FfiDeviceSensors {
+                fpga_temp_c: f(sensors.fpga_temp_c),
+                frontend_temp_c: f(sensors.frontend_temp_c),
+                board_power_w: f(sensors.board_power_w),
+                adc_range_db: f(sensors.adc_range_db),
+                usb_buffer_fill: f(sensors.usb_buffer_fill),
+                dsp_buffer_fill: f(sensors.dsp_buffer_fill),
+                errors_per_second: f(sensors.errors_per_second),
+                usb_overflows_per_second: f(sensors.usb_overflows_per_second),
+                dsp_overflows_per_second: f(sensors.dsp_overflows_per_second),
+                gps_satellites: f(sensors.gps_satellites),
+                gps_latitude: f(sensors.gps_latitude),
+                gps_longitude: f(sensors.gps_longitude),
+            };
+        }
+        true
+    })
 }
 
 // --- Remote Control FFI --- //
@@ -1512,36 +1774,42 @@ pub unsafe extern "C" fn spectran_source_get_sensors(
 /// that remains valid for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_endpoints_client_new(base_url_ptr: *const c_char) -> *mut c_void {
-    clear_last_error();
-    if base_url_ptr.is_null() {
-        set_last_error("spectran_endpoints_client_new: base_url pointer is null");
-        return std::ptr::null_mut();
-    }
-    let base_url_cstr = unsafe { CStr::from_ptr(base_url_ptr) };
-    let base_url = match base_url_cstr.to_str() {
-        Ok(s) => s,
-        Err(e) => {
-            set_last_error(format!(
-                "spectran_endpoints_client_new: base_url is not valid UTF-8: {}",
-                e
-            ));
-            return std::ptr::null_mut();
-        }
-    };
+    catch_ffi(
+        "spectran_endpoints_client_new",
+        std::ptr::null_mut(),
+        || {
+            clear_last_error();
+            if base_url_ptr.is_null() {
+                set_last_error("spectran_endpoints_client_new: base_url pointer is null");
+                return std::ptr::null_mut();
+            }
+            let base_url_cstr = unsafe { CStr::from_ptr(base_url_ptr) };
+            let base_url = match base_url_cstr.to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    set_last_error(format!(
+                        "spectran_endpoints_client_new: base_url is not valid UTF-8: {}",
+                        e
+                    ));
+                    return std::ptr::null_mut();
+                }
+            };
 
-    match HttpEndpointsClient::new(
-        base_url.to_string(),
-        crate::http_endpoints::AuthMethod::None,
-    ) {
-        Ok(client) => Box::into_raw(Box::new(client)) as *mut c_void,
-        Err(e) => {
-            set_last_error(format!(
-                "spectran_endpoints_client_new failed for {}: {}",
-                base_url, e
-            ));
-            std::ptr::null_mut()
-        }
-    }
+            match HttpEndpointsClient::new(
+                base_url.to_string(),
+                crate::http_endpoints::AuthMethod::None,
+            ) {
+                Ok(client) => Box::into_raw(Box::new(client)) as *mut c_void,
+                Err(e) => {
+                    set_last_error(format!(
+                        "spectran_endpoints_client_new failed for {}: {}",
+                        base_url, e
+                    ));
+                    std::ptr::null_mut()
+                }
+            }
+        },
+    )
 }
 
 /// Free a client previously returned by [`spectran_endpoints_client_new`].
@@ -1552,12 +1820,15 @@ pub unsafe extern "C" fn spectran_endpoints_client_new(base_url_ptr: *const c_ch
 /// this call the pointer must not be used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_endpoints_client_free(ptr: *mut c_void) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(ptr as *mut HttpEndpointsClient));
-    }
+    catch_ffi("spectran_endpoints_client_free", (), || {
+        let client_ptr = ptr as *mut HttpEndpointsClient;
+        if client_ptr.is_null() || !client_ptr.is_aligned() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(client_ptr));
+        }
+    });
 }
 
 /// Query the connected RTSA server's metadata. Returns a heap-allocated
@@ -1572,59 +1843,66 @@ pub unsafe extern "C" fn spectran_endpoints_client_free(ptr: *mut c_void) {
 pub unsafe extern "C" fn spectran_endpoints_client_get_info(
     ptr: *mut c_void,
 ) -> *mut FfiServerInfo {
-    unsafe {
-        clear_last_error();
-        if ptr.is_null() {
-            set_last_error("spectran_endpoints_client_get_info: client pointer is null");
-            return std::ptr::null_mut();
-        }
-
-        let client = &mut *(ptr as *mut HttpEndpointsClient);
-        let info_result = match ffi_block_on(client.get_info()) {
-            Ok(r) => r,
-            Err(ctx) => {
-                set_last_error(format!("spectran_endpoints_client_get_info: {}", ctx));
+    catch_ffi(
+        "spectran_endpoints_client_get_info",
+        std::ptr::null_mut(),
+        || unsafe {
+            clear_last_error();
+            let client_ptr = ptr as *const HttpEndpointsClient;
+            if client_ptr.is_null() || !client_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_endpoints_client_get_info: client pointer is null or unaligned",
+                );
                 return std::ptr::null_mut();
             }
-        };
 
-        match info_result {
-            Ok(info) => {
-                let ffi_info = Box::new(FfiServerInfo {
-                    name: CString::new(info.name)
-                        .unwrap_or_else(|_| CString::new("invalid").unwrap())
-                        .into_raw(),
-                    version: CString::new("N/A".to_string())
-                        .unwrap_or_else(|_| CString::new("invalid").unwrap())
-                        .into_raw(),
-                    build: CString::new("N/A".to_string())
-                        .unwrap_or_else(|_| CString::new("invalid").unwrap())
-                        .into_raw(),
-                    serial: CString::new(info.uuid.clone())
-                        .unwrap_or_else(|_| CString::new("invalid").unwrap())
-                        .into_raw(), // Use UUID as serial
-                    title: CString::new(info.title)
-                        .unwrap_or_else(|_| CString::new("invalid").unwrap())
-                        .into_raw(),
-                    mission: CString::new(info.mission)
-                        .unwrap_or_else(|_| CString::new("invalid").unwrap())
-                        .into_raw(),
-                });
-                Box::into_raw(ffi_info)
+            let client = &*client_ptr;
+            let info_result = match ffi_block_on(client.get_info()) {
+                Ok(r) => r,
+                Err(ctx) => {
+                    set_last_error(format!("spectran_endpoints_client_get_info: {}", ctx));
+                    return std::ptr::null_mut();
+                }
+            };
+
+            match info_result {
+                Ok(info) => {
+                    let ffi_info = Box::new(FfiServerInfo {
+                        name: CString::new(info.name)
+                            .unwrap_or_else(|_| CString::new("invalid").unwrap())
+                            .into_raw(),
+                        version: CString::new("N/A".to_string())
+                            .unwrap_or_else(|_| CString::new("invalid").unwrap())
+                            .into_raw(),
+                        build: CString::new("N/A".to_string())
+                            .unwrap_or_else(|_| CString::new("invalid").unwrap())
+                            .into_raw(),
+                        serial: CString::new(info.uuid.clone())
+                            .unwrap_or_else(|_| CString::new("invalid").unwrap())
+                            .into_raw(), // Use UUID as serial
+                        title: CString::new(info.title)
+                            .unwrap_or_else(|_| CString::new("invalid").unwrap())
+                            .into_raw(),
+                        mission: CString::new(info.mission)
+                            .unwrap_or_else(|_| CString::new("invalid").unwrap())
+                            .into_raw(),
+                    });
+                    Box::into_raw(ffi_info)
+                }
+                Err(e) => {
+                    set_last_error(format!("spectran_endpoints_client_get_info failed: {}", e));
+                    std::ptr::null_mut()
+                }
             }
-            Err(e) => {
-                set_last_error(format!("spectran_endpoints_client_get_info failed: {}", e));
-                std::ptr::null_mut()
-            }
-        }
-    }
+        },
+    )
 }
 
 /// Read the device's live sensors through an endpoints client, into
 /// `out`. The same reading as [`spectran_source_get_sensors`], but off a
 /// standalone client rather than a streaming source — so a caller can
-/// poll sensors during a capture without contending for the source's
-/// read lock, which would stall sample delivery.
+/// poll sensors during a capture without contending for exclusive access
+/// to the `SpectranSource*` handle.
 ///
 /// Returns `true` when the read completed (fields may be `NaN` where the
 /// device omits them), `false` — leaving `out` untouched — for a null
@@ -1640,37 +1918,42 @@ pub unsafe extern "C" fn spectran_endpoints_client_get_sensors(
     ptr: *mut c_void,
     out: *mut FfiDeviceSensors,
 ) -> bool {
-    clear_last_error();
-    if ptr.is_null() || out.is_null() {
-        set_last_error("spectran_endpoints_client_get_sensors: null pointer".to_string());
-        return false;
-    }
-    let client = unsafe { &*(ptr as *mut HttpEndpointsClient) };
-    let sensors = match ffi_block_on(client.get_device_sensors()) {
-        Ok(result) => result.unwrap_or_default(),
-        Err(e) => {
-            set_last_error(format!("spectran_endpoints_client_get_sensors: {e}"));
+    catch_ffi("spectran_endpoints_client_get_sensors", false, || {
+        clear_last_error();
+        let client_ptr = ptr as *const HttpEndpointsClient;
+        if client_ptr.is_null() || !client_ptr.is_aligned() || out.is_null() || !out.is_aligned() {
+            set_last_error(
+                "spectran_endpoints_client_get_sensors: null or unaligned pointer".to_string(),
+            );
             return false;
         }
-    };
-    let f = |v: Option<f64>| v.unwrap_or(f64::NAN);
-    unsafe {
-        *out = FfiDeviceSensors {
-            fpga_temp_c: f(sensors.fpga_temp_c),
-            frontend_temp_c: f(sensors.frontend_temp_c),
-            board_power_w: f(sensors.board_power_w),
-            adc_range_db: f(sensors.adc_range_db),
-            usb_buffer_fill: f(sensors.usb_buffer_fill),
-            dsp_buffer_fill: f(sensors.dsp_buffer_fill),
-            errors_per_second: f(sensors.errors_per_second),
-            usb_overflows_per_second: f(sensors.usb_overflows_per_second),
-            dsp_overflows_per_second: f(sensors.dsp_overflows_per_second),
-            gps_satellites: f(sensors.gps_satellites),
-            gps_latitude: f(sensors.gps_latitude),
-            gps_longitude: f(sensors.gps_longitude),
+        let client = unsafe { &*client_ptr };
+        let sensors = match ffi_block_on(client.get_device_sensors()) {
+            Ok(result) => result.unwrap_or_default(),
+            Err(e) => {
+                set_last_error(format!("spectran_endpoints_client_get_sensors: {e}"));
+                return false;
+            }
         };
-    }
-    true
+        let f = |v: Option<f64>| v.unwrap_or(f64::NAN);
+        unsafe {
+            *out = FfiDeviceSensors {
+                fpga_temp_c: f(sensors.fpga_temp_c),
+                frontend_temp_c: f(sensors.frontend_temp_c),
+                board_power_w: f(sensors.board_power_w),
+                adc_range_db: f(sensors.adc_range_db),
+                usb_buffer_fill: f(sensors.usb_buffer_fill),
+                dsp_buffer_fill: f(sensors.dsp_buffer_fill),
+                errors_per_second: f(sensors.errors_per_second),
+                usb_overflows_per_second: f(sensors.usb_overflows_per_second),
+                dsp_overflows_per_second: f(sensors.dsp_overflows_per_second),
+                gps_satellites: f(sensors.gps_satellites),
+                gps_latitude: f(sensors.gps_latitude),
+                gps_longitude: f(sensors.gps_longitude),
+            };
+        }
+        true
+    })
 }
 
 /// Free a server-info struct previously returned by
@@ -1682,18 +1965,20 @@ pub unsafe extern "C" fn spectran_endpoints_client_get_sensors(
 /// After this call the pointer must not be used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_server_info_free(ptr: *mut FfiServerInfo) {
-    if ptr.is_null() {
-        return;
-    }
-    let info = unsafe { Box::from_raw(ptr) };
-    unsafe {
-        drop(CString::from_raw(info.name as *mut c_char));
-        drop(CString::from_raw(info.version as *mut c_char));
-        drop(CString::from_raw(info.build as *mut c_char));
-        drop(CString::from_raw(info.serial as *mut c_char));
-        drop(CString::from_raw(info.title as *mut c_char));
-        drop(CString::from_raw(info.mission as *mut c_char));
-    }
+    catch_ffi("spectran_server_info_free", (), || {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return;
+        }
+        let info = unsafe { Box::from_raw(ptr) };
+        unsafe {
+            drop(CString::from_raw(info.name as *mut c_char));
+            drop(CString::from_raw(info.version as *mut c_char));
+            drop(CString::from_raw(info.build as *mut c_char));
+            drop(CString::from_raw(info.serial as *mut c_char));
+            drop(CString::from_raw(info.title as *mut c_char));
+            drop(CString::from_raw(info.mission as *mut c_char));
+        }
+    });
 }
 
 /// Start or stop server-side streaming. Returns a `SpectranFfiError`.
@@ -1707,33 +1992,40 @@ pub unsafe extern "C" fn spectran_endpoints_client_control_streaming(
     ptr: *mut c_void,
     start: bool,
 ) -> SpectranFfiError {
-    unsafe {
-        clear_last_error();
-        if ptr.is_null() {
-            set_last_error("spectran_endpoints_client_control_streaming: client pointer is null");
-            return SpectranFfiError::NullPointer;
-        }
-
-        let client = &mut *(ptr as *mut HttpEndpointsClient);
-
-        match ffi_block_on(client.control_streaming(start)) {
-            Ok(Ok(())) => SpectranFfiError::Success,
-            Ok(Err(e)) => {
-                set_last_error(format!(
-                    "spectran_endpoints_client_control_streaming(start={}) failed: {}",
-                    start, e
-                ));
-                SpectranFfiError::InternalError
+    catch_ffi(
+        "spectran_endpoints_client_control_streaming",
+        SpectranFfiError::InternalError,
+        || unsafe {
+            clear_last_error();
+            let client_ptr = ptr as *const HttpEndpointsClient;
+            if client_ptr.is_null() || !client_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_endpoints_client_control_streaming: client pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
             }
-            Err(ctx) => {
-                set_last_error(format!(
-                    "spectran_endpoints_client_control_streaming: {}",
-                    ctx
-                ));
-                SpectranFfiError::RuntimeContext
+
+            let client = &*client_ptr;
+
+            match ffi_block_on(client.control_streaming(start)) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!(
+                        "spectran_endpoints_client_control_streaming(start={}) failed: {}",
+                        start, e
+                    ));
+                    SpectranFfiError::InternalError
+                }
+                Err(ctx) => {
+                    set_last_error(format!(
+                        "spectran_endpoints_client_control_streaming: {}",
+                        ctx
+                    ));
+                    SpectranFfiError::RuntimeContext
+                }
             }
-        }
-    }
+        },
+    )
 }
 
 /// Start or stop server-side recording. `name` is the recording label and
@@ -1751,39 +2043,46 @@ pub unsafe extern "C" fn spectran_endpoints_client_control_recording(
     start: bool,
     name: *const c_char,
 ) -> SpectranFfiError {
-    unsafe {
-        clear_last_error();
-        if ptr.is_null() {
-            set_last_error("spectran_endpoints_client_control_recording: client pointer is null");
-            return SpectranFfiError::NullPointer;
-        }
-
-        let client = &mut *(ptr as *mut HttpEndpointsClient);
-
-        let name_str = if name.is_null() {
-            None
-        } else {
-            Some(CStr::from_ptr(name).to_string_lossy().into_owned())
-        };
-
-        match ffi_block_on(client.control_recording(start, name_str)) {
-            Ok(Ok(())) => SpectranFfiError::Success,
-            Ok(Err(e)) => {
-                set_last_error(format!(
-                    "spectran_endpoints_client_control_recording(start={}) failed: {}",
-                    start, e
-                ));
-                SpectranFfiError::InternalError
+    catch_ffi(
+        "spectran_endpoints_client_control_recording",
+        SpectranFfiError::InternalError,
+        || unsafe {
+            clear_last_error();
+            let client_ptr = ptr as *const HttpEndpointsClient;
+            if client_ptr.is_null() || !client_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_endpoints_client_control_recording: client pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
             }
-            Err(ctx) => {
-                set_last_error(format!(
-                    "spectran_endpoints_client_control_recording: {}",
-                    ctx
-                ));
-                SpectranFfiError::RuntimeContext
+
+            let client = &*client_ptr;
+
+            let name_str = if name.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(name).to_string_lossy().into_owned())
+            };
+
+            match ffi_block_on(client.control_recording(start, name_str)) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!(
+                        "spectran_endpoints_client_control_recording(start={}) failed: {}",
+                        start, e
+                    ));
+                    SpectranFfiError::InternalError
+                }
+                Err(ctx) => {
+                    set_last_error(format!(
+                        "spectran_endpoints_client_control_recording: {}",
+                        ctx
+                    ));
+                    SpectranFfiError::RuntimeContext
+                }
             }
-        }
-    }
+        },
+    )
 }
 
 /// Versioned native/HTTP capability JSON. Does not change the existing C
@@ -1792,22 +2091,29 @@ pub unsafe extern "C" fn spectran_endpoints_client_control_recording(
 /// ptr must be a live source, used exclusively for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_source_capabilities_json(ptr: *mut c_void) -> *mut c_char {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("Null source");
-        return std::ptr::null_mut();
-    }
-    let source = unsafe { &*(ptr as *mut SpectranSource) };
-    match ffi_block_on(source.device_capabilities())
-        .and_then(|caps| caps.to_json().map_err(|e| e.to_string()))
-        .and_then(|json| CString::new(json).map_err(|e| e.to_string()))
-    {
-        Ok(json) => json.into_raw(),
-        Err(error) => {
-            set_last_error(error);
-            std::ptr::null_mut()
-        }
-    }
+    catch_ffi(
+        "spectran_source_capabilities_json",
+        std::ptr::null_mut(),
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *const SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                set_last_error("spectran_source_capabilities_json: null or unaligned source");
+                return std::ptr::null_mut();
+            }
+            let source = unsafe { &*src_ptr };
+            match ffi_block_on(source.device_capabilities())
+                .and_then(|caps| caps.to_json().map_err(|e| e.to_string()))
+                .and_then(|json| CString::new(json).map_err(|e| e.to_string()))
+            {
+                Ok(json) => json.into_raw(),
+                Err(error) => {
+                    set_last_error(error);
+                    std::ptr::null_mut()
+                }
+            }
+        },
+    )
 }
 
 /// Native IQ receiver span bounds. Missing metadata is an error, not a guessed
@@ -1820,30 +2126,44 @@ pub unsafe extern "C" fn spectran_source_rf_span_range(
     min_hz: *mut f64,
     max_hz: *mut f64,
 ) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() || min_hz.is_null() || max_hz.is_null() {
-        return SpectranFfiError::InternalError;
-    }
-    let source = unsafe { &*(ptr as *mut SpectranSource) };
-    match ffi_block_on(source.device_capabilities()) {
-        Ok(caps) => match caps.rf_span_hz {
-            Some(range) => {
-                unsafe {
-                    *min_hz = range.min;
-                    *max_hz = range.max;
-                }
-                SpectranFfiError::Success
+    catch_ffi(
+        "spectran_source_rf_span_range",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *const SpectranSource;
+            if src_ptr.is_null()
+                || !src_ptr.is_aligned()
+                || min_hz.is_null()
+                || !min_hz.is_aligned()
+                || max_hz.is_null()
+                || !max_hz.is_aligned()
+            {
+                set_last_error("spectran_source_rf_span_range: null or unaligned pointer");
+                return SpectranFfiError::NullPointer;
             }
-            None => {
-                set_last_error("RF span bounds are unknown");
-                SpectranFfiError::InternalError
+            let source = unsafe { &*src_ptr };
+            match ffi_block_on(source.device_capabilities()) {
+                Ok(caps) => match caps.rf_span_hz {
+                    Some(range) => {
+                        unsafe {
+                            *min_hz = range.min;
+                            *max_hz = range.max;
+                        }
+                        SpectranFfiError::Success
+                    }
+                    None => {
+                        set_last_error("RF span bounds are unknown");
+                        SpectranFfiError::InternalError
+                    }
+                },
+                Err(error) => {
+                    set_last_error(error);
+                    SpectranFfiError::RuntimeContext
+                }
             }
         },
-        Err(error) => {
-            set_last_error(error);
-            SpectranFfiError::RuntimeContext
-        }
-    }
+    )
 }
 
 /// Set an explicit native IQ receiver RF span. Sample rate remains independent.
@@ -1854,22 +2174,32 @@ pub unsafe extern "C" fn spectran_source_set_rf_span_hz(
     ptr: *mut c_void,
     hz: f64,
 ) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() {
-        return SpectranFfiError::InternalError;
-    }
-    let source = unsafe { &mut *(ptr as *mut SpectranSource) };
-    match ffi_block_on(source.set_rf_span_hz(hz)) {
-        Ok(Ok(_)) => SpectranFfiError::Success,
-        Ok(Err(error)) => {
-            set_last_error(error.to_string());
-            SpectranFfiError::InternalError
-        }
-        Err(error) => {
-            set_last_error(error);
-            SpectranFfiError::RuntimeContext
-        }
-    }
+    catch_ffi(
+        "spectran_source_set_rf_span_hz",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let src_ptr = ptr as *mut SpectranSource;
+            if src_ptr.is_null() || !src_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_source_set_rf_span_hz: source pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
+            let source = unsafe { &mut *src_ptr };
+            match ffi_block_on(source.set_rf_span_hz(hz)) {
+                Ok(Ok(_)) => SpectranFfiError::Success,
+                Ok(Err(error)) => {
+                    set_last_error(error.to_string());
+                    SpectranFfiError::InternalError
+                }
+                Err(error) => {
+                    set_last_error(error);
+                    SpectranFfiError::RuntimeContext
+                }
+            }
+        },
+    )
 }
 
 /// Native-only builder settings. NULL strings and zero span/decimation mean
@@ -1885,38 +2215,51 @@ pub unsafe extern "C" fn spectran_source_builder_native_options(
     clock: *const c_char,
     decimation: u32,
 ) -> SpectranFfiError {
-    clear_last_error();
-    let Some(builder) = (unsafe { builder.as_mut() }) else {
-        return SpectranFfiError::InternalError;
-    };
-    let text = |value: *const c_char| -> std::result::Result<Option<String>, std::str::Utf8Error> {
-        if value.is_null() {
-            Ok(None)
-        } else {
-            unsafe { CStr::from_ptr(value) }
-                .to_str()
-                .map(|s| Some(s.to_owned()))
-        }
-    };
-    let result = (|| {
-        Ok::<_, std::str::Utf8Error>(crate::capabilities::NativeReceiverOptions {
-            family: text(family)?,
-            mode: text(mode)?,
-            receiver_clock: text(clock)?,
-            rf_span_hz: (rf_span_hz != 0.0).then_some(rf_span_hz),
-            decimation_factor: (decimation != 0).then_some(decimation),
-        })
-    })();
-    match result {
-        Ok(options) => {
-            builder.native_options(options);
-            SpectranFfiError::Success
-        }
-        Err(error) => {
-            set_last_error(error.to_string());
-            SpectranFfiError::InternalError
-        }
-    }
+    catch_ffi(
+        "spectran_source_builder_native_options",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            if builder.is_null() || !builder.is_aligned() {
+                set_last_error(
+                    "spectran_source_builder_native_options: builder pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
+            let builder = unsafe { &mut *builder };
+            let text =
+                |value: *const c_char| -> std::result::Result<Option<String>, std::str::Utf8Error> {
+                    if value.is_null() {
+                        Ok(None)
+                    } else {
+                        unsafe { CStr::from_ptr(value) }
+                            .to_str()
+                            .map(|s| Some(s.to_owned()))
+                    }
+                };
+            let result = (|| {
+                Ok::<_, std::str::Utf8Error>(crate::capabilities::NativeReceiverOptions {
+                    family: text(family)?,
+                    mode: text(mode)?,
+                    receiver_clock: text(clock)?,
+                    rf_span_hz: (rf_span_hz != 0.0).then_some(rf_span_hz),
+                    decimation_factor: (decimation != 0).then_some(decimation),
+                })
+            })();
+            match result {
+                Ok(options) => {
+                    builder.native_options(options);
+                    SpectranFfiError::Success
+                }
+                Err(error) => {
+                    set_last_error(format!(
+                        "spectran_source_builder_native_options: invalid UTF-8: {error}"
+                    ));
+                    SpectranFfiError::InvalidString
+                }
+            }
+        },
+    )
 }
 
 // --- General FFI Utilities --- //
@@ -1931,12 +2274,14 @@ pub unsafe extern "C" fn spectran_source_builder_native_options(
 /// behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_string_free(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        drop(CString::from_raw(s));
-    }
+    catch_ffi("spectran_string_free", (), || {
+        if s.is_null() {
+            return;
+        }
+        unsafe {
+            drop(CString::from_raw(s));
+        }
+    });
 }
 
 /// Translate an [`SpectranFfiError`] into a heap-allocated C string. The
@@ -1950,24 +2295,26 @@ pub unsafe extern "C" fn spectran_string_free(s: *mut c_char) {
 pub unsafe extern "C" fn spectran_get_error_message(
     error_code: std::os::raw::c_int,
 ) -> *mut c_char {
-    // Taken as a plain int, not the enum: a C enum is an int and any
-    // value can arrive, while an out-of-range Rust enum is undefined
-    // behaviour before the match runs.
-    let message = match error_code {
-        x if x == SpectranFfiError::Success as i32 => "Success",
-        x if x == SpectranFfiError::NullPointer as i32 => "Null pointer provided",
-        x if x == SpectranFfiError::InvalidString as i32 => "Invalid UTF-8 string provided",
-        x if x == SpectranFfiError::InternalError as i32 => "Internal Rust error",
-        x if x == SpectranFfiError::BuildFailed as i32 => "Failed to build Spectran source",
-        x if x == SpectranFfiError::ReadError as i32 => "Failed to read from Spectran source",
-        x if x == SpectranFfiError::RuntimeContext as i32 => {
-            "Called from a thread context that cannot block (current-thread tokio runtime)"
-        }
-        _ => "Unknown error code",
-    };
-    CString::new(message)
-        .unwrap_or_else(|_| CString::new("invalid").unwrap())
-        .into_raw()
+    catch_ffi("spectran_get_error_message", ptr::null_mut(), || {
+        // Taken as a plain int, not the enum: a C enum is an int and any
+        // value can arrive, while an out-of-range Rust enum is undefined
+        // behaviour before the match runs.
+        let message = match error_code {
+            x if x == SpectranFfiError::Success as i32 => "Success",
+            x if x == SpectranFfiError::NullPointer as i32 => "Null pointer provided",
+            x if x == SpectranFfiError::InvalidString as i32 => "Invalid UTF-8 string provided",
+            x if x == SpectranFfiError::InternalError as i32 => "Internal Rust error",
+            x if x == SpectranFfiError::BuildFailed as i32 => "Failed to build Spectran source",
+            x if x == SpectranFfiError::ReadError as i32 => "Failed to read from Spectran source",
+            x if x == SpectranFfiError::RuntimeContext as i32 => {
+                "Called from a thread context that cannot block (current-thread tokio runtime)"
+            }
+            _ => "Unknown error code",
+        };
+        CString::new(message)
+            .unwrap_or_else(|_| CString::new("invalid").unwrap())
+            .into_raw()
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -1989,7 +2336,9 @@ pub unsafe extern "C" fn spectran_get_error_message(
 /// borrows it).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_sink_builder_new() -> *mut SpectranSinkBuilder {
-    Box::into_raw(Box::new(SpectranSinkBuilder::new()))
+    catch_ffi("spectran_sink_builder_new", ptr::null_mut(), || {
+        Box::into_raw(Box::new(SpectranSinkBuilder::new()))
+    })
 }
 
 /// Whether this build carries a transmit path at all.
@@ -2013,7 +2362,9 @@ pub unsafe extern "C" fn spectran_sink_builder_new() -> *mut SpectranSinkBuilder
 /// to call from any thread at any time.
 #[unsafe(no_mangle)]
 pub extern "C" fn spectran_sink_supported() -> bool {
-    crate::unified_sink::UnifiedSink::tx_supported()
+    catch_ffi("spectran_sink_supported", false, || {
+        crate::unified_sink::UnifiedSink::tx_supported()
+    })
 }
 
 /// Free a sink builder. Null is a no-op.
@@ -2023,9 +2374,11 @@ pub extern "C" fn spectran_sink_supported() -> bool {
 /// [`spectran_sink_builder_new`] that has not already been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_sink_builder_free(builder: *mut SpectranSinkBuilder) {
-    if !builder.is_null() {
-        unsafe { drop(Box::from_raw(builder)) };
-    }
+    catch_ffi("spectran_sink_builder_free", (), || {
+        if !builder.is_null() && builder.is_aligned() {
+            unsafe { drop(Box::from_raw(builder)) };
+        }
+    });
 }
 
 /// Set the TX center frequency in Hz on a sink builder.
@@ -2037,10 +2390,14 @@ pub unsafe extern "C" fn spectran_sink_builder_center_frequency_hz(
     builder: *mut SpectranSinkBuilder,
     hz: f64,
 ) {
-    if let Some(b) = unsafe { builder.as_mut() } {
-        let updated = std::mem::take(b).center_frequency_hz(hz);
-        *b = updated;
-    }
+    catch_ffi("spectran_sink_builder_center_frequency_hz", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(b) = builder.as_mut()
+        {
+            let updated = std::mem::take(b).center_frequency_hz(hz);
+            *b = updated;
+        }
+    });
 }
 
 /// Set the TX IQ sample rate (span) in Hz on a sink builder.
@@ -2052,10 +2409,14 @@ pub unsafe extern "C" fn spectran_sink_builder_sample_rate_hz(
     builder: *mut SpectranSinkBuilder,
     hz: f64,
 ) {
-    if let Some(b) = unsafe { builder.as_mut() } {
-        let updated = std::mem::take(b).sample_rate_hz(hz);
-        *b = updated;
-    }
+    catch_ffi("spectran_sink_builder_sample_rate_hz", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(b) = builder.as_mut()
+        {
+            let updated = std::mem::take(b).sample_rate_hz(hz);
+            *b = updated;
+        }
+    });
 }
 
 /// Set the transmission gain in dB on a sink builder.
@@ -2067,32 +2428,59 @@ pub unsafe extern "C" fn spectran_sink_builder_trans_gain_db(
     builder: *mut SpectranSinkBuilder,
     db: f64,
 ) {
-    if let Some(b) = unsafe { builder.as_mut() } {
-        let updated = std::mem::take(b).trans_gain_db(db);
-        *b = updated;
-    }
+    catch_ffi("spectran_sink_builder_trans_gain_db", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(b) = builder.as_mut()
+        {
+            let updated = std::mem::take(b).trans_gain_db(db);
+            *b = updated;
+        }
+    });
+}
+
+/// Pin a sink builder to a specific device serial number (native-SDK TX).
+///
+/// # Safety
+/// `builder` must be a live pointer from [`spectran_sink_builder_new`];
+/// `serial` must be null (no-op) or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_sink_builder_device_serial(
+    builder: *mut SpectranSinkBuilder,
+    serial: *const c_char,
+) {
+    catch_ffi("spectran_sink_builder_device_serial", (), || unsafe {
+        if builder.is_aligned()
+            && let Some(b) = builder.as_mut()
+            && !serial.is_null()
+        {
+            let serial_str = CStr::from_ptr(serial).to_string_lossy().into_owned();
+            let updated = std::mem::take(b).device_serial(serial_str);
+            *b = updated;
+        }
+    });
 }
 
 /// Build a sink from the builder's current configuration.
 ///
 /// The builder is **borrowed**, exactly like [`spectran_source_build`]:
 /// the caller retains ownership and must still free it with
-/// [`spectran_sink_builder_free`]. (An earlier revision consumed the
-/// builder here while the source API borrowed it — following the
-/// source convention then double-freed the builder on every open.)
+/// [`spectran_sink_builder_free`].
 ///
 /// # Safety
 /// `builder` must be a live pointer from [`spectran_sink_builder_new`].
 /// The returned sink must be freed with [`spectran_sink_free`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_sink_build(builder: *mut SpectranSinkBuilder) -> *mut c_void {
-    clear_last_error();
-    let Some(builder_ref) = (unsafe { builder.as_ref() }) else {
-        set_last_error("Null builder".to_string());
-        return ptr::null_mut();
-    };
-    let sink = builder_ref.clone().build();
-    Box::into_raw(Box::new(sink)) as *mut c_void
+    catch_ffi("spectran_sink_build", ptr::null_mut(), || {
+        clear_last_error();
+        if builder.is_null() || !builder.is_aligned() {
+            set_last_error("spectran_sink_build: builder pointer is null or unaligned");
+            return ptr::null_mut();
+        }
+        let builder_ref = unsafe { &*builder };
+        let sink = builder_ref.clone().build();
+        Box::into_raw(Box::new(sink)) as *mut c_void
+    })
 }
 
 /// Free a sink. Null is a no-op.
@@ -2102,16 +2490,17 @@ pub unsafe extern "C" fn spectran_sink_build(builder: *mut SpectranSinkBuilder) 
 /// that has not already been freed, with no other thread using it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_sink_free(ptr: *mut c_void) {
-    if !ptr.is_null() {
-        unsafe { drop(Box::from_raw(ptr as *mut UnifiedSink)) };
-    }
+    catch_ffi("spectran_sink_free", (), || {
+        let sink_ptr = ptr as *mut UnifiedSink;
+        if !sink_ptr.is_null() && sink_ptr.is_aligned() {
+            unsafe { drop(Box::from_raw(sink_ptr)) };
+        }
+    });
 }
 
 /// Initialize the sink and bring the transmitter up: loads the native
-/// SDK, opens the first matching device, configures the IQ transmitter
-/// from the builder settings, and starts the TX stream. (An earlier
-/// revision only loaded the SDK library — nothing ever opened or
-/// started the device, so every write failed.)
+/// SDK, opens the matching device, configures the IQ transmitter
+/// from the builder settings, and starts the TX stream.
 ///
 /// Blocking; uses the shared FFI runtime via `ffi_block_on` — safe to
 /// call from plain C threads and from multi-threaded tokio contexts.
@@ -2121,26 +2510,33 @@ pub unsafe extern "C" fn spectran_sink_free(ptr: *mut c_void) {
 /// concurrently from another thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_sink_initialize(ptr: *mut c_void) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("Null pointer".to_string());
-        return SpectranFfiError::NullPointer;
-    }
-    let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
-    match ffi_block_on(async {
-        sink.initialize().await?;
-        sink.start_streaming().await
-    }) {
-        Ok(Ok(())) => SpectranFfiError::Success,
-        Ok(Err(e)) => {
-            set_last_error(format!("Initialize error: {}", e));
-            SpectranFfiError::InternalError
-        }
-        Err(msg) => {
-            set_last_error(msg);
-            SpectranFfiError::InternalError
-        }
-    }
+    catch_ffi(
+        "spectran_sink_initialize",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let sink_ptr = ptr as *mut UnifiedSink;
+            if sink_ptr.is_null() || !sink_ptr.is_aligned() {
+                set_last_error("spectran_sink_initialize: sink pointer is null or unaligned");
+                return SpectranFfiError::NullPointer;
+            }
+            let sink = unsafe { &mut *sink_ptr };
+            match ffi_block_on(async {
+                sink.initialize().await?;
+                sink.start_streaming().await
+            }) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!("Initialize error: {}", e));
+                    SpectranFfiError::InternalError
+                }
+                Err(msg) => {
+                    set_last_error(msg);
+                    SpectranFfiError::RuntimeContext
+                }
+            }
+        },
+    )
 }
 
 /// Stop the TX stream and disconnect the device.
@@ -2150,23 +2546,165 @@ pub unsafe extern "C" fn spectran_sink_initialize(ptr: *mut c_void) -> SpectranF
 /// concurrently from another thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_sink_stop_streaming(ptr: *mut c_void) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() {
-        set_last_error("Null pointer".to_string());
-        return SpectranFfiError::NullPointer;
-    }
-    let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
-    match ffi_block_on(async { sink.stop_streaming().await }) {
-        Ok(Ok(())) => SpectranFfiError::Success,
-        Ok(Err(e)) => {
-            set_last_error(format!("Stop streaming error: {}", e));
-            SpectranFfiError::InternalError
+    catch_ffi(
+        "spectran_sink_stop_streaming",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let sink_ptr = ptr as *mut UnifiedSink;
+            if sink_ptr.is_null() || !sink_ptr.is_aligned() {
+                set_last_error("spectran_sink_stop_streaming: sink pointer is null or unaligned");
+                return SpectranFfiError::NullPointer;
+            }
+            let sink = unsafe { &mut *sink_ptr };
+            match ffi_block_on(async { sink.stop_streaming().await }) {
+                Ok(Ok(())) => SpectranFfiError::Success,
+                Ok(Err(e)) => {
+                    set_last_error(format!("Stop streaming error: {}", e));
+                    SpectranFfiError::InternalError
+                }
+                Err(msg) => {
+                    set_last_error(msg);
+                    SpectranFfiError::RuntimeContext
+                }
+            }
+        },
+    )
+}
+
+/// Retune the TX center frequency in Hz on a live or uninitialized sink.
+///
+/// # Safety
+/// `ptr` must be a live pointer from [`spectran_sink_build`], not used
+/// concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_sink_set_center_frequency_hz(
+    ptr: *mut c_void,
+    hz: f64,
+) -> SpectranFfiError {
+    catch_ffi(
+        "spectran_sink_set_center_frequency_hz",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let sink_ptr = ptr as *mut UnifiedSink;
+            if sink_ptr.is_null() || !sink_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_sink_set_center_frequency_hz: sink pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
+            let sink = unsafe { &mut *sink_ptr };
+            match sink.set_center_frequency_hz(hz) {
+                Ok(()) => SpectranFfiError::Success,
+                Err(e) => {
+                    set_last_error(format!("spectran_sink_set_center_frequency_hz failed: {e}"));
+                    SpectranFfiError::InternalError
+                }
+            }
+        },
+    )
+}
+
+/// Update the TX IQ sample rate in Hz on a live or uninitialized sink.
+///
+/// # Safety
+/// `ptr` must be a live pointer from [`spectran_sink_build`], not used
+/// concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_sink_set_sample_rate_hz(
+    ptr: *mut c_void,
+    hz: f64,
+) -> SpectranFfiError {
+    catch_ffi(
+        "spectran_sink_set_sample_rate_hz",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let sink_ptr = ptr as *mut UnifiedSink;
+            if sink_ptr.is_null() || !sink_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_sink_set_sample_rate_hz: sink pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
+            let sink = unsafe { &mut *sink_ptr };
+            match sink.set_sample_rate_hz(hz) {
+                Ok(()) => SpectranFfiError::Success,
+                Err(e) => {
+                    set_last_error(format!("spectran_sink_set_sample_rate_hz failed: {e}"));
+                    SpectranFfiError::InternalError
+                }
+            }
+        },
+    )
+}
+
+/// Update the TX gain in dB on a live or uninitialized sink.
+///
+/// # Safety
+/// `ptr` must be a live pointer from [`spectran_sink_build`], not used
+/// concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_sink_set_trans_gain_db(
+    ptr: *mut c_void,
+    db: f64,
+) -> SpectranFfiError {
+    catch_ffi(
+        "spectran_sink_set_trans_gain_db",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let sink_ptr = ptr as *mut UnifiedSink;
+            if sink_ptr.is_null() || !sink_ptr.is_aligned() {
+                set_last_error(
+                    "spectran_sink_set_trans_gain_db: sink pointer is null or unaligned",
+                );
+                return SpectranFfiError::NullPointer;
+            }
+            let sink = unsafe { &mut *sink_ptr };
+            match sink.set_trans_gain_db(db) {
+                Ok(()) => SpectranFfiError::Success,
+                Err(e) => {
+                    set_last_error(format!("spectran_sink_set_trans_gain_db failed: {e}"));
+                    SpectranFfiError::InternalError
+                }
+            }
+        },
+    )
+}
+
+/// Read the TX device's master stream clock in nanoseconds since the Unix
+/// epoch. Returns `true` when readable (and writes `*out_time_ns` when
+/// non-null), `false` otherwise.
+///
+/// # Safety
+/// `ptr` must be a live pointer from [`spectran_sink_build`]; `out_time_ns`,
+/// when non-null, must point to a writable, aligned `i64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_sink_get_master_stream_time_ns(
+    ptr: *mut c_void,
+    out_time_ns: *mut i64,
+) -> bool {
+    catch_ffi("spectran_sink_get_master_stream_time_ns", false, || {
+        let sink_ptr = ptr as *mut UnifiedSink;
+        if sink_ptr.is_null() || !sink_ptr.is_aligned() {
+            return false;
         }
-        Err(msg) => {
-            set_last_error(msg);
-            SpectranFfiError::InternalError
+        if !out_time_ns.is_null() && !out_time_ns.is_aligned() {
+            return false;
         }
-    }
+        let sink = unsafe { &mut *sink_ptr };
+        match sink.master_stream_time_ns() {
+            Ok(nanos) => {
+                if !out_time_ns.is_null() {
+                    unsafe { *out_time_ns = nanos };
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    })
 }
 
 /// Queue one burst of interleaved IQ samples for transmission.
@@ -2174,13 +2712,13 @@ pub unsafe extern "C" fn spectran_sink_stop_streaming(ptr: *mut c_void) -> Spect
 /// `start_time_s`/`end_time_s` are in device **master stream time**
 /// seconds; `flags` are `tx_flags` packet-boundary bits (pass
 /// `SPECTRAN_TX_SEGMENT_START | SPECTRAN_TX_SEGMENT_END | SPECTRAN_TX_PUSH`
-/// for a self-contained burst). Samples use the same
-/// [`FfiComplex`] layout as the read path — the header no longer uses
-/// C99 `_Complex`, which MSVC rejects in C++.
+/// for a self-contained burst). When `num_samples == 0`, `samples` may be
+/// `NULL` to send a 0-sample startup/shutdown sync packet.
 ///
 /// # Safety
-/// `ptr` must be a live pointer from [`spectran_sink_build`]; `samples`
-/// must point to `num_samples` readable [`FfiComplex`] elements.
+/// `ptr` must be a live pointer from [`spectran_sink_build`]; when
+/// `num_samples > 0`, `samples` must be properly aligned and point to
+/// `num_samples` readable [`FfiComplex`] elements.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spectran_sink_write_samples(
     ptr: *mut c_void,
@@ -2191,33 +2729,55 @@ pub unsafe extern "C" fn spectran_sink_write_samples(
     samples: *const FfiComplex,
     num_samples: usize,
 ) -> SpectranFfiError {
-    clear_last_error();
-    if ptr.is_null() || samples.is_null() {
-        set_last_error("Null pointer".to_string());
-        return SpectranFfiError::NullPointer;
-    }
+    catch_ffi(
+        "spectran_sink_write_samples",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            let sink_ptr = ptr as *mut UnifiedSink;
+            if sink_ptr.is_null() || !sink_ptr.is_aligned() {
+                set_last_error("spectran_sink_write_samples: sink pointer is null or unaligned");
+                return SpectranFfiError::NullPointer;
+            }
+            if num_samples > 0 {
+                if samples.is_null() {
+                    set_last_error("spectran_sink_write_samples: samples pointer is null");
+                    return SpectranFfiError::NullPointer;
+                }
+                if !samples.is_aligned() {
+                    set_last_error("spectran_sink_write_samples: samples pointer is not aligned");
+                    return SpectranFfiError::InternalError;
+                }
+            }
 
-    // A length that cannot describe a real buffer (more than isize::MAX
-    // bytes) is a caller bug; refuse it rather than build an invalid slice.
-    if num_samples > isize::MAX as usize / std::mem::size_of::<FfiComplex>() {
-        set_last_error(format!(
-            "num_samples {num_samples} exceeds the maximum slice length"
-        ));
-        return SpectranFfiError::InternalError;
-    }
+            // A length that cannot describe a real buffer (more than isize::MAX
+            // bytes) is a caller bug; refuse it rather than build an invalid slice.
+            if num_samples > isize::MAX as usize / std::mem::size_of::<FfiComplex>() {
+                set_last_error(format!(
+                    "num_samples {num_samples} exceeds the maximum slice length"
+                ));
+                return SpectranFfiError::InternalError;
+            }
 
-    let sink = unsafe { &mut *(ptr as *mut UnifiedSink) };
-    // SAFETY: FfiComplex and Complex32 are both repr(C) {f32, f32};
-    // the layout assertion lives next to the FfiComplex definition.
-    let slice = unsafe { std::slice::from_raw_parts(samples as *const Complex32, num_samples) };
+            let sink = unsafe { &mut *sink_ptr };
+            let slice: &[Complex32] = if num_samples == 0 {
+                &[]
+            } else {
+                // SAFETY: FfiComplex and Complex32 have identical size and alignment
+                // (asserted at compile time above), `samples` is non-null & aligned,
+                // and `num_samples * size_of::<FfiComplex>() <= isize::MAX`.
+                unsafe { std::slice::from_raw_parts(samples as *const Complex32, num_samples) }
+            };
 
-    match sink.write_samples(channel, start_time_s, end_time_s, flags, slice) {
-        Ok(_) => SpectranFfiError::Success,
-        Err(e) => {
-            set_last_error(format!("Write error: {}", e));
-            SpectranFfiError::InternalError
-        }
-    }
+            match sink.write_samples(channel, start_time_s, end_time_s, flags, slice) {
+                Ok(_) => SpectranFfiError::Success,
+                Err(e) => {
+                    set_last_error(format!("Write error: {}", e));
+                    SpectranFfiError::InternalError
+                }
+            }
+        },
+    )
 }
 
 #[cfg(test)]

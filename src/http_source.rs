@@ -534,6 +534,7 @@ impl HttpSource {
         // Security: validate scheme and warn on non-local hosts — the one
         // shared implementation, also used by the link-budget probe.
         crate::http_endpoints::validate_base_url(&base_url)?;
+        let base_url = base_url.trim_end_matches('/').to_string();
         // And the one place `rate_reduction(0)` is caught, before it can
         // reach the wire or silently disarm the link check.
         crate::http_endpoints::StreamParams::validate_rate_reduction(rate_reduction)?;
@@ -2028,25 +2029,62 @@ impl HttpSource {
     /// later restart cannot fire it for the first time after an external
     /// retune it would undo.
     async fn configure_rtsa_device(&mut self) -> Result<()> {
-        let connect_run = self.write_connect_run().await;
-
-        // Tune the hardware *before* opening the stream — but only on the
-        // first start. A restart (from `restart_pending`) happens *after* an
-        // external retune, and re-pushing this source's target would undo
-        // it; the stream just needs to reconnect. See `initial_tune_done`.
+        // Only run connect/run and initial tune on the very first start.
+        // Reconnects (from `restart_pending` or transient stream drops) must
+        // neither hit `/remoteconfig` + sleep 500 ms nor overwrite an external
+        // retune.
         if self.initial_tune_done {
-            debug!("Skipping device retune on stream restart (already tuned once)");
-        } else {
-            self.initial_tune_done = true;
-            self.apply_initial_tune().await;
+            debug!(
+                "Skipping device connect/run and retune on stream restart (already configured once)"
+            );
+            return Ok(());
         }
 
+        let connect_run = self.write_connect_run().await;
+        self.initial_tune_done = true;
+        self.apply_initial_tune().await;
         connect_run
     }
 
-    /// Set the RTSA block's `connect` and `run` switches.
+    /// Set the receiver block's `connect` and `run` switches if needed.
     async fn write_connect_run(&mut self) -> Result<()> {
         use crate::http_endpoints::ConfigItem;
+
+        fn find_connect_run_block(
+            item: &ConfigItem,
+            enclosing_block: Option<&str>,
+        ) -> Option<(String, Option<bool>, Option<bool>)> {
+            let ConfigItem::Group { name, items, .. } = item else {
+                return None;
+            };
+            let current_block = if name.starts_with("Block_") || name == "RTSA" {
+                Some(name.as_str())
+            } else {
+                enclosing_block
+            };
+            let mut connect_val = None;
+            let mut run_val = None;
+            for child in items {
+                if let ConfigItem::Bool {
+                    name: field, value, ..
+                } = child
+                {
+                    if field == "connect" {
+                        connect_val = Some(*value);
+                    } else if field == "run" {
+                        run_val = Some(*value);
+                    }
+                }
+            }
+            if (connect_val.is_some() || run_val.is_some())
+                && let Some(block) = current_block
+            {
+                return Some((block.to_string(), connect_val, run_val));
+            }
+            items
+                .iter()
+                .find_map(|child| find_connect_run_block(child, current_block))
+        }
 
         info!("Configuring RTSA device for streaming...");
 
@@ -2057,7 +2095,16 @@ impl HttpSource {
             config.request
         );
 
-        // Configure RTSA block with connect=true and run=true
+        let target_block = match find_connect_run_block(&config.config, None) {
+            Some((block, Some(true), Some(true))) => {
+                info!("RTSA block {block} already has connect=true, run=true; skipping write");
+                return Ok(());
+            }
+            Some((block, _, _)) => block,
+            None => "RTSA".to_string(),
+        };
+
+        // Configure discovered receiver block (or legacy "RTSA" fallback) with connect=true and run=true
         let rtsa_config = vec![
             ConfigItem::Bool {
                 name: "connect".to_string(),
@@ -2080,9 +2127,9 @@ impl HttpSource {
         ];
 
         self.endpoints_client
-            .update_config(config.request + 1, "RTSA", rtsa_config)
+            .update_config(config.request + 1, &target_block, rtsa_config)
             .await?;
-        info!("Successfully configured RTSA device: connect=true, run=true");
+        info!("Successfully configured RTSA block {target_block}: connect=true, run=true");
         // Give device a moment to process the configuration
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         Ok(())
@@ -2114,7 +2161,26 @@ impl HttpSource {
         // device already is".
         let center_hz = self.configured_center_hz;
         let rate_hz = self.configured_rate_hz;
-        let decimation_index = (rate_hz > 0.0).then(|| crate::decimation_index_for_rate(rate_hz));
+        let decimation_index = if rate_hz.is_finite() && rate_hz > 0.0 {
+            if let Some(rates) = self
+                .endpoints_client
+                .get_device_capabilities()
+                .await
+                .sample_rates()
+            {
+                rates
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (**a - rate_hz).abs().total_cmp(&(**b - rate_hz).abs())
+                    })
+                    .map(|(idx, _)| idx)
+            } else {
+                Some(crate::decimation_index_for_rate(rate_hz))
+            }
+        } else {
+            None
+        };
 
         info!(
             "Tuning RTSA device to center={:.6} MHz, span={:.3} MHz \
@@ -2131,7 +2197,8 @@ impl HttpSource {
             reference_level_dbm: self.reference_level_dbm,
         };
 
-        let need_control_fallback = match self.endpoints_client.apply_capture_config(&request).await {
+        let need_control_fallback = match self.endpoints_client.apply_capture_config(&request).await
+        {
             Ok(applied) => {
                 info!(
                     "RTSA device reports center={:?} Hz, decimation={:?}, \
@@ -2498,7 +2565,7 @@ impl HttpSourceBuilder {
     /// (100 MHz / 1 MS/s / Int16 / no auth).
     pub fn new(base_url: &str) -> Self {
         Self {
-            base_url: base_url.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
             listen_only: false,
             center_frequency_hz: 100e6, // 100 MHz default
             sample_rate_hz: 1e6,        // 1 MS/s default

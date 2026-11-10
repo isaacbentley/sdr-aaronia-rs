@@ -17,6 +17,10 @@ classifiers = [
 ]
 # Version comes from python-aaronia/Cargo.toml (single source of truth).
 dynamic = ["version"]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+arrow = ["pyarrow>=14.0"]
 
 # A real command, so checking a setup needs no code:
 #   aaronia-doctor http://localhost:54664

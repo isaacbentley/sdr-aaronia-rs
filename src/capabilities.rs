@@ -103,7 +103,8 @@ pub struct ConfigOption {
     test,
     all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     )
 ))]
 pub(crate) fn sdk_options(labels: &str, disabled: u64) -> Vec<ConfigOption> {

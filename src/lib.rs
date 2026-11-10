@@ -71,42 +71,73 @@ pub use error::{Error, Result};
 pub use num_complex::Complex32;
 pub use utils::RxChannel;
 
-#[cfg(feature = "native-sdk")]
+#[cfg(all(
+    feature = "native-sdk",
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
+))]
 #[cfg_attr(docsrs, doc(cfg(feature = "native-sdk")))]
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod native_sdk;
 
-#[cfg(feature = "native-sdk")]
+#[cfg(all(
+    feature = "native-sdk",
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
+))]
 #[cfg_attr(docsrs, doc(cfg(feature = "native-sdk")))]
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod sdk_source;
 
-#[cfg(feature = "native-sdk")]
+#[cfg(all(
+    feature = "native-sdk",
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
+))]
 #[cfg_attr(docsrs, doc(cfg(feature = "native-sdk")))]
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod sdk_sink;
 
-#[cfg(feature = "native-sdk")]
+#[cfg(all(
+    feature = "native-sdk",
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
+))]
 #[cfg_attr(docsrs, doc(cfg(feature = "native-sdk")))]
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub use native_sdk::{NativeSdkClient, NativeSdkSource};
 
 #[cfg(feature = "ffi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
 pub use c_api::{
-    CSpectranSourceType, FfiComplex, FfiDeviceSensors, FfiServerInfo, FfiSourceInfo,
-    SpectranFfiError, spectran_endpoints_client_control_recording,
+    CSpectranSourceType, FfiComplex, FfiDeviceCapabilities, FfiDeviceSensors, FfiServerInfo,
+    FfiSourceInfo, SpectranFfiError, spectran_endpoints_client_control_recording,
     spectran_endpoints_client_control_streaming, spectran_endpoints_client_free,
     spectran_endpoints_client_get_info, spectran_endpoints_client_get_sensors,
     spectran_endpoints_client_new, spectran_get_error_message,
-    spectran_iq_sample_rate_for_bandwidth, spectran_sdk_installed, spectran_server_info_free,
-    spectran_source_build, spectran_source_builder_center_frequency_hz,
+    spectran_iq_sample_rate_for_bandwidth, spectran_last_error, spectran_sdk_installed,
+    spectran_server_info_free, spectran_sink_build, spectran_sink_builder_center_frequency_hz,
+    spectran_sink_builder_device_serial, spectran_sink_builder_free, spectran_sink_builder_new,
+    spectran_sink_builder_sample_rate_hz, spectran_sink_builder_trans_gain_db, spectran_sink_free,
+    spectran_sink_get_master_stream_time_ns, spectran_sink_initialize,
+    spectran_sink_set_center_frequency_hz, spectran_sink_set_sample_rate_hz,
+    spectran_sink_set_trans_gain_db, spectran_sink_stop_streaming, spectran_sink_supported,
+    spectran_sink_write_samples, spectran_source_build, spectran_source_builder_auto_reconnect,
+    spectran_source_builder_center_frequency_hz, spectran_source_builder_device_serial,
     spectran_source_builder_file_source, spectran_source_builder_force_source_type,
-    spectran_source_builder_free, spectran_source_builder_http_source, spectran_source_builder_new,
-    spectran_source_builder_reference_level_dbm, spectran_source_builder_sample_rate_hz,
-    spectran_source_free, spectran_source_get_sensors, spectran_source_get_source_info,
-    spectran_source_info_free, spectran_source_read_samples, spectran_source_start_streaming,
-    spectran_source_stop_streaming, spectran_string_free, spectran_usable_bandwidth_hz,
+    spectran_source_builder_free, spectran_source_builder_http_source,
+    spectran_source_builder_listen_only, spectran_source_builder_native_options,
+    spectran_source_builder_new, spectran_source_builder_read_timeout_us,
+    spectran_source_builder_receiver_channel, spectran_source_builder_reference_level_dbm,
+    spectran_source_builder_sample_rate_hz, spectran_source_builder_stream_format,
+    spectran_source_builder_stream_scale, spectran_source_capabilities_free,
+    spectran_source_capabilities_json, spectran_source_free, spectran_source_get_capabilities,
+    spectran_source_get_cumulative_drops, spectran_source_get_gps_time_ns,
+    spectran_source_get_last_timestamp_ns, spectran_source_get_master_stream_time_ns,
+    spectran_source_get_sensors, spectran_source_get_source_info, spectran_source_info_free,
+    spectran_source_read_samples, spectran_source_read_samples_dual,
+    spectran_source_read_samples_dual_timeout, spectran_source_read_samples_timeout,
+    spectran_source_rf_span_range, spectran_source_set_center_frequency_hz,
+    spectran_source_set_clock_source, spectran_source_set_reference_level_dbm,
+    spectran_source_set_rf_span_hz, spectran_source_set_sample_rate_hz,
+    spectran_source_start_streaming, spectran_source_stop_streaming, spectran_source_take_overrun,
+    spectran_string_free, spectran_usable_bandwidth_hz,
 };
 pub use detection::{get_sdk_library_path, get_sdk_path, get_xml_config_path, is_sdk_installed};
 #[cfg(feature = "file")]

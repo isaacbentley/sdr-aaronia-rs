@@ -52,7 +52,11 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../include)
 # --- Rust static library -------------------------------------------------
 set(CARGO_MANIFEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 if (NOT DEFINED CARGO_TARGET_DIR)
-    set(CARGO_TARGET_DIR ${CARGO_MANIFEST_DIR}/target)
+    if (DEFINED ENV{CARGO_TARGET_DIR} AND NOT "$ENV{CARGO_TARGET_DIR}" STREQUAL "")
+        set(CARGO_TARGET_DIR "$ENV{CARGO_TARGET_DIR}")
+    else()
+        set(CARGO_TARGET_DIR ${CARGO_MANIFEST_DIR}/target)
+    endif()
 endif()
 
 # The staticlib's name follows the Rust toolchain, not the OS: the
@@ -92,15 +96,19 @@ endif()
 #   cmake -S soapy-aaronia -B soapy-aaronia/build -DAARONIA_NATIVE_SDK=ON
 # Windows and Linux only, and the Aaronia SDK must be installed at run
 # time for the backend to be selected.
+set(_default_native_sdk OFF)
+if (((UNIX AND NOT APPLE) OR WIN32) AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_default_native_sdk ON)
+endif()
 option(AARONIA_NATIVE_SDK
-    "Build the Rust library with the native-sdk feature (Windows/Linux; enables TX)"
-    OFF)
+    "Build the Rust library with the native-sdk feature (64-bit Windows/Linux; enables native RX/TX)"
+    ${_default_native_sdk})
 set(CARGO_FEATURES "")
 if (AARONIA_NATIVE_SDK)
     set(CARGO_FEATURES --features native-sdk)
 endif()
 add_custom_target(sdr_aaronia_rs_static ALL
-    COMMAND cargo build --release -p sdr-aaronia-rs ${CARGO_FEATURES}
+    COMMAND cargo build --release -p sdr-aaronia-rs --target-dir ${CARGO_TARGET_DIR} ${CARGO_FEATURES}
     WORKING_DIRECTORY ${CARGO_MANIFEST_DIR}
     COMMENT "cargo build --release -p sdr-aaronia-rs (static lib for SoapyAaronia)"
     VERBATIM

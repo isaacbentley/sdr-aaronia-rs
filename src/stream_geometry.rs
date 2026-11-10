@@ -18,7 +18,20 @@ impl IqGeometry {
         if !rate.is_finite() || rate <= 0.0 {
             return None;
         }
-        let bandwidth_hz = (span.is_finite() && span > 0.0 && span <= rate).then_some(span);
+        // Allow tiny IEEE-754 rounding jitter when `span` and `rate` are
+        // nominally identical (e.g. `raw` or TX packets), while still
+        // rejecting genuinely super-Nyquist spans (`span > rate`).
+        let bandwidth_hz = if span.is_finite() && span > 0.0 {
+            if span <= rate {
+                Some(span)
+            } else if span <= rate * (1.0 + 1e-12) {
+                Some(rate)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let center_frequency_hz = bandwidth_hz.and_then(|width| {
             let center = start + width / 2.0;
             (center.is_finite() && center >= 0.0).then_some(center)
@@ -35,7 +48,8 @@ impl IqGeometry {
     test,
     all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     )
 ))]
 pub(crate) fn validate_eco_span(span: f64, minimum: f64, maximum: f64) -> crate::Result<()> {

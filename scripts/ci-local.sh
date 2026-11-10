@@ -116,8 +116,9 @@ fi
 
 # ---- hack job ------------------------------------------------------
 if ! skipped hack; then
-    step "cargo hack check --each-feature --no-dev-deps"
+    step "cargo hack check --each-feature (--no-dev-deps + --all-targets)"
     cargo hack check --each-feature --no-dev-deps
+    cargo hack check --each-feature --all-targets
 fi
 
 # ---- machete job ---------------------------------------------------

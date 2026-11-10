@@ -106,12 +106,12 @@ pub struct HttpSink {
     sample_buffer: Vec<Complex32>,
     last_transmission_end_time: f64,
     streaming_delay: f64,
-    tx: tokio::sync::mpsc::Sender<(Vec<f32>, f64, f64)>, // (samples, start_time, end_time)
+    tx: Option<tokio::sync::mpsc::Sender<(Vec<f32>, f64, f64)>>, // (samples, start_time, end_time)
     dropped_samples: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Handle to the background task that drains `tx` and performs the
-    /// HTTP pushes. Held so `Drop` can abort it explicitly rather than
-    /// relying on the task noticing a dropped `tx` on its next `recv()`.
-    sender_task: tokio::task::JoinHandle<()>,
+    /// HTTP pushes. Awaited in `Kernel::finish` so queued batches flush
+    /// before flowgraph teardown, and aborted in `Drop` if dropped early.
+    sender_task: Option<tokio::task::JoinHandle<()>>,
     #[input]
     input: futuresdr::runtime::buffer::DefaultCpuReader<Complex32>,
 }
@@ -204,9 +204,9 @@ impl HttpSink {
             sample_buffer: Vec::with_capacity(buffer_size * 2),
             last_transmission_end_time: now,
             streaming_delay,
-            tx,
+            tx: Some(tx),
             dropped_samples,
-            sender_task,
+            sender_task: Some(sender_task),
             input: futuresdr::runtime::buffer::DefaultCpuReader::default(),
         })
     }
@@ -247,12 +247,11 @@ impl HttpSink {
 
         self.last_transmission_end_time = end_time + (1.0 / self.sample_rate_hz);
 
-        if self
-            .tx
-            .send((samples_vec, start_time, end_time))
-            .await
-            .is_err()
-        {
+        let sent = match self.tx.as_ref() {
+            Some(tx) => tx.send((samples_vec, start_time, end_time)).await.is_ok(),
+            None => false,
+        };
+        if !sent {
             // The background sender task is gone (e.g. it panicked), so
             // this batch will never reach the device. Count it the same
             // way a failed/timed-out push is counted — otherwise
@@ -270,15 +269,27 @@ impl HttpSink {
         self.sample_buffer.clear();
         Ok(())
     }
+
+    async fn flush_and_drain_sender(&mut self) {
+        if !self.sample_buffer.is_empty() {
+            let _ = self.push_batch().await;
+        }
+        // Close `tx` so the background sender task drains every queued batch
+        // and terminates before we signal `io.finished = true`.
+        self.tx.take();
+        if let Some(task) = self.sender_task.take() {
+            let _ = task.await;
+        }
+    }
 }
 
 impl Drop for HttpSink {
     fn drop(&mut self) {
-        // Explicit abort rather than relying on `tx`'s drop to close the
-        // channel and have the task notice on its next `recv()` — mirrors
-        // `SpectranSource`'s `http_task` handling for the same reason: a
-        // background task should not linger past its owner's lifetime.
-        self.sender_task.abort();
+        // Explicit abort when dropped before graceful flowgraph completion so
+        // a background task never lingers past its owner's lifetime.
+        if let Some(task) = self.sender_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -294,10 +305,7 @@ impl Kernel for HttpSink {
 
         if input_len == 0 {
             if self.input.finished() {
-                // Flush remaining samples if the flowgraph is finishing
-                if !self.sample_buffer.is_empty() {
-                    let _ = self.push_batch().await;
-                }
+                self.flush_and_drain_sender().await;
                 io.finished = true;
                 return Ok(());
             }
@@ -327,20 +335,8 @@ impl Kernel for HttpSink {
         self.input.consume(consumed);
 
         if self.input.finished() && consumed == input_len {
-            // Finish *now*, in this call. The previous code left this
-            // branch empty ("next call will handle io.finished"), which
-            // silently assumed the runtime would invoke work() once more
-            // after the upstream's finish notification. When the finish
-            // flag arrived together with the final samples — the normal
-            // case for a short VectorSource graph — no further callback
-            // is guaranteed, and the flowgraph hung forever awaiting a
-            // work() call that never came. That is the intermittent
-            // wedge that stalled a windows-latest CI runner for ~2 hours
-            // and reproduced under the constrained Linux VM: timing
-            // determined whether an extra callback happened to arrive.
-            if !self.sample_buffer.is_empty() {
-                let _ = self.push_batch().await;
-            }
+            // Finish *now*, in this call, after draining all queued HTTP batches.
+            self.flush_and_drain_sender().await;
             io.finished = true;
         }
 
@@ -366,7 +362,9 @@ mod tests {
 
         // Kill the background sender task and give the abort a moment to
         // take effect, so the channel is genuinely closed before we push.
-        sink.sender_task.abort();
+        if let Some(ref task) = sink.sender_task {
+            task.abort();
+        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert_eq!(sink.dropped_samples(), 0);

@@ -51,6 +51,7 @@ async fn test_http_sink_builder_and_flowgraph() -> anyhow::Result<()> {
     Mock::given(method("POST"))
         .and(path("/sample"))
         .respond_with(ResponseTemplate::new(200))
+        .expect(2)
         .mount(&mock_server)
         .await;
 
@@ -89,6 +90,38 @@ async fn test_http_sink_work_server_error() -> anyhow::Result<()> {
 
     let samples: Vec<Complex32> = (0..5)
         .map(|i| Complex32::new(i as f32, -i as f32))
+        .collect();
+    let src = VectorSource::<Complex32>::new(samples);
+
+    let mut fg = Flowgraph::new();
+    connect!(fg, src > sink);
+
+    run_flowgraph_with_deadline(fg).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_http_sink_flushes_all_queued_batches_before_finish() -> anyhow::Result<()> {
+    let mock_server = MockServer::start().await;
+
+    // Add a small per-POST latency so multiple batches sit queued in the
+    // mpsc channel when VectorSource finishes. Previously `HttpSink::drop`
+    // aborted `sender_task` before those queued POSTs reached the server.
+    Mock::given(method("POST"))
+        .and(path("/sample"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(15)))
+        .expect(6)
+        .mount(&mock_server)
+        .await;
+
+    // 5 full batches of 4 + 1 partial tail of 2 = 6 HTTP POSTs.
+    let sink = HttpSinkBuilder::new(&mock_server.uri())
+        .buffer_size(4)
+        .build()
+        .unwrap();
+
+    let samples: Vec<Complex32> = (0..22)
+        .map(|i| Complex32::new(i as f32, -(i as f32)))
         .collect();
     let src = VectorSource::<Complex32>::new(samples);
 

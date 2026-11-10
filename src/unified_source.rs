@@ -10,7 +10,7 @@
 //! The goal is to provide a seamless developer experience where the
 //! underlying connection method is abstracted away.
 
-use crate::utils::{DEFAULT_RECEIVER_CLOCK_HZ, validate_iq_mode};
+use crate::utils::{RECEIVER_CLOCKS_HZ, validate_iq_mode};
 use crate::{Error, Result};
 use futures::stream::StreamExt;
 use num_complex::Complex32;
@@ -18,20 +18,22 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::file_source::RtsaSource;
 use crate::http_endpoints::HttpEndpointsClient;
 
 #[cfg(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 ))]
 use crate::native_sdk::NativeSdkSource;
 
 #[cfg(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 ))]
 use crate::detection::is_sdk_installed;
 
@@ -50,6 +52,22 @@ pub use crate::utils::RxChannel;
 
 /// Default blocking-read timeout — see [`SpectranConfig::read_timeout`].
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Widest receiver clock across the Spectran V6 family (491.52 MHz), used
+/// for HTTP sample-rate bounds checking so wideband V6 / V6 PLUS units
+/// (> 61.44 MS/s) are accepted over HTTP.
+const MAX_HTTP_RECEIVER_CLOCK_HZ: f64 = RECEIVER_CLOCKS_HZ[RECEIVER_CLOCKS_HZ.len() - 1];
+
+/// Cap on read-deadline offsets so `Instant::now() + timeout` can never
+/// overflow/panic when callers pass `Duration::MAX` or `u64::MAX` µs.
+const MAX_READ_DEADLINE_TIMEOUT: Duration = Duration::from_secs(86_400 * 365);
+
+fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+    let capped = timeout.min(MAX_READ_DEADLINE_TIMEOUT);
+    let now = tokio::time::Instant::now();
+    now.checked_add(capped)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400))
+}
 
 /// Attempts made when first reaching the RTSA server, including the
 /// initial try. Connecting to a freshly-resolved hostname (notably
@@ -445,10 +463,13 @@ pub struct SpectranSource {
     // Source-specific implementations
     #[cfg(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     ))]
     native_source: Option<NativeSdkSource>,
 
+    http_auth: crate::http_endpoints::AuthMethod,
+    listen_only: bool,
     http_client: Option<HttpEndpointsClient>,
     /// Stream parameters as the server reports them, updated by the HTTP
     /// reader task. Preferred over the configured values when reporting
@@ -529,11 +550,13 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 if let Some(sdk) = &mut self.native_source
-                    && let Ok((_health, gps)) = unsafe { sdk.get_health_and_gps() }
+                    && let Ok((_health, gps)) =
+                        crate::utils::maybe_block_in_place(|| unsafe { sdk.get_health_and_gps() })
                 {
                     return gps.time_s.and_then(crate::utils::epoch_seconds_to_nanos);
                 }
@@ -568,7 +591,8 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => self
                 .native_source
@@ -580,6 +604,17 @@ impl SpectranSource {
 
     /// Create a new unified Aaronia source with automatic detection
     pub async fn new(config: SpectranConfig) -> Result<Self> {
+        Self::new_with_options(config, crate::http_endpoints::AuthMethod::None, false).await
+    }
+
+    /// Create a new unified Aaronia source with explicit HTTP authentication
+    /// and optional `listen_only` mode (suppresses `/control` and `/remoteconfig`
+    /// writes on HTTP sources).
+    pub async fn new_with_options(
+        config: SpectranConfig,
+        http_auth: crate::http_endpoints::AuthMethod,
+        listen_only: bool,
+    ) -> Result<Self> {
         let mut source = Self {
             config: config.clone(),
             source_type: SourceType::Http, // Will be updated during detection
@@ -592,10 +627,13 @@ impl SpectranSource {
 
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             native_source: None,
 
+            http_auth,
+            listen_only,
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -630,10 +668,10 @@ impl SpectranSource {
             .native
             .mode
             .as_deref()
-            .is_some_and(|mode| !matches!(mode, "raw" | "iqreceiver"))
+            .is_some_and(|mode| !matches!(mode, "raw" | "iqreceiver" | "iqtransceiver"))
         {
             return Err(Error::Config(
-                "receive mode must be raw or iqreceiver".into(),
+                "receive mode must be raw, iqreceiver, or iqtransceiver".into(),
             ));
         }
         if config
@@ -649,16 +687,14 @@ impl SpectranSource {
 
         // Hardware-bound source types must respect the IQ Mode
         // constraint. File sources read pre-recorded samples and aren't
-        // subject to it. The native SDK is not exempt either — it applies
-        // the check inside `configure_iq_receiver`, before writing
-        // anything to the device, so an over-wide rate is refused there
-        // without the hardware ever seeing it. It is checked against the
-        // clock that call leaves in place rather than this default: the
-        // default in raw mode, where the call installs it, and the
-        // device's live clock in the modes that leave it alone.
+        // subject to it. Over HTTP we validate against the widest V6
+        // receiver clock (491.52 MHz -> up to 327.68 MS/s) so wideband
+        // V6 / V6 PLUS units are not rejected by ECO-only limits.
         match source_type {
             SourceType::Http => {
-                validate_iq_mode(config.sample_rate_hz, DEFAULT_RECEIVER_CLOCK_HZ)?;
+                if !listen_only {
+                    validate_iq_mode(config.sample_rate_hz, MAX_HTTP_RECEIVER_CLOCK_HZ)?;
+                }
             }
             SourceType::NativeSdk | SourceType::File => {}
         }
@@ -680,14 +716,16 @@ impl SpectranSource {
         match source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 source.init_native_sdk().await?;
             }
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => {
                 return Err(Error::Config(
@@ -704,6 +742,23 @@ impl SpectranSource {
 
         info!("SpectranSource initialized with {:?} backend", source_type);
         Ok(source)
+    }
+
+    /// Update the HTTP authentication method used when connecting or querying
+    /// HTTP endpoints.
+    pub fn set_http_auth(&mut self, auth: crate::http_endpoints::AuthMethod) {
+        self.http_auth = auth;
+    }
+
+    /// Configure whether an HTTP source operates in read-only (`listen_only`)
+    /// mode without issuing `/control` or `/remoteconfig` writes.
+    pub fn set_listen_only(&mut self, enabled: bool) {
+        self.listen_only = enabled;
+    }
+
+    /// Return whether `listen_only` mode is enabled.
+    pub fn is_listen_only(&self) -> bool {
+        self.listen_only
     }
 
     /// Detect the best available source type based on configuration
@@ -735,7 +790,8 @@ impl SpectranSource {
         // Check for Native SDK first
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         {
             if is_sdk_installed() {
@@ -748,7 +804,8 @@ impl SpectranSource {
 
         #[cfg(not(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         )))]
         {
             info!("Native SDK not supported on this platform - falling back to localhost HTTP");
@@ -762,36 +819,19 @@ impl SpectranSource {
     /// Initialize native SDK source
     #[cfg(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     ))]
     async fn init_native_sdk(&mut self) -> Result<()> {
         info!("Initializing Native SDK source");
 
-        unsafe {
+        let config = &mut self.config;
+        let source = crate::utils::maybe_block_in_place(|| unsafe {
             let mut source = NativeSdkSource::new()?;
             source.initialize()?;
 
-            // Per the official RTSA-API-Samples (EnumDevices.cpp:33,
-            // RawIQ.cpp:101), `AARTSAAPI_EnumDevice` takes the bare device
-            // family ("spectranv6"); only `AARTSAAPI_OpenDevice` takes the
-            // mode-qualified form ("spectranv6/raw"). Passing the qualified
-            // form to enumeration causes the SDK to silently return zero
-            // devices.
-            //
-            // The family cannot be hardcoded either: `EnumDevice` matches
-            // one family at a time, so asking for `spectranv6` on a
-            // machine holding a V6 ECO — which enumerates under
-            // `spectranv6eco` — returned zero devices and surfaced as
-            // "No Spectran V6 devices found" with the device sitting
-            // right there on the USB bus. Try each known family, as
-            // `NativeSdkClient::detect_device_family` documents, and take
-            // the mode from whichever answered: the ECO's IQ receiver
-            // pipeline is spelled `iqreceiver`, not `rtsa`.
-            // Enumerate every family rather than stopping at the first
-            // with a device: a machine holding both a V6 and an ECO must
-            // still honour a `device_serial` that names the second one.
             let mut populated = Vec::new();
-            let families: Vec<&str> = match self.config.native.family.as_deref() {
+            let families: Vec<&str> = match config.native.family.as_deref() {
                 Some(family) => vec![family],
                 None => crate::native_sdk::NativeSdkClient::DEVICE_FAMILIES.to_vec(),
             };
@@ -803,11 +843,11 @@ impl SpectranSource {
             }
             if populated.is_empty() {
                 return Err(Error::DeviceNotFound {
-                    serial: self.config.device_serial.clone(),
+                    serial: config.device_serial.clone(),
                     families: families.iter().map(|f| f.to_string()).collect(),
                 });
             }
-            let (device_family, devices) = match &self.config.device_serial {
+            let (device_family, devices) = match &config.device_serial {
                 Some(serial) => populated
                     .into_iter()
                     .find(|(_, devices)| {
@@ -819,20 +859,24 @@ impl SpectranSource {
                         serial: Some(serial.clone()),
                         families: families.iter().map(|f| f.to_string()).collect(),
                     })?,
-                None => populated.swap_remove(0),
+                None => populated
+                    .iter()
+                    .position(|(_, devices)| devices.iter().any(|d| d.ready() && !d.active()))
+                    .map(|idx| populated.swap_remove(idx))
+                    .unwrap_or_else(|| populated.swap_remove(0)),
             };
 
             let open_mode = format!(
                 "{device_family}/{}",
-                self.config
+                config
                     .native
                     .mode
                     .as_deref()
                     .unwrap_or_else(|| crate::native_sdk::raw_mode_for_family(device_family))
             );
 
-            // Select device (use specified serial or first available)
-            let device_info = if let Some(ref serial) = self.config.device_serial {
+            // Select device (use specified serial or first ready & idle device)
+            let device_info = if let Some(ref serial) = config.device_serial {
                 devices
                     .iter()
                     .find(|d| NativeSdkSource::get_device_serial(d) == *serial)
@@ -841,7 +885,10 @@ impl SpectranSource {
                         families: families.iter().map(|f| f.to_string()).collect(),
                     })?
             } else {
-                &devices[0]
+                devices
+                    .iter()
+                    .find(|d| d.ready() && !d.active())
+                    .unwrap_or(&devices[0])
             };
 
             let selected_serial = NativeSdkSource::get_device_serial(device_info);
@@ -858,31 +905,32 @@ impl SpectranSource {
             }
             // `WideChar` is u16 on Windows and u32 on Linux; widen
             // through u32 first so the cast compiles on both targets.
-            let serial_wide: Vec<widestring::WideChar> =
-                NativeSdkSource::get_device_serial(device_info)
-                    .encode_utf16()
-                    .chain([0])
-                    .map(|c| c as widestring::WideChar)
-                    .collect();
+            let serial_wide: Vec<widestring::WideChar> = selected_serial
+                .encode_utf16()
+                .chain([0])
+                .map(|c| c as widestring::WideChar)
+                .collect();
 
-            // Open and configure device. The channel selection is a
-            // parameter of configure_iq_receiver (not a follow-up call)
-            // so every reconfiguration path — including retunes —
-            // re-applies it automatically.
+            // Open and configure device. Roll back the opened handle if
+            // configuration fails so the USB device is not stranded open.
             source.open_device(&open_mode, &serial_wide)?;
-            source.configure_iq_receiver_with_options(
-                self.config.center_frequency_hz,
-                self.config.sample_rate_hz,
-                self.config.reference_level_dbm,
-                self.config.receiver_channel,
-                &self.config.native,
-            )?;
+            if let Err(e) = source.configure_iq_receiver_with_options(
+                config.center_frequency_hz,
+                config.sample_rate_hz,
+                config.reference_level_dbm,
+                config.receiver_channel,
+                &config.native,
+            ) {
+                let _ = source.stop_streaming();
+                return Err(e);
+            }
 
-            self.config.device_serial = Some(selected_serial);
-            self.config.native.family = Some(device_family.to_owned());
-            self.config.native.mode = Some(open_mode.split_once('/').unwrap().1.to_owned());
-            self.native_source = Some(source);
-        }
+            config.device_serial = Some(selected_serial);
+            config.native.family = Some(device_family.to_owned());
+            config.native.mode = Some(open_mode.split_once('/').unwrap().1.to_owned());
+            Ok::<_, Error>(source)
+        })?;
+        self.native_source = Some(source);
 
         Ok(())
     }
@@ -897,8 +945,7 @@ impl SpectranSource {
             "http://localhost:54664".to_string()
         });
 
-        let client =
-            HttpEndpointsClient::new(base_url.clone(), crate::http_endpoints::AuthMethod::None)?;
+        let client = HttpEndpointsClient::new(base_url.clone(), self.http_auth.clone())?;
 
         // Test connection immediately. Retried: a `*.local` hostname
         // that mDNS hasn't resolved yet refuses the first connection
@@ -908,26 +955,30 @@ impl SpectranSource {
             .await
             .map_err(|e| Error::Protocol(format!("Failed to connect to Aaronia RTSA Suite Pro at {}. Is it running and accessible? Error: {}", base_url, e)))?;
 
-        // Tune the hardware to the requested frequency *before* opening the
-        // stream.  Without this the `/stream` endpoint returns whatever the
-        // RTSA Suite is already configured to, completely ignoring the
-        // caller's `center_frequency_hz` / `sample_rate_hz`.
-        info!(
-            "Tuning HTTP source to center={:.3} MHz, rate={:.3} MS/s, ref_level={} dBm",
-            self.config.center_frequency_hz / 1e6,
-            self.config.sample_rate_hz / 1e6,
-            self.config.reference_level_dbm,
-        );
-        retry_connect("Initial tuning", || {
-            client.configure_capture(crate::http_endpoints::CaptureControl {
-                frequency_center_hz: Some(self.config.center_frequency_hz),
-                frequency_span_hz: Some(self.config.sample_rate_hz),
-                reference_level_dbm: Some(self.config.reference_level_dbm as f32),
-                control_type: crate::http_endpoints::ControlType::Capture,
-                ..Default::default()
+        if !self.listen_only {
+            // Tune the hardware to the requested frequency *before* opening the
+            // stream. Without this the `/stream` endpoint returns whatever the
+            // RTSA Suite is already configured to, completely ignoring the
+            // caller's `center_frequency_hz` / `sample_rate_hz`.
+            info!(
+                "Tuning HTTP source to center={:.3} MHz, rate={:.3} MS/s, ref_level={} dBm",
+                self.config.center_frequency_hz / 1e6,
+                self.config.sample_rate_hz / 1e6,
+                self.config.reference_level_dbm,
+            );
+            retry_connect("Initial tuning", || {
+                client.configure_capture(crate::http_endpoints::CaptureControl {
+                    frequency_center_hz: Some(self.config.center_frequency_hz),
+                    frequency_span_hz: Some(self.config.sample_rate_hz),
+                    reference_level_dbm: Some(self.config.reference_level_dbm as f32),
+                    control_type: crate::http_endpoints::ControlType::Capture,
+                    ..Default::default()
+                })
             })
-        })
-        .await?;
+            .await?;
+        } else {
+            info!("HTTP source in listen_only mode; skipping initial /control write");
+        }
 
         // Create a channel for sending samples from the async task to
         // SpectranSource. Each item also carries whether the reader
@@ -966,6 +1017,7 @@ impl SpectranSource {
         let rate_bits = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rate_bits_for_task = rate_bits.clone();
         let auto_reconnect = self.config.auto_reconnect;
+        let listen_only = self.listen_only;
 
         // Spawn a task to continuously read from the HTTP stream and send samples
         let reader_task = tokio::spawn(async move {
@@ -1050,9 +1102,10 @@ impl SpectranSource {
                                     crate::http_streaming::DropResult::Drop { .. }
                                         | crate::http_streaming::DropResult::Backward { .. }
                                 ) || std::mem::take(&mut flag_overrun_after_gap);
-                                let timestamp_ns =
-                                    crate::utils::epoch_seconds_to_nanos(packet.metadata.start_time)
-                                        .unwrap_or(0);
+                                let timestamp_ns = crate::utils::epoch_seconds_to_nanos(
+                                    packet.metadata.start_time,
+                                )
+                                .unwrap_or(0);
                                 let cumulative_drops = drop_detector.drops();
                                 // The capture frequency rides with the
                                 // samples it belongs to. Reading it from
@@ -1128,27 +1181,29 @@ impl SpectranSource {
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
 
-                // Re-apply tuning: if the RTSA-Suite restarted, it came
-                // back on its mission's frequency and would otherwise
-                // stream the wrong band under the caller's nose. Best
-                // effort — a failure here is reported and the stream is
-                // attempted anyway, since a wrongly-tuned stream is
-                // still more useful than none and the next reconnect
-                // retries the tuning.
-                let desired = *tuning_for_task
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(e) = client_for_task
-                    .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center_hz: Some(desired.center_frequency_hz),
-                        frequency_span_hz: Some(desired.sample_rate_hz),
-                        reference_level_dbm: Some(desired.reference_level_dbm as f32),
-                        control_type: crate::http_endpoints::ControlType::Capture,
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    warn!("Re-applying tuning after reconnect failed: {e}");
+                if !listen_only {
+                    // Re-apply tuning: if the RTSA-Suite restarted, it came
+                    // back on its mission's frequency and would otherwise
+                    // stream the wrong band under the caller's nose. Best
+                    // effort — a failure here is reported and the stream is
+                    // attempted anyway, since a wrongly-tuned stream is
+                    // still more useful than none and the next reconnect
+                    // retries the tuning.
+                    let desired = *tuning_for_task
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Err(e) = client_for_task
+                        .configure_capture(crate::http_endpoints::CaptureControl {
+                            frequency_center_hz: Some(desired.center_frequency_hz),
+                            frequency_span_hz: Some(desired.sample_rate_hz),
+                            reference_level_dbm: Some(desired.reference_level_dbm as f32),
+                            control_type: crate::http_endpoints::ControlType::Capture,
+                            ..Default::default()
+                        })
+                        .await
+                    {
+                        warn!("Re-applying tuning after reconnect failed: {e}");
+                    }
                 }
 
                 // Timestamps restart across the gap; without this the
@@ -1220,7 +1275,8 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 if !self
@@ -1233,12 +1289,13 @@ impl SpectranSource {
                     self.init_native_sdk().await?;
                 }
                 if let Some(ref mut source) = self.native_source {
-                    unsafe { source.start_streaming()? };
+                    crate::utils::maybe_block_in_place(|| unsafe { source.start_streaming() })?;
                 }
             }
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => {
                 return Err(Error::Config("Native SDK not available".to_string()));
@@ -1290,11 +1347,14 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 if let Some(ref mut source) = self.native_source {
-                    unsafe { source.read_samples_dual(rx1, rx2, max_samples) }
+                    crate::utils::maybe_block_in_place(|| unsafe {
+                        source.read_samples_dual(rx1, rx2, max_samples)
+                    })
                 } else {
                     Err(Error::Config(
                         "Native SDK source not initialized".to_string(),
@@ -1335,38 +1395,36 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
-                let deadline = tokio::time::Instant::now() + timeout;
+                let deadline = deadline_after(timeout);
                 let start_len = rx1.len();
-                loop {
-                    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    let want = max_samples - (rx1.len() - start_len);
-                    let n = match self.native_source.as_mut() {
-                        Some(source) => unsafe {
-                            source.read_samples_dual_within(rx1, rx2, want, budget)?
-                        },
-                        None => {
-                            return Err(Error::Config(
-                                "Native SDK source not initialized".to_string(),
-                            ));
+                let source = self.native_source.as_mut().ok_or_else(|| {
+                    Error::Config("Native SDK source not initialized".to_string())
+                })?;
+                crate::utils::maybe_block_in_place(|| {
+                    loop {
+                        let budget =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        let want = max_samples - (rx1.len() - start_len);
+                        let n = unsafe { source.read_samples_dual_within(rx1, rx2, want, budget)? };
+                        let total = rx1.len() - start_len;
+                        if total >= max_samples
+                            || tokio::time::Instant::now() >= deadline
+                            || (n == 0 && total > 0)
+                        {
+                            if total == 0 && max_samples > 0 {
+                                return Err(Error::Io(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "no sample pairs arrived within the read deadline",
+                                )));
+                            }
+                            return Ok(total);
                         }
-                    };
-                    let total = rx1.len() - start_len;
-                    if total >= max_samples
-                        || tokio::time::Instant::now() >= deadline
-                        || (n == 0 && total > 0)
-                    {
-                        if total == 0 && max_samples > 0 {
-                            return Err(Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "no sample pairs arrived within the read deadline",
-                            )));
-                        }
-                        return Ok(total);
                     }
-                }
+                })
             }
             _ => {
                 let _ = (rx1, rx2, max_samples, timeout);
@@ -1413,7 +1471,7 @@ impl SpectranSource {
         max_samples: usize,
         timeout: Duration,
     ) -> Result<usize> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = deadline_after(timeout);
         match self.source_type {
             SourceType::Http => {
                 let start_len = buffer.len();
@@ -1560,40 +1618,38 @@ impl SpectranSource {
             }
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 let start_len = buffer.len();
-                loop {
-                    // Bound the SDK poll by what is left of the deadline,
-                    // so a zero timeout drains without waiting as the C
-                    // header promises.
-                    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    let want = max_samples - (buffer.len() - start_len);
-                    let n = match self.native_source.as_mut() {
-                        Some(source) => unsafe {
-                            source.read_samples_within(buffer, want, budget)?
-                        },
-                        None => {
-                            return Err(Error::Config(
-                                "Native SDK source not initialized".to_string(),
-                            ));
+                let source = self.native_source.as_mut().ok_or_else(|| {
+                    Error::Config("Native SDK source not initialized".to_string())
+                })?;
+                crate::utils::maybe_block_in_place(|| {
+                    loop {
+                        // Bound the SDK poll by what is left of the deadline,
+                        // so a zero timeout drains without waiting as the C
+                        // header promises.
+                        let budget =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        let want = max_samples - (buffer.len() - start_len);
+                        let n = unsafe { source.read_samples_within(buffer, want, budget)? };
+                        let total = buffer.len() - start_len;
+                        if total >= max_samples
+                            || tokio::time::Instant::now() >= deadline
+                            || (n == 0 && total > 0)
+                        {
+                            if total == 0 && max_samples > 0 {
+                                return Err(Error::Io(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "no samples arrived within the read deadline",
+                                )));
+                            }
+                            return Ok(total);
                         }
-                    };
-                    let total = buffer.len() - start_len;
-                    if total >= max_samples
-                        || tokio::time::Instant::now() >= deadline
-                        || (n == 0 && total > 0)
-                    {
-                        if total == 0 && max_samples > 0 {
-                            return Err(Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "no samples arrived within the read deadline",
-                            )));
-                        }
-                        return Ok(total);
                     }
-                }
+                })
             }
             _ => Box::pin(self.read_samples(buffer, max_samples)).await,
         }
@@ -1612,7 +1668,8 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 self.read_samples_deadline(buffer, max_samples, self.config.read_timeout)
@@ -1620,7 +1677,8 @@ impl SpectranSource {
             }
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => Err(Error::Config("Native SDK not available".to_string())),
             SourceType::Http => {
@@ -1629,23 +1687,19 @@ impl SpectranSource {
             }
             SourceType::File => {
                 if let Some(ref mut source) = self.file_source {
-                    // Read samples from file - fix the API call
-                    let sample_data = source.read_samples(max_samples, None)?;
-                    if let Some(data) = sample_data {
+                    while let Some(data) = source.read_samples(max_samples, None)? {
                         match data {
                             crate::file_source::SampleData::Iq(samples) => {
                                 let n = samples.len();
                                 buffer.extend(samples);
-                                Ok(n)
+                                return Ok(n);
                             }
                             _ => {
-                                warn!("File contains non-IQ data, cannot convert to Complex32");
-                                Ok(0)
+                                debug!("Skipping non-IQ chunk in RTSA file");
                             }
                         }
-                    } else {
-                        Ok(0)
                     }
+                    Ok(0)
                 } else {
                     Err(Error::Config("File source not initialized".to_string()))
                 }
@@ -1681,7 +1735,8 @@ impl SpectranSource {
     pub fn capture_frequency_hz(&self) -> f64 {
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         if let Some(source) = &self.native_source {
             return source.observed_center_frequency_hz().unwrap_or(0.0);
@@ -1695,7 +1750,8 @@ impl SpectranSource {
     pub fn capture_bandwidth_hz(&self) -> f64 {
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         if let Some(source) = &self.native_source {
             return source.observed_bandwidth_hz().unwrap_or(0.0);
@@ -1738,7 +1794,8 @@ impl SpectranSource {
     // fails to type-check on platforms where the fallback takes `&()`.
     #[cfg(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     ))]
     fn native_cumulative_drops(&self) -> u64 {
         self.native_source
@@ -1748,7 +1805,8 @@ impl SpectranSource {
 
     #[cfg(not(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     )))]
     fn native_cumulative_drops(&self) -> u64 {
         0
@@ -1756,7 +1814,8 @@ impl SpectranSource {
 
     #[cfg(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     ))]
     fn native_last_timestamp_ns(&self) -> i64 {
         self.native_source
@@ -1766,7 +1825,8 @@ impl SpectranSource {
 
     #[cfg(not(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     )))]
     fn native_last_timestamp_ns(&self) -> i64 {
         0
@@ -1774,7 +1834,8 @@ impl SpectranSource {
 
     #[cfg(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     ))]
     fn native_take_overrun(&mut self) -> bool {
         self.native_source
@@ -1784,7 +1845,8 @@ impl SpectranSource {
 
     #[cfg(not(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     )))]
     fn native_take_overrun(&mut self) -> bool {
         false
@@ -1833,16 +1895,18 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 if let Some(ref mut source) = self.native_source {
-                    unsafe { source.stop_streaming()? };
+                    crate::utils::maybe_block_in_place(|| unsafe { source.stop_streaming() })?;
                 }
             }
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => {
                 return Err(Error::Config("Native SDK not available".to_string()));
@@ -1924,7 +1988,8 @@ impl SpectranSource {
         }
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         if self.source_type == SourceType::NativeSdk
             && self
@@ -1938,19 +2003,24 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 if let Some(ref mut source) = self.native_source {
-                    unsafe {
+                    let sample_rate_hz = self.config.sample_rate_hz;
+                    let reference_level_dbm = self.config.reference_level_dbm;
+                    let receiver_channel = self.config.receiver_channel;
+                    let native_opts = &self.config.native;
+                    crate::utils::maybe_block_in_place(|| unsafe {
                         source.configure_iq_receiver_with_options(
                             hz,
-                            self.config.sample_rate_hz,
-                            self.config.reference_level_dbm,
-                            self.config.receiver_channel,
-                            &self.config.native,
-                        )?
-                    };
+                            sample_rate_hz,
+                            reference_level_dbm,
+                            receiver_channel,
+                            native_opts,
+                        )
+                    })?;
                 } else {
                     return Err(Error::Config(
                         "Native SDK source not initialized".to_string(),
@@ -1959,12 +2029,18 @@ impl SpectranSource {
             }
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
+                if self.listen_only {
+                    return Err(Error::Config(
+                        "cannot modify device settings on a listen_only HTTP source".into(),
+                    ));
+                }
                 let client = self
                     .http_client
                     .as_ref()
@@ -2001,18 +2077,22 @@ impl SpectranSource {
         if self.source_type == SourceType::File {
             return Ok(());
         }
-        // Enforce the IQ-mode constraint at runtime exactly as the
-        // builder does at construction: without this, an out-of-range
-        // runtime rate was shipped to the server unchecked, the request
-        // was silently clamped device-side, and the cached value made
-        // the plugin report a rate the hardware wasn't producing.
+        // Enforce the IQ-mode constraint at runtime against the widest V6
+        // receiver clock so wideband V6 / V6 PLUS units are accepted while
+        // impossible rates are rejected before hitting the wire.
         if self.source_type == SourceType::Http {
-            validate_iq_mode(hz, DEFAULT_RECEIVER_CLOCK_HZ)?;
+            if self.listen_only {
+                return Err(Error::Config(
+                    "cannot modify device settings on a listen_only HTTP source".into(),
+                ));
+            }
+            validate_iq_mode(hz, MAX_HTTP_RECEIVER_CLOCK_HZ)?;
         }
         // Native validation uses the selected device/mode, as at construction.
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         if self.source_type == SourceType::NativeSdk
             && self
@@ -2031,22 +2111,26 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 if let Some(ref mut source) = self.native_source {
                     let mut options = self.config.native.clone();
                     options.rf_span_hz = None;
                     options.decimation_factor = None;
-                    unsafe {
+                    let center_frequency_hz = self.config.center_frequency_hz;
+                    let reference_level_dbm = self.config.reference_level_dbm;
+                    let receiver_channel = self.config.receiver_channel;
+                    crate::utils::maybe_block_in_place(|| unsafe {
                         source.configure_iq_receiver_with_options(
-                            self.config.center_frequency_hz,
+                            center_frequency_hz,
                             hz,
-                            self.config.reference_level_dbm,
-                            self.config.receiver_channel,
+                            reference_level_dbm,
+                            receiver_channel,
                             &options,
-                        )?
-                    };
+                        )
+                    })?;
                     self.config.native = options;
                 } else {
                     return Err(Error::Config(
@@ -2056,7 +2140,8 @@ impl SpectranSource {
             }
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => {
                 return Err(Error::Config("Native SDK not available".to_string()));
@@ -2096,7 +2181,8 @@ impl SpectranSource {
     pub async fn set_rf_span_hz(&mut self, hz: f64) -> Result<f64> {
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         if self.source_type == SourceType::NativeSdk {
             let source = self
@@ -2106,7 +2192,10 @@ impl SpectranSource {
             if !source.is_device_open() {
                 if !hz.is_finite()
                     || hz <= 0.0
-                    || !matches!(self.config.native.mode.as_deref(), Some("iqreceiver"))
+                    || !matches!(
+                        self.config.native.mode.as_deref(),
+                        Some("iqreceiver" | "iqtransceiver")
+                    )
                 {
                     return Err(Error::Config(
                         "positive RF span requires iqreceiver mode".into(),
@@ -2117,7 +2206,8 @@ impl SpectranSource {
                 self.config.native.rf_span_hz = Some(hz);
                 return Ok(hz);
             }
-            let applied = unsafe { source.set_rf_span_hz(hz)? };
+            let applied =
+                crate::utils::maybe_block_in_place(|| unsafe { source.set_rf_span_hz(hz) })?;
             self.config.native.rf_span_hz = Some(applied);
             return Ok(applied);
         }
@@ -2137,7 +2227,8 @@ impl SpectranSource {
         }
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         if self.source_type == SourceType::NativeSdk
             && self
@@ -2151,19 +2242,24 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 if let Some(ref mut source) = self.native_source {
-                    unsafe {
+                    let center_frequency_hz = self.config.center_frequency_hz;
+                    let sample_rate_hz = self.config.sample_rate_hz;
+                    let receiver_channel = self.config.receiver_channel;
+                    let native_opts = &self.config.native;
+                    crate::utils::maybe_block_in_place(|| unsafe {
                         source.configure_iq_receiver_with_options(
-                            self.config.center_frequency_hz,
-                            self.config.sample_rate_hz,
+                            center_frequency_hz,
+                            sample_rate_hz,
                             dbm,
-                            self.config.receiver_channel,
-                            &self.config.native,
-                        )?
-                    };
+                            receiver_channel,
+                            native_opts,
+                        )
+                    })?;
                 } else {
                     return Err(Error::Config(
                         "Native SDK source not initialized".to_string(),
@@ -2172,12 +2268,18 @@ impl SpectranSource {
             }
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
+                if self.listen_only {
+                    return Err(Error::Config(
+                        "cannot modify device settings on a listen_only HTTP source".into(),
+                    ));
+                }
                 let client = self
                     .http_client
                     .as_ref()
@@ -2212,11 +2314,14 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 if let Some(ref mut source_impl) = self.native_source {
-                    unsafe { source_impl.set_clock_source(source)? };
+                    crate::utils::maybe_block_in_place(|| unsafe {
+                        source_impl.set_clock_source(source)
+                    })?;
                 } else {
                     return Err(Error::Config(
                         "Native SDK source not initialized".to_string(),
@@ -2225,12 +2330,18 @@ impl SpectranSource {
             }
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
+                if self.listen_only {
+                    return Err(Error::Config(
+                        "cannot modify device settings on a listen_only HTTP source".into(),
+                    ));
+                }
                 let client = self
                     .http_client
                     .as_ref()
@@ -2262,11 +2373,14 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
                 if let Some(ref mut source_impl) = self.native_source {
-                    unsafe { source_impl.set_gps_mode(source)? };
+                    crate::utils::maybe_block_in_place(|| unsafe {
+                        source_impl.set_gps_mode(source)
+                    })?;
                 } else {
                     return Err(Error::Config(
                         "Native SDK source not initialized".to_string(),
@@ -2275,12 +2389,18 @@ impl SpectranSource {
             }
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
+                if self.listen_only {
+                    return Err(Error::Config(
+                        "cannot modify device settings on a listen_only HTTP source".into(),
+                    ));
+                }
                 let client = self
                     .http_client
                     .as_ref()
@@ -2360,6 +2480,9 @@ impl SpectranSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
+                if self.listen_only {
+                    return Ok(client.detect_remote_config_license().await);
+                }
                 Ok(client.probe_remote_config_write_license().await)
             }
             _ => Ok(crate::http_endpoints::RemoteConfigStatus::Active),
@@ -2410,7 +2533,8 @@ impl SpectranSource {
     /// what it has actually seen.
     #[cfg(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     ))]
     fn native_observed_rate_hz(&self) -> f64 {
         self.native_source
@@ -2421,7 +2545,8 @@ impl SpectranSource {
 
     #[cfg(not(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     )))]
     fn native_observed_rate_hz(&self) -> f64 {
         0.0
@@ -2481,13 +2606,18 @@ impl SpectranSource {
     pub async fn device_capabilities(&self) -> crate::http_endpoints::DeviceCapabilities {
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         if self.source_type == SourceType::NativeSdk {
             return self
                 .native_source
                 .as_ref()
-                .and_then(|source| unsafe { source.device_capabilities().ok() })
+                .and_then(|source| {
+                    crate::utils::maybe_block_in_place(|| unsafe {
+                        source.device_capabilities().ok()
+                    })
+                })
                 .map(|mut caps| {
                     caps.serial = self.config.device_serial.clone();
                     caps.device_mode = self
@@ -2510,7 +2640,7 @@ impl SpectranSource {
         if self.source_type != SourceType::Http {
             return Default::default();
         }
-        use crate::http_endpoints::{AuthMethod, DeviceCapabilities, HttpEndpointsClient};
+        use crate::http_endpoints::{DeviceCapabilities, HttpEndpointsClient};
 
         if let Some(client) = &self.http_client {
             return client.get_device_capabilities().await;
@@ -2518,7 +2648,7 @@ impl SpectranSource {
         let Some(base_url) = &self.config.http_base_url else {
             return DeviceCapabilities::default();
         };
-        match HttpEndpointsClient::new(base_url.clone(), AuthMethod::None) {
+        match HttpEndpointsClient::new(base_url.clone(), self.http_auth.clone()) {
             Ok(client) => client.get_device_capabilities().await,
             Err(e) => {
                 warn!("device capabilities: could not build a client for {base_url}: {e}");
@@ -2541,13 +2671,14 @@ impl SpectranSource {
         if self.source_type != SourceType::Http {
             return Default::default();
         }
-        use crate::http_endpoints::{AuthMethod, DeviceSensors, HttpEndpointsClient};
+        use crate::http_endpoints::{DeviceSensors, HttpEndpointsClient};
 
         // The native SDK has no usable sensor surface (see the doc above);
         // never fall through to an HTTP fetch for a native source.
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         if self.source_type == SourceType::NativeSdk {
             return DeviceSensors::default();
@@ -2559,7 +2690,7 @@ impl SpectranSource {
         let Some(base_url) = &self.config.http_base_url else {
             return DeviceSensors::default();
         };
-        match HttpEndpointsClient::new(base_url.clone(), AuthMethod::None) {
+        match HttpEndpointsClient::new(base_url.clone(), self.http_auth.clone()) {
             Ok(client) => client.get_device_sensors().await.unwrap_or_default(),
             Err(e) => {
                 warn!("device sensors: could not build a client for {base_url}: {e}");
@@ -2578,7 +2709,8 @@ impl SpectranSource {
         match self.source_type {
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => self
                 .native_source
@@ -2587,7 +2719,8 @@ impl SpectranSource {
                 .unwrap_or(false),
             #[cfg(not(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             )))]
             SourceType::NativeSdk => false,
             SourceType::Http => self.http_receiver.is_some(),
@@ -2646,6 +2779,8 @@ impl std::fmt::Display for SourceInfo {
 /// Builder pattern for easy SpectranSource configuration
 pub struct SpectranSourceBuilder {
     pub(crate) config: SpectranConfig,
+    pub(crate) http_auth: crate::http_endpoints::AuthMethod,
+    pub(crate) listen_only: bool,
 }
 
 impl SpectranSourceBuilder {
@@ -2653,7 +2788,33 @@ impl SpectranSourceBuilder {
     pub fn new() -> Self {
         Self {
             config: SpectranConfig::default(),
+            http_auth: crate::http_endpoints::AuthMethod::None,
+            listen_only: false,
         }
+    }
+
+    /// Create a builder seeded from an existing [`SpectranConfig`].
+    pub fn from_config(config: SpectranConfig) -> Self {
+        Self {
+            config,
+            http_auth: crate::http_endpoints::AuthMethod::None,
+            listen_only: false,
+        }
+    }
+
+    /// Set the HTTP authentication method used when connecting to RTSA Suite.
+    pub fn http_auth(&mut self, auth: crate::http_endpoints::AuthMethod) -> &mut Self {
+        self.http_auth = auth;
+        self
+    }
+
+    /// Enable or disable read-only (`listen_only`) mode for HTTP sources.
+    ///
+    /// When enabled, `SpectranSource` streams from `/stream` without issuing
+    /// `/control` or `/remoteconfig` writes on startup or reconnect.
+    pub fn listen_only(&mut self, enabled: bool) -> &mut Self {
+        self.listen_only = enabled;
+        self
     }
 
     /// Set explicit native receive settings (does not enable TX).
@@ -2751,7 +2912,12 @@ impl SpectranSourceBuilder {
 
     /// Build the SpectranSource
     pub async fn build(&self) -> Result<SpectranSource> {
-        SpectranSource::new(self.config.clone()).await
+        SpectranSource::new_with_options(
+            self.config.clone(),
+            self.http_auth.clone(),
+            self.listen_only,
+        )
+        .await
     }
 }
 
@@ -2961,9 +3127,12 @@ mod tests {
             last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             native_source: None,
+            http_auth: crate::http_endpoints::AuthMethod::None,
+            listen_only: false,
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3047,9 +3216,12 @@ mod tests {
             last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             native_source: None,
+            http_auth: crate::http_endpoints::AuthMethod::None,
+            listen_only: false,
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3085,9 +3257,12 @@ mod tests {
             last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             native_source: None,
+            http_auth: crate::http_endpoints::AuthMethod::None,
+            listen_only: false,
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3125,9 +3300,12 @@ mod tests {
             last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             native_source: None,
+            http_auth: crate::http_endpoints::AuthMethod::None,
+            listen_only: false,
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3154,7 +3332,8 @@ mod tests {
         // on.
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         let expected = if is_sdk_installed() {
             SourceType::NativeSdk
@@ -3163,7 +3342,8 @@ mod tests {
         };
         #[cfg(not(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         )))]
         let expected = SourceType::Http;
         assert_eq!(detected_type, expected);
@@ -3329,9 +3509,12 @@ mod tests {
             last_read_sample_rate_hz: 0.0,
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             native_source: None,
+            http_auth: crate::http_endpoints::AuthMethod::None,
+            listen_only: false,
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3632,5 +3815,43 @@ mod tests {
             !source.take_overrun(),
             "take_overrun must clear the flag after reading it"
         );
+    }
+
+    #[tokio::test]
+    async fn extreme_read_timeout_does_not_panic_instant_addition() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let mut source = http_test_source(rx);
+        tx.send((vec![Complex32::new(1.0, -1.0)], false, 0, 1, 915e6, 1e6))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut buffer = Vec::new();
+        let n = source
+            .read_samples_deadline(&mut buffer, 4, Duration::MAX)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn http_wideband_v6_sample_rate_passes_validation() {
+        validate_iq_mode(122.88e6, MAX_HTTP_RECEIVER_CLOCK_HZ)
+            .expect("122.88 MS/s wideband V6 rate must pass HTTP IQ validation");
+        validate_iq_mode(245.76e6, MAX_HTTP_RECEIVER_CLOCK_HZ)
+            .expect("245.76 MS/s wideband V6 PLUS rate must pass HTTP IQ validation");
+        assert!(validate_iq_mode(400e6, MAX_HTTP_RECEIVER_CLOCK_HZ).is_err());
+    }
+
+    #[tokio::test]
+    async fn listen_only_http_source_refuses_runtime_writes() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut source = http_test_source(rx);
+        source.set_listen_only(true);
+        assert!(source.is_listen_only());
+        assert!(source.set_center_frequency_hz(915e6).await.is_err());
+        assert!(source.set_sample_rate_hz(10e6).await.is_err());
+        assert!(source.set_reference_level_dbm(-30.0).await.is_err());
+        assert!(source.set_clock_source("Oscillator").await.is_err());
+        assert!(source.set_gps_mode("Time").await.is_err());
     }
 }

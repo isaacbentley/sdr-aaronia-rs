@@ -124,9 +124,11 @@ private:
     // readSensor must take this lock too, not only the setters.
     mutable std::mutex _mutex;
     double _centerFrequency;
+    double _txCenterFrequency;
     double _sampleRate;    // RX sample rate
     double _txSampleRate;  // TX sample rate (defaults to RX rate)
     double _referenceLevel;
+    double _txGain;
     // Per-direction stream state. RX and TX streams are distinct
     // handles (&_rxStreamTag / &_txStreamTag) with their own formats —
     // a single shared format let an RX CS16 + TX CF32 app corrupt its
@@ -135,6 +137,9 @@ private:
     std::string _txFormat;
     bool _rxSetup;
     bool _txSetup;
+    bool _txActive;
+    bool _txInBurst;
+    double _nextTxTimeS;
     int _rxStreamTag;
     int _txStreamTag;
     bool _isStreaming;

@@ -225,9 +225,15 @@ jobs:
         run: |
           if [ "$RUNNER_OS" == "Windows" ]; then
             cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release \
+              -DAARONIA_NATIVE_SDK=ON \
               -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          elif [ "$RUNNER_OS" == "Linux" ]; then
+            cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release \
+              -DAARONIA_NATIVE_SDK=ON \
+              -DCMAKE_VERBOSE_MAKEFILE=ON
           else
             cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release \
+              -DAARONIA_NATIVE_SDK=OFF \
               -DCMAKE_VERBOSE_MAKEFILE=ON
           fi
           cmake --build soapy-aaronia/build --config Release

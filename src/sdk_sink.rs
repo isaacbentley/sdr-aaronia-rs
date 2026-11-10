@@ -74,6 +74,7 @@ impl SdkSinkConfig {
 pub struct SdkSink {
     native_source: Option<crate::native_sdk::NativeSdkSource>,
     config: SdkSinkConfig,
+    device_serial: Option<String>,
 }
 
 impl SdkSink {
@@ -82,6 +83,7 @@ impl SdkSink {
         Self {
             native_source: None,
             config: SdkSinkConfig::default(),
+            device_serial: None,
         }
     }
 
@@ -90,13 +92,34 @@ impl SdkSink {
         Self {
             native_source: None,
             config,
+            device_serial: None,
         }
+    }
+
+    /// Pin this sink to a specific device serial number.
+    #[must_use]
+    pub fn with_device_serial(mut self, serial: impl Into<String>) -> Self {
+        self.device_serial = Some(serial.into());
+        self
+    }
+
+    /// Set or clear the target device serial number.
+    pub fn set_device_serial(&mut self, serial: Option<String>) {
+        self.device_serial = serial;
+    }
+
+    /// Return the configured target device serial number, if any.
+    pub fn device_serial(&self) -> Option<&str> {
+        self.device_serial.as_deref()
     }
 
     /// Initialize the SDK sink
     pub async fn initialize(&mut self) -> Result<()> {
-        let mut native_source = unsafe { crate::native_sdk::NativeSdkSource::new()? };
-        unsafe { native_source.initialize()? };
+        let native_source = crate::utils::maybe_block_in_place(|| unsafe {
+            let mut native_source = crate::native_sdk::NativeSdkSource::new()?;
+            native_source.initialize()?;
+            Ok::<_, crate::Error>(native_source)
+        })?;
         self.native_source = Some(native_source);
         Ok(())
     }
@@ -116,39 +139,128 @@ impl SdkSink {
         self.config = config;
     }
 
+    /// Retune the TX center frequency in Hz (applied immediately if open).
+    pub fn set_center_frequency_hz(&mut self, hz: f64) -> Result<()> {
+        if !hz.is_finite() || hz <= 0.0 {
+            return Err(crate::Error::Config(
+                "TX center frequency must be finite and positive".into(),
+            ));
+        }
+        if let Some(ref mut native_source) = self.native_source
+            && native_source.is_device_open()
+        {
+            let sample_rate_hz = self.config.sample_rate_hz;
+            let trans_gain_db = self.config.trans_gain_db;
+            crate::utils::maybe_block_in_place(|| unsafe {
+                native_source.configure_iq_transmitter(hz, sample_rate_hz, trans_gain_db)
+            })?;
+        }
+        self.config.center_frequency_hz = hz;
+        Ok(())
+    }
+
+    /// Update the TX IQ sample rate in Hz (applied immediately if open).
+    pub fn set_sample_rate_hz(&mut self, hz: f64) -> Result<()> {
+        if !hz.is_finite() || hz <= 0.0 {
+            return Err(crate::Error::Config(
+                "TX sample rate must be finite and positive".into(),
+            ));
+        }
+        if let Some(ref mut native_source) = self.native_source
+            && native_source.is_device_open()
+        {
+            let center_frequency_hz = self.config.center_frequency_hz;
+            let trans_gain_db = self.config.trans_gain_db;
+            crate::utils::maybe_block_in_place(|| unsafe {
+                native_source.configure_iq_transmitter(center_frequency_hz, hz, trans_gain_db)
+            })?;
+        }
+        self.config.sample_rate_hz = hz;
+        Ok(())
+    }
+
+    /// Update the TX gain in dB (applied immediately if open).
+    pub fn set_trans_gain_db(&mut self, db: f64) -> Result<()> {
+        if !db.is_finite() {
+            return Err(crate::Error::Config("TX gain must be finite".into()));
+        }
+        if let Some(ref mut native_source) = self.native_source
+            && native_source.is_device_open()
+        {
+            let center_frequency_hz = self.config.center_frequency_hz;
+            let sample_rate_hz = self.config.sample_rate_hz;
+            crate::utils::maybe_block_in_place(|| unsafe {
+                native_source.configure_iq_transmitter(center_frequency_hz, sample_rate_hz, db)
+            })?;
+        }
+        self.config.trans_gain_db = db;
+        Ok(())
+    }
+
     /// Start the transmit stream and configure the device
     pub async fn start_streaming(&mut self) -> Result<()> {
         let native_source = self
             .native_source
             .as_mut()
             .ok_or_else(|| crate::Error::Sdk("Source not initialized".to_string()))?;
+        let config = &self.config;
+        let target_serial = self.device_serial.as_deref();
 
-        unsafe {
-            let family = self.config.device_family().to_string();
-            let open_mode = self.config.device_open_mode();
+        crate::utils::maybe_block_in_place(|| unsafe {
+            let family = config.device_family().to_string();
+            let open_mode = config.device_open_mode();
             let devices = native_source.find_devices(&family)?;
             if devices.is_empty() {
-                return Err(crate::Error::Sdk(format!("No {} devices found", family)));
+                return Err(crate::Error::DeviceNotFound {
+                    serial: target_serial.map(str::to_owned),
+                    families: vec![family],
+                });
             }
 
-            let device_info = &devices[0];
+            let device_info = if let Some(serial) = target_serial {
+                devices
+                    .iter()
+                    .find(|d| crate::native_sdk::NativeSdkSource::get_device_serial(d) == serial)
+                    .ok_or_else(|| crate::Error::DeviceNotFound {
+                        serial: Some(serial.to_owned()),
+                        families: vec![family],
+                    })?
+            } else {
+                devices
+                    .iter()
+                    .find(|d| d.ready() && !d.active())
+                    .unwrap_or(&devices[0])
+            };
+
+            let selected_serial =
+                crate::native_sdk::NativeSdkSource::get_device_serial(device_info);
             if !device_info.ready() {
-                return Err(crate::Error::Sdk("Device not ready".to_string()));
+                return Err(crate::Error::DeviceNotReady {
+                    serial: selected_serial,
+                });
+            }
+            if device_info.active() {
+                return Err(crate::Error::SdkApi {
+                    operation: "select transmit device".into(),
+                    code: crate::native_sdk::SdkError::Busy,
+                });
             }
 
             native_source.open_device(&open_mode, &device_info.serial_number)?;
 
-            // Configure transmitter
-            native_source.configure_iq_transmitter(
-                self.config.center_frequency_hz,
-                self.config.sample_rate_hz,
-                self.config.trans_gain_db,
-            )?;
-
-            // Start streaming
-            native_source.start_streaming()?;
-        }
-        Ok(())
+            let setup_res = native_source
+                .configure_iq_transmitter(
+                    config.center_frequency_hz,
+                    config.sample_rate_hz,
+                    config.trans_gain_db,
+                )
+                .and_then(|()| native_source.start_streaming());
+            if let Err(e) = setup_res {
+                let _ = native_source.stop_streaming();
+                return Err(e);
+            }
+            Ok(())
+        })
     }
 
     /// The device's master stream clock, in nanoseconds since the Unix
@@ -191,8 +303,7 @@ impl SdkSink {
             .native_source
             .as_mut()
             .ok_or_else(|| crate::Error::Sdk("Source not initialized".to_string()))?;
-        unsafe { native_source.stop_streaming()? };
-        Ok(())
+        crate::utils::maybe_block_in_place(|| unsafe { native_source.stop_streaming() })
     }
 
     /// Check if streaming is active
@@ -258,6 +369,7 @@ pub mod futuresdr_sink {
         sink: SdkSink,
         channel: i32,
         samples_per_burst: usize,
+        next_tx_time_s: Option<f64>,
         #[input]
         input: futuresdr::runtime::buffer::DefaultCpuReader<Complex32>,
     }
@@ -289,7 +401,8 @@ pub mod futuresdr_sink {
             Self {
                 sink,
                 channel,
-                samples_per_burst,
+                samples_per_burst: samples_per_burst.max(1),
+                next_tx_time_s: None,
                 input: futuresdr::runtime::buffer::DefaultCpuReader::default(),
             }
         }
@@ -322,8 +435,10 @@ pub mod futuresdr_sink {
             // `TxBurst` documents that the device schedules a burst against
             // its own master stream clock and that zero timestamps are
             // wrong — `start_time: 0.0` asks the device to transmit at the
-            // Unix epoch, decades in the past. Derive a real window from the
-            // device clock instead.
+            // Unix epoch, decades in the past. Derive a monotonic window
+            // from the device clock instead so consecutive bursts within
+            // `TX_SCHEDULE_LEAD_S` are queued back-to-back rather than
+            // overlapping in time.
             let sample_rate_hz = self.sink.config().sample_rate_hz;
             let duration_s = if sample_rate_hz > 0.0 {
                 n as f64 / sample_rate_hz
@@ -337,14 +452,19 @@ pub mod futuresdr_sink {
                     // Back to the vendor's seconds here, at the one
                     // boundary that wants them: TxBurst feeds the packet
                     // header directly.
-                    let start = crate::utils::epoch_nanos_to_seconds(now_ns) + TX_SCHEDULE_LEAD_S;
-                    (start, start + duration_s)
+                    let min_start =
+                        crate::utils::epoch_nanos_to_seconds(now_ns) + TX_SCHEDULE_LEAD_S;
+                    let start = self.next_tx_time_s.map_or(min_start, |t| t.max(min_start));
+                    let end = start + duration_s;
+                    self.next_tx_time_s = Some(end);
+                    (start, end)
                 }
                 Err(e) => {
                     // No usable clock: fall back to the SDK's documented
                     // "process this packet now" escape hatch rather than
                     // handing the scheduler an epoch-zero window.
                     warn!("Master stream time unavailable ({e}); dispatching burst with PUSH");
+                    self.next_tx_time_s = None;
                     flags |= crate::native_sdk::tx_flags::PUSH;
                     (0.0, 0.0)
                 }
@@ -362,7 +482,10 @@ pub mod futuresdr_sink {
             // `self.input.consume(n)` runs.
             let write_result = {
                 let i = self.input.slice();
-                self.sink.write_samples(self.channel, burst, &i[..n])
+                let samples = &i[..n];
+                let channel = self.channel;
+                let sink = &mut self.sink;
+                crate::utils::maybe_block_in_place(|| sink.write_samples(channel, burst, samples))
             };
             if let Err(e) = write_result {
                 error!("Failed to write samples to SDK: {}", e);
@@ -371,6 +494,8 @@ pub mod futuresdr_sink {
             self.input.consume(n);
             if self.input.finished() && n == input_len {
                 io.finished = true;
+            } else if n < input_len {
+                io.call_again = true;
             }
             Ok(())
         }

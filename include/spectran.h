@@ -142,8 +142,8 @@ void spectran_source_builder_device_serial(SpectranSourceBuilder* builder, const
 void spectran_source_builder_force_source_type(SpectranSourceBuilder *builder,
                                               int source_type);
 
-/* Whether the native SDK library is present, by the search the builder
- * uses; does not load it. */
+/* Whether the native SDK backend is compiled into this binary and the
+ * vendor SDK library is present on disk; does not load it. */
 bool spectran_sdk_installed(void);
 
 /* Alias-free bandwidth (Hz) delivered at an IQ sample rate; smaller than
@@ -169,9 +169,18 @@ void spectran_source_builder_read_timeout_us(SpectranSourceBuilder* builder, uin
 // Automatic reconnection of the HTTP sample stream (default true). When
 // false, a dropped stream ends the session and later reads error out.
 void spectran_source_builder_auto_reconnect(SpectranSourceBuilder* builder, bool enabled);
+// Passive HTTP mode (default false). When true, never writes to /control or
+// /remoteconfig, allowing read-only attachment to shared or unlicensed servers.
+void spectran_source_builder_listen_only(SpectranSourceBuilder* builder, bool enabled);
 SpectranSource* spectran_source_build(SpectranSourceBuilder* builder);
 
 // --- SpectranSource FFI --- //
+//
+// Thread-safety contract: a `SpectranSource*` handle is NOT internally
+// synchronized. All calls targeting the same `SpectranSource*` (including
+// reads, retunes, capability/sensor queries, and free) MUST be serialized
+// by the caller (single thread at a time). Separate `SpectranSource*` or
+// `HttpEndpointsClient*` handles may be used concurrently on separate threads.
 //
 // Read return codes: >= 0 samples read; -1 generic error (details via
 // spectran_last_error); -3 timeout — a private convention of this API,
@@ -268,16 +277,25 @@ void spectran_sink_builder_free(SpectranSinkBuilder* builder);
 void spectran_sink_builder_center_frequency_hz(SpectranSinkBuilder* builder, double hz);
 void spectran_sink_builder_sample_rate_hz(SpectranSinkBuilder* builder, double hz);
 void spectran_sink_builder_trans_gain_db(SpectranSinkBuilder* builder, double db);
+void spectran_sink_builder_device_serial(SpectranSinkBuilder* builder, const char* serial);
 SpectranSink* spectran_sink_build(SpectranSinkBuilder* builder);
 void spectran_sink_free(SpectranSink* sink);
-// Loads the native SDK, opens the first matching device, configures
+// Thread-safety contract: like SpectranSource*, a SpectranSink* handle has no
+// internal lock and must be accessed by at most one thread at a time.
+//
+// Loads the native SDK, opens the matching device, configures
 // the IQ transmitter from the builder settings, and starts the TX
 // stream. Blocking.
 SpectranFfiError spectran_sink_initialize(SpectranSink* sink);
 SpectranFfiError spectran_sink_stop_streaming(SpectranSink* sink);
+SpectranFfiError spectran_sink_set_center_frequency_hz(SpectranSink* sink, double hz);
+SpectranFfiError spectran_sink_set_sample_rate_hz(SpectranSink* sink, double hz);
+SpectranFfiError spectran_sink_set_trans_gain_db(SpectranSink* sink, double db);
+bool spectran_sink_get_master_stream_time_ns(SpectranSink* sink, int64_t* out_time_ns);
 // start_time_s / end_time_s are in device MASTER STREAM TIME seconds,
 // not wall-clock epoch time. Samples use the same FfiComplex layout as
-// the read path.
+// the read path. Pass samples == NULL with num_samples == 0 for a 0-sample
+// startup/shutdown sync packet.
 SpectranFfiError spectran_sink_write_samples(
     SpectranSink* sink,
     int32_t channel,
@@ -294,9 +312,9 @@ HttpEndpointsClient* spectran_endpoints_client_new(const char* base_url);
 void spectran_endpoints_client_free(HttpEndpointsClient* client);
 FfiServerInfo* spectran_endpoints_client_get_info(HttpEndpointsClient* client);
 
-/* Fill *out with the device's live sensors through a standalone client,
- * off the streaming source's read lock. Same reading and return contract
- * as spectran_source_get_sensors. */
+/* Fill *out with the device's live sensors through a standalone client
+ * (safe to call concurrently while another thread owns a SpectranSource*).
+ * Same reading and return contract as spectran_source_get_sensors. */
 bool spectran_endpoints_client_get_sensors(HttpEndpointsClient* client, FfiDeviceSensors* out);
 void spectran_server_info_free(FfiServerInfo* info);
 SpectranFfiError spectran_endpoints_client_control_streaming(HttpEndpointsClient* client, bool start);
@@ -305,9 +323,9 @@ SpectranFfiError spectran_endpoints_client_control_recording(HttpEndpointsClient
 // --- General FFI Utilities --- //
 
 /* Additive native SDK APIs; existing struct layouts remain unchanged. */
-char *spectran_source_capabilities_json(void *source);
-SpectranFfiError spectran_source_rf_span_range(void *source, double *min_hz, double *max_hz);
-SpectranFfiError spectran_source_set_rf_span_hz(void *source, double hz);
+char *spectran_source_capabilities_json(SpectranSource *source);
+SpectranFfiError spectran_source_rf_span_range(SpectranSource *source, double *min_hz, double *max_hz);
+SpectranFfiError spectran_source_set_rf_span_hz(SpectranSource *source, double hz);
 SpectranFfiError spectran_source_builder_native_options(SpectranSourceBuilder *builder,
     const char *family, const char *mode, double rf_span_hz, const char *clock, uint32_t decimation);
 

@@ -35,18 +35,32 @@ pub fn is_sdk_installed() -> bool {
 /// Checks [`SDK_PATH_ENV`] first (any platform), then the documented
 /// per-platform default install locations.
 pub fn get_sdk_path() -> Option<String> {
-    if let Ok(env_path) = std::env::var(SDK_PATH_ENV) {
-        let trimmed = env_path.trim();
-        if !trimmed.is_empty() {
-            if Path::new(trimmed).is_dir() {
-                return Some(trimmed.to_string());
+    if let Some(os_val) = std::env::var_os(SDK_PATH_ENV) {
+        match os_val.into_string() {
+            Ok(env_path) => {
+                if !env_path.trim().is_empty() {
+                    if Path::new(&env_path).is_dir() {
+                        return Some(env_path);
+                    }
+                    let trimmed = env_path.trim();
+                    if Path::new(trimmed).is_dir() {
+                        return Some(trimmed.to_string());
+                    }
+                    tracing::warn!(
+                        "{} is set to {:?} but that directory does not exist; \
+                         falling back to the default install path",
+                        SDK_PATH_ENV,
+                        trimmed
+                    );
+                }
             }
-            tracing::warn!(
-                "{} is set to {:?} but that directory does not exist; \
-                 falling back to the default install path",
-                SDK_PATH_ENV,
-                trimmed
-            );
+            Err(non_utf8) => {
+                tracing::warn!(
+                    "{} is set to non-UTF-8 path {:?}; falling back to the default install path",
+                    SDK_PATH_ENV,
+                    non_utf8
+                );
+            }
         }
     }
 
@@ -65,8 +79,26 @@ fn default_sdk_path() -> Option<String> {
     let candidate: Option<&str> = None;
 
     candidate
-        .filter(|p| Path::new(p).exists())
+        .filter(|p| Path::new(p).is_dir())
         .map(str::to_string)
+}
+
+/// Candidate installation roots for `sdk_path`. When `AARONIA_SDK_PATH`
+/// points directly at `<install>/sdk`, its parent directory is the main
+/// RTSA-Suite installation root holding `paths.xml` and `RTSAFileTool`.
+fn candidate_install_roots(sdk_path: &str) -> Vec<PathBuf> {
+    let root = Path::new(sdk_path);
+    let mut roots = vec![root.to_path_buf()];
+    if root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("sdk"))
+        && let Some(parent) = root.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        roots.push(parent.to_path_buf());
+    }
+    roots
 }
 
 /// Platform-specific SDK library filename.
@@ -103,27 +135,27 @@ fn sdk_library_name() -> Option<&'static str> {
 pub fn get_sdk_library_path() -> Option<String> {
     let sdk_path = get_sdk_path()?;
     let lib_name = sdk_library_name()?;
-    let root = Path::new(&sdk_path);
-    let mut roots = vec![root.to_path_buf()];
-    if root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.eq_ignore_ascii_case("sdk"))
-        && let Some(parent) = root.parent()
-    {
-        roots.push(parent.to_path_buf());
-    }
+    let roots = candidate_install_roots(&sdk_path);
     roots
         .iter()
         .flat_map(|r| [r.join(lib_name), r.join("sdk").join(lib_name)])
-        .find(|p| p.exists())
+        .find(|p| p.is_file())
         .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Returns the XML configuration directory path
 pub fn get_xml_config_path() -> Option<String> {
-    // XML files live in the main installation directory on every platform.
-    get_sdk_path()
+    // XML files (`paths.xml`) live in the main installation directory on
+    // every platform, even when `AARONIA_SDK_PATH` points at `<root>/sdk`.
+    let sdk_path = get_sdk_path()?;
+    let roots = candidate_install_roots(&sdk_path);
+    if let Some(found) = roots.iter().find(|r| r.join("paths.xml").is_file()) {
+        return Some(found.to_string_lossy().into_owned());
+    }
+    // If `sdk_path` ends with `sdk` and no `paths.xml` was found in `sdk/`,
+    // prefer the parent install root so `AARTSAAPI_Init_With_Path` searches
+    // the main installation directory.
+    roots.last().map(|r| r.to_string_lossy().into_owned())
 }
 
 /// Returns the path to the RTSAFileTool CLI utility
@@ -135,12 +167,11 @@ pub fn get_rtsa_file_tool_path() -> Option<String> {
     #[cfg(not(target_os = "windows"))]
     let tool_name = "RTSAFileTool";
 
-    let tool_path: PathBuf = [sdk_path.as_str(), tool_name].iter().collect();
-    if tool_path.exists() {
-        Some(tool_path.to_string_lossy().into_owned())
-    } else {
-        None
-    }
+    candidate_install_roots(&sdk_path)
+        .into_iter()
+        .map(|r| r.join(tool_name))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -273,5 +304,27 @@ mod tests {
             assert!(found.ends_with(lib_name));
             assert!(is_sdk_installed());
         }
+
+        // 4. Pointing `AARONIA_SDK_PATH` directly at `<install>/sdk` must
+        // still resolve `paths.xml` and `RTSAFileTool` from `<install>/`
+        // (HIGH-07 regression check).
+        let install_root = TempDir::new("sdk-subdir");
+        let sdk_sub = install_root.path().join("sdk");
+        std::fs::create_dir_all(&sdk_sub).unwrap();
+        std::fs::write(install_root.path().join("paths.xml"), b"<paths/>").unwrap();
+        #[cfg(target_os = "windows")]
+        let tool_name = "RTSAFileTool.exe";
+        #[cfg(not(target_os = "windows"))]
+        let tool_name = "RTSAFileTool";
+        std::fs::write(install_root.path().join(tool_name), b"stub").unwrap();
+        unsafe { std::env::set_var(SDK_PATH_ENV, &sdk_sub) };
+        assert_eq!(
+            get_xml_config_path().as_deref(),
+            Some(install_root.path().to_str().unwrap())
+        );
+        assert_eq!(
+            get_rtsa_file_tool_path().as_deref(),
+            Some(install_root.path().join(tool_name).to_str().unwrap())
+        );
     }
 }

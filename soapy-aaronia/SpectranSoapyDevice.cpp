@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 
 // One channel's worth of a read, CF32 -> interleaved CS16. Shared by
@@ -10,9 +11,11 @@
 // drift between them.
 static void convertToCS16(const FfiComplex *in, int16_t *out, intptr_t n) {
     for (intptr_t i = 0; i < n; ++i) {
+        const float re = std::isfinite(in[i].re) ? in[i].re : 0.0f;
+        const float im = std::isfinite(in[i].im) ? in[i].im : 0.0f;
         // lrintf: round-to-nearest instead of truncation.
-        out[i * 2]     = static_cast<int16_t>(std::lrintf(std::clamp(in[i].re * 32767.0f, -32768.0f, 32767.0f)));
-        out[i * 2 + 1] = static_cast<int16_t>(std::lrintf(std::clamp(in[i].im * 32767.0f, -32768.0f, 32767.0f)));
+        out[i * 2]     = static_cast<int16_t>(std::lrintf(std::clamp(re * 32767.0f, -32768.0f, 32767.0f)));
+        out[i * 2 + 1] = static_cast<int16_t>(std::lrintf(std::clamp(im * 32767.0f, -32768.0f, 32767.0f)));
     }
 }
 
@@ -25,16 +28,29 @@ static std::string lastErrorOr(const char *fallback) {
 }
 
 SpectranSoapyDevice::SpectranSoapyDevice(SpectranSource* source, SpectranSink* sink, const SoapySDR::Kwargs &args)
-    : _source(source), _sink(sink), _centerFrequency(100e6), _sampleRate(1e6),
-      _txSampleRate(0.0), _referenceLevel(-20.0),
-      _rxSetup(false), _txSetup(false), _rxStreamTag(0), _txStreamTag(0),
+    : _source(source), _sink(sink), _centerFrequency(100e6), _txCenterFrequency(100e6), _sampleRate(1e6),
+      _txSampleRate(0.0), _referenceLevel(-20.0), _txGain(-20.0),
+      _rxSetup(false), _txSetup(false), _txActive(false), _txInBurst(false), _nextTxTimeS(0.0),
+      _rxStreamTag(0), _txStreamTag(0),
       _isStreaming(false), _rxChannels(1), _rxDualStream(false), _rxSwapped(false),
       _hasFreqRange(false), _freqMinHz(0.0), _freqMaxHz(0.0), _freqStepHz(0.0),
       _hasRefRange(false), _refMinDbm(0.0), _refMaxDbm(0.0), _refStepDb(0.0),
       _sourceType(Http)
 {
     if (!_source) {
+        if (_sink) {
+            spectran_sink_free(_sink);
+            _sink = nullptr;
+        }
         throw std::runtime_error("SpectranSoapyDevice initialized with null source pointer");
+    }
+
+    if (args.count("tx_gain") != 0) {
+        try {
+            const double g = std::stod(args.at("tx_gain"));
+            if (std::isfinite(g)) _txGain = g;
+        } catch (const std::exception &) {
+        }
     }
 
     // The URL the source streams from, for the standalone sensor client
@@ -49,6 +65,7 @@ SpectranSoapyDevice::SpectranSoapyDevice(SpectranSource* source, SpectranSink* s
     FfiSourceInfo* info = spectran_source_get_source_info(_source);
     if (info) {
         _centerFrequency = info->center_frequency_hz;
+        _txCenterFrequency = info->center_frequency_hz;
         _sampleRate = info->sample_rate_hz;
         _referenceLevel = info->reference_level_dbm;
         _sourceType = info->source_type;
@@ -134,9 +151,10 @@ SpectranSoapyDevice::~SpectranSoapyDevice() {
             _source = nullptr;
         }
         if (_sink) {
-            // Stop unconditionally: the sink's stream lifecycle (started
-            // at setupStream) is independent of the RX _isStreaming flag.
-            spectran_sink_stop_streaming(_sink);
+            if (_txActive) {
+                spectran_sink_stop_streaming(_sink);
+                _txActive = false;
+            }
             spectran_sink_free(_sink);
             _sink = nullptr;
         }
@@ -272,23 +290,31 @@ SoapySDR::Stream *SpectranSoapyDevice::setupStream(
         // Soapy contract — not on the first write.
         throw std::runtime_error("Unsupported TX stream format: " + format + " (TX is CF32-only)");
     }
-    SpectranFfiError err = spectran_sink_initialize(_sink);
-    if (err != Success) {
-        throw std::runtime_error(lastErrorOr("Failed to initialize sink"));
-    }
     _txFormat = format;
     _txSetup = true;
+    _txActive = false;
+    _txInBurst = false;
+    _nextTxTimeS = 0.0;
     return reinterpret_cast<SoapySDR::Stream *>(&_txStreamTag);
 }
 
 void SpectranSoapyDevice::closeStream(SoapySDR::Stream *stream) {
     std::lock_guard<std::mutex> lock(_mutex);
     if (stream == reinterpret_cast<SoapySDR::Stream *>(&_rxStreamTag)) {
+        if (_isStreaming && _source) {
+            spectran_source_stop_streaming(_source);
+            _isStreaming = false;
+        }
         _rxSetup = false;
         _rxDualStream = false;
         _rxSwapped = false;
     } else if (stream == reinterpret_cast<SoapySDR::Stream *>(&_txStreamTag)) {
-        if (_sink) spectran_sink_stop_streaming(_sink);
+        if (_sink && _txActive) {
+            spectran_sink_stop_streaming(_sink);
+        }
+        _txActive = false;
+        _txInBurst = false;
+        _nextTxTimeS = 0.0;
         _txSetup = false;
     }
 }
@@ -307,9 +333,18 @@ int SpectranSoapyDevice::activateStream(
     std::lock_guard<std::mutex> lock(_mutex);
 
     if (stream == reinterpret_cast<SoapySDR::Stream *>(&_txStreamTag)) {
-        // The TX stream was brought up in setupStream (the sink's
-        // initialize opens, configures, and starts the transmitter).
-        return _txSetup ? 0 : SOAPY_SDR_STREAM_ERROR;
+        if (!_sink || !_txSetup) return SOAPY_SDR_STREAM_ERROR;
+        if (_txActive) return 0;
+        SpectranFfiError err = spectran_sink_initialize(_sink);
+        if (err != Success) {
+            SoapySDR::logf(SOAPY_SDR_ERROR, "activateStream(TX) failed: %s",
+                           lastErrorOr("Failed to initialize sink").c_str());
+            return SOAPY_SDR_STREAM_ERROR;
+        }
+        _txActive = true;
+        _txInBurst = false;
+        _nextTxTimeS = 0.0;
+        return 0;
     }
     if (stream != reinterpret_cast<SoapySDR::Stream *>(&_rxStreamTag) || !_rxSetup) {
         return SOAPY_SDR_STREAM_ERROR;
@@ -336,7 +371,13 @@ int SpectranSoapyDevice::deactivateStream(
     std::lock_guard<std::mutex> lock(_mutex);
 
     if (stream == reinterpret_cast<SoapySDR::Stream *>(&_txStreamTag)) {
-        if (_sink) spectran_sink_stop_streaming(_sink);
+        if (!_txSetup) return SOAPY_SDR_STREAM_ERROR;
+        if (_txActive && _sink) {
+            spectran_sink_stop_streaming(_sink);
+        }
+        _txActive = false;
+        _txInBurst = false;
+        _nextTxTimeS = 0.0;
         return 0;
     }
     if (stream != reinterpret_cast<SoapySDR::Stream *>(&_rxStreamTag)) {
@@ -359,7 +400,8 @@ int SpectranSoapyDevice::readStream(
     if (stream != reinterpret_cast<SoapySDR::Stream *>(&_rxStreamTag)) {
         return SOAPY_SDR_STREAM_ERROR;
     }
-    if (!buffs || !buffs[0]) return SOAPY_SDR_STREAM_ERROR;
+    const size_t cappedElems = std::min(numElems, static_cast<size_t>(std::numeric_limits<int>::max()));
+    if (cappedElems > 0 && (!buffs || !buffs[0])) return SOAPY_SDR_STREAM_ERROR;
 
     // Output flags describe *this* read; clear whatever the caller
     // passed in rather than OR-ing into it.
@@ -368,6 +410,12 @@ int SpectranSoapyDevice::readStream(
     // Serialize against retunes: the C ABI takes `&mut` on the Rust
     // side, so an unlocked readStream racing setFrequency is UB.
     std::lock_guard<std::mutex> lock(_mutex);
+    if (!_rxSetup || !_isStreaming) {
+        return SOAPY_SDR_STREAM_ERROR;
+    }
+    if (cappedElems == 0) {
+        return 0;
+    }
 
     const uint64_t timeout_us = timeoutUs > 0 ? static_cast<uint64_t>(timeoutUs) : 0;
 
@@ -387,13 +435,13 @@ int SpectranSoapyDevice::readStream(
                 _source,
                 static_cast<FfiComplex *>(rx1Buf),
                 static_cast<FfiComplex *>(rx2Buf),
-                numElems, timeout_us);
+                cappedElems, timeout_us);
         } else if (_rxFormat == SOAPY_SDR_CS16) {
-            if (_tempFloatBuffer.size() < numElems) _tempFloatBuffer.resize(numElems);
-            if (_tempFloatBufferRx2.size() < numElems) _tempFloatBufferRx2.resize(numElems);
+            if (_tempFloatBuffer.size() < cappedElems) _tempFloatBuffer.resize(cappedElems);
+            if (_tempFloatBufferRx2.size() < cappedElems) _tempFloatBufferRx2.resize(cappedElems);
             read = spectran_source_read_samples_dual_timeout(
                 _source, _tempFloatBuffer.data(), _tempFloatBufferRx2.data(),
-                numElems, timeout_us);
+                cappedElems, timeout_us);
             if (read > 0) {
                 convertToCS16(_tempFloatBuffer.data(), static_cast<int16_t *>(rx1Buf), read);
                 convertToCS16(_tempFloatBufferRx2.data(), static_cast<int16_t *>(rx2Buf), read);
@@ -403,12 +451,12 @@ int SpectranSoapyDevice::readStream(
         }
     } else if (_rxFormat == SOAPY_SDR_CF32) {
         FfiComplex *out = static_cast<FfiComplex *>(buffs[0]);
-        read = spectran_source_read_samples_timeout(_source, out, numElems, timeout_us);
+        read = spectran_source_read_samples_timeout(_source, out, cappedElems, timeout_us);
     } else if (_rxFormat == SOAPY_SDR_CS16) {
-        if (_tempFloatBuffer.size() < numElems) {
-            _tempFloatBuffer.resize(numElems);
+        if (_tempFloatBuffer.size() < cappedElems) {
+            _tempFloatBuffer.resize(cappedElems);
         }
-        read = spectran_source_read_samples_timeout(_source, _tempFloatBuffer.data(), numElems, timeout_us);
+        read = spectran_source_read_samples_timeout(_source, _tempFloatBuffer.data(), cappedElems, timeout_us);
         if (read > 0) {
             convertToCS16(_tempFloatBuffer.data(), static_cast<int16_t *>(buffs[0]), read);
         }
@@ -451,10 +499,11 @@ int SpectranSoapyDevice::writeStream(
     if (stream != reinterpret_cast<SoapySDR::Stream *>(&_txStreamTag)) {
         return SOAPY_SDR_STREAM_ERROR;
     }
-    if (!buffs || !buffs[0]) return SOAPY_SDR_STREAM_ERROR;
+    const size_t cappedElems = std::min(numElems, static_cast<size_t>(std::numeric_limits<int>::max()));
+    if (cappedElems > 0 && (!buffs || !buffs[0])) return SOAPY_SDR_STREAM_ERROR;
 
     std::lock_guard<std::mutex> lock(_mutex);
-    if (!_sink || !_txSetup) {
+    if (!_sink || !_txSetup || !_txActive) {
         return SOAPY_SDR_STREAM_ERROR;
     }
 
@@ -465,36 +514,55 @@ int SpectranSoapyDevice::writeStream(
     if (flags & SOAPY_SDR_HAS_TIME) {
         SoapySDR::logf(SOAPY_SDR_WARNING,
                        "writeStream: timed TX (SOAPY_SDR_HAS_TIME) is not supported; "
-                       "samples are pushed for immediate transmission");
+                       "samples are scheduled on the device master stream clock");
     }
 
     const double rate = _txSampleRate > 0.0 ? _txSampleRate : _sampleRate;
-    const double duration_s = rate > 0.0 ? static_cast<double>(numElems) / rate : 0.0;
+    const double duration_s = (rate > 0.0 && std::isfinite(rate))
+        ? static_cast<double>(cappedElems) / rate
+        : 0.0;
 
-    // Each writeStream call is one self-contained burst, pushed for
-    // immediate transmission (times relative to "now" in the device
-    // clock are handled by the PUSH flag path in the SDK).
-    const uint64_t burstFlags =
-        SPECTRAN_TX_SEGMENT_START | SPECTRAN_TX_SEGMENT_END | SPECTRAN_TX_PUSH;
+    double start_s = 0.0;
+    int64_t master_ns = 0;
+    if (spectran_sink_get_master_stream_time_ns(_sink, &master_ns)
+        || spectran_source_get_master_stream_time_ns(_source, &master_ns)) {
+        const double now_s = static_cast<double>(master_ns) * 1e-9;
+        start_s = std::max(_nextTxTimeS, now_s + 0.020);
+        _nextTxTimeS = start_s + duration_s;
+    }
+
+    const bool endBurst = (flags & SOAPY_SDR_END_BURST) != 0;
+    uint64_t burstFlags = SPECTRAN_TX_PUSH;
+    if (!_txInBurst) {
+        burstFlags |= SPECTRAN_TX_SEGMENT_START;
+        _txInBurst = true;
+    }
+    if (endBurst) {
+        burstFlags |= SPECTRAN_TX_SEGMENT_END;
+        _txInBurst = false;
+        _nextTxTimeS = 0.0;
+    }
 
     SpectranFfiError err = spectran_sink_write_samples(
         _sink,
         0,
-        0.0,
+        start_s,
         duration_s,
         burstFlags,
-        static_cast<const FfiComplex*>(buffs[0]),
-        numElems
+        cappedElems > 0 ? static_cast<const FfiComplex*>(buffs[0]) : nullptr,
+        cappedElems
     );
 
     flags = 0;
     if (err != Success) {
+        _txInBurst = false;
+        _nextTxTimeS = 0.0;
         SoapySDR::logf(SOAPY_SDR_ERROR, "writeStream failed: %s",
                        lastErrorOr("write error").c_str());
         return SOAPY_SDR_STREAM_ERROR;
     }
 
-    return static_cast<int>(numElems);
+    return static_cast<int>(cappedElems);
 }
 
 // --- Time API ---
@@ -671,8 +739,21 @@ void SpectranSoapyDevice::setFrequency(const int direction, const size_t channel
     (void)channel;
     (void)name;
     (void)args;
-    if (direction != SOAPY_SDR_RX) return;
+    if (!std::isfinite(frequency) || frequency <= 0.0) return;
     std::lock_guard<std::mutex> lock(_mutex);
+
+    if (direction == SOAPY_SDR_TX) {
+        if (!_sink) return;
+        SpectranFfiError err = spectran_sink_set_center_frequency_hz(_sink, frequency);
+        if (err == Success) {
+            _txCenterFrequency = frequency;
+        } else {
+            SoapySDR::logf(SOAPY_SDR_ERROR, "setFrequency(TX) failed: %s",
+                           lastErrorOr("unknown error").c_str());
+        }
+        return;
+    }
+    if (direction != SOAPY_SDR_RX) return;
 
     SpectranFfiError err = spectran_source_set_center_frequency_hz(_source, frequency);
     if (err == Success) {
@@ -684,10 +765,12 @@ void SpectranSoapyDevice::setFrequency(const int direction, const size_t channel
 }
 
 double SpectranSoapyDevice::getFrequency(const int direction, const size_t channel, const std::string &name) const {
-    (void)direction;
     (void)channel;
     (void)name;
     std::lock_guard<std::mutex> lock(_mutex);
+    if (direction == SOAPY_SDR_TX) {
+        return _txCenterFrequency;
+    }
     return _centerFrequency;
 }
 
@@ -718,13 +801,21 @@ SoapySDR::RangeList SpectranSoapyDevice::getFrequencyRange(const int direction, 
 
 void SpectranSoapyDevice::setSampleRate(const int direction, const size_t channel, const double rate) {
     (void)channel;
+    if (!std::isfinite(rate) || rate <= 0.0) return;
     std::lock_guard<std::mutex> lock(_mutex);
 
     if (direction == SOAPY_SDR_TX) {
-        // The TX rate feeds burst-duration computation in writeStream;
-        // silently dropping it (old behaviour) derived TX timing from
-        // the RX rate.
-        _txSampleRate = rate;
+        if (!_sink) {
+            _txSampleRate = rate;
+            return;
+        }
+        SpectranFfiError err = spectran_sink_set_sample_rate_hz(_sink, rate);
+        if (err == Success) {
+            _txSampleRate = rate;
+        } else {
+            SoapySDR::logf(SOAPY_SDR_ERROR, "setSampleRate(TX) failed: %s",
+                           lastErrorOr("unknown error").c_str());
+        }
         return;
     }
     if (direction != SOAPY_SDR_RX) return;
@@ -833,9 +924,12 @@ size_t SpectranSoapyDevice::getStreamMTU(SoapySDR::Stream *stream) const {
 }
 
 std::vector<std::string> SpectranSoapyDevice::listGains(const int direction, const size_t channel) const {
-    (void)direction;
     (void)channel;
     std::vector<std::string> gains;
+    if (direction == SOAPY_SDR_TX) {
+        if (_sink) gains.push_back("PA");
+        return gains;
+    }
     gains.push_back("REF"); // Reference level
     return gains;
 }
@@ -843,8 +937,21 @@ std::vector<std::string> SpectranSoapyDevice::listGains(const int direction, con
 void SpectranSoapyDevice::setGain(const int direction, const size_t channel, const std::string &name, const double value) {
     (void)channel;
     (void)name;
-    if (direction != SOAPY_SDR_RX) return;
+    if (!std::isfinite(value)) return;
     std::lock_guard<std::mutex> lock(_mutex);
+
+    if (direction == SOAPY_SDR_TX) {
+        if (!_sink) return;
+        SpectranFfiError err = spectran_sink_set_trans_gain_db(_sink, value);
+        if (err == Success) {
+            _txGain = value;
+        } else {
+            SoapySDR::logf(SOAPY_SDR_ERROR, "setGain(PA) failed: %s",
+                           lastErrorOr("unknown error").c_str());
+        }
+        return;
+    }
+    if (direction != SOAPY_SDR_RX) return;
 
     // NOTE: "gain" here is the Aaronia *reference level* in dBm, not an
     // amplifier gain: RAISING it reduces sensitivity. Exposed under the
@@ -860,17 +967,21 @@ void SpectranSoapyDevice::setGain(const int direction, const size_t channel, con
 }
 
 double SpectranSoapyDevice::getGain(const int direction, const size_t channel, const std::string &name) const {
-    (void)direction;
     (void)channel;
     (void)name;
     std::lock_guard<std::mutex> lock(_mutex);
+    if (direction == SOAPY_SDR_TX) {
+        return _txGain;
+    }
     return _referenceLevel;
 }
 
 SoapySDR::Range SpectranSoapyDevice::getGainRange(const int direction, const size_t channel, const std::string &name) const {
-    (void)direction;
     (void)channel;
     (void)name;
+    if (direction == SOAPY_SDR_TX) {
+        return SoapySDR::Range(-50.0, 10.0, 0.5);
+    }
     // Reference level in dBm, as reflevel0 declares it. A V6 ECO says
     // -55 to +23; the constant said -100 to +10, so an application's
     // gain slider spanned values the device silently clamped at one end

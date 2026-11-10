@@ -762,6 +762,14 @@ fn read_iq_f32<R: Read>(reader: &mut R, count: usize) -> Result<Vec<Complex32>> 
         let byte_view =
             unsafe { std::slice::from_raw_parts_mut(samples.as_mut_ptr() as *mut u8, count * 8) };
         reader.read_exact(byte_view)?;
+        for s in &mut samples {
+            if !s.re.is_finite() {
+                s.re = 0.0;
+            }
+            if !s.im.is_finite() {
+                s.im = 0.0;
+            }
+        }
         Ok(samples)
     }
 
@@ -774,9 +782,11 @@ fn read_iq_f32<R: Read>(reader: &mut R, count: usize) -> Result<Vec<Complex32>> 
             .0
             .iter()
             .map(|c| {
+                let re = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let im = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
                 Complex32::new(
-                    f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-                    f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                    if re.is_finite() { re } else { 0.0 },
+                    if im.is_finite() { im } else { 0.0 },
                 )
             })
             .collect())
@@ -2051,6 +2061,17 @@ impl RtsaSource {
             return self.read_raw_iq_samples(num_samples);
         }
 
+        // When no explicit `sub_stream_id` is passed on a multi-substream
+        // file, pin to the primary stream's first sub-stream in file order so
+        // per-substream `samp_chunk_start_samples` indices cannot splice
+        // samples from a second sub-stream mid-playback.
+        let effective_sub_stream = sub_stream_id.or_else(|| {
+            self.samp_chunk_offsets
+                .iter()
+                .find(|(_, s)| s.stream_id == self.iq_stream_id)
+                .map(|(_, s)| s.sub_stream_id)
+        });
+
         // Each iteration either returns data from the chunk containing the
         // cursor, or skips one unsupported-payload chunk and retries. A
         // single call returns at most one chunk's worth of samples.
@@ -2067,7 +2088,8 @@ impl RtsaSource {
             for idx in (start_hint..n_chunks).chain(0..start_hint) {
                 let (offset, ref samp_chunk) = self.samp_chunk_offsets[idx];
                 if samp_chunk.stream_id == self.iq_stream_id
-                    && (sub_stream_id.is_none() || sub_stream_id == Some(samp_chunk.sub_stream_id))
+                    && (effective_sub_stream.is_none()
+                        || effective_sub_stream == Some(samp_chunk.sub_stream_id))
                 {
                     let chunk_start_sample =
                         *self.samp_chunk_start_samples.get(&offset).unwrap_or(&0);
@@ -2186,28 +2208,81 @@ impl RtsaSource {
                                     DspStreamSampleType::DsStF32
                                     | DspStreamSampleType::DsStF32N => {
                                         if samp_chunk.compression > 0 {
-                                            // Same contract as the DSPT_IQ arm
-                                            // above: the compressed payload is
-                                            // proprietary, and reinterpreting
-                                            // it as raw f32 would silently
-                                            // return garbage spectra.
-                                            return Err(Error::FileFormat {
-                                                offset: 0,
-                                                reason: format!(
-                                                    "compressed DSPT_SPECTRA chunk at 0x{:08X}: \
-                                                     in-band decompression is unsupported \
-                                                     (proprietary format); export the file \
-                                                     uncompressed via RTSAFileTool",
-                                                    offset
-                                                ),
-                                            });
+                                            // RTSA File Format 4 documents single wavelet blocks
+                                            // of 1..=16 spectra frames. Decode single-block chunks
+                                            // in-band via `Decompressor`; reject multi-block or
+                                            // malformed chunks explicitly instead of misreading
+                                            // compressed bytes as raw f32.
+                                            const MAX_WAVELET_ROWS: u32 = 16;
+                                            const MAX_COMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+                                            let payload_len = (samp_chunk.header.size as usize)
+                                                .saturating_sub(
+                                                    samp_chunk.header.header_size as usize,
+                                                );
+                                            let mut decoded_slice = None;
+                                            if (1..=MAX_WAVELET_ROWS)
+                                                .contains(&samp_chunk.num_samples)
+                                                && samp_chunk.sample_size > 0
+                                                && payload_len > 0
+                                                && payload_len <= MAX_COMPRESSED_BYTES
+                                            {
+                                                let block_start =
+                                                    offset + samp_chunk.header.header_size as u64;
+                                                self.reader.seek(SeekFrom::Start(block_start))?;
+                                                let mut compressed = vec![0u8; payload_len];
+                                                self.reader.read_exact(&mut compressed)?;
+                                                let rows = samp_chunk.num_samples as usize;
+                                                let cols = samp_chunk.sample_size as usize;
+                                                if let Ok(mut decoded) =
+                                                    crate::decompression::Decompressor::new()
+                                                        .decompress(
+                                                            &compressed,
+                                                            samp_chunk.compression as u32,
+                                                            rows,
+                                                            cols,
+                                                        )
+                                                {
+                                                    for v in &mut decoded {
+                                                        if !v.is_finite() {
+                                                            *v = 0.0;
+                                                        }
+                                                    }
+                                                    let start_bin =
+                                                        samples_in_chunk_before as usize * cols;
+                                                    let end_bin = (samples_in_chunk_before
+                                                        + to_read)
+                                                        as usize
+                                                        * cols;
+                                                    if end_bin <= decoded.len() {
+                                                        decoded_slice = Some(
+                                                            decoded[start_bin..end_bin].to_vec(),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            match decoded_slice {
+                                                Some(samples) => Some(SampleData::Spectra(samples)),
+                                                None => {
+                                                    return Err(Error::FileFormat {
+                                                        offset,
+                                                        reason: format!(
+                                                            "compressed DSPT_SPECTRA chunk at 0x{:08X}: \
+                                                             in-band decompression is unsupported \
+                                                             (multi-block or proprietary framing); export \
+                                                             the file uncompressed via RTSAFileTool",
+                                                            offset
+                                                        ),
+                                                    });
+                                                }
+                                            }
+                                        } else {
+                                            // One sample is a whole spectrum of
+                                            // `sample_size` bins.
+                                            let bins =
+                                                to_read as usize * samp_chunk.sample_size as usize;
+                                            let samples = read_f32_vec(&mut self.reader, bins)?;
+                                            Some(SampleData::Spectra(samples))
                                         }
-                                        // One sample is a whole spectrum of
-                                        // `sample_size` bins.
-                                        let bins =
-                                            to_read as usize * samp_chunk.sample_size as usize;
-                                        let samples = read_f32_vec(&mut self.reader, bins)?;
-                                        Some(SampleData::Spectra(samples))
                                     }
                                     _ => None, // Unsupported sample type for Spectra
                                 }
@@ -2317,22 +2392,38 @@ impl RtsaSource {
         // the first chunk in file order whose range holds the index is the
         // one a read resumes in. Counting across sub-streams, as this did,
         // put the reader in a different chunk than the next read chose.
-        for &(offset, ref samp_chunk) in &self.samp_chunk_offsets {
-            if samp_chunk.stream_id == self.iq_stream_id {
-                let chunk_start_sample = *self.samp_chunk_start_samples.get(&offset).unwrap_or(&0);
-                let chunk_end_sample = chunk_start_sample + samp_chunk.num_samples as u64;
-                if (chunk_start_sample..chunk_end_sample).contains(&sample_index) {
-                    let samples_into_chunk = sample_index - chunk_start_sample;
-                    let byte_offset = samples_into_chunk * samp_chunk.sample_stride_bytes();
-                    let data_start = offset + samp_chunk.header.header_size as u64;
-                    self.reader
-                        .seek(SeekFrom::Start(data_start + byte_offset))?;
-                    self.current_sample_index = sample_index;
-                    // The next read must rescan from the start: the seek
-                    // may have moved backwards past the cursor hint.
-                    self.chunk_scan_hint = 0;
-                    return Ok(());
+        // Prefer the primary stream's first sub-stream (matching an
+        // unfiltered `read_samples(..., None)`), falling back to any
+        // sub-stream of `iq_stream_id` if a secondary sub-stream is longer.
+        let default_sub = self
+            .samp_chunk_offsets
+            .iter()
+            .find(|(_, s)| s.stream_id == self.iq_stream_id)
+            .map(|(_, s)| s.sub_stream_id);
+        for pass_filter in [default_sub, None] {
+            for &(offset, ref samp_chunk) in &self.samp_chunk_offsets {
+                if samp_chunk.stream_id == self.iq_stream_id
+                    && (pass_filter.is_none() || pass_filter == Some(samp_chunk.sub_stream_id))
+                {
+                    let chunk_start_sample =
+                        *self.samp_chunk_start_samples.get(&offset).unwrap_or(&0);
+                    let chunk_end_sample = chunk_start_sample + samp_chunk.num_samples as u64;
+                    if (chunk_start_sample..chunk_end_sample).contains(&sample_index) {
+                        let samples_into_chunk = sample_index - chunk_start_sample;
+                        let byte_offset = samples_into_chunk * samp_chunk.sample_stride_bytes();
+                        let data_start = offset + samp_chunk.header.header_size as u64;
+                        self.reader
+                            .seek(SeekFrom::Start(data_start + byte_offset))?;
+                        self.current_sample_index = sample_index;
+                        // The next read must rescan from the start: the seek
+                        // may have moved backwards past the cursor hint.
+                        self.chunk_scan_hint = 0;
+                        return Ok(());
+                    }
                 }
+            }
+            if pass_filter.is_none() {
+                break;
             }
         }
         Err(Error::FileFormat {

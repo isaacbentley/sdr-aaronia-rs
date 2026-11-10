@@ -20,7 +20,8 @@ use num_complex::Complex32;
 
 #[cfg(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 ))]
 use crate::sdk_sink::{SdkSink, SdkSinkConfig};
 
@@ -55,9 +56,11 @@ impl Default for UnifiedSinkConfig {
 /// availability and the hardware-unverified caveat.
 pub struct UnifiedSink {
     config: UnifiedSinkConfig,
+    device_serial: Option<String>,
     #[cfg(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     ))]
     backend: Option<SdkSink>,
 }
@@ -83,7 +86,8 @@ impl UnifiedSink {
     pub const fn tx_supported() -> bool {
         cfg!(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))
     }
 
@@ -95,12 +99,87 @@ impl UnifiedSink {
     pub fn with_config(config: UnifiedSinkConfig) -> Self {
         Self {
             config,
+            device_serial: None,
             #[cfg(all(
                 feature = "native-sdk",
-                any(target_os = "windows", target_os = "linux")
+                any(target_os = "windows", target_os = "linux"),
+                target_pointer_width = "64"
             ))]
             backend: None,
         }
+    }
+
+    /// Set or clear the target device serial number used when starting TX.
+    pub fn set_device_serial(&mut self, serial: Option<String>) {
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
+        ))]
+        if let Some(ref mut backend) = self.backend {
+            backend.set_device_serial(serial.clone());
+        }
+        self.device_serial = serial;
+    }
+
+    /// Return the configured target device serial number, if any.
+    pub fn device_serial(&self) -> Option<&str> {
+        self.device_serial.as_deref()
+    }
+
+    /// Retune the TX center frequency in Hz (applied immediately if open).
+    pub fn set_center_frequency_hz(&mut self, hz: f64) -> Result<()> {
+        if !hz.is_finite() || hz <= 0.0 {
+            return Err(Error::Config(
+                "TX center frequency must be finite and positive".into(),
+            ));
+        }
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
+        ))]
+        if let Some(ref mut backend) = self.backend {
+            backend.set_center_frequency_hz(hz)?;
+        }
+        self.config.center_frequency_hz = hz;
+        Ok(())
+    }
+
+    /// Update the TX IQ sample rate in Hz (applied immediately if open).
+    pub fn set_sample_rate_hz(&mut self, hz: f64) -> Result<()> {
+        if !hz.is_finite() || hz <= 0.0 {
+            return Err(Error::Config(
+                "TX sample rate must be finite and positive".into(),
+            ));
+        }
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
+        ))]
+        if let Some(ref mut backend) = self.backend {
+            backend.set_sample_rate_hz(hz)?;
+        }
+        self.config.sample_rate_hz = hz;
+        Ok(())
+    }
+
+    /// Update the TX gain in dB (applied immediately if open).
+    pub fn set_trans_gain_db(&mut self, db: f64) -> Result<()> {
+        if !db.is_finite() {
+            return Err(Error::Config("TX gain must be finite".into()));
+        }
+        #[cfg(all(
+            feature = "native-sdk",
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
+        ))]
+        if let Some(ref mut backend) = self.backend {
+            backend.set_trans_gain_db(db)?;
+        }
+        self.config.trans_gain_db = db;
+        Ok(())
     }
 
     /// Load the native SDK library. Does not touch the device;
@@ -111,7 +190,8 @@ impl UnifiedSink {
     pub async fn initialize(&mut self) -> Result<()> {
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         {
             // Re-initialising must not orphan a live backend: stop it so
@@ -122,18 +202,20 @@ impl UnifiedSink {
                 tracing::warn!("stopping the previous sink backend failed: {e}");
             }
             let mut sdk_sink = SdkSink::with_config(self.sdk_config());
+            sdk_sink.set_device_serial(self.device_serial.clone());
             sdk_sink.initialize().await?;
             self.backend = Some(sdk_sink);
             Ok(())
         }
         #[cfg(not(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         )))]
         {
             Err(Error::Sdk(
                 "transmission requires the Aaronia native SDK (feature \
-                 `native-sdk` on Windows or Linux); this build has no TX \
+                 `native-sdk` on 64-bit Windows or Linux); this build has no TX \
                  backend"
                     .to_string(),
             ))
@@ -148,7 +230,8 @@ impl UnifiedSink {
     pub async fn start_streaming(&mut self) -> Result<()> {
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         {
             let backend = self
@@ -159,7 +242,8 @@ impl UnifiedSink {
         }
         #[cfg(not(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         )))]
         {
             Err(Error::Sdk("no TX backend in this build".to_string()))
@@ -169,7 +253,8 @@ impl UnifiedSink {
     pub async fn stop_streaming(&mut self) -> Result<()> {
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         if let Some(ref mut sdk_sink) = self.backend {
             sdk_sink.stop_streaming().await?;
@@ -187,7 +272,8 @@ impl UnifiedSink {
     pub fn master_stream_time_ns(&mut self) -> Result<i64> {
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         {
             let backend = self
@@ -198,7 +284,8 @@ impl UnifiedSink {
         }
         #[cfg(not(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         )))]
         {
             Err(Error::Sdk("no TX backend in this build".to_string()))
@@ -219,7 +306,8 @@ impl UnifiedSink {
     #[cfg_attr(
         not(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         )),
         allow(unused_variables)
     )]
@@ -238,7 +326,8 @@ impl UnifiedSink {
     ) -> Result<()> {
         #[cfg(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         ))]
         {
             let config_center_frequency_hz = self.config.center_frequency_hz;
@@ -254,11 +343,12 @@ impl UnifiedSink {
                 sample_rate_hz: config_sample_rate_hz,
                 flags,
             };
-            backend.write_samples(channel, burst, samples)
+            crate::utils::maybe_block_in_place(|| backend.write_samples(channel, burst, samples))
         }
         #[cfg(not(all(
             feature = "native-sdk",
-            any(target_os = "windows", target_os = "linux")
+            any(target_os = "windows", target_os = "linux"),
+            target_pointer_width = "64"
         )))]
         {
             Err(Error::Sdk("no TX backend in this build".to_string()))
@@ -267,7 +357,8 @@ impl UnifiedSink {
 
     #[cfg(all(
         feature = "native-sdk",
-        any(target_os = "windows", target_os = "linux")
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
     ))]
     fn sdk_config(&self) -> SdkSinkConfig {
         SdkSinkConfig {
@@ -292,6 +383,7 @@ impl Default for UnifiedSink {
 #[derive(Debug, Clone, Default)]
 pub struct SpectranSinkBuilder {
     config: UnifiedSinkConfig,
+    device_serial: Option<String>,
 }
 
 impl SpectranSinkBuilder {
@@ -327,7 +419,45 @@ impl SpectranSinkBuilder {
         self
     }
 
+    /// Pin this sink to a specific device serial number.
+    #[must_use]
+    pub fn device_serial(mut self, serial: String) -> Self {
+        self.device_serial = Some(serial);
+        self
+    }
+
     pub fn build(self) -> UnifiedSink {
-        UnifiedSink::with_config(self.config)
+        let mut sink = UnifiedSink::with_config(self.config);
+        sink.device_serial = self.device_serial;
+        sink
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_propagates_serial_and_runtime_setters_validate_inputs() {
+        let mut sink = SpectranSinkBuilder::new()
+            .center_frequency_hz(915e6)
+            .sample_rate_hz(5e6)
+            .trans_gain_db(-15.0)
+            .device_serial("SN-TX-42".to_string())
+            .build();
+        assert_eq!(sink.device_serial(), Some("SN-TX-42"));
+        assert_eq!(sink.config().center_frequency_hz, 915e6);
+
+        sink.set_center_frequency_hz(2.45e9).unwrap();
+        sink.set_sample_rate_hz(10e6).unwrap();
+        sink.set_trans_gain_db(-10.0).unwrap();
+        assert_eq!(sink.config().center_frequency_hz, 2.45e9);
+        assert_eq!(sink.config().sample_rate_hz, 10e6);
+        assert_eq!(sink.config().trans_gain_db, -10.0);
+
+        assert!(sink.set_center_frequency_hz(0.0).is_err());
+        assert!(sink.set_center_frequency_hz(f64::NAN).is_err());
+        assert!(sink.set_sample_rate_hz(-1.0).is_err());
+        assert!(sink.set_trans_gain_db(f64::INFINITY).is_err());
     }
 }

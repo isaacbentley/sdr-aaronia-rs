@@ -75,6 +75,7 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "time", "sy
 [[bench]]
 name = "parse_int16_packet"
 harness = false
+required-features = ["http"]
 
 [[bench]]
 name = "deinterleave_dual_iq"
@@ -83,20 +84,63 @@ harness = false
 [[bench]]
 name = "decompress_block"
 harness = false
+required-features = ["file"]
 
 [[bench]]
 name = "rtsa_open_and_read"
 harness = false
+required-features = ["file"]
 
-# `http_sink_test` drives a FutureSDR flowgraph and imports
-# `sdr_aaronia_rs::http_sink`, both of which only exist under the
-# `futuresdr` feature. Without this guard `cargo clippy --all-targets` and
-# `cargo test --all-targets` fail to compile on a default checkout with
-# `cannot find module or crate futuresdr`. (`tests/native_sdk_load.rs`
-# needs no entry — it guards itself with an inner `#![cfg(...)]`.)
+# Feature guards for integration tests so `cargo check/test --all-targets`
+# succeeds under every isolated `--no-default-features --features <feat>`
+# permutation.
+[[test]]
+name = "c_api_test"
+required-features = ["ffi"]
+
+[[test]]
+name = "http_mock_test"
+required-features = ["http"]
+
+[[test]]
+name = "http_resilience_test"
+required-features = ["http", "file"]
+
 [[test]]
 name = "http_sink_test"
 required-features = ["futuresdr"]
+
+[[test]]
+name = "integration_test"
+required-features = ["http", "file"]
+
+[[test]]
+name = "live_smoke"
+required-features = ["http", "file"]
+
+[[test]]
+name = "native_sdk_live"
+required-features = ["native-sdk", "http", "file", "ffi"]
+
+[[test]]
+name = "properties"
+required-features = ["http", "file"]
+
+[[test]]
+name = "rtsa_negative_test"
+required-features = ["file"]
+
+[[test]]
+name = "test_cw_mag"
+required-features = ["file"]
+
+[[test]]
+name = "test_cw_meta"
+required-features = ["file"]
+
+[[test]]
+name = "wire_contract"
+required-features = ["http"]
 
 [features]
 default    = ["http", "file", "ffi"]
@@ -110,10 +154,14 @@ native-sdk = ["dep:libloading", "dep:widestring"]
 
 [[example]]
 name = "noaa_scanner"
-required-features = ["futuresdr", "http"]
+required-features = ["futuresdr", "http", "file"]
 
 [[example]]
 name = "native_sdk_basic"
+required-features = ["native-sdk"]
+
+[[example]]
+name = "native_sdk_transmit"
 required-features = ["native-sdk"]
 
 [[example]]
@@ -126,11 +174,11 @@ required-features = ["http"]
 
 [[example]]
 name = "http_iq_quickstart"
-required-features = ["http"]
+required-features = ["http", "file"]
 
 [[example]]
 name = "read_rtsa_file"
-required-features = ["file"]
+required-features = ["http", "file"]
 
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]

@@ -7,8 +7,10 @@
 //! part of seify's built-in enumeration registry — `seify::enumerate()`
 //! will not discover it; open it explicitly.
 //!
-//! Blocking: every control call and `read` uses `Runtime::block_on`
-//! internally and must not be called from within an async runtime.
+//! Blocking: control calls and `read` drive an internal process-wide
+//! Tokio runtime, using `block_in_place` on multi-threaded Tokio workers
+//! and a scoped helper thread if invoked inside a `current_thread`
+//! runtime or `LocalSet`.
 
 use crate::unified_source::{SourceType, SpectranSource, SpectranSourceBuilder};
 use num_complex::Complex32;
@@ -17,7 +19,7 @@ use seify::{
     Args, DeviceInfo, Direction, FrequencyControl, GainControl, Range, RangeItem, RxDevice,
     RxStreamer, SampleRateControl,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 
 /// Cached tuning state shared across clones; updated by the setters so
@@ -30,23 +32,58 @@ struct Tuning {
     reference_level_dbm: f64,
 }
 
-fn block_on<F: std::future::Future>(runtime: &Runtime, fut: F) -> F::Output {
-    if let Ok(handle) = tokio::runtime::Handle::try_current()
-        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-    {
-        tokio::task::block_in_place(|| runtime.block_on(fut))
-    } else {
-        runtime.block_on(fut)
+static SEIFY_RUNTIME: OnceLock<std::result::Result<Runtime, String>> = OnceLock::new();
+
+fn seify_runtime() -> std::result::Result<&'static Runtime, seify::Error> {
+    SEIFY_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| seify::Error::Io(std::io::Error::other(e.clone())))
+}
+
+fn block_on<F>(runtime: &Runtime, fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => runtime.block_on(fut),
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            let mut fut_opt = Some(fut);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| runtime.block_on(fut_opt.take().unwrap()))
+            })) {
+                Ok(out) => out,
+                Err(payload) => match fut_opt {
+                    // `block_in_place` panicked before running our closure
+                    // (for example, inside a `LocalSet`).
+                    Some(fut) => std::thread::scope(|s| {
+                        s.spawn(|| runtime.block_on(fut))
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                    }),
+                    None => std::panic::resume_unwind(payload),
+                },
+            }
+        }
+        Ok(_) => std::thread::scope(|s| {
+            s.spawn(|| runtime.block_on(fut))
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p))
+        }),
     }
 }
 
 /// Seify device wrapper around [`SpectranSource`]. `Clone` shares the
-/// underlying source/runtime/tuning (required by seify's
-/// `Device::from_impl`).
+/// underlying source/tuning (required by seify's `Device::from_impl`).
 #[derive(Clone)]
 pub struct SpectranSeifyDevice {
     source: Arc<Mutex<SpectranSource>>,
-    runtime: Arc<Runtime>,
     tuning: Arc<Mutex<Tuning>>,
     capabilities: Arc<crate::capabilities::DeviceCapabilities>,
 }
@@ -54,12 +91,7 @@ pub struct SpectranSeifyDevice {
 impl SpectranSeifyDevice {
     /// Create a new Seify device from arguments string.
     pub fn from_args(args: &Args) -> std::result::Result<Self, seify::Error> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?,
-        );
+        let runtime = seify_runtime()?;
 
         let mut builder = SpectranSourceBuilder::new();
 
@@ -74,6 +106,12 @@ impl SpectranSeifyDevice {
             && (sdk == "true" || sdk == "1")
         {
             builder.force_source_type(SourceType::NativeSdk);
+        }
+
+        if let Ok(listen_only) = args.get::<String>("listen_only")
+            && (listen_only == "true" || listen_only == "1")
+        {
+            builder.listen_only(true);
         }
 
         let mut center_frequency_hz = 100e6;
@@ -101,14 +139,13 @@ impl SpectranSeifyDevice {
             receiver_clock: args.get::<String>("receiver_clock").ok(),
             decimation_factor: args.get::<u32>("decimation").ok(),
         });
-        let source = block_on(&runtime, builder.build())
+        let source = block_on(runtime, builder.build())
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
 
-        let capabilities = Arc::new(block_on(&runtime, source.device_capabilities()));
+        let capabilities = Arc::new(block_on(runtime, source.device_capabilities()));
         Ok(Self {
             capabilities,
             source: Arc::new(Mutex::new(source)),
-            runtime,
             tuning: Arc::new(Mutex::new(Tuning {
                 center_frequency_hz,
                 sample_rate_hz,
@@ -226,8 +263,9 @@ impl FrequencyControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
+        let runtime = seify_runtime()?;
         let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
-        block_on(&self.runtime, source.set_center_frequency_hz(frequency))
+        block_on(runtime, source.set_center_frequency_hz(frequency))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
         self.tuning
             .lock()
@@ -282,8 +320,9 @@ impl SampleRateControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
+        let runtime = seify_runtime()?;
         let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
-        block_on(&self.runtime, source.set_sample_rate_hz(rate))
+        block_on(runtime, source.set_sample_rate_hz(rate))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
         self.tuning
             .lock()
@@ -372,8 +411,9 @@ impl GainControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
+        let runtime = seify_runtime()?;
         let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
-        block_on(&self.runtime, source.set_reference_level_dbm(gain))
+        block_on(runtime, source.set_reference_level_dbm(gain))
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
         self.tuning
             .lock()
@@ -392,18 +432,20 @@ impl RxDevice for SpectranSeifyDevice {
         _args: Args,
     ) -> std::result::Result<Self::RxStreamer, seify::Error> {
         if channels != [0] {
-            // `channels.first()` guards the empty-list case, which used
-            // to panic inside the error path itself.
-            return Err(seify::Error::invalid_channel(
-                Direction::Rx,
-                channels.first().copied().unwrap_or(0),
-                1,
-            ));
+            // Report the offending non-zero channel when present (e.g.
+            // `[0, 1]` -> `1`), falling back to `1` for duplicate `[0, 0]`
+            // or `0` for `[]`.
+            let bad = channels
+                .iter()
+                .copied()
+                .find(|&c| c != 0)
+                .unwrap_or(if channels.is_empty() { 0 } else { 1 });
+            return Err(seify::Error::invalid_channel(Direction::Rx, bad, 1));
         }
         Ok(SpectranSeifyRxStreamer {
             source: self.source.clone(),
-            runtime: self.runtime.clone(),
             deferred_overrun: false,
+            active: false,
         })
     }
 }
@@ -416,8 +458,19 @@ impl DynDeviceBackend for SpectranSeifyDevice {
 
 pub struct SpectranSeifyRxStreamer {
     source: Arc<Mutex<SpectranSource>>,
-    runtime: Arc<Runtime>,
     deferred_overrun: bool,
+    active: bool,
+}
+
+impl Drop for SpectranSeifyRxStreamer {
+    fn drop(&mut self) {
+        if self.active
+            && let Ok(runtime) = seify_runtime()
+        {
+            let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = block_on(runtime, source.stop_streaming());
+        }
+    }
 }
 
 impl RxStreamer for SpectranSeifyRxStreamer {
@@ -426,17 +479,21 @@ impl RxStreamer for SpectranSeifyRxStreamer {
     }
 
     fn activate_at(&mut self, _time_ns: Option<i64>) -> std::result::Result<(), seify::Error> {
+        let runtime = seify_runtime()?;
         let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
-        block_on(&self.runtime, source.start_streaming())
+        block_on(runtime, source.start_streaming())
             .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
+        self.active = true;
         Ok(())
     }
 
     fn deactivate_at(&mut self, _time_ns: Option<i64>) -> std::result::Result<(), seify::Error> {
+        let runtime = seify_runtime()?;
         let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
-        block_on(&self.runtime, source.stop_streaming())
-            .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())))?;
-        Ok(())
+        let res = block_on(runtime, source.stop_streaming())
+            .map_err(|e| seify::Error::Io(std::io::Error::other(e.to_string())));
+        self.active = false;
+        res
     }
 
     fn read(
@@ -452,14 +509,17 @@ impl RxStreamer for SpectranSeifyRxStreamer {
         if buffers.is_empty() {
             return Ok(0);
         }
+        let runtime = seify_runtime()?;
         let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
         let buf = &mut buffers[0];
 
-        // Honour the caller's timeout (a non-positive value gets a
-        // sane default); partial reads within the deadline are
-        // returned rather than discarded. The source mutex is held for
-        // at most this bounded duration.
-        let timeout = if _timeout_us > 0 {
+        // Honour the caller's timeout: `0` performs a non-blocking drain,
+        // positive values bound the wait in microseconds, and negative
+        // values get a 100 ms default. Partial reads within the deadline
+        // are returned rather than discarded.
+        let timeout = if _timeout_us == 0 {
+            std::time::Duration::ZERO
+        } else if _timeout_us > 0 {
             std::time::Duration::from_micros(_timeout_us as u64)
         } else {
             std::time::Duration::from_millis(100)
@@ -469,7 +529,7 @@ impl RxStreamer for SpectranSeifyRxStreamer {
         let mut temp = source.take_scratch();
         temp.reserve(buf.len());
         let outcome = block_on(
-            &self.runtime,
+            runtime,
             source.read_samples_deadline(&mut temp, buf.len(), timeout),
         );
         let read = match outcome {

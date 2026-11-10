@@ -222,15 +222,16 @@ pub struct AARTSAAPI_Device {
     pub d: *mut c_void,
 }
 
-// SAFETY: both handles are opaque, heap-allocated vendor objects owned
-// exclusively by their wrapper structs and only ever used behind `&mut`
-// (exclusive access). The AARTSAAPI vendor samples configure and poll
-// from worker threads other than the opening thread, and the API
-// documents no thread affinity, so *transferring exclusive ownership*
-// between threads (`Send`) is sound. `Sync` is also implemented because
-// PyO3 0.23+ requires `#[pyclass]` structs to be `Send + Sync`. This is
-// safe because the handle is only ever accessed via `&mut self`, meaning
-// concurrent shared access is impossible in safe Rust.
+// SAFETY: both handles are opaque, heap-allocated vendor objects owned by
+// their wrapper structs. Safe wrappers (`NativeSdkSource`, `SdkSource`,
+// `SdkSink`) serialize access via `&mut self` for streaming/configuration
+// and via `NativeSdkSource::device_query_lock` (`Mutex<()>`) for the single
+// `&self` metadata query (`device_capabilities`), making concurrent calls on
+// one handle impossible in safe Rust. Callers invoking `unsafe` methods on
+// `NativeSdkClient` with raw `AARTSAAPI_Handle` / `AARTSAAPI_Device` values
+// must serialize concurrent access to the same handle themselves.
+// `Send + Sync` are kept on these wrapper structs so `SpectranSource` and
+// `PySpectranSource` (`#[pyclass]` in PyO3 0.23+) preserve their auto-traits.
 unsafe impl Send for AARTSAAPI_Handle {}
 unsafe impl Sync for AARTSAAPI_Handle {}
 unsafe impl Send for AARTSAAPI_Device {}
@@ -339,6 +340,20 @@ pub struct AARTSAAPI_Packet {
     pub fp32: *mut f32, // IQ data pointer
     pub interleave: i64,
 }
+
+// Compile-time ABI layout verification against `aaroniartsaapi.h` (64-bit).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<AARTSAAPI_Packet>() == 120);
+#[cfg(all(target_os = "windows", target_pointer_width = "64"))]
+const _: () = {
+    assert!(std::mem::size_of::<AARTSAAPI_DeviceInfo>() == 256);
+    assert!(std::mem::size_of::<AARTSAAPI_ConfigInfo>() == 2472);
+};
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+const _: () = {
+    assert!(std::mem::size_of::<AARTSAAPI_DeviceInfo>() == 496);
+    assert!(std::mem::size_of::<AARTSAAPI_ConfigInfo>() == 4888);
+};
 
 // === FFI Function Type Definitions ===
 
@@ -465,8 +480,10 @@ type AARTSAAPI_SendPacket = unsafe extern "C" fn(
 static SDK_LIVE_INITS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 
 pub struct NativeSdkClient {
-    _lib: Library,
+    _lib: std::mem::ManuallyDrop<Library>,
     initialized: std::sync::atomic::AtomicBool,
+    active_handles: std::sync::atomic::AtomicUsize,
+    leaked_resource: std::sync::atomic::AtomicBool,
 
     // Core functions
     init: AARTSAAPI_Init,
@@ -557,6 +574,16 @@ fn add_sdk_root_to_dll_search_path(lib_path: &str) {
     // one way a root could still come out empty.
     if root.as_os_str().is_empty() {
         return;
+    }
+
+    static ADDED_DLL_DIRS: std::sync::Mutex<Option<std::collections::HashSet<std::path::PathBuf>>> =
+        std::sync::Mutex::new(None);
+    {
+        let mut guard = ADDED_DLL_DIRS.lock().unwrap_or_else(|p| p.into_inner());
+        let set = guard.get_or_insert_with(std::collections::HashSet::new);
+        if !set.insert(root.to_path_buf()) {
+            return;
+        }
     }
 
     let wide: Vec<u16> = root
@@ -723,8 +750,10 @@ impl NativeSdkClient {
             info!("All SDK functions loaded successfully");
 
             Ok(Self {
-                _lib: lib,
+                _lib: std::mem::ManuallyDrop::new(lib),
                 initialized: std::sync::atomic::AtomicBool::new(false),
+                active_handles: std::sync::atomic::AtomicUsize::new(0),
+                leaked_resource: std::sync::atomic::AtomicBool::new(false),
                 init,
                 init_with_path,
                 shutdown,
@@ -797,17 +826,29 @@ impl NativeSdkClient {
     pub unsafe fn shutdown(&self) -> Result<()> {
         unsafe {
             // Serialize the flag transition with init as well as the count.
-            // Swapping before the lock allowed the same client to re-init
-            // while shutdown was waiting, corrupting the live-client count.
+            // Only decrement `*live` and clear `initialized` once shutdown (or
+            // refcount handoff) actually succeeds, and refuse `AARTSAAPI_Shutdown`
+            // if handles or devices remain open on this client.
             let mut live = SDK_LIVE_INITS.lock().unwrap_or_else(|p| p.into_inner());
-            if !self
-                .initialized
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
+            if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(());
             }
-            *live = live.saturating_sub(1);
-            if *live > 0 {
+            if self
+                .active_handles
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+                || self
+                    .leaked_resource
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Sdk(
+                    "cannot shut down Aaronia SDK while handles or devices remain open".to_string(),
+                ));
+            }
+            if *live > 1 {
+                *live -= 1;
+                self.initialized
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 debug!(
                     "SDK still in use by {} other client(s); not shut down",
                     *live
@@ -816,6 +857,9 @@ impl NativeSdkClient {
             }
             let result = (self.shutdown)();
             check_res(result, "AARTSAAPI_Shutdown")?;
+            *live = 0;
+            self.initialized
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             info!("SDK shutdown successfully");
             Ok(())
         }
@@ -837,8 +881,26 @@ impl NativeSdkClient {
                     "AARTSAAPI_Open returned no handle (result 0x{result:08X})"
                 )));
             }
+            self.active_handles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             debug!("SDK handle opened successfully");
             Ok(handle)
+        }
+    }
+
+    fn decrement_active_handles(&self) {
+        use std::sync::atomic::Ordering;
+        let mut cur = self.active_handles.load(Ordering::SeqCst);
+        while cur > 0 {
+            match self.active_handles.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
         }
     }
 
@@ -846,6 +908,7 @@ impl NativeSdkClient {
         unsafe {
             let result = (self.close)(handle);
             check_res(result, "AARTSAAPI_Close")?;
+            self.decrement_active_handles();
             debug!("SDK handle closed successfully");
             Ok(())
         }
@@ -984,18 +1047,26 @@ impl NativeSdkClient {
         unsafe {
             let mut device = AARTSAAPI_Device { d: ptr::null_mut() };
             let wide_type = string_to_wide(device_type)?;
-            let result = (self.open_device)(
-                handle,
-                &mut device,
-                wide_type.as_ptr(),
-                serial_number.as_ptr(),
-            );
+            // Copy up to the first NUL and append a trailing NUL so `&[]`
+            // becomes `L""` (not a dangling non-null pointer) and an
+            // unterminated slice never causes `wcslen` to read out of bounds.
+            let serial_len = serial_number
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(serial_number.len());
+            let mut serial_buf = Vec::with_capacity(serial_len + 1);
+            serial_buf.extend_from_slice(&serial_number[..serial_len]);
+            serial_buf.push(0);
+
+            let result =
+                (self.open_device)(handle, &mut device, wide_type.as_ptr(), serial_buf.as_ptr());
 
             if let Err(error) = check_res(result, "AARTSAAPI_OpenDevice") {
                 // Some SDK builds allocate a device before failing. Release
                 // that partial open too; the caller never receives its handle.
-                if !device.d.is_null() {
-                    let _ = self.close_device(handle, &mut device);
+                if !device.d.is_null() && self.close_device(handle, &mut device).is_err() {
+                    self.leaked_resource
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 return Err(error);
             }
@@ -1006,6 +1077,8 @@ impl NativeSdkClient {
                     "AARTSAAPI_OpenDevice({device_type}) returned no device (result 0x{result:08X})"
                 )));
             }
+            self.active_handles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             info!("Device {} opened successfully", device_type);
             Ok(device)
         }
@@ -1055,6 +1128,7 @@ impl NativeSdkClient {
         unsafe {
             let result = (self.close_device)(handle, device);
             check_res(result, "AARTSAAPI_CloseDevice")?;
+            self.decrement_active_handles();
             info!("Device closed successfully");
             Ok(())
         }
@@ -1138,9 +1212,19 @@ impl NativeSdkClient {
         unsafe {
             let mut size: i64 = 1024;
             let mut buffer = vec![0 as WideChar; size as usize];
-            let result = (self.config_get_string)(device, config, buffer.as_mut_ptr(), &mut size);
+            let mut result =
+                (self.config_get_string)(device, config, buffer.as_mut_ptr(), &mut size);
+            if result == AARTSAAPI_ERROR_BUFFER_SIZE && (1..=65_536).contains(&size) {
+                let cap = (size as usize) + 1;
+                buffer.resize(cap, 0);
+                size = cap as i64;
+                result = (self.config_get_string)(device, config, buffer.as_mut_ptr(), &mut size);
+            }
             check_res(result, "AARTSAAPI_ConfigGetString")?;
-            Ok(wide_to_string(&buffer))
+            let valid_len = usize::try_from(size)
+                .unwrap_or(buffer.len())
+                .min(buffer.len());
+            Ok(wide_to_string(&buffer[..valid_len]))
         }
     }
 
@@ -1228,6 +1312,11 @@ impl NativeSdkClient {
             let mut config = AARTSAAPI_Config { d: ptr::null_mut() };
             let result = (self.config_health)(device, &mut config);
             check_res(result, "AARTSAAPI_ConfigHealth")?;
+            if config.d.is_null() {
+                return Err(Error::Sdk(format!(
+                    "AARTSAAPI_ConfigHealth returned no config (result 0x{result:08X})"
+                )));
+            }
             Ok(config)
         }
     }
@@ -1246,6 +1335,9 @@ impl NativeSdkClient {
                 return Ok(None);
             }
             check_res(result, "AARTSAAPI_ConfigFirst")?;
+            if config.d.is_null() {
+                return Ok(None);
+            }
             Ok(Some(config))
         }
     }
@@ -1403,6 +1495,26 @@ impl Drop for NativeSdkClient {
         unsafe {
             if let Err(e) = self.shutdown() {
                 error!("Error shutting down SDK during NativeSdkClient drop: {}", e);
+            }
+            // Only unload the shared library if no handles/devices remain
+            // open, none were leaked on failed close, and this client is no
+            // longer holding an active SDK initialization. Unloading the
+            // library while Qt / USB worker threads are still running inside
+            // it causes a use-after-dlclose SIGSEGV.
+            if !self.initialized.load(std::sync::atomic::Ordering::SeqCst)
+                && self
+                    .active_handles
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                && !self
+                    .leaked_resource
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::mem::ManuallyDrop::drop(&mut self._lib);
+            } else {
+                warn!(
+                    "Skipping SDK library unload because resources remain active or shutdown failed"
+                );
             }
         }
     }
@@ -1633,7 +1745,19 @@ impl DeviceOpenMode {
         match self {
             Self::Raw | Self::EcoRaw | Self::EcoIqReceiver | Self::IqReceiver => true,
             Self::EcoRtsa | Self::Sweepsa | Self::EcoSweepsa => false,
-            Self::Other(_) => false,
+            Self::Other(s) => s
+                .split_once('/')
+                .is_some_and(|(family, mode)| !family.is_empty() && mode == "iqtransceiver"),
+        }
+    }
+
+    pub(crate) fn is_iq_receiver_pipeline(&self) -> bool {
+        match self {
+            Self::EcoIqReceiver | Self::IqReceiver => true,
+            Self::Other(s) => s
+                .split_once('/')
+                .is_some_and(|(family, mode)| !family.is_empty() && mode == "iqtransceiver"),
+            _ => false,
         }
     }
 
@@ -1719,6 +1843,10 @@ pub struct NativeSdkSource {
     /// `AARTSAAPI_Packet::endTime` of the most recent packet, seconds
     /// since the epoch (0.0 before any packet).
     last_packet_end_time_s: f64,
+    /// Serializes `&self` metadata queries (`device_capabilities`) so two
+    /// concurrent shared-reference callers cannot race on `self.device`
+    /// inside the C++ config tree while `NativeSdkSource` remains `Sync`.
+    device_query_lock: std::sync::Mutex<()>,
 }
 
 /// Which of the two packet-consuming read paths a streaming session
@@ -1832,6 +1960,7 @@ impl NativeSdkSource {
             drop_events: 0,
             overrun_pending: false,
             last_packet_end_time_s: 0.0,
+            device_query_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -1864,6 +1993,21 @@ impl NativeSdkSource {
         health: &mut HealthState,
         gps: &mut GpsState,
     ) -> Result<()> {
+        unsafe { self.walk_health_tree_bounded(device, group, health, gps, 0) }
+    }
+
+    unsafe fn walk_health_tree_bounded(
+        &self,
+        device: &mut AARTSAAPI_Device,
+        group: &mut AARTSAAPI_Config,
+        health: &mut HealthState,
+        gps: &mut GpsState,
+        depth: usize,
+    ) -> Result<()> {
+        const MAX_HEALTH_TREE_DEPTH: usize = 16;
+        if depth > MAX_HEALTH_TREE_DEPTH {
+            return Ok(());
+        }
         unsafe {
             let mut current = match self.client.config_first(device, group)? {
                 Some(c) => c,
@@ -1880,13 +2024,19 @@ impl NativeSdkSource {
                     // `HealthState`); the GPS fields are the useful ones.
                     match name.as_str() {
                         "frontendtemp" => {
-                            health.front_temp_c = self.read_health_value(device, &mut current);
+                            health.front_temp_c = self
+                                .read_health_value(device, &mut current)
+                                .filter(|v| v.is_finite());
                         }
                         "fpgatemp" => {
-                            health.fpga_temp_c = self.read_health_value(device, &mut current);
+                            health.fpga_temp_c = self
+                                .read_health_value(device, &mut current)
+                                .filter(|v| v.is_finite());
                         }
                         "boardpower" => {
-                            health.board_power_w = self.read_health_value(device, &mut current);
+                            health.board_power_w = self
+                                .read_health_value(device, &mut current)
+                                .filter(|v| v.is_finite());
                         }
                         // `satellites` is the HTTP `/healthstatus` name;
                         // `gpssats` is what SDK 3.0.3's own samples read
@@ -1894,36 +2044,45 @@ impl NativeSdkSource {
                         "satellites" | "gpssats" => {
                             gps.satellites = self
                                 .read_health_value(device, &mut current)
+                                .filter(|v| v.is_finite() && *v >= 0.0 && *v <= u32::MAX as f64)
                                 .map(|v| v as u32);
                         }
                         "gpsposvalid" => {
                             gps.position_valid = self
                                 .read_health_value(device, &mut current)
-                                .is_some_and(|v| v != 0.0);
+                                .is_some_and(|v| v.is_finite() && v != 0.0);
                         }
                         "gpslatitude" => {
-                            gps.latitude = self.read_health_value(device, &mut current);
+                            gps.latitude = self
+                                .read_health_value(device, &mut current)
+                                .filter(|v| v.is_finite());
                         }
                         "gpslongitude" => {
-                            gps.longitude = self.read_health_value(device, &mut current);
+                            gps.longitude = self
+                                .read_health_value(device, &mut current)
+                                .filter(|v| v.is_finite());
                         }
                         "gpselevation" => {
-                            gps.altitude = self.read_health_value(device, &mut current);
+                            gps.altitude = self
+                                .read_health_value(device, &mut current)
+                                .filter(|v| v.is_finite());
                         }
                         "gpstimevalid" => {
                             gps.time_valid = self
                                 .read_health_value(device, &mut current)
-                                .is_some_and(|v| v != 0.0);
+                                .is_some_and(|v| v.is_finite() && v != 0.0);
                         }
                         "gpstime" => {
-                            gps.time_s = self.read_health_value(device, &mut current);
+                            gps.time_s = self
+                                .read_health_value(device, &mut current)
+                                .filter(|v| v.is_finite());
                         }
                         _ => {}
                     }
                 }
 
                 // Recurse into children
-                let _ = self.walk_health_tree(device, &mut current, health, gps);
+                let _ = self.walk_health_tree_bounded(device, &mut current, health, gps, depth + 1);
 
                 if !self.client.config_next(device, group, &mut current)? {
                     break;
@@ -2234,6 +2393,25 @@ impl NativeSdkSource {
             if reference_level_dbm.is_some_and(|level| !level.is_finite()) {
                 return Err(Error::Config("reference level must be finite".into()));
             }
+            if !config.start_frequency.is_finite()
+                || !config.stop_frequency.is_finite()
+                || config.start_frequency <= 0.0
+                || config.start_frequency >= config.stop_frequency
+            {
+                return Err(Error::Config(
+                    "sweepsa start_frequency and stop_frequency must be positive, finite, and start < stop"
+                        .into(),
+                ));
+            }
+            if !config.rbw.is_finite()
+                || config.rbw <= 0.0
+                || !config.vbw.is_finite()
+                || config.vbw <= 0.0
+            {
+                return Err(Error::Config(
+                    "sweepsa rbw and vbw must be positive and finite".into(),
+                ));
+            }
             let device = self
                 .device
                 .as_mut()
@@ -2408,6 +2586,10 @@ impl NativeSdkSource {
     /// application or HTTP server is involved. Missing fields stay unknown.
     pub unsafe fn device_capabilities(&self) -> Result<crate::capabilities::DeviceCapabilities> {
         use crate::capabilities::{DeviceCapabilities, ValueRange, sdk_options};
+        let _query_guard = self
+            .device_query_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         unsafe {
             let mut device = self
                 .device
@@ -2442,6 +2624,8 @@ impl NativeSdkSource {
             caps.receiver_clocks = options("device/receiverclock");
             caps.receiver_channels = options("device/receiverchannel");
             caps.decimations = options("main/decimation");
+            let enabled_decimations = caps.decimations.iter().filter(|o| o.enabled).count();
+            caps.decimation_steps = (enabled_decimations > 0).then_some(enabled_decimations);
             caps.clock_sources = options("device/sclksource")
                 .into_iter()
                 .filter(|o| o.enabled)
@@ -2464,7 +2648,20 @@ impl NativeSdkSource {
             caps.clock_source = text("device/sclksource");
             caps.gps_mode = text("device/gpsmode");
             caps.receiver_clock = text("device/receiverclock");
-            caps.rx_antenna = text("device/receiverchannel");
+            if let Some(clock_hz) = self.receiver_clock_hz.or_else(|| {
+                caps.receiver_clock
+                    .as_deref()
+                    .map(crate::utils::receiver_clock_for_label)
+            }) && clock_hz.is_finite()
+                && clock_hz > 0.0
+            {
+                caps.native_iq_rate_hz = Some(clock_hz / crate::utils::IQ_RATE_CLOCK_RATIO);
+            }
+            caps.rx_antenna = text("device/receiverchannel").map(|ch| match ch.as_str() {
+                "Rx1" => "RX1".to_string(),
+                "Rx2" => "RX2".to_string(),
+                _ => ch,
+            });
             Ok(caps)
         }
     }
@@ -2473,10 +2670,11 @@ impl NativeSdkSource {
     /// documented IQ receiver modes, not raw clock/decimation pipelines.
     pub unsafe fn set_rf_span_hz(&mut self, hz: f64) -> Result<f64> {
         unsafe {
-            if !matches!(
-                self.open_mode,
-                Some(DeviceOpenMode::EcoIqReceiver | DeviceOpenMode::IqReceiver)
-            ) {
+            if !self
+                .open_mode
+                .as_ref()
+                .is_some_and(DeviceOpenMode::is_iq_receiver_pipeline)
+            {
                 return Err(Error::Config(
                     "RF span requires an iqreceiver mode; raw mode uses clock/decimation".into(),
                 ));
@@ -2492,7 +2690,10 @@ impl NativeSdkSource {
             let info = self.client.get_config_info(device, &mut span)?;
             crate::stream_geometry::validate_eco_span(hz, info.min_value, info.max_value)?;
             self.client.set_config_float(device, &mut span, hz)?;
-            self.client.get_config_float(device, &mut span)
+            let applied = self.client.get_config_float(device, &mut span)?;
+            self.sample_buffer.clear();
+            self.dual_sample_buffer.clear();
+            Ok(applied)
         }
     }
 
@@ -2536,6 +2737,16 @@ impl NativeSdkSource {
     ) -> Result<()> {
         unsafe {
             Self::require_mode(self.open_mode.as_ref(), DeviceOpenMode::carries_iq, "IQ")?;
+            if !center_frequency_hz.is_finite() || center_frequency_hz <= 0.0 {
+                return Err(Error::Config(format!(
+                    "centre frequency {center_frequency_hz} must be positive and finite"
+                )));
+            }
+            if !sample_rate_hz.is_finite() || sample_rate_hz <= 0.0 {
+                return Err(Error::Config(format!(
+                    "sample rate {sample_rate_hz} must be positive and finite"
+                )));
+            }
             let caps = self.device_capabilities()?;
             for (name, value, bounds) in [
                 (
@@ -2647,10 +2858,10 @@ impl NativeSdkSource {
             } else {
                 Self::read_receiver_clock_hz(&self.client, device, &mut root)
             };
-            let eco_iq = matches!(
-                self.open_mode,
-                Some(DeviceOpenMode::EcoIqReceiver | DeviceOpenMode::IqReceiver)
-            );
+            let eco_iq = self
+                .open_mode
+                .as_ref()
+                .is_some_and(DeviceOpenMode::is_iq_receiver_pipeline);
             let explicit_raw =
                 options.receiver_clock.is_some() || options.decimation_factor.is_some();
             if eco_iq {
@@ -2846,6 +3057,19 @@ impl NativeSdkSource {
         trans_gain_db: f64,
     ) -> Result<()> {
         unsafe {
+            if !center_frequency_hz.is_finite() || center_frequency_hz <= 0.0 {
+                return Err(Error::Config(
+                    "TX center frequency must be positive and finite".into(),
+                ));
+            }
+            if !sample_rate_hz.is_finite() || sample_rate_hz <= 0.0 {
+                return Err(Error::Config(
+                    "TX sample rate must be positive and finite".into(),
+                ));
+            }
+            if !trans_gain_db.is_finite() {
+                return Err(Error::Config("TX gain must be finite".into()));
+            }
             let device = self
                 .device
                 .as_mut()
@@ -3023,15 +3247,54 @@ impl NativeSdkSource {
                 return Ok(None);
             };
 
+            let warned = packet.flags
+                & (tx_flags::WARN_OVERFLOW
+                    | tx_flags::WARN_DROPPED
+                    | tx_flags::WARN_INACCURATE
+                    | tx_flags::TIME_DISCONTINUITY);
+            if warned != 0 {
+                if warned & (tx_flags::WARN_DROPPED | tx_flags::TIME_DISCONTINUITY) != 0 {
+                    self.drop_events += 1;
+                }
+                if warned
+                    & (tx_flags::WARN_OVERFLOW
+                        | tx_flags::WARN_DROPPED
+                        | tx_flags::TIME_DISCONTINUITY)
+                    != 0
+                {
+                    self.overrun_pending = true;
+                }
+                tracing::debug!("SDK spectra packet flags 0x{:x}", packet.flags);
+            }
+            if packet.end_time.is_finite() && packet.end_time > 0.0 {
+                self.last_packet_end_time_s = packet.end_time;
+            }
+
             // Consume on every path out from here: `get_packet` always
             // returns the head of the queue, so leaving one behind makes
             // every later read return the same packet forever.
+            let prev_out_len = out.len();
             let result = (|| {
-                if packet.fp32.is_null() || packet.num <= 0 || packet.size == 0 {
+                if packet.fp32.is_null() || packet.num <= 0 || packet.size <= 0 {
                     return Ok(None);
                 }
-                let frames = packet.num as usize;
-                let bins = packet.size as usize;
+                if !packet.fp32.is_aligned() {
+                    return Err(Error::Sdk(
+                        "spectra packet fp32 pointer is unaligned".to_string(),
+                    ));
+                }
+                let Ok(frames) = usize::try_from(packet.num) else {
+                    return Err(Error::Sdk(format!(
+                        "spectra packet has invalid frame count ({})",
+                        packet.num
+                    )));
+                };
+                let Ok(bins) = usize::try_from(packet.size) else {
+                    return Err(Error::Sdk(format!(
+                        "spectra packet has invalid bin count ({})",
+                        packet.size
+                    )));
+                };
                 // Bound the product before allocating: a corrupt header
                 // must not size a multi-gigabyte copy.
                 const MAX_VALUES: usize = 1 << 26;
@@ -3053,8 +3316,14 @@ impl NativeSdkSource {
                     )));
                 };
                 out.reserve(total);
+                let sanitize = |v: f32| if v.is_finite() { v } else { 0.0 };
                 if stride == 0 || stride == bins {
-                    out.extend_from_slice(std::slice::from_raw_parts(packet.fp32, total));
+                    out.extend(
+                        std::slice::from_raw_parts(packet.fp32, total)
+                            .iter()
+                            .copied()
+                            .map(sanitize),
+                    );
                 } else if stride > bins {
                     let span = (frames - 1)
                         .checked_mul(stride)
@@ -3067,10 +3336,12 @@ impl NativeSdkSource {
                         )));
                     }
                     for frame in 0..frames {
-                        out.extend_from_slice(std::slice::from_raw_parts(
-                            packet.fp32.add(frame * stride),
-                            bins,
-                        ));
+                        out.extend(
+                            std::slice::from_raw_parts(packet.fp32.add(frame * stride), bins)
+                                .iter()
+                                .copied()
+                                .map(sanitize),
+                        );
                     }
                 } else {
                     return Err(Error::Sdk(format!(
@@ -3086,7 +3357,14 @@ impl NativeSdkSource {
                 }))
             })();
 
-            self.client.consume_packets(device, stream, 1)?;
+            if let Err(e) = self.client.consume_packets(device, stream, 1) {
+                out.truncate(prev_out_len);
+                return Err(e);
+            }
+            if result.is_err() {
+                self.drop_events += 1;
+                self.overrun_pending = true;
+            }
             result
         }
     }
@@ -3214,10 +3492,10 @@ impl NativeSdkSource {
             // it. Only the first packet is ever waited for, so latency is
             // unchanged — a call still returns as soon as any data exists.
             let started = std::time::Instant::now();
-            // Samples already handed over from carry-over count as "data
-            // in hand": a caller draining a backlog must not sleep out
-            // the poll budget for a packet that is not there.
-            let mut got_packet = from_carry > 0;
+            // Carry-over hits the early return above (`from_carry == 0` here),
+            // so `got_packet` tracks whether at least one queued packet has
+            // yielded samples in this call.
+            let mut got_packet = false;
             let mut read_geometry = None;
 
             while remaining > 0 {
@@ -3252,9 +3530,10 @@ impl NativeSdkSource {
                 // (any real interleave is tiny) — it's a corruption backstop,
                 // not a tight spec bound.
                 const MAX_IQ_STRIDE: i64 = 4096;
-                let valid_iq_stride = (2..=MAX_IQ_STRIDE).contains(&packet.stride);
-                let has_valid_samples =
-                    !packet.fp32.is_null() && packet.num > 0 && valid_iq_stride;
+                let valid_iq_stride = (2..=MAX_IQ_STRIDE).contains(&packet.stride)
+                    && (packet.size == 0 || packet.size >= 2)
+                    && (packet.fp32.is_null() || packet.fp32.is_aligned());
+                let has_valid_samples = !packet.fp32.is_null() && packet.num > 0 && valid_iq_stride;
                 // Leave the first packet of a new geometry in the SDK queue.
                 // Each returned buffer, including a carried packet tail, has
                 // one frequency mapping. Do not relabel old IQ with new metadata.
@@ -3268,8 +3547,10 @@ impl NativeSdkSource {
                     // samples are lost as surely as a `WARN_DROPPED`
                     // packet's, and the caller must hear so the same way.
                     warn!(
-                        "Skipping packet with out-of-range IQ stride {} (expected 2..={})",
-                        packet.stride, MAX_IQ_STRIDE
+                        "Skipping packet with invalid IQ layout (stride={}, size={}, aligned={})",
+                        packet.stride,
+                        packet.size,
+                        packet.fp32.is_aligned()
                     );
                     self.drop_events += 1;
                     self.overrun_pending = true;
@@ -3312,12 +3593,23 @@ impl NativeSdkSource {
                         packet.flags & tx_flags::TIME_DISCONTINUITY != 0,
                     );
                 }
+                let prev_buf_len = buffer.len();
+                let prev_carry_len = self.sample_buffer.len();
+                let mut added_to_caller = 0usize;
                 if has_valid_samples {
-                    got_packet = true;
                     const MAX_SAMPLES: usize = 1 << 24;
-                    // Bound-check `packet.num` *before* multiplying so a garbage
-                    // or hostile count can't overflow the `i64` multiply itself.
-                    if packet.num as usize > MAX_SAMPLES / 2 {
+                    let Ok(packet_samples) = usize::try_from(packet.num) else {
+                        self.drop_events += 1;
+                        self.overrun_pending = true;
+                        self.client.consume_packets(device, 0, 1)?;
+                        return Err(Error::Sdk(format!(
+                            "Packet sample count {} does not fit usize",
+                            packet.num
+                        )));
+                    };
+                    // Bound-check `packet_samples` *before* multiplying so a garbage
+                    // or hostile count can't overflow the multiply itself.
+                    if packet_samples > MAX_SAMPLES / 2 {
                         // Consume before erroring: get_packet always
                         // returns the head of the queue, so a leaked
                         // packet would make every subsequent call
@@ -3332,78 +3624,91 @@ impl NativeSdkSource {
                             MAX_SAMPLES
                         )));
                     }
-                    // SAFETY: packet.fp32 is verified non-null above, and packet.num * 2 is bounds-checked.
+                    // SAFETY: packet.fp32 is verified non-null and aligned above, and
+                    // packet_samples is bounds-checked.
                     // `Complex32` is `#[repr(C)]` with fields `{re: f32, im: f32}`, so it has
                     // identical layout to `[f32; 2]`. This compile-time assertion guards against
                     // a future change to that representation.
-                    const _: () =
+                    const _: () = {
                         assert!(std::mem::size_of::<Complex32>() == 2 * std::mem::size_of::<f32>());
+                        assert!(std::mem::align_of::<Complex32>() == std::mem::align_of::<f32>());
+                    };
                     // Take the *whole* packet: the first `to_caller` samples
                     // satisfy this call and any excess is carried over for the
                     // next one. `consume_packets` below hands the packet back
                     // to the SDK, so anything not copied out here is gone —
                     // truncating to `max_samples` silently punched a hole in
                     // the IQ stream on every oversized packet.
-                    let packet_samples = packet.num as usize;
                     let stride = packet.stride as usize;
                     let (to_caller, _to_carry) = split_packet(packet_samples, remaining);
+                    let sanitize = |c: Complex32| {
+                        Complex32::new(
+                            if c.re.is_finite() { c.re } else { 0.0 },
+                            if c.im.is_finite() { c.im } else { 0.0 },
+                        )
+                    };
 
-                    // `packet_samples >= 1` (guarded by `packet.num > 0`
-                    // above) and `remaining >= 1` (the loop guard), so
-                    // neither the `- 1` below nor the slice splits can
-                    // underflow.
                     if stride == 2 {
                         // Tightly packed IQ pairs — the common raw-IQ layout.
                         let complex_slice = std::slice::from_raw_parts(
                             packet.fp32 as *const Complex32,
                             packet_samples,
                         );
-                        buffer.extend_from_slice(&complex_slice[..to_caller]);
+                        buffer.extend(complex_slice[..to_caller].iter().copied().map(sanitize));
                         self.sample_buffer
-                            .extend(complex_slice[to_caller..].iter().copied());
+                            .extend(complex_slice[to_caller..].iter().copied().map(sanitize));
                     } else {
-                        // Per the official header, `stride` is the "offset
-                        // from sample to sample in floats" and is not required
-                        // to be 2 (e.g. multi-channel interleaved layouts).
-                        // Gather sample-by-sample so a wider stride doesn't
-                        // smear neighbouring channels into the IQ data.
-                        // SAFETY: each sample spans floats
-                        // [i*stride, i*stride+1], the last of which is
-                        // (num-1)*stride + 2 floats into the buffer the SDK
-                        // guarantees valid for `num` samples of `stride`
-                        // floats.
-                        let floats = std::slice::from_raw_parts(
-                            packet.fp32 as *const f32,
-                            (packet_samples - 1) * stride + 2,
-                        );
-                        let sample_at =
-                            |i: usize| Complex32::new(floats[i * stride], floats[i * stride + 1]);
+                        const MAX_PACKET_FLOATS: usize = 1 << 26;
+                        let Some(float_count) = (packet_samples - 1)
+                            .checked_mul(stride)
+                            .and_then(|n| n.checked_add(2))
+                            .filter(|&n| n <= MAX_PACKET_FLOATS)
+                        else {
+                            self.drop_events += 1;
+                            self.overrun_pending = true;
+                            self.client.consume_packets(device, 0, 1)?;
+                            return Err(Error::Sdk(format!(
+                                "IQ packet describes too many floats ({packet_samples} samples x stride {stride})"
+                            )));
+                        };
+                        let floats =
+                            std::slice::from_raw_parts(packet.fp32 as *const f32, float_count);
+                        let sample_at = |i: usize| {
+                            sanitize(Complex32::new(floats[i * stride], floats[i * stride + 1]))
+                        };
                         buffer.extend((0..to_caller).map(sample_at));
                         self.sample_buffer
                             .extend((to_caller..packet_samples).map(sample_at));
                     }
-                    samples_read += to_caller;
-                    remaining -= to_caller;
+                    added_to_caller = to_caller;
+                }
+
+                // Consume the packet; if consumption fails, roll back any
+                // samples copied from it so the next call does not duplicate them.
+                if let Err(e) = self.client.consume_packets(device, 0, 1) {
+                    buffer.truncate(prev_buf_len);
+                    self.sample_buffer.truncate(prev_carry_len);
+                    return Err(e);
+                }
+
+                if has_valid_samples {
+                    got_packet = true;
+                    samples_read += added_to_caller;
+                    remaining -= added_to_caller;
                     self.observed_sample_rate_hz = geometry.map(|g| g.sample_rate_hz);
                     self.observed_bandwidth_hz = geometry.and_then(|g| g.bandwidth_hz);
                     self.observed_center_frequency_hz =
                         geometry.and_then(|g| g.center_frequency_hz);
                     read_geometry = geometry;
-                    if packet.end_time > 0.0 {
+                    if packet.end_time.is_finite() && packet.end_time > 0.0 {
                         self.last_packet_end_time_s = packet.end_time;
                     }
 
-                    // `trace!`, not `info!`: this runs on every read call
-                    // (thousands/sec at speed), so an enabled info subscriber
-                    // would pay per-read formatting on the hot path.
                     trace!(
                         "Read {} IQ samples (sample rate: {} Hz, center freq: {} Hz)",
                         samples_read, packet.step_frequency, packet.start_frequency
                     );
                 }
-
-                // Consume the packet
-                self.client.consume_packets(device, 0, 1)?;
             }
 
             if !got_packet {
@@ -3520,7 +3825,7 @@ impl NativeSdkSource {
             // Carry-over already handed out counts as data in hand, so a
             // caller draining a backlog never sleeps out the deadline.
             let mut remaining = remaining;
-            let mut got_packet = from_carry > 0;
+            let mut got_packet = false;
             let mut read_geometry = None;
 
             while remaining > 0 {
@@ -3551,14 +3856,44 @@ impl NativeSdkSource {
                 if got_packet && has_valid_samples && read_geometry != geometry {
                     break;
                 }
+                // Decode packet flags on every consumed packet, including
+                // empty metadata packets, matching `read_samples_within`.
+                let warned = packet.flags
+                    & (tx_flags::WARN_OVERFLOW
+                        | tx_flags::WARN_DROPPED
+                        | tx_flags::WARN_INACCURATE
+                        | tx_flags::TIME_DISCONTINUITY);
+                if warned != 0 {
+                    if warned & (tx_flags::WARN_DROPPED | tx_flags::TIME_DISCONTINUITY) != 0 {
+                        self.drop_events += 1;
+                    }
+                    if warned
+                        & (tx_flags::WARN_OVERFLOW
+                            | tx_flags::WARN_DROPPED
+                            | tx_flags::TIME_DISCONTINUITY)
+                        != 0
+                    {
+                        self.overrun_pending = true;
+                    }
+                    tracing::debug!("SDK dual packet flags 0x{:x}", packet.flags);
+                }
+                let prev_rx1_len = rx1.len();
+                let prev_rx2_len = rx2.len();
+                let prev_carry_len = self.dual_sample_buffer.len();
+                let mut added_to_caller = 0usize;
                 if has_valid_samples {
-                    got_packet = true;
-                    // Same corruption backstop as `read_samples`; the
-                    // dual lower bound (4 floats per sample) is enforced
-                    // by `deinterleave_dual_iq` with a clearer error.
+                    if !packet.fp32.is_aligned() || (packet.size != 0 && packet.size < 4) {
+                        warn!(
+                            "Skipping dual packet with invalid IQ layout (size={}, aligned={})",
+                            packet.size,
+                            packet.fp32.is_aligned()
+                        );
+                        self.drop_events += 1;
+                        self.overrun_pending = true;
+                        self.client.consume_packets(device, 0, 1)?;
+                        continue;
+                    }
                     const MAX_IQ_STRIDE: i64 = 4096;
-                    // Every early exit below consumes the packet without
-                    // delivering it: a loss, reported like the device's own.
                     if packet.stride > MAX_IQ_STRIDE {
                         warn!(
                             "Skipping packet with out-of-range IQ stride {} (expected <= {})",
@@ -3567,14 +3902,19 @@ impl NativeSdkSource {
                         self.drop_events += 1;
                         self.overrun_pending = true;
                         self.client.consume_packets(device, 0, 1)?;
-                        return Ok(pairs_read);
+                        continue;
                     }
                     const MAX_SAMPLES: usize = 1 << 24;
-                    if packet.num as usize > MAX_SAMPLES / 4 {
-                        // Consume before erroring: get_packet always
-                        // returns the head of the queue, so a leaked
-                        // packet would make every subsequent call
-                        // re-fetch it and re-error forever.
+                    let Ok(packet_samples) = usize::try_from(packet.num) else {
+                        self.drop_events += 1;
+                        self.overrun_pending = true;
+                        self.client.consume_packets(device, 0, 1)?;
+                        return Err(Error::Sdk(format!(
+                            "Packet sample count {} does not fit usize",
+                            packet.num
+                        )));
+                    };
+                    if packet_samples > MAX_SAMPLES / 4 {
                         self.drop_events += 1;
                         self.overrun_pending = true;
                         self.client.consume_packets(device, 0, 1)?;
@@ -3585,43 +3925,30 @@ impl NativeSdkSource {
                         )));
                     }
 
-                    let packet_samples = packet.num as usize;
                     let stride = packet.stride.max(0) as usize;
                     let floats: &[f32] = if stride >= 4 {
-                        // The individual caps above still admit a corrupt
-                        // num/stride pair that *together* describe a
-                        // multi-GB slice; bound the product too. Real
-                        // packets are a few MB — 1<<26 floats (256 MiB)
-                        // is a corruption backstop, not a spec bound.
                         const MAX_PACKET_FLOATS: usize = 1 << 26;
-                        let float_count = (packet_samples - 1) * stride + 4;
-                        if float_count > MAX_PACKET_FLOATS {
+                        let Some(float_count) = (packet_samples - 1)
+                            .checked_mul(stride)
+                            .and_then(|n| n.checked_add(4))
+                            .filter(|&n| n <= MAX_PACKET_FLOATS)
+                        else {
                             self.drop_events += 1;
                             self.overrun_pending = true;
                             self.client.consume_packets(device, 0, 1)?;
                             return Err(Error::Sdk(format!(
-                                "dual-channel packet describes {} floats ({} samples x stride {}), \
-                                 exceeding the {} backstop (corrupt packet header?)",
-                                float_count, packet_samples, stride, MAX_PACKET_FLOATS
+                                "dual-channel packet describes too many floats ({packet_samples} samples x stride {stride}, \
+                                 exceeding the {MAX_PACKET_FLOATS} backstop)"
                             )));
-                        }
-                        // SAFETY: fp32 verified non-null; float_count is
-                        // bounded just above; the SDK guarantees the
-                        // buffer valid for `num` samples of `stride`
-                        // floats, the last of which we read 4 into.
+                        };
                         std::slice::from_raw_parts(packet.fp32 as *const f32, float_count)
                     } else {
-                        // Too narrow for two channels; let the demux
-                        // helper produce its diagnostic without reading
-                        // out of bounds.
                         &[]
                     };
                     let pairs =
                         match crate::utils::deinterleave_dual_iq(floats, packet_samples, stride) {
                             Ok(p) => p,
                             Err(e) => {
-                                // Hand the packet back before surfacing the
-                                // error so the stream can continue.
                                 self.drop_events += 1;
                                 self.overrun_pending = true;
                                 self.client.consume_packets(device, 0, 1)?;
@@ -3629,12 +3956,15 @@ impl NativeSdkSource {
                             }
                         };
 
-                    // Single pass, no intermediate buffer: the first
-                    // `to_caller` pairs satisfy this call, the rest are
-                    // carried over — whole-packet semantics identical to
-                    // the mono path.
+                    let sanitize = |c: Complex32| {
+                        Complex32::new(
+                            if c.re.is_finite() { c.re } else { 0.0 },
+                            if c.im.is_finite() { c.im } else { 0.0 },
+                        )
+                    };
                     let (to_caller, _to_carry) = split_packet(packet_samples, remaining);
                     for (i, (a, b)) in pairs.enumerate() {
+                        let (a, b) = (sanitize(a), sanitize(b));
                         if i < to_caller {
                             rx1.push(a);
                             rx2.push(b);
@@ -3642,43 +3972,27 @@ impl NativeSdkSource {
                             self.dual_sample_buffer.push_back((a, b));
                         }
                     }
-                    pairs_read += to_caller;
-                    remaining -= to_caller;
+                    added_to_caller = to_caller;
+                }
+
+                if let Err(e) = self.client.consume_packets(device, 0, 1) {
+                    rx1.truncate(prev_rx1_len);
+                    rx2.truncate(prev_rx2_len);
+                    self.dual_sample_buffer.truncate(prev_carry_len);
+                    return Err(e);
+                }
+
+                if has_valid_samples {
+                    got_packet = true;
+                    pairs_read += added_to_caller;
+                    remaining -= added_to_caller;
                     self.observed_sample_rate_hz = geometry.map(|g| g.sample_rate_hz);
                     self.observed_bandwidth_hz = geometry.and_then(|g| g.bandwidth_hz);
                     self.observed_center_frequency_hz =
                         geometry.and_then(|g| g.center_frequency_hz);
                     read_geometry = geometry;
-                    if packet.end_time > 0.0 {
+                    if packet.end_time.is_finite() && packet.end_time > 0.0 {
                         self.last_packet_end_time_s = packet.end_time;
-                    }
-                    // The device's own loss report. The mono path decodes
-                    // these where it logs them; this path never looked, so
-                    // a dual capture could lose packets with no signal at
-                    // all to `cumulative_drops` or `take_overrun`.
-                    let warned = packet.flags
-                        & (tx_flags::WARN_OVERFLOW
-                            | tx_flags::WARN_DROPPED
-                            | tx_flags::WARN_INACCURATE
-                            | tx_flags::TIME_DISCONTINUITY);
-                    if warned != 0 {
-                        if warned & (tx_flags::WARN_DROPPED | tx_flags::TIME_DISCONTINUITY) != 0 {
-                            self.drop_events += 1;
-                        }
-                        // Not `WARN_INACCURATE`: the ECO's iqreceiver sets it on most
-                        // packets when its fractional resampler is in use (a 30 s soak at
-                        // 15.36 MS/s saw it 4121 times against one real discontinuity).
-                        // It is a quality note, not lost samples; an overrun means the
-                        // stream is not contiguous.
-                        if warned
-                            & (tx_flags::WARN_OVERFLOW
-                                | tx_flags::WARN_DROPPED
-                                | tx_flags::TIME_DISCONTINUITY)
-                            != 0
-                        {
-                            self.overrun_pending = true;
-                        }
-                        tracing::debug!("SDK dual packet flags 0x{:x}", packet.flags);
                     }
 
                     trace!(
@@ -3686,8 +4000,6 @@ impl NativeSdkSource {
                         pairs_read, packet.step_frequency
                     );
                 }
-
-                self.client.consume_packets(device, 0, 1)?;
             }
 
             if !got_packet {
@@ -3827,10 +4139,22 @@ impl Drop for NativeSdkSource {
 
             // Close the device before the handle: an opened device that is
             // never closed stays exclusively held until the process exits.
-            if let (Some(mut device), Some(handle)) = (self.device.take(), self.handle.as_mut())
-                && let Err(e) = self.client.close_device(handle, &mut device)
-            {
-                error!("Error closing device during drop: {}", e);
+            if let Some(mut device) = self.device.take() {
+                match self.handle.as_mut() {
+                    Some(handle) => {
+                        if let Err(e) = self.client.close_device(handle, &mut device) {
+                            self.client
+                                .leaked_resource
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            error!("Error closing device during drop: {}", e);
+                        }
+                    }
+                    None => {
+                        self.client
+                            .leaked_resource
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
             }
 
             if let Some(e) = self
@@ -3838,6 +4162,9 @@ impl Drop for NativeSdkSource {
                 .take()
                 .and_then(|mut h| self.client.close_handle(&mut h).err())
             {
+                self.client
+                    .leaked_resource
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 error!("Error closing handle during drop: {}", e);
             }
         }
@@ -3971,16 +4298,12 @@ pub struct TxStream<'a> {
 }
 
 // SAFETY: `AARTSAAPI_Device` wraps a raw pointer (`d: *mut c_void`) to
-// SDK-internal state, which makes the auto-derived `Send`/`Sync` both
-// absent by default. `TxStream` borrows the device *exclusively*
-// (`&'a mut AARTSAAPI_Device`), so the borrow checker already prevents
-// any concurrent access through this handle — `Send` only permits
-// *moving* the whole stream (and its exclusive borrow) to another
-// thread, which is sound. `Sync` is deliberately not implemented:
-// nothing in this API takes `&self`, so there is no use case for
-// sharing `&TxStream` across threads, and doing so would require the
-// SDK to tolerate concurrent calls on one device handle, which is
-// undocumented and not assumed here.
+// SDK-internal state. `TxStream` borrows the device *exclusively*
+// (`&'a mut AARTSAAPI_Device`), so the borrow checker prevents concurrent
+// access through this handle. Note that whether the vendor C++ TX runtime
+// tolerates `AARTSAAPI_SendPacket` from an OS thread other than the opening
+// thread is undocumented and hardware-unverified (same caveat as `SdkSinkBlock`).
+// `Sync` is deliberately not implemented.
 unsafe impl Send for TxStream<'_> {}
 
 impl<'a> TxStream<'a> {
@@ -4003,8 +4326,33 @@ impl<'a> TxStream<'a> {
             // identical layout to `[f32; 2]`; this guards against a future
             // change to that representation breaking the raw-pointer cast
             // below.
-            const _: () =
+            const _: () = {
                 assert!(std::mem::size_of::<Complex32>() == 2 * std::mem::size_of::<f32>());
+                assert!(std::mem::align_of::<Complex32>() == std::mem::align_of::<f32>());
+            };
+
+            if !burst.center_frequency_hz.is_finite() || burst.center_frequency_hz <= 0.0 {
+                return Err(Error::Config(
+                    "TX burst center_frequency_hz must be positive and finite".into(),
+                ));
+            }
+            if !burst.sample_rate_hz.is_finite() || burst.sample_rate_hz <= 0.0 {
+                return Err(Error::Config(
+                    "TX burst sample_rate_hz must be positive and finite".into(),
+                ));
+            }
+            if !burst.start_time.is_finite()
+                || !burst.end_time.is_finite()
+                || burst.start_time < 0.0
+                || burst.end_time < burst.start_time
+            {
+                return Err(Error::Config(
+                    "TX burst timestamps must be finite, non-negative, and end_time >= start_time"
+                        .into(),
+                ));
+            }
+            let num_samples = i64::try_from(samples.len())
+                .map_err(|_| Error::Config("TX sample slice length overflows i64".into()))?;
 
             let half_span = burst.sample_rate_hz / 2.0;
             let packet = AARTSAAPI_Packet {
@@ -4020,8 +4368,8 @@ impl<'a> TxStream<'a> {
                 step_frequency: burst.sample_rate_hz,
                 span_frequency: burst.sample_rate_hz,
                 rbw_frequency: 0.0,
-                num: samples.len() as i64,
-                total: samples.len() as i64,
+                num: num_samples,
+                total: num_samples,
                 // Per the official header, `size` is "size of each
                 // sample" (in floats), not the total buffer size. One
                 // complex IQ sample is 2 floats.
@@ -4029,10 +4377,13 @@ impl<'a> TxStream<'a> {
                 stride: 2, // Complex IQ contains 2 floats
                 // SAFETY: `AARTSAAPI_Packet::fp32` is `*mut f32` in the
                 // official header even for outbound (SendPacket) use;
-                // the send path is documented as read-only over this
-                // buffer, so casting away `const` here does not expose
-                // the caller's immutable slice to an actual mutation.
-                fp32: samples.as_ptr() as *mut f32,
+                // pass NULL when `samples` is empty (e.g. `STREAM_START`
+                // sync packet) rather than `NonNull::dangling()`.
+                fp32: if samples.is_empty() {
+                    ptr::null_mut()
+                } else {
+                    samples.as_ptr() as *mut f32
+                },
                 interleave: 0,
             };
 
@@ -4294,10 +4645,14 @@ mod tests {
             );
         }
 
-        // Unknown payloads must not silently become IQ or spectra.
+        // Unknown payloads must not silently become IQ or spectra, except
+        // the documented `iqtransceiver` mode which carries IQ.
         let unknown = DeviceOpenMode::Other("spectranv6/somethingnew".to_string());
         assert!(!unknown.carries_iq());
         assert!(!unknown.carries_spectra());
+        let transceiver = DeviceOpenMode::from_open_string("spectranv6/iqtransceiver");
+        assert!(transceiver.carries_iq());
+        assert!(!transceiver.carries_spectra());
     }
 
     /// The guard refuses only the combinations that would return the
@@ -4715,6 +5070,7 @@ mod tests {
             drop_events: 0,
             overrun_pending: false,
             last_packet_end_time_s: 0.0,
+            device_query_lock: std::sync::Mutex::new(()),
         };
 
         assert!(!source.is_streaming());

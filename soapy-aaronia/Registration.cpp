@@ -92,13 +92,19 @@ struct SinkGuard {
 double parseArgDouble(const SoapySDR::Kwargs &args, const char *key) {
     // Validate before any Rust allocation exists; std::stod throws
     // std::invalid_argument/out_of_range with an unhelpful message, so
-    // wrap it with the offending key/value.
+    // wrap it with the offending key/value, and reject NaN/Inf up front.
+    double val = 0.0;
     try {
-        return std::stod(args.at(key));
+        val = std::stod(args.at(key));
     } catch (const std::exception &) {
         throw std::runtime_error(std::string("invalid numeric value for device arg '")
                                  + key + "': " + args.at(key));
     }
+    if (!std::isfinite(val)) {
+        throw std::runtime_error(std::string("non-finite numeric value for device arg '")
+                                 + key + "': " + args.at(key));
+    }
+    return val;
 }
 } // namespace
 
@@ -186,6 +192,9 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
     // Soapy applications need.
     if (args.count("read_timeout") != 0) {
         const double seconds = parseArgDouble(args, "read_timeout");
+        if (seconds < 0.0 || seconds > 3.1536e9) {
+            throw std::runtime_error("read_timeout must be between 0 and 3.1536e9 seconds");
+        }
         if (seconds > 0.0) {
             spectran_source_builder_read_timeout_us(
                 builder, static_cast<uint64_t>(seconds * 1e6));
@@ -198,6 +207,11 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         const std::string &v = args.at("reconnect");
         const bool enabled = !(v == "0" || v == "false" || v == "no");
         spectran_source_builder_auto_reconnect(builder, enabled);
+    }
+    if (args.count("listen_only") != 0) {
+        const std::string &v = args.at("listen_only");
+        const bool enabled = !(v == "0" || v == "false" || v == "no");
+        spectran_source_builder_listen_only(builder, enabled);
     }
 
     const auto nativeArg = [&](const char *name) -> const char * {
@@ -234,9 +248,15 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
     // be advertised as having one here; settling that needs an SDK
     // query this crate does not yet make.
     bool txPossible = false;
+    std::string resolvedSerial = args.count("serial") != 0 ? args.at("serial") : "";
+    const bool hasTxGain = args.count("tx_gain") != 0;
+    const double txGain = hasTxGain ? parseArgDouble(args, "tx_gain") : -20.0;
     if (FfiSourceInfo* info = spectran_source_get_source_info(source.p)) {
         // Receive discovery must never open a transmitter as a side effect.
         txPossible = info->source_type == NativeSdk && args.count("tx") && args.at("tx") == "true";
+        if (resolvedSerial.empty() && info->device_serial && info->device_serial[0] != '\0') {
+            resolvedSerial = info->device_serial;
+        }
         spectran_source_info_free(info);
     }
     SinkGuard sink(nullptr);
@@ -244,9 +264,13 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         SpectranSinkBuilder* sink_builder = spectran_sink_builder_new();
         SinkBuilderGuard sinkBuilderGuard(sink_builder);
         if (sink_builder) {
+            if (!resolvedSerial.empty()) {
+                spectran_sink_builder_device_serial(sink_builder, resolvedSerial.c_str());
+            }
             // TX shares the tuning args with RX unless retuned later.
             if (hasFreq) spectran_sink_builder_center_frequency_hz(sink_builder, freq);
             if (hasRate) spectran_sink_builder_sample_rate_hz(sink_builder, rate);
+            if (hasTxGain) spectran_sink_builder_trans_gain_db(sink_builder, txGain);
             sink.p = spectran_sink_build(sink_builder);
         }
     }

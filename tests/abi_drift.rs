@@ -258,17 +258,39 @@ fn pyo3_exposed(src: &str) -> Vec<String> {
         }
     };
 
-    for (attr, span) in [("#[pymethods]", 6000usize), ("#[pyfunction]", 400usize)] {
-        let mut cursor = 0usize;
-        while let Some(rel) = src[cursor..].find(attr) {
-            let at = cursor + rel + attr.len();
-            let end = match src[at..].find(attr) {
-                Some(next) => at + next,
-                None => (at + span).min(src.len()),
-            };
-            collect_fns(at, end.min(at + span));
-            cursor = at;
+    let balanced_braces_end = |from: usize| -> Option<usize> {
+        let open_rel = src[from..].find('{')?;
+        let open = from + open_rel;
+        let mut depth = 0usize;
+        for (i, b) in src.as_bytes().iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
         }
+        None
+    };
+
+    let mut cursor = 0usize;
+    while let Some(rel) = src[cursor..].find("#[pymethods]") {
+        let at = cursor + rel + "#[pymethods]".len();
+        let end = balanced_braces_end(at).unwrap_or_else(|| (at + 6000).min(src.len()));
+        collect_fns(at, end);
+        cursor = end;
+    }
+
+    let mut cursor = 0usize;
+    while let Some(rel) = src[cursor..].find("#[pyfunction]") {
+        let at = cursor + rel + "#[pyfunction]".len();
+        let end = (at + 400).min(src.len());
+        collect_fns(at, end);
+        cursor = at;
     }
 
     out.sort();

@@ -191,3 +191,34 @@ def test_metadata_requires_an_open_source():
     for operation in [source.capabilities, source.source_info, lambda: source.set_rf_span_hz(44e6)]:
         with pytest.raises(aaronia.SpectranHardwareError):
             operation()
+
+
+def test_backend_setters_clear_conflicting_selection():
+    cfg = aaronia.SpectranConfig()
+    cfg.file_path = "capture.rtsa"
+    assert cfg.file_path == "capture.rtsa"
+    assert not cfg.force_native_sdk
+
+    cfg.http_base_url = "http://127.0.0.1:54664"
+    assert cfg.http_base_url == "http://127.0.0.1:54664"
+    assert cfg.file_path is None
+    assert not cfg.force_native_sdk
+
+    cfg.force_native_sdk = True
+    assert cfg.force_native_sdk is True
+    assert cfg.http_base_url is None
+    assert cfg.file_path is None
+
+
+def test_listen_only_roundtrip():
+    cfg = aaronia.SpectranConfig()
+    assert cfg.listen_only is False
+    cfg.listen_only = True
+    assert cfg.listen_only is True
+
+
+def test_blocks_rejects_excessive_count_immediately():
+    src = aaronia.SpectranSource()
+    with pytest.raises(ValueError):
+        src.blocks(1 << 40)
+

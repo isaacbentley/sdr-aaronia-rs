@@ -24,9 +24,10 @@ use numpy::PyArray1;
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use sdr_aaronia_rs::http_endpoints::AuthMethod;
 use sdr_aaronia_rs::http_streaming::StreamFormat;
 use sdr_aaronia_rs::{Error as AaroniaError, SpectranConfig, SpectranSource};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
@@ -113,6 +114,7 @@ fn map_any_err<E: std::fmt::Display>(e: E) -> PyErr {
 #[derive(Clone)]
 struct PySpectranConfig {
     inner: SpectranConfig,
+    listen_only: bool,
 }
 
 #[pymethods]
@@ -121,6 +123,7 @@ impl PySpectranConfig {
     fn new() -> Self {
         Self {
             inner: SpectranConfig::default(),
+            listen_only: false,
         }
     }
 
@@ -256,11 +259,12 @@ impl PySpectranConfig {
 
     /// Base URL of an RTSA-Suite HTTP server block
     /// (e.g. `"http://atc.local:54664"`). Setting this pins the source
-    /// to the HTTP backend.
+    /// to the HTTP backend and clears any previously set `file_path`.
     #[setter]
     fn set_http_base_url(&mut self, url: Option<String>) {
         self.inner.http_base_url = url.clone();
         if url.is_some() {
+            self.inner.file_path = None;
             self.inner.force_source_type = Some(sdr_aaronia_rs::unified_source::SourceType::Http);
         } else if self.inner.force_source_type
             == Some(sdr_aaronia_rs::unified_source::SourceType::Http)
@@ -275,11 +279,12 @@ impl PySpectranConfig {
     }
 
     /// Path to a recorded `.rtsa` file. Setting this pins the source to
-    /// the file backend.
+    /// the file backend and clears any previously set `http_base_url`.
     #[setter]
     fn set_file_path(&mut self, path: Option<String>) {
         self.inner.file_path = path.clone();
         if path.is_some() {
+            self.inner.http_base_url = None;
             self.inner.force_source_type = Some(sdr_aaronia_rs::unified_source::SourceType::File);
         } else if self.inner.force_source_type
             == Some(sdr_aaronia_rs::unified_source::SourceType::File)
@@ -343,6 +348,8 @@ impl PySpectranConfig {
     fn set_force_native_sdk(&mut self, on: bool) {
         use sdr_aaronia_rs::unified_source::SourceType;
         if on {
+            self.inner.http_base_url = None;
+            self.inner.file_path = None;
             self.inner.force_source_type = Some(SourceType::NativeSdk);
         } else if self.inner.force_source_type == Some(SourceType::NativeSdk) {
             self.inner.force_source_type = None;
@@ -390,6 +397,18 @@ impl PySpectranConfig {
     fn get_auto_reconnect(&self) -> bool {
         self.inner.auto_reconnect
     }
+
+    /// Stream from an HTTP server without issuing `/control` or
+    /// `/remoteconfig` writes (default `False`).
+    #[setter]
+    fn set_listen_only(&mut self, enabled: bool) {
+        self.listen_only = enabled;
+    }
+
+    #[getter]
+    fn get_listen_only(&self) -> bool {
+        self.listen_only
+    }
 }
 
 /// The `(rx1, rx2)` pair returned by `read_samples_dual_numpy`.
@@ -398,49 +417,84 @@ type DualArrays<'py> = (
     Bound<'py, PyArray1<Complex32>>,
 );
 
-/// A streaming IQ source. Construct, `start_streaming(config)`, then
-/// call the `read_samples_*` methods; each blocks (GIL released) until
-/// `count` samples arrive or `config.read_timeout_s` (default 30 s)
-/// elapses, which raises `SpectranTimeoutError`.
-#[pyclass(name = "SpectranSource")]
-struct PySpectranSource {
-    // Field order matters: `source` must drop before `rt` so the
-    // source's background tasks shut down while the runtime is alive.
+struct SourceState {
     source: Option<SpectranSource>,
-    rt: Arc<Runtime>,
-    /// Scratch buffer reused across reads. `read_samples` *appends* to
-    /// the Vec it is given, so every read starts with `clear()` —
-    /// capacity is retained, no per-read allocation in steady state.
+    last_config: Option<(SpectranConfig, bool)>,
+    /// Scratch buffer reused across reads when building Arrow buffers.
     read_scratch: Vec<Complex32>,
 }
 
-impl Drop for PySpectranSource {
-    fn drop(&mut self) {
-        if let Some(mut source) = self.source.take() {
-            let _ = self.rt.block_on(source.stop_streaming());
+enum BindingErr {
+    NotStreaming,
+    RuntimeClosed,
+    Aaronia(AaroniaError),
+}
+
+impl From<BindingErr> for PyErr {
+    fn from(err: BindingErr) -> Self {
+        match err {
+            BindingErr::NotStreaming => SpectranHardwareError::new_err("Not streaming"),
+            BindingErr::RuntimeClosed => SpectranHardwareError::new_err("Runtime is shut down"),
+            BindingErr::Aaronia(e) => map_aaronia_err(e),
         }
     }
 }
 
-impl PySpectranSource {
-    /// Clear the scratch, read up to `count` samples (GIL released),
-    /// and return how many landed in `self.read_scratch[..n]`.
-    fn read_into_scratch(&mut self, py: Python<'_>, count: usize) -> PyResult<usize> {
-        if count > MAX_READ_SAMPLES {
-            return Err(PyValueError::new_err(format!(
-                "count {count} exceeds the per-read limit of {MAX_READ_SAMPLES} samples"
-            )));
-        }
-        let source = self
-            .source
-            .as_mut()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
+/// A streaming IQ source. Construct, `start_streaming(config)`, then
+/// call the `read_samples_*` methods; each blocks (GIL released) until
+/// `count` samples arrive or `config.read_timeout_s` (default 30 s)
+/// elapses, which raises `SpectranTimeoutError`.
+///
+/// Mutable state is serialized by a Rust `Mutex` acquired exclusively
+/// while the GIL is detached, so concurrent Python threads (e.g. a
+/// control thread calling `set_center_frequency_hz` while a reader
+/// thread waits in `read_samples_numpy`) wait cleanly instead of
+/// raising `RuntimeError: Already borrowed` or deadlocking with
+/// `pyo3-log`.
+#[pyclass(name = "SpectranSource")]
+struct PySpectranSource {
+    state: Mutex<SourceState>,
+    rt: Option<Runtime>,
+}
 
-        self.read_scratch.clear();
-        let rt = self.rt.clone();
-        let scratch = &mut self.read_scratch;
-        py.detach(|| rt.block_on(source.read_samples(scratch, count)))
-            .map_err(map_aaronia_err)
+impl Drop for PySpectranSource {
+    fn drop(&mut self) {
+        let source = self.state.get_mut().ok().and_then(|s| s.source.take());
+        let rt = self.rt.take();
+        if source.is_none() && rt.is_none() {
+            return;
+        }
+        // Release the GIL while stopping the source and shutting down
+        // the Tokio runtime: `pyo3-log` forwards Rust `tracing`/`log`
+        // records to Python's `logging` module by acquiring the GIL on
+        // Tokio worker threads, so blocking on `rt` or dropping `rt`
+        // with the GIL held causes an ABBA deadlock.
+        Python::attach(|py| {
+            py.detach(move || {
+                if let Some(rt) = rt {
+                    if let Some(mut source) = source {
+                        let _ = rt.block_on(async {
+                            tokio::time::timeout(Duration::from_secs(2), source.stop_streaming())
+                                .await
+                        });
+                        drop(source);
+                    }
+                    rt.shutdown_timeout(Duration::from_millis(250));
+                } else {
+                    drop(source);
+                }
+            });
+        });
+    }
+}
+
+impl PySpectranSource {
+    fn lock_state(&self) -> MutexGuard<'_, SourceState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn runtime(&self) -> Result<&Runtime, BindingErr> {
+        self.rt.as_ref().ok_or(BindingErr::RuntimeClosed)
     }
 }
 
@@ -450,55 +504,95 @@ impl PySpectranSource {
     fn new() -> PyResult<Self> {
         let rt = Runtime::new().map_err(map_any_err)?;
         Ok(Self {
-            source: None,
-            rt: Arc::new(rt),
-            read_scratch: Vec::new(),
+            state: Mutex::new(SourceState {
+                source: None,
+                last_config: None,
+                read_scratch: Vec::new(),
+            }),
+            rt: Some(rt),
         })
     }
 
-    /// Connect to the backend selected by `config` and start streaming.
-    /// Blocking (GIL released).
-    fn start_streaming(&mut self, py: Python<'_>, config: &PySpectranConfig) -> PyResult<()> {
-        let prev = self.source.take();
-        let rt = self.rt.clone();
-        let config_inner = config.inner.clone();
-        let source = py
-            .detach(|| {
-                rt.block_on(async {
+    /// Connect to the backend selected by `config` (or the previously
+    /// supplied configuration when `config` is omitted) and start
+    /// streaming. Blocking (GIL released).
+    #[pyo3(signature = (config=None))]
+    fn start_streaming(&self, py: Python<'_>, config: Option<&PySpectranConfig>) -> PyResult<()> {
+        let explicit = config.map(|c| (c.inner.clone(), c.listen_only));
+        py.detach(|| {
+            let rt = self.runtime()?;
+            let mut state = self.lock_state();
+            let (config_inner, listen_only) = match explicit {
+                Some(pair) => {
+                    state.last_config = Some(pair.clone());
+                    pair
+                }
+                None => state
+                    .last_config
+                    .clone()
+                    .unwrap_or_else(|| (SpectranConfig::default(), false)),
+            };
+            let prev = state.source.take();
+            let source = rt
+                .block_on(async {
                     if let Some(mut old) = prev {
                         let _ = old.stop_streaming().await;
                     }
-                    let mut source = SpectranSource::new(config_inner).await?;
+                    let mut source = SpectranSource::new_with_options(
+                        config_inner,
+                        AuthMethod::None,
+                        listen_only,
+                    )
+                    .await?;
                     source.start_streaming().await?;
                     Ok::<_, AaroniaError>(source)
                 })
-            })
-            .map_err(map_aaronia_err)?;
-
-        self.source = Some(source);
-        Ok(())
+                .map_err(BindingErr::Aaronia)?;
+            state.source = Some(source);
+            Ok::<_, BindingErr>(())
+        })
+        .map_err(Into::into)
     }
 
     /// Stop streaming and release the backend. Blocking (GIL released).
-    fn stop_streaming(&mut self, py: Python<'_>) -> PyResult<()> {
-        if let Some(mut source) = self.source.take() {
-            let rt = self.rt.clone();
-            py.detach(|| rt.block_on(source.stop_streaming()))
-                .map_err(map_aaronia_err)?;
-        }
-        Ok(())
+    fn stop_streaming(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            let rt = self.runtime()?;
+            let mut state = self.lock_state();
+            if let Some(mut source) = state.source.take() {
+                rt.block_on(source.stop_streaming())
+                    .map_err(BindingErr::Aaronia)?;
+            }
+            Ok::<_, BindingErr>(())
+        })
+        .map_err(Into::into)
     }
 
     /// Read up to `count` IQ samples as a NumPy `complex64` array.
     /// The samples are copied once into a NumPy-owned buffer (safe to
     /// hold after further reads or after the source is dropped).
     fn read_samples_numpy<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         count: usize,
     ) -> PyResult<Bound<'py, PyArray1<Complex32>>> {
-        let read = self.read_into_scratch(py, count)?;
-        Ok(PyArray1::from_slice(py, &self.read_scratch[..read]))
+        if count > MAX_READ_SAMPLES {
+            return Err(PyValueError::new_err(format!(
+                "count {count} exceeds the per-read limit of {MAX_READ_SAMPLES} samples"
+            )));
+        }
+        let samples = py
+            .detach(|| {
+                let rt = self.runtime()?;
+                let mut state = self.lock_state();
+                let source = state.source.as_mut().ok_or(BindingErr::NotStreaming)?;
+                let mut out = Vec::with_capacity(count);
+                rt.block_on(source.read_samples(&mut out, count))
+                    .map_err(BindingErr::Aaronia)?;
+                Ok::<_, BindingErr>(out)
+            })
+            .map_err(PyErr::from)?;
+        Ok(PyArray1::from_vec(py, samples))
     }
 
     /// Read up to `count` IQ samples as a PyArrow `FixedSizeListArray`
@@ -506,17 +600,37 @@ impl PySpectranSource {
     /// building the Arrow buffer; the Arrow → pyarrow handoff itself is
     /// the standard C-Data interface (no further copy).
     fn read_samples_arrow<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         count: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let read = self.read_into_scratch(py, count)?;
-
-        let mut float_values = Vec::with_capacity(read * 2);
-        for c in self.read_scratch.iter().take(read) {
-            float_values.push(c.re);
-            float_values.push(c.im);
+        if count > MAX_READ_SAMPLES {
+            return Err(PyValueError::new_err(format!(
+                "count {count} exceeds the per-read limit of {MAX_READ_SAMPLES} samples"
+            )));
         }
+        let float_values = py
+            .detach(|| {
+                let rt = self.runtime()?;
+                let mut state = self.lock_state();
+                let SourceState {
+                    source,
+                    read_scratch,
+                    ..
+                } = &mut *state;
+                let source = source.as_mut().ok_or(BindingErr::NotStreaming)?;
+                read_scratch.clear();
+                let read = rt
+                    .block_on(source.read_samples(read_scratch, count))
+                    .map_err(BindingErr::Aaronia)?;
+                let mut floats = Vec::with_capacity(read * 2);
+                for c in read_scratch.iter().take(read) {
+                    floats.push(c.re);
+                    floats.push(c.im);
+                }
+                Ok::<_, BindingErr>(floats)
+            })
+            .map_err(PyErr::from)?;
 
         let list_array = FixedSizeListArray::try_new(
             Arc::new(Field::new("item", DataType::Float32, false)),
@@ -532,79 +646,89 @@ impl PySpectranSource {
     /// Retune the running source's center frequency in Hz. Blocking
     /// (GIL released). Previously the only way to retune was tearing
     /// down and rebuilding the whole source.
-    fn set_center_frequency_hz(&mut self, py: Python<'_>, freq_hz: f64) -> PyResult<()> {
-        let source = self
-            .source
-            .as_mut()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        let rt = self.rt.clone();
-        py.detach(|| rt.block_on(source.set_center_frequency_hz(freq_hz)))
-            .map_err(map_aaronia_err)
+    fn set_center_frequency_hz(&self, py: Python<'_>, freq_hz: f64) -> PyResult<()> {
+        py.detach(|| {
+            let rt = self.runtime()?;
+            let mut state = self.lock_state();
+            let source = state.source.as_mut().ok_or(BindingErr::NotStreaming)?;
+            rt.block_on(source.set_center_frequency_hz(freq_hz))
+                .map_err(BindingErr::Aaronia)
+        })
+        .map_err(Into::into)
     }
 
     /// Change the running source's IQ sample rate in Hz (validated
     /// against the IQ-mode constraint). Blocking (GIL released).
-    fn set_sample_rate_hz(&mut self, py: Python<'_>, rate_hz: f64) -> PyResult<()> {
-        let source = self
-            .source
-            .as_mut()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        let rt = self.rt.clone();
-        py.detach(|| rt.block_on(source.set_sample_rate_hz(rate_hz)))
-            .map_err(map_aaronia_err)
+    fn set_sample_rate_hz(&self, py: Python<'_>, rate_hz: f64) -> PyResult<()> {
+        py.detach(|| {
+            let rt = self.runtime()?;
+            let mut state = self.lock_state();
+            let source = state.source.as_mut().ok_or(BindingErr::NotStreaming)?;
+            rt.block_on(source.set_sample_rate_hz(rate_hz))
+                .map_err(BindingErr::Aaronia)
+        })
+        .map_err(Into::into)
     }
 
     /// Device-provided native/HTTP capabilities, with schema version and
     /// explicit nulls for unknown values. Blocking SDK work releases the GIL.
     fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let source = self
-            .source
-            .as_ref()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        let rt = self.rt.clone();
         let json = py
-            .detach(|| rt.block_on(source.device_capabilities()).to_json())
-            .map_err(map_aaronia_err)?;
+            .detach(|| {
+                let rt = self.runtime()?;
+                let state = self.lock_state();
+                let source = state.source.as_ref().ok_or(BindingErr::NotStreaming)?;
+                rt.block_on(source.device_capabilities())
+                    .to_json()
+                    .map_err(BindingErr::Aaronia)
+            })
+            .map_err(PyErr::from)?;
         py.import("json")?.call_method1("loads", (json,))
     }
 
     /// Actual sample geometry from the last returned buffer. RF width zero
     /// means unknown and is independent of sample_rate_hz.
     fn source_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let source = self
-            .source
-            .as_ref()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        let info = source.source_info();
+        let info = py
+            .detach(|| {
+                let state = self.lock_state();
+                let source = state.source.as_ref().ok_or(BindingErr::NotStreaming)?;
+                Ok::<_, BindingErr>(source.source_info())
+            })
+            .map_err(PyErr::from)?;
         let result = pyo3::types::PyDict::new(py);
         result.set_item("sample_rate_hz", info.sample_rate_hz)?;
         result.set_item("bandwidth_hz", info.bandwidth_hz)?;
         result.set_item("center_frequency_hz", info.center_frequency_hz)?;
+        result.set_item("reference_level_dbm", info.reference_level_dbm)?;
+        result.set_item("source_type", format!("{:?}", info.source_type))?;
         result.set_item("device_serial", info.device_serial)?;
         Ok(result)
     }
 
     /// Set native IQ receiver RF span independently of IQ sample rate.
-    fn set_rf_span_hz(&mut self, py: Python<'_>, hz: f64) -> PyResult<f64> {
-        let source = self
-            .source
-            .as_mut()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        let rt = self.rt.clone();
-        py.detach(|| rt.block_on(source.set_rf_span_hz(hz)))
-            .map_err(map_aaronia_err)
+    fn set_rf_span_hz(&self, py: Python<'_>, hz: f64) -> PyResult<f64> {
+        py.detach(|| {
+            let rt = self.runtime()?;
+            let mut state = self.lock_state();
+            let source = state.source.as_mut().ok_or(BindingErr::NotStreaming)?;
+            rt.block_on(source.set_rf_span_hz(hz))
+                .map_err(BindingErr::Aaronia)
+        })
+        .map_err(Into::into)
     }
 
     /// Change the running source's reference level in dBm. Blocking
     /// (GIL released).
-    fn set_reference_level_dbm(&mut self, py: Python<'_>, dbm: f64) -> PyResult<()> {
-        let source = self
-            .source
-            .as_mut()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        let rt = self.rt.clone();
-        py.detach(|| rt.block_on(source.set_reference_level_dbm(dbm)))
-            .map_err(map_aaronia_err)
+    fn set_reference_level_dbm(&self, py: Python<'_>, dbm: f64) -> PyResult<()> {
+        py.detach(|| {
+            let rt = self.runtime()?;
+            let mut state = self.lock_state();
+            let source = state.source.as_mut().ok_or(BindingErr::NotStreaming)?;
+            rt.block_on(source.set_reference_level_dbm(dbm))
+                .map_err(BindingErr::Aaronia)
+        })
+        .map_err(Into::into)
     }
 
     /// Read up to `count` time-aligned (Rx1, Rx2) sample pairs from a
@@ -612,7 +736,7 @@ impl PySpectranSource {
     /// length. Requires `config.receiver_channel = "Rx1And2"` on the
     /// native-SDK backend.
     fn read_samples_dual_numpy<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         count: usize,
     ) -> PyResult<DualArrays<'py>> {
@@ -621,38 +745,32 @@ impl PySpectranSource {
                 "count {count} exceeds the per-read limit of {MAX_READ_SAMPLES} samples"
             )));
         }
-        let source = self
-            .source
-            .as_mut()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        let rt = self.rt.clone();
         let (rx1, rx2) = py
             .detach(|| {
+                let rt = self.runtime()?;
+                let mut state = self.lock_state();
+                let source = state.source.as_mut().ok_or(BindingErr::NotStreaming)?;
                 rt.block_on(async {
-                    // Sized up front: from capacity 0 each channel regrows
-                    // several times per read, and the arrays are copied
-                    // out into NumPy afterwards anyway.
                     let mut rx1 = Vec::with_capacity(count);
                     let mut rx2 = Vec::with_capacity(count);
                     source.read_samples_dual(&mut rx1, &mut rx2, count).await?;
                     Ok::<_, AaroniaError>((rx1, rx2))
                 })
+                .map_err(BindingErr::Aaronia)
             })
-            .map_err(map_aaronia_err)?;
-        Ok((
-            PyArray1::from_slice(py, &rx1),
-            PyArray1::from_slice(py, &rx2),
-        ))
+            .map_err(PyErr::from)?;
+        Ok((PyArray1::from_vec(py, rx1), PyArray1::from_vec(py, rx2)))
     }
 
     /// True once if a receive-side overrun (dropped packets) occurred
     /// since the last call.
-    fn take_overrun(&mut self) -> PyResult<bool> {
-        let source = self
-            .source
-            .as_mut()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        Ok(source.take_overrun())
+    fn take_overrun(&self, py: Python<'_>) -> PyResult<bool> {
+        py.detach(|| {
+            let mut state = self.lock_state();
+            let source = state.source.as_mut().ok_or(BindingErr::NotStreaming)?;
+            Ok::<_, BindingErr>(source.take_overrun())
+        })
+        .map_err(Into::into)
     }
 
     /// Enter a `with` block. The source is already streaming.
@@ -668,7 +786,7 @@ impl PySpectranSource {
     /// replace the error that actually explains what went wrong.
     #[pyo3(signature = (exc_type=None, _exc_value=None, _traceback=None))]
     fn __exit__(
-        &mut self,
+        &self,
         py: Python<'_>,
         exc_type: Option<Py<PyAny>>,
         _exc_value: Option<Py<PyAny>>,
@@ -685,40 +803,48 @@ impl PySpectranSource {
     ///
     /// Ends cleanly when the stream closes, rather than raising, so a
     /// `for` loop terminates the way a reader expects.
-    fn blocks(slf: Py<Self>, count: usize) -> BlockIterator {
-        BlockIterator { source: slf, count }
+    fn blocks(slf: Py<Self>, count: usize) -> PyResult<BlockIterator> {
+        if count > MAX_READ_SAMPLES {
+            return Err(PyValueError::new_err(format!(
+                "count {count} exceeds the per-read limit of {MAX_READ_SAMPLES} samples"
+            )));
+        }
+        Ok(BlockIterator { source: slf, count })
     }
 
     /// Number of timestamp gaps the drop detector has seen so far.
-    fn cumulative_drops(&self) -> PyResult<u64> {
-        let source = self
-            .source
-            .as_ref()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        Ok(source.cumulative_drops())
+    fn cumulative_drops(&self, py: Python<'_>) -> PyResult<u64> {
+        py.detach(|| {
+            let state = self.lock_state();
+            let source = state.source.as_ref().ok_or(BindingErr::NotStreaming)?;
+            Ok::<_, BindingErr>(source.cumulative_drops())
+        })
+        .map_err(Into::into)
     }
 
     /// Timestamp (epoch ns) of the most recently received sample
     /// block. Supported by the HTTP and native-SDK backends; 0 when
     /// unavailable.
-    fn last_timestamp_ns(&self) -> PyResult<i64> {
-        let source = self
-            .source
-            .as_ref()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        Ok(source.last_timestamp_ns())
+    fn last_timestamp_ns(&self, py: Python<'_>) -> PyResult<i64> {
+        py.detach(|| {
+            let state = self.lock_state();
+            let source = state.source.as_ref().ok_or(BindingErr::NotStreaming)?;
+            Ok::<_, BindingErr>(source.last_timestamp_ns())
+        })
+        .map_err(Into::into)
     }
 
     /// The device's master stream clock (epoch ns) — the timebase it
     /// paces streams against. Unlike `last_timestamp_ns` it is readable
     /// before the first block arrives. Native-SDK backend only; `None`
     /// otherwise.
-    fn master_stream_time_ns(&mut self) -> PyResult<Option<i64>> {
-        let source = self
-            .source
-            .as_mut()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        Ok(source.master_stream_time_ns())
+    fn master_stream_time_ns(&self, py: Python<'_>) -> PyResult<Option<i64>> {
+        py.detach(|| {
+            let mut state = self.lock_state();
+            let source = state.source.as_mut().ok_or(BindingErr::NotStreaming)?;
+            Ok::<_, BindingErr>(source.master_stream_time_ns())
+        })
+        .map_err(Into::into)
     }
 
     /// The latest GPS time (epoch ns), or `None` without a valid fix.
@@ -726,12 +852,13 @@ impl PySpectranSource {
     /// enabled — the device ships with GPS off, in which state this
     /// stays `None`. Quantised at roughly 240 ns by the device's own
     /// reading.
-    fn gps_time_ns(&mut self) -> PyResult<Option<i64>> {
-        let source = self
-            .source
-            .as_mut()
-            .ok_or_else(|| SpectranHardwareError::new_err("Not streaming"))?;
-        Ok(source.gps_time_ns())
+    fn gps_time_ns(&self, py: Python<'_>) -> PyResult<Option<i64>> {
+        py.detach(|| {
+            let mut state = self.lock_state();
+            let source = state.source.as_mut().ok_or(BindingErr::NotStreaming)?;
+            Ok::<_, BindingErr>(source.gps_time_ns())
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -750,7 +877,7 @@ impl BlockIterator {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        let mut source = self.source.borrow_mut(py);
+        let source = self.source.borrow(py);
         match source.read_samples_numpy(py, self.count) {
             // File playback signals its end with an empty read rather
             // than an error; without this the loop spins forever on
@@ -792,7 +919,7 @@ fn sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
 /// spectrum you want to see, from which a real rate is chosen). Pass
 /// `file` instead of `url` to play back a recording.
 #[pyfunction]
-#[pyo3(signature = (url=None, *, center_frequency_hz=None, sample_rate_hz=None, bandwidth_hz=None, reference_level_dbm=None, file=None, sdk=false, serial=None, format=None, scale=None, read_timeout_s=None))]
+#[pyo3(signature = (url=None, *, center_frequency_hz=None, sample_rate_hz=None, bandwidth_hz=None, reference_level_dbm=None, file=None, sdk=false, serial=None, format=None, scale=None, read_timeout_s=None, listen_only=false))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
@@ -807,6 +934,7 @@ fn open(
     format: Option<&str>,
     scale: Option<f64>,
     read_timeout_s: Option<f64>,
+    listen_only: bool,
 ) -> PyResult<Py<PySpectranSource>> {
     if [url.is_some(), file.is_some(), sdk]
         .iter()
@@ -861,9 +989,10 @@ fn open(
     if let Some(seconds) = read_timeout_s {
         cfg.set_read_timeout_s(seconds)?;
     }
+    cfg.set_listen_only(listen_only);
 
-    let mut source = PySpectranSource::new()?;
-    source.start_streaming(py, &cfg)?;
+    let source = PySpectranSource::new()?;
+    source.start_streaming(py, Some(&cfg))?;
     Py::new(py, source)
 }
 

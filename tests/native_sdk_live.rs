@@ -20,7 +20,8 @@
 
 #![cfg(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 ))]
 
 use sdr_aaronia_rs::Complex32;

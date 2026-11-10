@@ -31,6 +31,7 @@ pub mod native_sdk {
 pub struct SdkSource {
     native_source: Option<crate::native_sdk::NativeSdkSource>,
     config: SdkConfig,
+    device_serial: Option<String>,
 }
 
 /// Configuration for SDK source
@@ -114,6 +115,7 @@ impl SdkSource {
         Self {
             native_source: None,
             config: SdkConfig::default(),
+            device_serial: None,
         }
     }
 
@@ -122,13 +124,34 @@ impl SdkSource {
         Self {
             native_source: None,
             config,
+            device_serial: None,
         }
+    }
+
+    /// Pin this source to a specific device serial number.
+    #[must_use]
+    pub fn with_device_serial(mut self, serial: impl Into<String>) -> Self {
+        self.device_serial = Some(serial.into());
+        self
+    }
+
+    /// Set or clear the target device serial number.
+    pub fn set_device_serial(&mut self, serial: Option<String>) {
+        self.device_serial = serial;
+    }
+
+    /// Return the configured target device serial number, if any.
+    pub fn device_serial(&self) -> Option<&str> {
+        self.device_serial.as_deref()
     }
 
     /// Initialize the SDK source
     pub async fn initialize(&mut self) -> Result<()> {
-        let mut native_source = unsafe { crate::native_sdk::NativeSdkSource::new()? };
-        unsafe { native_source.initialize()? };
+        let native_source = crate::utils::maybe_block_in_place(|| unsafe {
+            let mut native_source = crate::native_sdk::NativeSdkSource::new()?;
+            native_source.initialize()?;
+            Ok::<_, crate::Error>(native_source)
+        })?;
         self.native_source = Some(native_source);
         Ok(())
     }
@@ -154,40 +177,72 @@ impl SdkSource {
             .native_source
             .as_mut()
             .ok_or_else(|| crate::Error::Sdk("Source not initialized".to_string()))?;
+        let config = &self.config;
+        let target_serial = self.device_serial.as_deref();
 
-        unsafe {
+        crate::utils::maybe_block_in_place(|| unsafe {
             // Enumerate with the bare family; open with the
             // mode-qualified string. Passing a mode-qualified
             // string to enumeration makes the SDK silently
             // return zero devices.
-            let family = self.config.device_family().to_string();
-            let open_mode = self.config.device_open_mode();
+            let family = config.device_family().to_string();
+            let open_mode = config.device_open_mode();
             let devices = native_source.find_devices(&family)?;
             if devices.is_empty() {
-                return Err(crate::Error::Sdk(format!("No {} devices found", family)));
+                return Err(crate::Error::DeviceNotFound {
+                    serial: target_serial.map(str::to_owned),
+                    families: vec![family],
+                });
             }
 
-            let device_info = &devices[0];
+            let device_info = if let Some(serial) = target_serial {
+                devices
+                    .iter()
+                    .find(|d| crate::native_sdk::NativeSdkSource::get_device_serial(d) == serial)
+                    .ok_or_else(|| crate::Error::DeviceNotFound {
+                        serial: Some(serial.to_owned()),
+                        families: vec![family],
+                    })?
+            } else {
+                devices
+                    .iter()
+                    .find(|d| d.ready() && !d.active())
+                    .unwrap_or(&devices[0])
+            };
+
+            let selected_serial =
+                crate::native_sdk::NativeSdkSource::get_device_serial(device_info);
             if !device_info.ready() {
-                return Err(crate::Error::Sdk("Device not ready".to_string()));
+                return Err(crate::Error::DeviceNotReady {
+                    serial: selected_serial,
+                });
+            }
+            if device_info.active() {
+                return Err(crate::Error::SdkApi {
+                    operation: "select receive device".into(),
+                    code: crate::native_sdk::SdkError::Busy,
+                });
             }
 
             native_source.open_device(&open_mode, &device_info.serial_number)?;
 
-            // Configure device. The channel selection is a parameter of
-            // configure_iq_receiver (not a follow-up call) so any future
-            // reconfiguration path re-applies it automatically.
-            native_source.configure_iq_receiver(
-                self.config.center_frequency_hz,
-                self.config.sample_rate_hz,
-                self.config.reference_level_dbm,
-                self.config.receiver_channel,
-            )?;
-
-            // Start streaming
-            native_source.start_streaming()?;
-        }
-        Ok(())
+            // Configure device and start streaming; close the opened device
+            // handle immediately if either setup step fails so the USB handle
+            // is not stranded open until drop.
+            let setup_res = native_source
+                .configure_iq_receiver(
+                    config.center_frequency_hz,
+                    config.sample_rate_hz,
+                    config.reference_level_dbm,
+                    config.receiver_channel,
+                )
+                .and_then(|()| native_source.start_streaming());
+            if let Err(e) = setup_res {
+                let _ = native_source.stop_streaming();
+                return Err(e);
+            }
+            Ok(())
+        })
     }
 
     /// Stop streaming
@@ -196,8 +251,7 @@ impl SdkSource {
             .native_source
             .as_mut()
             .ok_or_else(|| crate::Error::Sdk("Source not initialized".to_string()))?;
-        unsafe { native_source.stop_streaming()? };
-        Ok(())
+        crate::utils::maybe_block_in_place(|| unsafe { native_source.stop_streaming() })
     }
 
     /// Read samples from the source
@@ -207,7 +261,9 @@ impl SdkSource {
         max_samples: usize,
     ) -> Result<usize> {
         match self.native_source.as_mut() {
-            Some(native_source) => Ok(unsafe { native_source.read_samples(buffer, max_samples)? }),
+            Some(native_source) => crate::utils::maybe_block_in_place(|| unsafe {
+                native_source.read_samples(buffer, max_samples)
+            }),
             None => Ok(0),
         }
     }
@@ -225,9 +281,9 @@ impl SdkSource {
         max_samples: usize,
     ) -> Result<usize> {
         match self.native_source.as_mut() {
-            Some(native_source) => {
-                Ok(unsafe { native_source.read_samples_dual(rx1, rx2, max_samples)? })
-            }
+            Some(native_source) => crate::utils::maybe_block_in_place(|| unsafe {
+                native_source.read_samples_dual(rx1, rx2, max_samples)
+            }),
             None => Ok(0),
         }
     }

@@ -1,10 +1,14 @@
 //! SDK lifecycle fault injection. No Aaronia installation or USB device.
 use super::*;
 use std::cell::{Cell, RefCell};
+
+static LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 thread_local! {
     static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static FAIL: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static CONFIG_AVAILABLE: Cell<bool> = const { Cell::new(false) };
+    static LAST_OPEN_SERIAL: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 fn call(name: &'static str) -> u32 {
     CALLS.with(|calls| calls.borrow_mut().push(name));
@@ -14,13 +18,20 @@ fn call(name: &'static str) -> u32 {
         AARTSAAPI_OK
     }
 }
-fn reset(fail: &[&'static str]) {
+fn reset(fail: &[&'static str]) -> std::sync::MutexGuard<'static, ()> {
+    let guard = LIFECYCLE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    *SDK_LIVE_INITS.lock().unwrap_or_else(|p| p.into_inner()) = 0;
     CONFIG_AVAILABLE.with(|available| available.set(false));
+    LAST_OPEN_SERIAL.with(|serial| *serial.borrow_mut() = None);
     CALLS.with(|calls| calls.borrow_mut().clear());
     FAIL.with(|failed| *failed.borrow_mut() = fail.to_vec());
+    guard
 }
 fn calls() -> Vec<&'static str> {
     CALLS.with(|calls| calls.borrow().clone())
+}
+fn last_open_serial() -> Option<String> {
+    LAST_OPEN_SERIAL.with(|serial| serial.borrow().clone())
 }
 unsafe extern "C" fn mock_init(_memory: u32) -> u32 {
     AARTSAAPI_ERROR_NOT_FOUND
@@ -60,7 +71,20 @@ unsafe extern "C" fn mock_open_device(
     _device_type: *const WideChar,
     _serial: *const WideChar,
 ) -> u32 {
+    assert!(!_serial.is_null(), "serial pointer must never be null");
+    assert_ne!(
+        _serial as usize,
+        std::mem::align_of::<WideChar>(),
+        "serial pointer must never be a dangling empty-slice pointer"
+    );
     unsafe {
+        let mut len = 0usize;
+        while *_serial.add(len) != 0 {
+            len += 1;
+            assert!(len <= 256, "serial pointer must be NUL-terminated");
+        }
+        let slice = std::slice::from_raw_parts(_serial, len);
+        LAST_OPEN_SERIAL.with(|s| *s.borrow_mut() = Some(wide_to_string(slice)));
         (*_device).d = std::ptr::dangling_mut::<u8>().cast();
     }
     call("open_device")
@@ -240,8 +264,10 @@ fn client() -> Arc<NativeSdkClient> {
     #[cfg(target_os = "windows")]
     let lib = libloading::os::windows::Library::this().unwrap().into();
     Arc::new(NativeSdkClient {
-        _lib: lib,
+        _lib: std::mem::ManuallyDrop::new(lib),
         initialized: std::sync::atomic::AtomicBool::new(false),
+        active_handles: std::sync::atomic::AtomicUsize::new(0),
+        leaked_resource: std::sync::atomic::AtomicBool::new(false),
         init: mock_init,
         init_with_path: mock_init_with_path,
         shutdown: mock_shutdown,
@@ -279,7 +305,10 @@ fn client() -> Arc<NativeSdkClient> {
     })
 }
 fn source(active: bool, connected: bool) -> NativeSdkSource {
-    let mut source = NativeSdkSource::with_client(client());
+    let c = client();
+    c.active_handles
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let mut source = NativeSdkSource::with_client(c);
     source.handle = Some(AARTSAAPI_Handle {
         d: std::ptr::dangling_mut::<u8>().cast(),
     });
@@ -293,7 +322,7 @@ fn source(active: bool, connected: bool) -> NativeSdkSource {
 }
 #[test]
 fn stop_attempts_every_cleanup_stage_and_returns_first_failure() {
-    reset(&["stop_device", "disconnect_device"]);
+    let _guard = reset(&["stop_device", "disconnect_device"]);
     let mut source = source(true, true);
     assert!(
         matches!(unsafe { source.stop_streaming() }, Err(Error::SdkApi { operation, .. }) if operation == "AARTSAAPI_StopDevice")
@@ -311,7 +340,7 @@ fn stop_attempts_every_cleanup_stage_and_returns_first_failure() {
 }
 #[test]
 fn failed_start_releases_partial_connection() {
-    reset(&["start_device"]);
+    let _guard = reset(&["start_device"]);
     let mut source = source(false, false);
     assert!(unsafe { source.start_streaming() }.is_err());
     assert!(!source.is_device_open());
@@ -328,7 +357,7 @@ fn failed_start_releases_partial_connection() {
 }
 #[test]
 fn failed_connect_releases_partial_connection() {
-    reset(&["connect_device"]);
+    let _guard = reset(&["connect_device"]);
     let mut source = source(false, false);
     assert!(unsafe { source.start_streaming() }.is_err());
     assert_eq!(
@@ -338,13 +367,13 @@ fn failed_connect_releases_partial_connection() {
 }
 #[test]
 fn drop_closes_an_open_device_that_never_started() {
-    reset(&[]);
+    let _guard = reset(&[]);
     drop(source(false, false));
     assert_eq!(calls(), vec!["close_device", "close"]);
 }
 #[test]
 fn failed_close_retains_handle_for_drop_cleanup() {
-    reset(&["close_device"]);
+    let _guard = reset(&["close_device"]);
     let mut source = source(true, true);
     assert!(unsafe { source.stop_streaming() }.is_err());
     assert!(source.is_device_open());
@@ -363,7 +392,7 @@ fn failed_close_retains_handle_for_drop_cleanup() {
 }
 #[test]
 fn failed_device_open_closes_a_partially_allocated_handle() {
-    reset(&["open_device"]);
+    let _guard = reset(&["open_device"]);
     let client = client();
     let mut handle = AARTSAAPI_Handle {
         d: std::ptr::dangling_mut::<u8>().cast(),
@@ -383,7 +412,7 @@ fn failed_device_open_closes_a_partially_allocated_handle() {
 }
 #[test]
 fn sdk_shutdown_waits_for_the_last_initialized_client() {
-    reset(&[]);
+    let _guard = reset(&[]);
     let first = client();
     let second = client();
     unsafe {
@@ -398,10 +427,50 @@ fn sdk_shutdown_waits_for_the_last_initialized_client() {
 }
 
 #[test]
+fn failed_shutdown_preserves_live_init_count_and_skips_unload() {
+    let _guard = reset(&["shutdown"]);
+    let c = client();
+    unsafe {
+        c.init_with_path(1, "fixture").unwrap();
+        assert!(c.shutdown().is_err());
+        assert!(c.initialized.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(*SDK_LIVE_INITS.lock().unwrap(), 1);
+        FAIL.with(|failed| failed.borrow_mut().clear());
+        c.shutdown().unwrap();
+        assert!(!c.initialized.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(*SDK_LIVE_INITS.lock().unwrap(), 0);
+    }
+}
+
+#[test]
+fn open_device_accepts_empty_and_unterminated_serial_slices() {
+    let _guard = reset(&[]);
+    let client = client();
+    let mut handle = AARTSAAPI_Handle {
+        d: std::ptr::dangling_mut::<u8>().cast(),
+    };
+    unsafe {
+        let mut dev1 = client
+            .open_device(&mut handle, "spectranv6eco/iqreceiver", &[])
+            .unwrap();
+        assert_eq!(last_open_serial().as_deref(), Some(""));
+        client.close_device(&mut handle, &mut dev1).unwrap();
+
+        let unterminated = [b'A' as WideChar, b'B' as WideChar];
+        let mut dev2 = client
+            .open_device(&mut handle, "spectranv6eco/iqreceiver", &unterminated)
+            .unwrap();
+        assert_eq!(last_open_serial().as_deref(), Some("AB"));
+        client.close_device(&mut handle, &mut dev2).unwrap();
+    }
+}
+
+#[test]
 fn sweep_reference_level_is_checked_before_any_write() {
+    let _guard = reset(&[]);
     for level in [f64::NAN, f64::INFINITY, -56.0, 24.0] {
-        reset(&[]);
         CONFIG_AVAILABLE.with(|available| available.set(true));
+        CALLS.with(|calls| calls.borrow_mut().clear());
         let mut source = source(false, false);
         assert!(
             unsafe {
@@ -411,8 +480,8 @@ fn sweep_reference_level_is_checked_before_any_write() {
         );
         assert!(!calls().contains(&"config_write"));
     }
-    reset(&[]);
     CONFIG_AVAILABLE.with(|available| available.set(true));
+    CALLS.with(|calls| calls.borrow_mut().clear());
     let mut source = source(false, false);
     unsafe {
         source
@@ -429,7 +498,7 @@ fn sweep_reference_level_is_checked_before_any_write() {
 }
 #[test]
 fn missing_explicit_sweep_reference_metadata_fails_before_writes() {
-    reset(&[]);
+    let _guard = reset(&[]);
     let mut source = source(false, false);
     assert!(
         unsafe { source.configure_sweepsa_with_reference_level(&Default::default(), Some(-50.0)) }

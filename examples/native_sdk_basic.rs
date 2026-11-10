@@ -15,7 +15,8 @@
 
 #[cfg(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 ))]
 fn main() -> anyhow::Result<()> {
     use sdr_aaronia_rs::native_sdk::NativeSdkSource;
@@ -129,7 +130,8 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(not(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 )))]
 fn main() {
     println!("This example requires the 'native-sdk' feature and Windows or Linux.");

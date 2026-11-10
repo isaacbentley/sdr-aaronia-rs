@@ -755,6 +755,7 @@ pub async fn measure_link_throughput_with(
     // Same URL validation the source applies at construction — one shared
     // implementation, so the probe and the capture accept the same URLs.
     validate_base_url(base_url)?;
+    let base_url = base_url.trim_end_matches('/');
 
     // Same client settings as every other RTSA connection in this crate,
     // via the one shared builder.

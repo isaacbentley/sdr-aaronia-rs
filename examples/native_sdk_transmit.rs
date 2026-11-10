@@ -11,7 +11,8 @@
 
 #[cfg(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 ))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -139,7 +140,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(not(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 )))]
 fn main() {
     println!("This example requires the 'native-sdk' feature and Windows or Linux.");

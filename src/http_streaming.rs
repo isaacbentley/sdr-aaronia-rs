@@ -29,11 +29,13 @@ const DEFAULT_INT16_ENCODE_SCALE: f64 = 32768.0;
 /// HTTP source's link-budget restart, its `current_sample_rate` adoption
 /// hysteresis and its retune detection, and by the unified source's
 /// read boundary — all the same question: has the device actually moved?
+#[cfg(any(feature = "file", feature = "futuresdr"))]
 pub(crate) const RATE_CHANGE_BAND: f64 = 0.1;
 
 /// Whether `current` differs from `previous` by more than
 /// [`RATE_CHANGE_BAND`] — the one spelling of "the device has retuned",
 /// shared by every rate tracker in the crate. `previous` must be positive.
+#[cfg(any(feature = "file", feature = "futuresdr"))]
 pub(crate) fn rate_moved(previous: f64, current: f64) -> bool {
     (current - previous).abs() / previous > RATE_CHANGE_BAND
 }
@@ -368,11 +370,13 @@ impl PacketMetadata {
     /// start and end times) from producing Inf/NaN.
     pub fn sample_rate_hz(&self) -> f64 {
         let duration = self.end_time - self.start_time;
-        let rate = self.sample_frequency.unwrap_or(if duration.is_finite() && duration > 0.0 {
-            self.samples as f64 / duration
-        } else {
-            0.0
-        });
+        let rate = self
+            .sample_frequency
+            .unwrap_or(if duration.is_finite() && duration > 0.0 {
+                self.samples as f64 / duration
+            } else {
+                0.0
+            });
         if rate.is_finite() && rate > 0.0 {
             rate
         } else {
@@ -385,12 +389,24 @@ impl StreamingSdrConfig {
     /// Create SDR config from packet metadata
     pub fn from_metadata(metadata: &PacketMetadata) -> Self {
         let raw_center = (metadata.start_frequency + metadata.end_frequency) / 2.0;
-        let center_frequency_hz = if raw_center.is_finite() { raw_center } else { 0.0 };
+        let center_frequency_hz = if raw_center.is_finite() {
+            raw_center
+        } else {
+            0.0
+        };
         let raw_bw = metadata.end_frequency - metadata.start_frequency;
-        let bandwidth_hz = if raw_bw.is_finite() && raw_bw >= 0.0 { raw_bw } else { 0.0 };
+        let bandwidth_hz = if raw_bw.is_finite() && raw_bw >= 0.0 {
+            raw_bw
+        } else {
+            0.0
+        };
         let duration = metadata.end_time - metadata.start_time;
         let raw_duration_ms = duration * 1000.0;
-        let duration_ms = if raw_duration_ms.is_finite() { raw_duration_ms } else { 0.0 };
+        let duration_ms = if raw_duration_ms.is_finite() {
+            raw_duration_ms
+        } else {
+            0.0
+        };
         let sample_rate_hz = metadata.sample_rate_hz();
         let antenna_name = metadata
             .antenna
@@ -872,9 +888,6 @@ pub struct StreamParser {
     /// time resync over a corrupt region doesn't trigger an O(n²) memmove
     /// cascade.
     consumed: usize,
-    /// Bytes of a rejected (over-cap) payload still to arrive. They are
-    /// dropped on receipt rather than buffered or scanned for headers.
-    skip_bytes: usize,
     /// The server-side encode scale requested via `?scale=N`, used as the
     /// fallback when a packet's `scale` field is absent. **Semantics
     /// (verified on live hardware)**: `scale` is the multiplier the server
@@ -896,7 +909,6 @@ impl StreamParser {
             format,
             buffer: Vec::new(),
             consumed: 0,
-            skip_bytes: 0,
             default_encode_scale: scale,
             counters: StatsCounters::default(),
             started_at: Instant::now(),
@@ -930,7 +942,6 @@ impl StreamParser {
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.consumed = 0;
-        self.skip_bytes = 0;
     }
 
     /// The wire's encode scale for this packet: the per-packet `scale`
@@ -997,13 +1008,7 @@ impl StreamParser {
     /// [`ParsedItem::Lost`].
     fn parse_buffered(&mut self, data: &Bytes, stop_at_loss: bool) -> Result<Vec<ParsedItem>> {
         self.counters.bytes_processed += data.len() as u64;
-        // The tail of a rejected payload: drop it without buffering.
-        let skip = self.skip_bytes.min(data.len());
-        self.skip_bytes -= skip;
-        if skip > 0 && skip == data.len() {
-            return Ok(Vec::new());
-        }
-        self.buffer.extend_from_slice(&data[skip..]);
+        self.buffer.extend_from_slice(data);
 
         let mut items = Vec::new();
         loop {
@@ -1178,13 +1183,14 @@ impl StreamParser {
             }
         };
         if expected_bytes > Self::MAX_BINARY_PAYLOAD {
-            // Drop the header and whatever of the payload has already
-            // arrived, and skip the rest as it streams in, so payload
-            // bytes are neither buffered nor scanned for headers.
-            let buffered = self.pending().len();
-            let payload_already_here = buffered - payload_start;
-            self.skip_bytes = expected_bytes.saturating_sub(payload_already_here);
-            self.consume_buffer(buffered);
+            // Do NOT trust `expected_bytes` from a corrupt/untrusted header
+            // to set a multi-gigabyte blind skip budget (which would discard
+            // live RF data forever in `process_data_recovering`). Consume
+            // only the rejected header and let `scan_packet_header` resync
+            // on the next valid `{...}\x1e` packet boundary (bounded by
+            // `MAX_JSON_BUFFER`, which returns a fatal error to force a TCP
+            // reconnect if un-framed bytes exceed the cap).
+            self.consume_buffer(payload_start);
             return Ok(ParseStep::Lost(Error::Protocol(format!(
                 "packet declares a binary payload of {} bytes (cap: {})",
                 expected_bytes,
@@ -1394,6 +1400,11 @@ impl StreamParser {
                     scratch[..values.len()].convert_to_f32_slice(values);
                 }
             }
+            for v in output.iter_mut() {
+                if !v.is_finite() {
+                    *v = 0.0;
+                }
+            }
             Ok(samples)
         }
 
@@ -1406,7 +1417,10 @@ impl StreamParser {
                 .map(|chunk| {
                     let i = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
                     let q = f16::from_le_bytes([chunk[2], chunk[3]]).to_f32();
-                    Complex32::new(i, q)
+                    Complex32::new(
+                        if i.is_finite() { i } else { 0.0 },
+                        if q.is_finite() { q } else { 0.0 },
+                    )
                 })
                 .collect())
         }
@@ -1447,6 +1461,14 @@ impl StreamParser {
                 );
                 samples.set_len(num_samples);
             }
+            for s in &mut samples {
+                if !s.re.is_finite() {
+                    s.re = 0.0;
+                }
+                if !s.im.is_finite() {
+                    s.im = 0.0;
+                }
+            }
             Ok(samples)
         }
 
@@ -1456,7 +1478,10 @@ impl StreamParser {
             for chunk in data.as_chunks::<8>().0 {
                 let i_val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 let q_val = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-                samples.push(Complex32::new(i_val, q_val));
+                samples.push(Complex32::new(
+                    if i_val.is_finite() { i_val } else { 0.0 },
+                    if q_val.is_finite() { q_val } else { 0.0 },
+                ));
             }
             Ok(samples)
         }
@@ -1602,10 +1627,8 @@ impl StreamParser {
                             let val = value.as_f64().ok_or_else(|| {
                                 Error::Protocol("Invalid spectrum value".to_string())
                             })? as f32;
-                            samples.push(Complex32::new(
-                                if val.is_finite() { val } else { 0.0 },
-                                0.0,
-                            ));
+                            samples
+                                .push(Complex32::new(if val.is_finite() { val } else { 0.0 }, 0.0));
                         }
                     }
                 }
@@ -1619,10 +1642,7 @@ impl StreamParser {
                         .as_f64()
                         .ok_or_else(|| Error::Protocol("Invalid value".to_string()))?
                         as f32;
-                    samples.push(Complex32::new(
-                        if val.is_finite() { val } else { 0.0 },
-                        0.0,
-                    ));
+                    samples.push(Complex32::new(if val.is_finite() { val } else { 0.0 }, 0.0));
                 }
                 Ok(samples)
             }
@@ -1913,23 +1933,26 @@ mod tests {
     }
     use super::*;
 
-    // The per-scalar implementation preceding the bulk conversion. Keep
+    // The per-scalar implementation preceding the bulk conversion, updated to
+    // apply the same finite-value sanitization (`NaN`/`Inf` -> `+0.0`). Keep
     // this independent reference for exact tests and the opt-in A/B meter.
     fn scalar_float16_iq(data: &[u8]) -> Vec<Complex32> {
+        let sanitize = |v: f32| if v.is_finite() { v } else { 0.0 };
         data.as_chunks::<4>()
             .0
             .iter()
             .map(|chunk| {
                 Complex32::new(
-                    f16::from_le_bytes([chunk[0], chunk[1]]).to_f32(),
-                    f16::from_le_bytes([chunk[2], chunk[3]]).to_f32(),
+                    sanitize(f16::from_le_bytes([chunk[0], chunk[1]]).to_f32()),
+                    sanitize(f16::from_le_bytes([chunk[2], chunk[3]]).to_f32()),
                 )
             })
             .collect()
     }
 
     fn assert_float16_iq_matches_scalar(data: &[u8]) {
-        let parser = StreamParser::new(StreamFormat::Float16, None).unwrap();
+        let parser = StreamFormat::Float16;
+        let parser = StreamParser::new(parser, None).unwrap();
         let actual = parser.parse_iq_float16_optimized(data).unwrap();
         let expected = scalar_float16_iq(data);
         assert_eq!(actual.len(), expected.len());
@@ -1947,8 +1970,8 @@ mod tests {
     fn float16_bulk_matches_every_half_bit_pattern_at_both_alignments() {
         // Exhaust all 65,536 representations, including both zeros,
         // subnormals, infinities, and signed quiet/signaling NaN payloads.
-        // Compare bits rather than float equality so NaN and signed-zero
-        // behavior is checked against the previous scalar conversion.
+        // Non-finite values are sanitized to +0.0; compare bits rather than
+        // float equality so signed-zero and sanitization behavior are exact.
         let payload: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
         for offset in 0..2 {
             let mut storage = vec![0; payload.len() + offset];
@@ -2306,17 +2329,14 @@ mod tests {
         let mut payload = oversized.as_bytes().to_vec();
         payload.push(ASCII_RECORD_SEPARATOR);
         assert!(parser.process_data(&Bytes::from(payload)).is_err());
-        assert_eq!(parser.skip_bytes, 320_000_000);
 
-        // The payload is dropped as it arrives, not buffered or scanned.
-        let junk = vec![b'{'; 4096];
+        // Stray non-header bytes after the rejected header are scanned past
+        // without permanently black-holing subsequent valid packets.
+        let junk = vec![b'x'; 4096];
         assert!(parser.process_data(&Bytes::from(junk)).unwrap().is_empty());
-        assert_eq!(parser.skip_bytes, 320_000_000 - 4096);
-        assert!(parser.pending().is_empty());
-        // Fast-forward past the remainder of the payload.
-        parser.skip_bytes = 0;
 
-        // The bad header is gone, so a good packet parses on the next call.
+        // The bad header is gone, so a good packet parses on the next call
+        // without touching any private parser state.
         let good = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":1,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
         let mut payload = good.as_bytes().to_vec();
         payload.push(ASCII_RECORD_SEPARATOR);
@@ -2327,6 +2347,74 @@ mod tests {
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].samples[0], Complex32::new(0.25, -0.25));
         assert_eq!(parser.stats().parse_errors, 1);
+    }
+
+    #[test]
+    fn recovering_parser_resyncs_after_corrupt_terabyte_header_without_black_holing_stream() {
+        let mut parser = StreamParser::new(StreamFormat::Float32, None).unwrap();
+        let corrupt = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":1000000000000,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
+        let good = r#"{"startTime":1.0,"endTime":2.0,"startFrequency":0.0,"endFrequency":1.0,"samples":1,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
+
+        let mut wire = corrupt.as_bytes().to_vec();
+        wire.push(ASCII_RECORD_SEPARATOR);
+        wire.extend_from_slice(b"corrupt-tail-bytes");
+        wire.extend_from_slice(good.as_bytes());
+        wire.push(ASCII_RECORD_SEPARATOR);
+        wire.extend_from_slice(&0.5f32.to_le_bytes());
+        wire.extend_from_slice(&(-0.5f32).to_le_bytes());
+
+        let items = parser.process_data_recovering(&Bytes::from(wire)).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], ParsedItem::Lost(_)));
+        match &items[1] {
+            ParsedItem::Packet(pkt) => {
+                assert_eq!(pkt.samples, vec![Complex32::new(0.5, -0.5)]);
+            }
+            other => panic!("expected recovered packet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_float32_iq_sanitizes_nan_and_infinity() {
+        let header = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":2,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
+
+        let mut f32_parser = StreamParser::new(StreamFormat::Float32, None).unwrap();
+        let mut f32_wire = header.as_bytes().to_vec();
+        f32_wire.push(ASCII_RECORD_SEPARATOR);
+        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.75f32] {
+            f32_wire.extend_from_slice(&v.to_le_bytes());
+        }
+        let pkts = f32_parser.process_data(&Bytes::from(f32_wire)).unwrap();
+        assert_eq!(
+            pkts[0].samples,
+            vec![Complex32::new(0.0, 0.0), Complex32::new(0.0, 0.75)]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "half SIMD conversion uses hardware intrinsics / inline assembly"
+    )]
+    fn binary_float16_iq_sanitizes_nan_and_infinity() {
+        let header = r#"{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":2,"unit":"volt","payload":"iq","minPower":0,"maxPower":1,"sampleSize":2}"#;
+
+        let mut f16_parser = StreamParser::new(StreamFormat::Float16, None).unwrap();
+        let mut f16_wire = header.as_bytes().to_vec();
+        f16_wire.push(ASCII_RECORD_SEPARATOR);
+        for v in [
+            f16::NAN,
+            f16::INFINITY,
+            f16::NEG_INFINITY,
+            f16::from_f32(-0.5),
+        ] {
+            f16_wire.extend_from_slice(&v.to_le_bytes());
+        }
+        let pkts = f16_parser.process_data(&Bytes::from(f16_wire)).unwrap();
+        assert_eq!(
+            pkts[0].samples,
+            vec![Complex32::new(0.0, 0.0), Complex32::new(0.0, -0.5)]
+        );
     }
 
     /// A compressed spectra packet carries no byte length, so framing it

@@ -144,26 +144,44 @@ pub fn deinterleave_dual_iq<'a>(
 /// ```
 pub fn parse_frequency(s: &str) -> Result<f64> {
     let s = s.trim();
-    let (value_str, unit_str) = if s.ends_with("k") || s.ends_with("K") {
-        (&s[0..s.len() - 1], "k")
-    } else if s.ends_with("m") || s.ends_with("M") {
-        (&s[0..s.len() - 1], "M")
-    } else if s.ends_with("g") || s.ends_with("G") {
-        (&s[0..s.len() - 1], "G")
+    // Strip optional trailing "Hz" (case-insensitive) so both "146.52M" and
+    // "146.52MHz" / "100Hz" parse cleanly.
+    let without_hz = if s.len() >= 2 && s[s.len() - 2..].eq_ignore_ascii_case("hz") {
+        s[..s.len() - 2].trim_end()
     } else {
-        (s, "")
+        s
+    };
+
+    let (value_str, scale) = if let Some(rest) = without_hz
+        .strip_suffix('k')
+        .or_else(|| without_hz.strip_suffix('K'))
+    {
+        (rest.trim_end(), 1e3)
+    } else if let Some(rest) = without_hz
+        .strip_suffix('m')
+        .or_else(|| without_hz.strip_suffix('M'))
+    {
+        (rest.trim_end(), 1e6)
+    } else if let Some(rest) = without_hz
+        .strip_suffix('g')
+        .or_else(|| without_hz.strip_suffix('G'))
+    {
+        (rest.trim_end(), 1e9)
+    } else {
+        (without_hz, 1.0)
     };
 
     let value = value_str
         .parse::<f64>()
-        .map_err(|_| Error::Config(format!("Invalid frequency value: {}", value_str)))?;
-
-    match unit_str {
-        "k" => Ok(value * 1e3),
-        "M" => Ok(value * 1e6),
-        "G" => Ok(value * 1e9),
-        _ => Ok(value), // Assume Hz if no unit specified
+        .map_err(|_| Error::Config(format!("Invalid frequency value: {}", s)))?;
+    let hz = value * scale;
+    if !hz.is_finite() || hz <= 0.0 {
+        return Err(Error::Config(format!(
+            "Frequency must be finite and positive: {}",
+            s
+        )));
     }
+    Ok(hz)
 }
 
 /// Parse sample rate strings with units (e.g., "25M", "10k", "2.5M")
@@ -225,11 +243,15 @@ pub fn db_to_linear(db: f64) -> f64 {
 /// assert_eq!(format_frequency(162_500.0), "162.50 kHz");
 /// ```
 pub fn format_frequency(freq_hz: f64) -> String {
-    if freq_hz >= 1e9 {
+    if !freq_hz.is_finite() {
+        return format!("{} Hz", freq_hz);
+    }
+    let abs = freq_hz.abs();
+    if abs >= 999_995_000.0 {
         format!("{:.2} GHz", freq_hz / 1e9)
-    } else if freq_hz >= 1e6 {
+    } else if abs >= 999_995.0 {
         format!("{:.2} MHz", freq_hz / 1e6)
-    } else if freq_hz >= 1e3 {
+    } else if abs >= 999.995 {
         format!("{:.2} kHz", freq_hz / 1e3)
     } else {
         format!("{:.1} Hz", freq_hz)
@@ -246,9 +268,13 @@ pub fn format_frequency(freq_hz: f64) -> String {
 /// assert_eq!(format_sample_rate(10_000.0), "10.0 ksps");
 /// ```
 pub fn format_sample_rate(rate_hz: f64) -> String {
-    if rate_hz >= 1e6 {
+    if !rate_hz.is_finite() {
+        return format!("{} sps", rate_hz);
+    }
+    let abs = rate_hz.abs();
+    if abs >= 999_950.0 {
         format!("{:.1} Msps", rate_hz / 1e6)
-    } else if rate_hz >= 1e3 {
+    } else if abs >= 999.95 {
         format!("{:.1} ksps", rate_hz / 1e3)
     } else {
         format!("{:.1} sps", rate_hz)
@@ -288,14 +314,19 @@ pub fn receiver_clock_for_label(label: &str) -> f64 {
         "245MHz" => 245_760_000.0,
         "492MHz" => 491_520_000.0, // ditto
         other => {
-            // Fallback: parse the leading integer and multiply by 1e6. Loses
+            // Fallback: parse the leading number and multiply by 1e6. Loses
             // the ".xx MHz" precision, but keeps `validate_iq_mode` working
-            // on labels we haven't enumerated.
+            // on labels we haven't enumerated. Non-finite or non-positive
+            // strings fall back to the default receiver clock.
             other
-                .trim_end_matches("MHz")
+                .strip_suffix("MHz")
+                .unwrap_or(other)
                 .trim()
                 .parse::<f64>()
+                .ok()
+                .filter(|mhz| mhz.is_finite() && *mhz > 0.0)
                 .map(|mhz| mhz * 1e6)
+                .filter(|hz| hz.is_finite())
                 .unwrap_or(DEFAULT_RECEIVER_CLOCK_HZ)
         }
     }
@@ -456,10 +487,17 @@ pub fn iq_ladder_from_top(top_hz: f64) -> [f64; 10] {
 /// `decimation0` enum lists them — and must not be capped at the ten a
 /// V6 ECO happens to have. A device declaring twelve would otherwise
 /// lose its two slowest rates with no diagnostic. Empty for zero rungs.
+/// Maximum decimation ladder depth accepted from untrusted metadata.
+/// Hardware ladders have 10–16 rungs; capping at 64 prevents both unbounded
+/// allocations and IEEE-754 `2f64.powi` overflow at `n >= 1024`.
+pub const MAX_LADDER_RUNGS: usize = 64;
+
 pub fn iq_ladder_from_top_n(top_hz: f64, rungs: usize) -> Vec<f64> {
-    (0..rungs)
-        .map(|n| top_hz / 2f64.powi(i32::try_from(n).unwrap_or(i32::MAX)))
-        .collect()
+    if !top_hz.is_finite() || top_hz <= 0.0 {
+        return Vec::new();
+    }
+    let capped = rungs.min(MAX_LADDER_RUNGS);
+    (0..capped).map(|n| top_hz / 2f64.powi(n as i32)).collect()
 }
 
 /// Alias-free bandwidth delivered at `sample_rate_hz`.
@@ -478,7 +516,11 @@ pub fn usable_bandwidth_hz(sample_rate_hz: f64) -> f64 {
 /// that the RTSA server, given an unsupported rate, does not choose the
 /// nearest one: see [`iq_sample_rate_for_bandwidth`].
 pub fn nearest_iq_sample_rate(requested_hz: f64) -> f64 {
-    iq_sample_rates()
+    let rates = iq_sample_rates();
+    if requested_hz.is_nan() || requested_hz <= 0.0 {
+        return *rates.last().unwrap_or(&IQ_CLOCK_HZ);
+    }
+    rates
         .into_iter()
         .min_by(|a, b| {
             (a - requested_hz)
@@ -502,8 +544,12 @@ pub fn nearest_iq_sample_rate(requested_hz: f64) -> f64 {
 /// Returns [`IQ_CLOCK_HZ`] when the request exceeds what the hardware
 /// can cover.
 pub fn iq_sample_rate_for_bandwidth(bandwidth_hz: f64) -> f64 {
+    let rates = iq_sample_rates();
+    if bandwidth_hz.is_nan() || bandwidth_hz <= 0.0 {
+        return *rates.last().unwrap_or(&IQ_CLOCK_HZ);
+    }
     let needed = bandwidth_hz / USABLE_BANDWIDTH_RATIO;
-    iq_sample_rates()
+    rates
         .into_iter()
         .filter(|rate| *rate >= needed)
         .fold(None::<f64>, |best, rate| {
@@ -535,6 +581,9 @@ pub fn iq_sample_rate_for_decimation_index(index: usize) -> f64 {
 /// the matching enum index has to be written back to `decimation0`.
 pub fn decimation_index_for_rate(sample_rate_hz: f64) -> usize {
     let rates = iq_sample_rates();
+    if sample_rate_hz.is_nan() || sample_rate_hz <= 0.0 {
+        return rates.len() - 1;
+    }
     rates
         .iter()
         .enumerate()
@@ -653,6 +702,38 @@ pub fn validate_iq_mode(sample_rate_hz: f64, receiver_clock_hz: f64) -> Result<(
         )));
     }
     Ok(())
+}
+
+/// Run a potentially blocking synchronous operation without starving a
+/// multi-threaded Tokio worker pool when called from an `async fn`.
+///
+/// Safe on non-Tokio threads, `current_thread` runtimes, and `LocalSet`s
+/// (where `tokio::task::block_in_place` panics before invoking its closure).
+#[allow(dead_code)]
+pub(crate) fn maybe_block_in_place<F: FnOnce() -> R, R>(f: F) -> R {
+    #[cfg(feature = "http")]
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current()
+            && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            let mut f = Some(f);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| (f.take().expect("closure called once"))())
+            })) {
+                Ok(res) => return res,
+                Err(_panic) if f.is_some() => {
+                    // `block_in_place` panicked before invoking `f` (e.g. inside a `LocalSet`).
+                }
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+            return (f.take().expect("closure still present"))();
+        }
+        f()
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        f()
+    }
 }
 
 #[cfg(test)]
@@ -1270,5 +1351,62 @@ mod tests {
         // The default constant must agree with the label resolver to avoid
         // drift between code paths.
         assert_eq!(DEFAULT_RECEIVER_CLOCK_HZ, receiver_clock_for_label("92MHz"));
+    }
+
+    #[test]
+    fn parse_and_helper_functions_reject_or_sanitize_non_finite_values() {
+        assert_eq!(parse_frequency("146.52MHz").unwrap(), 146_520_000.0);
+        assert_eq!(parse_frequency("100Hz").unwrap(), 100.0);
+        for bad in ["NaN", "inf", "-inf", "infM", "0", "-100M", "1e309G"] {
+            assert!(parse_frequency(bad).is_err(), "{bad} must be rejected");
+        }
+        for bad_label in ["NaN", "infMHz", "-92MHz", "0MHz", "92MHzMHz", "1e309MHz"] {
+            assert_eq!(
+                receiver_clock_for_label(bad_label),
+                DEFAULT_RECEIVER_CLOCK_HZ,
+                "bad clock label {bad_label} must fall back to default"
+            );
+        }
+        assert_eq!(iq_sample_rate_for_bandwidth(f64::NAN), 120_000.0);
+        assert_eq!(nearest_iq_sample_rate(f64::NAN), 120_000.0);
+        assert_eq!(decimation_index_for_rate(f64::NAN), 9);
+        assert_eq!(format_frequency(999_995.0), "1.00 MHz");
+        assert_eq!(format_frequency(999_995_000.0), "1.00 GHz");
+        assert_eq!(format_sample_rate(999_950.0), "1.0 Msps");
+        assert_eq!(
+            iq_ladder_from_top_n(61_440_000.0, 10_000).len(),
+            MAX_LADDER_RUNGS
+        );
+        assert!(iq_ladder_from_top_n(f64::NAN, 10).is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "tokio runtime uses OS I/O driver syscalls unsupported by Miri"
+    )]
+    fn maybe_block_in_place_handles_all_execution_contexts() {
+        // Plain OS thread
+        assert_eq!(maybe_block_in_place(|| 42), 42);
+
+        // Current-thread Tokio runtime
+        let current_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(current_rt.block_on(async { maybe_block_in_place(|| 7) }), 7);
+
+        // Multi-thread Tokio runtime (normal worker + LocalSet)
+        let multi_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(multi_rt.block_on(async { maybe_block_in_place(|| 99) }), 99);
+        let local = tokio::task::LocalSet::new();
+        assert_eq!(
+            multi_rt.block_on(local.run_until(async { maybe_block_in_place(|| 123) })),
+            123
+        );
     }
 }

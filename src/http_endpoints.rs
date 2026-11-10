@@ -1099,7 +1099,11 @@ impl StreamParams {
     /// this one function and cannot drift. The query is never empty
     /// (`format` is always present), so the `?` is unconditional.
     pub(crate) fn stream_url(&self, base_url: &str) -> String {
-        format!("{}/stream?{}", base_url, self.build_query_string())
+        format!(
+            "{}/stream?{}",
+            base_url.trim_end_matches('/'),
+            self.build_query_string()
+        )
     }
 
     /// Refuse parameter values the server would reject or misread,
@@ -1275,6 +1279,8 @@ impl HttpEndpointsClient {
     /// * `base_url` - The base URL of the Aaronia RTSA device (e.g., "http://127.0.0.1:8080").
     /// * `auth` - The authentication method to use.
     pub fn new(base_url: String, auth: AuthMethod) -> Result<Self> {
+        validate_base_url(&base_url)?;
+
         // Shared RTSA client settings; see `rtsa_client_builder` for why
         // there is no client-level timeout. 5 s connect: fast failure on
         // an unreachable server.
@@ -3066,6 +3072,18 @@ mod tests {
         let c = HttpEndpointsClient::new("http://localhost:54664".to_string(), AuthMethod::None)
             .unwrap();
         assert_eq!(c.base_url, "http://localhost:54664");
+
+        let params = StreamParamsBuilder::new().build();
+        assert_eq!(
+            params.stream_url("http://localhost:54664///"),
+            "http://localhost:54664/stream?format=float32"
+        );
+
+        assert!(
+            HttpEndpointsClient::new("ftp://localhost:54664".to_string(), AuthMethod::None)
+                .is_err()
+        );
+        assert!(HttpEndpointsClient::new("not-a-url".to_string(), AuthMethod::None).is_err());
     }
 
     #[test]

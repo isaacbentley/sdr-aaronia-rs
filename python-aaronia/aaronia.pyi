@@ -108,6 +108,9 @@ class SpectranConfig:
     (default 30.0). Must be positive and finite."""
     auto_reconnect: bool
     """Reconnect the HTTP stream after a drop (default ``True``)."""
+    listen_only: bool
+    """Stream from an HTTP server without issuing ``/control`` or
+    ``/remoteconfig`` writes (default ``False``)."""
 
 class SpectranSource:
     """A streaming IQ source.
@@ -136,8 +139,9 @@ class SpectranSource:
         a truncated capture is not mistaken for a finished one.
         """
 
-    def start_streaming(self, config: SpectranConfig) -> None:
-        """Connect to the backend selected by ``config`` and start streaming.
+    def start_streaming(self, config: Optional[SpectranConfig] = None) -> None:
+        """Connect to the backend selected by ``config`` (or the previous
+        configuration when omitted) and start streaming.
 
         Raises ``SpectranConnectionError`` if the endpoint is
         unreachable, ``ValueError`` for invalid configuration, and
@@ -234,6 +238,7 @@ def open(
     format: Optional[WireFormat] = None,
     scale: Optional[float] = None,
     read_timeout_s: Optional[float] = None,
+    listen_only: bool = False,
 ) -> SpectranSource:
     """Open a source and start streaming, in one call.
 

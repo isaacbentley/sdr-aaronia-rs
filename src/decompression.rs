@@ -277,16 +277,6 @@ impl Decompressor {
             )));
         }
 
-        if num_rows == 1 && num_cols >= 128 {
-            // IQ sample data (DSPT_IQ) uses a proprietary Aaronia compression format.
-            // Our cleanroom reverse-engineering attempt determined that native Rust
-            // decompression is currently infeasible without the official specifications.
-            // The fallback must be to use the Aaronia SDK/DLL for DSPT_IQ payloads.
-            return Err(Error::Protocol(
-                "DSPT_IQ decompression requires the Aaronia SDK/DLL. Native decompression is proprietary and currently unsupported.".to_string()
-            ));
-        }
-
         let coefficients = self.unpack_coefficients(data)?;
         let mut dequantized = self.dequantize(&coefficients, compression_factor)?;
         // Dimensions come from packet metadata; cap them like the decoded
@@ -710,5 +700,15 @@ mod tests {
             .decompress(&data, 2, 1, 1)
             .expect("decompression should succeed with truncation, not error");
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn single_frame_wide_spectra_decompresses_cleanly() {
+        let decompressor = Decompressor::new();
+        let data = [0b1000_0000; 32];
+        let result = decompressor
+            .decompress(&data, 1, 1, 256)
+            .expect("1x256 single-frame spectra must decompress via 1D column Haar transform");
+        assert_eq!(result.len(), 256);
     }
 }

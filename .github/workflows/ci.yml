@@ -177,7 +177,9 @@ jobs:
         uses: taiki-e/install-action@cargo-hack
 
       - name: cargo hack
-        run: cargo hack check --each-feature --no-dev-deps
+        run: |
+          cargo hack check --each-feature --no-dev-deps
+          cargo hack check --each-feature --all-targets
 
   machete:
     name: cargo-machete (unused dependencies)
@@ -280,7 +282,13 @@ jobs:
 
       - name: Build plugin (drives cargo internally)
         run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            native_sdk=ON
+          else
+            native_sdk=OFF
+          fi
           cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release \
+            -DAARONIA_NATIVE_SDK="$native_sdk" \
             -DCMAKE_VERBOSE_MAKEFILE=ON
           cmake --build soapy-aaronia/build
 

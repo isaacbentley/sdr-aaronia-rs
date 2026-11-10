@@ -2,7 +2,8 @@
 //! Run only with the radio released by other apps; no TX is opened.
 #[cfg(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 ))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -87,7 +88,8 @@ async fn main() -> anyhow::Result<()> {
 }
 #[cfg(not(all(
     feature = "native-sdk",
-    any(target_os = "windows", target_os = "linux")
+    any(target_os = "windows", target_os = "linux"),
+    target_pointer_width = "64"
 )))]
 fn main() {
     eprintln!("Requires native-sdk on Windows or Linux");
