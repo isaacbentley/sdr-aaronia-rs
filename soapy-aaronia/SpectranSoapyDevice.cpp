@@ -59,7 +59,7 @@ SpectranSoapyDevice::SpectranSoapyDevice(SpectranSource* source, SpectranSink* s
     if (args.count("url") != 0) {
         _httpUrl = args.at("url");
     } else if (args.count("file") == 0) {
-        _httpUrl = "http://localhost:54664";
+        _httpUrl = "http://localhost:42664";
     }
 
     FfiSourceInfo* info = spectran_source_get_source_info(_source);

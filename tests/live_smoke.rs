@@ -1,7 +1,8 @@
 //! Live smoke tests against a running RTSA-Suite PRO HTTP server block.
 //!
 //! All tests are `#[ignore]`d: they need real hardware/software at
-//! `AARONIA_LIVE_URL` (default `http://atc.local:54664`). Run with:
+//! `AARONIA_LIVE_URL` (default `http://atc.local:42664`; older saved RTSA
+//! missions use port `54664`). Run with:
 //!
 //! ```sh
 //! cargo test --test live_smoke -- --ignored --nocapture
@@ -20,7 +21,7 @@ use sdr_aaronia_rs::http_streaming::{DropDetector, PayloadType, StreamFormat};
 use std::time::{Duration, Instant};
 
 fn live_url() -> String {
-    std::env::var("AARONIA_LIVE_URL").unwrap_or_else(|_| "http://atc.local:54664".to_string())
+    std::env::var("AARONIA_LIVE_URL").unwrap_or_else(|_| "http://atc.local:42664".to_string())
 }
 
 fn client() -> HttpEndpointsClient {
@@ -28,7 +29,7 @@ fn client() -> HttpEndpointsClient {
 }
 
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_control_plane() {
     let c = client();
 
@@ -40,7 +41,7 @@ async fn live_control_plane() {
         info.name, info.title, info.port, info.mission
     );
     assert!(!info.uuid.is_empty(), "server must report a uuid");
-    assert_eq!(info.port, 54664);
+    assert_ne!(info.port, 0, "server must report a non-zero port");
 
     let inputs = c.get_inputs().await.expect("/inputs");
     println!("inputs: {:?}", inputs);
@@ -143,7 +144,7 @@ async fn live_control_plane() {
 }
 
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_device_sensors() {
     let c = client();
 
@@ -170,7 +171,7 @@ async fn live_device_sensors() {
 }
 
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_bandwidth_tracks_sample_rate() {
     use sdr_aaronia_rs::{SpectranConfig, SpectranSource, usable_bandwidth_hz};
 
@@ -323,13 +324,13 @@ async fn iq_stream_case(format: StreamFormat, secs: u64, label: &str) {
 }
 
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_stream_float32() {
     iq_stream_case(StreamFormat::Float32, 5, "float32").await;
 }
 
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_stream_int16() {
     iq_stream_case(StreamFormat::Int16, 5, "int16").await;
 }
@@ -420,7 +421,7 @@ async fn live_stream_spectra_int16() {
 /// *array* form — this exercises the dual-form `samples` deserializer
 /// against real wire data. `/samples` returns a JSON array of documents.
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_sample_endpoints() {
     let c = client();
 
@@ -451,7 +452,7 @@ async fn live_sample_endpoints() {
 /// Exercises `parse_json_samples` + the pair-count reconciliation on
 /// real data (the offline tests only cover synthetic documents).
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_stream_json_format() {
     let s = pump_stream(StreamFormat::Json, 3).await;
     println!(
@@ -468,7 +469,7 @@ async fn live_stream_json_format() {
 }
 
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_stream_float16() {
     let s = pump_stream(StreamFormat::Float16, 3).await;
     println!(
@@ -488,7 +489,7 @@ async fn live_stream_float16() {
 /// cleanly (server closes the connection). Exercises end-of-stream
 /// handling, which the timed pumps never reach.
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_stream_limit_ends_stream() {
     let c = client();
     let params = HttpEndpointsClient::stream_params()
@@ -514,7 +515,7 @@ async fn live_stream_limit_ends_stream() {
 /// `rate_reduction` + server-side `scale` must be accepted and still
 /// produce decodable packets (exercises the full query-parameter set).
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_stream_rate_reduction_and_scale() {
     let params = HttpEndpointsClient::stream_params()
         .format(StreamFormat::Int16)
@@ -628,7 +629,7 @@ async fn live_drop_detector_flags_oversubscribed_link() {
 /// error chain, not just error text. If a future mission *does* support
 /// it, the created input name is reported instead.
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_create_input_failure_is_typed() {
     let c = client();
     match c.create_input("main", InputProcessingType::Average).await {
@@ -691,7 +692,7 @@ async fn live_unified_source() {
 /// live-testable regardless of the attached device's capabilities, since
 /// `/sample` accepts pushed samples independent of RX/TX support.
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_tx_push_sample() {
     let c = client();
 
@@ -801,7 +802,7 @@ fn live_stream_seify() {
 /// (no license involved). This proves the crate's full-tuple retune path
 /// actually moves the device, then restores the original tuning.
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_retune_full_tuple_applies() {
     let c = client();
 
@@ -869,7 +870,7 @@ async fn live_retune_full_tuple_applies() {
 /// recovery) is covered by `http_resilience_test`, which can close a
 /// mock body at will.
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_auto_reconnect_stream_is_continuous() {
     use sdr_aaronia_rs::unified_source::{SpectranConfig, SpectranSource};
 
@@ -913,7 +914,7 @@ async fn live_auto_reconnect_stream_is_continuous() {
 /// device accepts, the read-back reflects the write, and the options the
 /// capability list advertises are ones the device will actually take.
 #[tokio::test]
-#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:54664"]
+#[ignore = "requires live RTSA-Suite PRO at AARONIA_LIVE_URL / atc.local:42664"]
 async fn live_clock_and_gps_mode_round_trip() {
     let c = client();
     let caps = c.get_device_capabilities().await;

@@ -190,7 +190,7 @@ def collect_soapy(url, fmt, rate, freq):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("url", nargs="?", default="http://localhost:54664")
+    ap.add_argument("url", nargs="?", default="http://localhost:42664")
     ap.add_argument("--rate", type=float, default=DEFAULT_RATE)
     ap.add_argument("--freq", type=float, default=DEFAULT_FREQ)
     # NOAA weather radio: always transmitting, on an exactly known

@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = args
         .get(3)
         .map(String::as_str)
-        .unwrap_or("http://localhost:54664");
+        .unwrap_or(sdr_aaronia_rs::DEFAULT_HTTP_URL);
 
     let config = SpectranConfig::from_http(url)
         .center_frequency_hz(freq)

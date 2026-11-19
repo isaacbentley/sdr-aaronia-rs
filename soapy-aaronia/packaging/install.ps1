@@ -57,4 +57,4 @@ Write-Host "Checking the module loads:"
 & SoapySDRUtil --check=aaronia
 Write-Host ""
 Write-Host "Done. Try your device with:"
-Write-Host '    SoapySDRUtil --probe="driver=aaronia,url=http://localhost:54664"'
+Write-Host '    SoapySDRUtil --probe="driver=aaronia,url=http://localhost:42664"'

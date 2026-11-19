@@ -246,7 +246,7 @@ def open(
     much spectrum to cover, from which a real rate is chosen); passing
     both raises ``ValueError``, as does passing both ``url`` and
     ``file``. With neither ``url`` nor ``file``, connects to
-    ``http://localhost:54664``.
+    ``http://localhost:42664`` (older saved RTSA missions use port ``54664``).
     """
 
 def sample_rates() -> List[float]:
@@ -256,7 +256,7 @@ def sample_rate_for_bandwidth(bandwidth_hz: float) -> float:
     """The lowest sample rate whose alias-free bandwidth covers
     ``bandwidth_hz``."""
 
-def diagnose(url: str = "http://localhost:54664") -> List[Tuple[bool, str, str]]:
+def diagnose(url: str = "http://localhost:42664") -> List[Tuple[bool, str, str]]:
     """Check an RTSA-Suite HTTP server.
 
     Returns ``(ok, message, fix)`` for each check. The

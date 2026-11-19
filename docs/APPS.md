@@ -19,7 +19,7 @@ Every application below uses the same device string. In most cases the
 RTSA-Suite HTTP server URL is the only argument needed:
 
 ```
-driver=aaronia,url=http://localhost:54664
+driver=aaronia,url=http://localhost:42664
 ```
 
 Add `format=I16` when streaming across a network to halve the wire
@@ -37,7 +37,8 @@ dropdown. If it does not appear, launch SDR++ from a terminal with
 SDR++ enumerates plugins at startup, so the variable must be set
 beforehand.
 
-Enumeration advertises a `localhost:54664` candidate without probing it,
+Enumeration advertises a `localhost:42664` candidate without probing it
+(missions saved with an earlier RTSA-Suite version still use port `54664`),
 because `find()` must not block on the network. For a remote server, use
 SDR++'s manual device string field with your own `url=`.
 
@@ -46,7 +47,7 @@ SDR++'s manual device string field with your own `url=`.
 GQRX accepts a device string directly in its configuration dialog:
 
 ```
-driver=aaronia,url=http://localhost:54664
+driver=aaronia,url=http://localhost:42664
 ```
 
 Select the sample rate from GQRX's list. The plugin advertises the
@@ -66,7 +67,7 @@ is not an amplifier gain: raising it reduces sensitivity. Start near
 
 Use the **Soapy Custom Source** block from `gr-soapy`:
 
-- Device string: `driver=aaronia,url=http://localhost:54664`
+- Device string: `driver=aaronia,url=http://localhost:42664`
 - Sample rate: a rate from the list above
 - Center frequency: as required. Retuning while running is safe.
 - Gain (`REF`): reference level in dBm
@@ -81,7 +82,7 @@ import SoapySDR
 from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
 import numpy as np
 
-sdr = SoapySDR.Device("driver=aaronia,url=http://localhost:54664")
+sdr = SoapySDR.Device("driver=aaronia,url=http://localhost:42664")
 sdr.setSampleRate(SOAPY_SDR_RX, 0, 15.36e6)
 sdr.setFrequency(SOAPY_SDR_RX, 0, 2.44e9)
 

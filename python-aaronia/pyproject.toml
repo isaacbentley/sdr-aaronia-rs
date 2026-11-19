@@ -23,7 +23,7 @@ dependencies = ["numpy>=1.24"]
 arrow = ["pyarrow>=14.0"]
 
 # A real command, so checking a setup needs no code:
-#   aaronia-doctor http://localhost:54664
+#   aaronia-doctor http://localhost:42664
 [project.scripts]
 aaronia-doctor = "aaronia:doctor_cli"
 

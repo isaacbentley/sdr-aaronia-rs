@@ -3409,9 +3409,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Only run when explicitly requested with --ignored - requires RTSA Suite Pro at atc.local:54664
+    #[ignore] // Only run when explicitly requested with --ignored - requires RTSA Suite Pro at atc.local:42664
     async fn test_rtsa_suite_pro_endpoint_debugging() {
-        let base_url = "http://atc.local:54664";
+        let base_url = "http://atc.local:42664";
         let client = match HttpEndpointsClient::new(base_url.to_string(), AuthMethod::None) {
             Ok(client) => client,
             Err(e) => {
@@ -3737,9 +3737,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Only run when explicitly requested with --ignored - requires RTSA Suite Pro at atc.local:54664
+    #[ignore] // Only run when explicitly requested with --ignored - requires RTSA Suite Pro at atc.local:42664
     async fn test_remote_config_license_detection() {
-        let base_url = "http://atc.local:54664";
+        let base_url = "http://atc.local:42664";
         let client = match HttpEndpointsClient::new(base_url.to_string(), AuthMethod::None) {
             Ok(client) => client,
             Err(e) => {

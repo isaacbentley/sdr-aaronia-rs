@@ -5,7 +5,10 @@ use sdr_aaronia_rs::http_endpoints::{AuthMethod, HttpEndpointsClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpEndpointsClient::new("http://localhost:54664".to_string(), AuthMethod::None)?;
+    let client = HttpEndpointsClient::new(
+        sdr_aaronia_rs::DEFAULT_HTTP_URL.to_string(),
+        AuthMethod::None,
+    )?;
 
     println!("Querying device info...");
     if let Ok(info) = client.get_info().await {

@@ -36,12 +36,13 @@ maturin develop --release --features native-sdk
 Check your setup before writing any code:
 
 ```bash
-aaronia-doctor http://localhost:54664
+aaronia-doctor http://localhost:42664
 ```
 
 It reports whether the server is reachable, whether the mission has an
 input carrying IQ, and what rate the device is running, and names the
-fix for each failure.
+fix for each failure. (Missions saved with an earlier RTSA-Suite version
+still use port `54664`.)
 
 ## Quickstart
 
@@ -49,7 +50,7 @@ fix for each failure.
 import aaronia
 
 with aaronia.open(
-    "http://localhost:54664", center_frequency_hz=2.44e9, bandwidth_hz=10e6
+    "http://localhost:42664", center_frequency_hz=2.44e9, bandwidth_hz=10e6
 ) as src:
     for block in src.blocks(65536):           # numpy complex64 arrays
         process(block)

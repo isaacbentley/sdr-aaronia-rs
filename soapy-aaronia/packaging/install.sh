@@ -71,4 +71,4 @@ echo "Checking the module loads:"
 SoapySDRUtil --check=aaronia
 echo
 echo "Done. Try your device with:"
-echo "    SoapySDRUtil --probe=\"driver=aaronia,url=http://localhost:54664\""
+echo "    SoapySDRUtil --probe=\"driver=aaronia,url=http://localhost:42664\""

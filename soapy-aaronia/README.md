@@ -74,7 +74,7 @@ Try it without installing:
 ```bash
 export SOAPY_SDR_PLUGIN_PATH=$PWD/soapy-aaronia/build
 SoapySDRUtil --check=aaronia
-SoapySDRUtil --probe="driver=aaronia,url=http://localhost:54664"
+SoapySDRUtil --probe="driver=aaronia,url=http://localhost:42664"
 ```
 
 Install into SoapySDR's module directory:
@@ -87,7 +87,7 @@ sudo cmake --install soapy-aaronia/build
 
 | Arg | Meaning |
 | --- | --- |
-| `url` | RTSA-Suite HTTP server URL (default `http://localhost:54664`) |
+| `url` | RTSA-Suite HTTP server URL (default `http://localhost:42664`; older saved RTSA missions use port `54664`) |
 | `file` | Play back a recorded `.rtsa` file |
 | `serial` | Select a device by serial via the native-SDK backend (Windows/Linux with the Aaronia SDK; omit `url` to allow SDK auto-detection) |
 | `freq` / `rate` / `ref_level` | Initial center frequency, sample rate, reference level. `rate` snaps to the device's ladder — see [Sample rates](#sample-rates) |
@@ -102,7 +102,7 @@ sudo cmake --install soapy-aaronia/build
 
 ```python
 import SoapySDR
-sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
+sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:42664,format=I16")
 ```
 
 ## Sample rates and bandwidth

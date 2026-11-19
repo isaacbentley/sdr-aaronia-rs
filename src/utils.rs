@@ -5,6 +5,65 @@
 
 use crate::{Error, Result};
 
+/// Default TCP port for the Aaronia RTSA-Suite HTTP Server block.
+///
+/// RTSA-Suite moved its default HTTP Server port from [`LEGACY_HTTP_PORT`]
+/// (`54664`) to `42664`. Missions saved with an earlier RTSA-Suite version
+/// keep their saved port (`54664`).
+pub const DEFAULT_HTTP_PORT: u16 = 42664;
+
+/// Legacy default TCP port used by Aaronia RTSA-Suite HTTP Server blocks in
+/// missions saved with earlier RTSA-Suite versions.
+pub const LEGACY_HTTP_PORT: u16 = 54664;
+
+/// Default localhost base URL for an Aaronia RTSA-Suite HTTP Server block.
+pub const DEFAULT_HTTP_URL: &str = "http://localhost:42664";
+
+/// Extract the explicit TCP port from an `http://` or `https://` URL.
+fn extract_http_port(url: &str) -> Option<u16> {
+    let trimmed = url.trim();
+    let (scheme, rest) = trimmed.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    let port_str = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        let (host, tail) = after_bracket.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        tail.strip_prefix(':')?
+    } else {
+        let (host, port) = host_port.rsplit_once(':')?;
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        port
+    };
+    port_str.parse::<u16>().ok()
+}
+
+/// Diagnostic hint for an Aaronia RTSA-Suite HTTP connection failure when the
+/// URL targets either [`DEFAULT_HTTP_PORT`] (`42664`) or [`LEGACY_HTTP_PORT`]
+/// (`54664`).
+///
+/// Returns `None` for any other port or non-HTTP URL.
+#[must_use]
+pub fn http_port_mismatch_hint(url: &str) -> Option<&'static str> {
+    match extract_http_port(url) {
+        Some(DEFAULT_HTTP_PORT) => Some(
+            "RTSA-Suite missions saved with an earlier version still use port 54664; \
+             if the HTTP Server block is on the legacy port, try :54664",
+        ),
+        Some(LEGACY_HTTP_PORT) => Some(
+            "Newer RTSA-Suite HTTP Server blocks default to port 42664; \
+             if the mission uses the new default port, try :42664",
+        ),
+        _ => None,
+    }
+}
+
 /// HTTP `User-Agent` string used by every outbound request from this
 /// crate (both the lightweight endpoints client and the streaming
 /// source).
@@ -1378,6 +1437,23 @@ mod tests {
             MAX_LADDER_RUNGS
         );
         assert!(iq_ladder_from_top_n(f64::NAN, 10).is_empty());
+    }
+
+    #[test]
+    fn http_port_mismatch_hint_covers_default_and_legacy_ports() {
+        let on_new = http_port_mismatch_hint(DEFAULT_HTTP_URL).unwrap();
+        assert!(on_new.contains("54664"), "{on_new}");
+
+        let on_legacy = http_port_mismatch_hint("http://atc.local:54664/stream").unwrap();
+        assert!(on_legacy.contains("42664"), "{on_legacy}");
+
+        assert!(http_port_mismatch_hint("HTTPS://user:pass@[::1]:42664/proxy?a=1#b").is_some());
+        assert!(http_port_mismatch_hint("http://[::1]:54664").is_some());
+        assert_eq!(http_port_mismatch_hint("http://localhost:8080"), None);
+        assert_eq!(http_port_mismatch_hint("http://localhost"), None);
+        assert_eq!(http_port_mismatch_hint("http://user:54664@localhost"), None);
+        assert_eq!(http_port_mismatch_hint("ftp://localhost:42664"), None);
+        assert_eq!(http_port_mismatch_hint("http://::42664"), None);
     }
 
     #[test]

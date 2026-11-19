@@ -37,7 +37,7 @@ use seify::dev::DynDeviceBackend;
 
 // Initialize with the HTTP endpoint URL
 let mut args = Args::new();
-args.set("url", "http://localhost:54664");
+args.set("url", "http://localhost:42664");
 
 // Open the device
 let dev = SpectranSeifyDevice::from_args(&args).expect("Failed to open Aaronia device");
@@ -113,7 +113,7 @@ its old meaning, the HTTP server on localhost; when the SDK is installed,
 
 ```bash
 # Example testing with SoapySDRUtil
-SoapySDRUtil --probe="driver=aaronia,url=http://localhost:54664"
+SoapySDRUtil --probe="driver=aaronia,url=http://localhost:42664"
 SoapySDRUtil --probe="driver=aaronia,sdk=true"
 ```
 
@@ -132,7 +132,7 @@ In Python (using `SoapySDR` python bindings):
 import SoapySDR
 
 # Open the device
-args = dict(driver="aaronia", url="http://localhost:54664")
+args = dict(driver="aaronia", url="http://localhost:42664")
 sdr = SoapySDR.Device(args)
 
 # Configure stream
@@ -159,7 +159,7 @@ Two different knobs, easy to confuse:
   this is the genuine low-bandwidth mode, halving network traffic:
 
 ```python
-sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:54664,format=I16")
+sdr = SoapySDR.Device("driver=aaronia,url=http://atc.local:42664,format=I16")
 ```
 
 ## 3. Transmit

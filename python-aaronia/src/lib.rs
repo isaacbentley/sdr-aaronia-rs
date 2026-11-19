@@ -258,8 +258,9 @@ impl PySpectranConfig {
     }
 
     /// Base URL of an RTSA-Suite HTTP server block
-    /// (e.g. `"http://atc.local:54664"`). Setting this pins the source
-    /// to the HTTP backend and clears any previously set `file_path`.
+    /// (e.g. `"http://atc.local:42664"`; older saved RTSA missions use `54664`).
+    /// Setting this pins the source to the HTTP backend and clears any
+    /// previously set `file_path`.
     #[setter]
     fn set_http_base_url(&mut self, url: Option<String>) {
         self.inner.http_base_url = url.clone();
@@ -967,7 +968,9 @@ fn open(
         }
         // Nothing chosen: the RTSA HTTP server's own default, which is
         // where it listens on the machine running RTSA-Suite.
-        (None, None, false) => cfg.set_http_base_url(Some("http://localhost:54664".to_string())),
+        (None, None, false) => {
+            cfg.set_http_base_url(Some(sdr_aaronia_rs::DEFAULT_HTTP_URL.to_string()))
+        }
     }
     if let Some(center_frequency_hz) = center_frequency_hz {
         cfg.set_center_frequency_hz(center_frequency_hz);
@@ -1005,7 +1008,7 @@ const DIAGNOSE_BUDGET: Duration = Duration::from_secs(20);
 /// here is one the quickstart documents; the point is that a program can
 /// name the fix instead of a person rereading the guide after a timeout.
 #[pyfunction]
-#[pyo3(signature = (url="http://localhost:54664"))]
+#[pyo3(signature = (url="http://localhost:42664"))]
 fn diagnose(py: Python<'_>, url: &str) -> PyResult<Vec<(bool, String, String)>> {
     use sdr_aaronia_rs::http_endpoints::{AuthMethod, HttpEndpointsClient};
 
@@ -1028,7 +1031,10 @@ fn diagnose(py: Python<'_>, url: &str) -> PyResult<Vec<(bool, String, String)>> 
                         out.push((
                             false,
                             format!("{url} is not a usable URL: {e}"),
-                            "Pass a base URL such as http://localhost:54664".to_string(),
+                            format!(
+                                "Pass a base URL such as {} (or :54664 for older saved RTSA missions)",
+                                sdr_aaronia_rs::DEFAULT_HTTP_URL
+                            ),
                         ));
                         return Ok(out);
                     }
@@ -1044,14 +1050,16 @@ fn diagnose(py: Python<'_>, url: &str) -> PyResult<Vec<(bool, String, String)>> 
                         String::new(),
                     )),
                     Err(e) => {
-                        out.push((
-                            false,
-                            format!("cannot reach {url}: {e}"),
-                            "Start RTSA-Suite, add an HTTP Server block to the mission, and \
-                         check the port. A *.local hostname can also take a moment to \
-                         resolve from a cold start."
-                                .to_string(),
-                        ));
+                        let mut fix = "Start RTSA-Suite, add an HTTP Server block to the mission, \
+                                       and check the port. A *.local hostname can also take a \
+                                       moment to resolve from a cold start."
+                            .to_string();
+                        if let Some(hint) = sdr_aaronia_rs::http_port_mismatch_hint(&url) {
+                            fix.push(' ');
+                            fix.push_str(hint);
+                            fix.push('.');
+                        }
+                        out.push((false, format!("cannot reach {url}: {e}"), fix));
                         // Nothing else can be checked without a server.
                         return Ok(out);
                     }
@@ -1186,7 +1194,7 @@ fn doctor_cli(py: Python<'_>) -> PyResult<i32> {
     let url = argv
         .get(1)
         .cloned()
-        .unwrap_or_else(|| "http://localhost:54664".to_string());
+        .unwrap_or_else(|| sdr_aaronia_rs::DEFAULT_HTTP_URL.to_string());
 
     println!("Checking {url}");
     let findings = diagnose(py, &url)?;

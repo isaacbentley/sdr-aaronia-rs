@@ -7,14 +7,14 @@ handoff into pyarrow. (Not "zero-copy": one copy per read is the honest
 count.)
 
 Usage:
-    python python_arrow_example.py [http://host:54664]
+    python python_arrow_example.py [http://host:42664]
 """
 
 import sys
 
 import aaronia
 
-url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:54664"
+url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:42664"
 
 config = aaronia.SpectranConfig()
 config.http_base_url = url          # pins the HTTP backend

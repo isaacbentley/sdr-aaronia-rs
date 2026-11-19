@@ -44,7 +44,7 @@ static std::vector<SoapySDR::Kwargs> findAaronia(const SoapySDR::Kwargs &args) {
         // server. When the native SDK is installed, advertise it too:
         // until it was, the only way to reach the SDK from Soapy was to
         // already know a serial.
-        device["url"] = "http://localhost:54664";
+        device["url"] = "http://localhost:42664";
         results.push_back(device);
         // Offer the SDK too when it is installed — but not when the
         // caller wrote `sdk=false`, which reached this branch precisely
@@ -133,7 +133,7 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
         spectran_source_builder_force_source_type(builder, NativeSdk);
     } else {
         // Nothing chosen: the HTTP server's own default, as before.
-        spectran_source_builder_http_source(builder, "http://localhost:54664");
+        spectran_source_builder_http_source(builder, "http://localhost:42664");
     }
 
     // Honor the serial arg findAaronia advertises (native-SDK backend

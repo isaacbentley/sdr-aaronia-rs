@@ -20,7 +20,10 @@ In RTSA-Suite PRO:
 4. Connect the device block's output to the HTTP Server block's input.
    Without this connection the server still starts and answers `/info`,
    but `/stream` returns no data.
-5. Confirm the port. The default is **54664**, which this crate assumes.
+5. Confirm the port. Newer RTSA-Suite HTTP Server blocks default to
+   **42664**, which this crate assumes. Missions saved with an earlier
+   RTSA-Suite version keep their saved port (**54664**); pass that port
+   explicitly if your mission still uses it.
 
 Save the mission so the configuration survives a restart.
 
@@ -30,15 +33,15 @@ Check that the server is reachable and streaming before writing code.
 Run this from the machine that will run your program:
 
 ```bash
-curl http://localhost:54664/info
+curl http://localhost:42664/info
 ```
 
 The response is JSON containing `name`, `uuid`, `port` and `mission`.
 Next confirm that an input exists and carries IQ data:
 
 ```bash
-curl http://localhost:54664/inputs
-curl http://localhost:54664/sample
+curl http://localhost:42664/inputs
+curl http://localhost:42664/sample
 ```
 
 When the mission is configured correctly, `/sample` reports
@@ -46,8 +49,9 @@ When the mission is configured correctly, `/sample` reports
 means the device is not in IQ mode; return to step 2.
 
 For a server on another machine, substitute its hostname in every URL
-below (for example `http://spectran.local:54664`) and allow inbound
-traffic on port 54664 through the RTSA host's firewall.
+below (for example `http://spectran.local:42664`) and allow inbound
+traffic on port 42664 (and 54664 if connecting to older saved missions)
+through the RTSA host's firewall.
 
 ## 3. Read samples
 
@@ -58,7 +62,7 @@ use sdr_aaronia_rs::{SpectranConfig, SpectranSource};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = SpectranConfig::from_http("http://localhost:54664")
+    let config = SpectranConfig::from_http("http://localhost:42664")
         .center_frequency_hz(2.44e9)
         .sample_rate_hz(15.36e6)  // Fs, not RF bandwidth — see the table below
         .reference_level_dbm(-20.0);
@@ -77,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 
 ```bash
 # args: <center-hz> <sample-rate-hz> <url>
-cargo run --example http_iq_quickstart --features http -- 2440e6 15.36e6 http://localhost:54664
+cargo run --example http_iq_quickstart --features http -- 2440e6 15.36e6 http://localhost:42664
 ```
 
 ### Python
@@ -90,14 +94,14 @@ Check the server first. The command ships with the package and reports
 what is wrong, and how to fix it:
 
 ```bash
-aaronia-doctor http://localhost:54664
+aaronia-doctor http://localhost:42664
 ```
 
 ```python
 import aaronia
 
 with aaronia.open(
-    "http://localhost:54664", center_frequency_hz=2.44e9, bandwidth_hz=10e6
+    "http://localhost:42664", center_frequency_hz=2.44e9, bandwidth_hz=10e6
 ) as src:
     samples = src.read_samples_numpy(65536)   # numpy complex64
     print(samples[:4], src.cumulative_drops())
@@ -115,7 +119,7 @@ unpack it, and run the bundled installer:
 
 ```bash
 ./install.sh
-SoapySDRUtil --probe="driver=aaronia,url=http://localhost:54664"
+SoapySDRUtil --probe="driver=aaronia,url=http://localhost:42664"
 ```
 
 [APPS.md](APPS.md) covers GQRX, SDR++ and GNU Radio.

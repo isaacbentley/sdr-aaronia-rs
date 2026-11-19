@@ -38,7 +38,7 @@ graph TB
 |---|---|---|---|
 | `SpectranConfig::from_file("recording.rtsa")` | File | None — fails if the file is missing | All |
 | `SpectranConfig::from_http("http://192.168.1.100")` | HTTP | None — fails if unreachable | All |
-| `SpectranConfig::default()` (nothing specified) | Native SDK, when the `native-sdk` feature is enabled and the SDK library is found | Connects to the default HTTP endpoint (`http://localhost:54664`) otherwise. Since `native-sdk` is not a default feature, a stock build always resolves to HTTP. | All (SDK itself is Windows/Linux only) |
+| `SpectranConfig::default()` (nothing specified) | Native SDK, when the `native-sdk` feature is enabled and the SDK library is found | Connects to the default HTTP endpoint (`http://localhost:42664`; older saved RTSA missions use port `54664`) otherwise. Since `native-sdk` is not a default feature, a stock build always resolves to HTTP. | All (SDK itself is Windows/Linux only) |
 | Force option, e.g. `config.force_native_sdk()` | Forced type | None — fails if unavailable | Depends on forced type |
 
 ## 4. Backend Implementations

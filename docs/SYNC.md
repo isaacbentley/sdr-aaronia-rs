@@ -52,9 +52,9 @@ between them is measured rather than commanded.
    use sdr_aaronia_rs::{SpectranConfig, SpectranSource};
 
    let mut provider =
-       SpectranSource::new(SpectranConfig::from_http("http://ref.local:54664")).await?;
+       SpectranSource::new(SpectranConfig::from_http("http://ref.local:42664")).await?;
    let mut consumer =
-       SpectranSource::new(SpectranConfig::from_http("http://sat.local:54664")).await?;
+       SpectranSource::new(SpectranConfig::from_http("http://sat.local:42664")).await?;
 
    provider.set_clock_source("PPS Provider").await?;
    consumer.set_clock_source("PPS").await?;

@@ -21,7 +21,7 @@
 //! ```bash
 //! cargo run --example noaa_scanner
 //! # Or specify a custom device:
-//! NOAA_DEVICE=http://192.168.1.100:54664 cargo run --example noaa_scanner
+//! NOAA_DEVICE=http://192.168.1.100:42664 cargo run --example noaa_scanner
 //! ```
 
 use anyhow::{Context, Result};
@@ -91,7 +91,7 @@ impl ScannerConfig {
             audio_rate_hz: 48_000.0,         // Standard audio rate
             min_power_threshold_dbm: -100.0, // Conservative threshold for weak signals
             device_url: env::var("NOAA_DEVICE")
-                .unwrap_or_else(|_| "http://atc.local:54664".to_string()),
+                .unwrap_or_else(|_| "http://atc.local:42664".to_string()),
         }
     }
 }

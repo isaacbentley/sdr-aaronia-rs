@@ -4464,12 +4464,12 @@ mod tests {
 
     #[cfg(feature = "futuresdr")]
     #[tokio::test]
-    #[ignore] // Only run when explicitly requested with --ignored - requires RTSA Suite Pro at atc.local:54664
+    #[ignore] // Only run when explicitly requested with --ignored - requires RTSA Suite Pro at atc.local:42664
     async fn test_live_rtsa_suite_pro_connection() {
         use crate::http_source::HttpSourceBuilder;
 
-        // Test connection to RTSA Suite Pro at atc.local:54664
-        let base_url = "http://atc.local:54664";
+        // Test connection to RTSA Suite Pro at atc.local:42664
+        let base_url = "http://atc.local:42664";
 
         println!("🔄 Testing connection to RTSA Suite Pro at {}", base_url);
 
@@ -4531,7 +4531,7 @@ mod tests {
         // but actual device parameter changes via /remoteconfig endpoint require
         // a separate "Remote Config" license from Aaronia.
         // See: https://aaronia.com/en/software-licence-remote-config
-        let base_url = "http://atc.local:54664";
+        let base_url = "http://atc.local:42664";
 
         println!("🔧 Testing RTSA Suite Pro Configuration Options:");
         println!("⚠️  NOTE: /remoteconfig endpoint requires separate licensing");

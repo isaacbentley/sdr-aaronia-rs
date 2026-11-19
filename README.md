@@ -20,7 +20,7 @@ selects a backend and presents the same interface either way.
 | --- | --- |
 | `file_path` | Buffered playback of an RTSA capture file |
 | `http_base_url` | HTTP streaming from an RTSA-Suite server block |
-| Neither | The native SDK, falling back to `localhost:54664` |
+| Neither | The native SDK, falling back to `localhost:42664` (older saved RTSA missions use `54664`) |
 | `force_source_type` | Exactly the backend you name |
 
 ## What it does
@@ -174,7 +174,7 @@ use std::sync::Arc;
 use sdr_aaronia_rs::{HttpSourceBuilder, RecordingBreakSink, StreamDiscontinuity};
 
 let breaks = Arc::new(RecordingBreakSink::new());
-let source = HttpSourceBuilder::new("http://atc.local:54664")
+let source = HttpSourceBuilder::new("http://atc.local:42664")
     .center_frequency_hz(146.52e6)
     .sample_rate_hz(1e6)
     .with_stream_breaks(breaks.clone())
@@ -301,7 +301,7 @@ pip install python-aaronia
 import aaronia
 
 with aaronia.open(
-    "http://localhost:54664", center_frequency_hz=2.44e9, bandwidth_hz=10e6
+    "http://localhost:42664", center_frequency_hz=2.44e9, bandwidth_hz=10e6
 ) as src:
     for block in src.blocks(65536):   # numpy complex64 arrays
         process(block)
@@ -317,7 +317,7 @@ the fix for whatever is wrong. Full reference:
 ### SoapySDR: GQRX, SDR++, GNU Radio and others
 
 ```bash
-SoapySDRUtil --probe="driver=aaronia,url=http://localhost:54664"
+SoapySDRUtil --probe="driver=aaronia,url=http://localhost:42664"
 ```
 
 Every release attaches a prebuilt plugin for Linux, macOS and Windows,

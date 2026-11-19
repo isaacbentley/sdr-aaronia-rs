@@ -148,7 +148,7 @@ makes a probe worse than none:
 use std::time::Duration;
 use sdr_aaronia_rs::link_budget::{DEFAULT_LINK_FORMAT, measure_link_throughput};
 
-let m = measure_link_throughput("http://localhost:54664", Duration::from_secs(3)).await?;
+let m = measure_link_throughput("http://localhost:42664", Duration::from_secs(3)).await?;
 println!("{m}");                                   // rate, window, settle discarded
 println!(
     "widest span: {:?} Hz",
@@ -194,7 +194,7 @@ directly:
 # async fn health() -> sdr_aaronia_rs::Result<()> {
 use sdr_aaronia_rs::http_endpoints::{AuthMethod, HttpEndpointsClient};
 
-let client = HttpEndpointsClient::new("http://localhost:54664".into(), AuthMethod::None)?;
+let client = HttpEndpointsClient::new("http://localhost:42664".into(), AuthMethod::None)?;
 for block in client.get_device_health().await? {
     // `None` means the block reported none of the counters — the honest
     // answer is "cannot say", not a device that has been cleared.
@@ -215,7 +215,7 @@ level, and the decimation ladder's depth.
 # async fn caps() -> sdr_aaronia_rs::Result<()> {
 use sdr_aaronia_rs::http_endpoints::{AuthMethod, HttpEndpointsClient};
 
-let client = HttpEndpointsClient::new("http://localhost:54664".into(), AuthMethod::None)?;
+let client = HttpEndpointsClient::new("http://localhost:42664".into(), AuthMethod::None)?;
 let caps = client.get_device_capabilities().await;
 println!("{:?} serial {:?}", caps.model, caps.serial);
 if let Some(range) = caps.center_frequency_hz {
@@ -276,7 +276,7 @@ use anyhow::Result;
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = HttpEndpointsClient::new(
-        "http://127.0.0.1:54664".to_string(),
+        "http://127.0.0.1:42664".to_string(),
         AuthMethod::None
     )?;
 
@@ -314,12 +314,12 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     // Low-level FutureSDR blocks
-    let source = HttpSourceBuilder::new("http://127.0.0.1:54664")
+    let source = HttpSourceBuilder::new("http://127.0.0.1:42664")
         .center_frequency_hz(146.52e6)
         .sample_rate_hz(25e3)
         .build()?;
 
-    let sink = HttpSinkBuilder::new("http://127.0.0.1:54664")
+    let sink = HttpSinkBuilder::new("http://127.0.0.1:42664")
         .center_frequency_hz(433.0e6)
         .sample_rate_hz(1e6)
         .build()?;
@@ -347,7 +347,7 @@ use sdr_aaronia_rs::{AuthMethod, HttpSourceBuilder, StreamFormat};
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    let _advanced_source = HttpSourceBuilder::new("http://127.0.0.1:54664")
+    let _advanced_source = HttpSourceBuilder::new("http://127.0.0.1:42664")
         .center_frequency_hz(446.125e6)  // UHF band
         .sample_rate_hz(12.5e3)          // 12.5 kS/s
         .format(StreamFormat::Int16)     // High-performance format
@@ -377,7 +377,7 @@ use anyhow::Result;
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = HttpEndpointsClient::new(
-        "http://127.0.0.1:54664".to_string(),
+        "http://127.0.0.1:42664".to_string(),
         AuthMethod::None
     )?;
 
@@ -408,7 +408,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = HttpEndpointsClient::new("http://127.0.0.1:54664".to_string(), AuthMethod::None)?;
+    let client = HttpEndpointsClient::new("http://127.0.0.1:42664".to_string(), AuthMethod::None)?;
     client.control_recording(true, Some("my_recording".to_string())).await?;
     client.control_recording(false, None).await?;
     Ok(())
@@ -423,7 +423,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = HttpEndpointsClient::new("http://127.0.0.1:54664".to_string(), AuthMethod::None)?;
+    let client = HttpEndpointsClient::new("http://127.0.0.1:42664".to_string(), AuthMethod::None)?;
     let _inputs = client.get_inputs().await?;
     let _new_input = client.create_input("main", InputProcessingType::Average).await?;
     Ok(())
@@ -437,7 +437,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = HttpEndpointsClient::new("http://127.0.0.1:54664".to_string(), AuthMethod::None)?;
+    let client = HttpEndpointsClient::new("http://127.0.0.1:42664".to_string(), AuthMethod::None)?;
     let user = client.get_user().await?;
     let _auth = AuthMethod::Token { token: user.token };
     Ok(())
@@ -467,7 +467,7 @@ code you can run. CI builds them, so they stay current:
 
 ```bash
 # args: <center-hz> <sample-rate-hz> <url>
-cargo run --example http_iq_quickstart --features http -- 2440e6 15.36e6 http://localhost:54664
+cargo run --example http_iq_quickstart --features http -- 2440e6 15.36e6 http://localhost:42664
 ```
 
 ## Related

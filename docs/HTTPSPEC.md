@@ -165,9 +165,9 @@ adjacent data packets." The Rust binding exposes
 
 **Examples**:
 ```
-http://localhost:54664/stream?format=float32&limit=1000
-http://localhost:54664/stream?format=int16&scale=1000000
-http://localhost:54664/stream?rate_reduction=10   # accepted, ignored for IQ
+http://localhost:42664/stream?format=float32&limit=1000
+http://localhost:42664/stream?format=int16&scale=1000000
+http://localhost:42664/stream?rate_reduction=10   # accepted, ignored for IQ
 ```
 
 ### An unknown `format` is not an error
@@ -267,12 +267,13 @@ performs the read; `HttpSource` runs it automatically on each stream-gap
 report and publishes the result on `StreamStats::device_health`.
 
 For a definitive answer, look at the RTSA host itself — the HTTP Server
-block's own panel, or the host's socket table for peers on port 54664.
+block's own panel, or the host's socket table for peers on port 42664
+(or 54664 for missions saved with an earlier RTSA version).
 
 ### Liveness
 
 There is no status endpoint. Aaronia's own remote control notes probe
-with `curl -v http://127.0.0.1:54664/api/status` and treat the `404 Not
+with `curl -v http://127.0.0.1:42664/api/status` and treat the `404 Not
 Found` as the answer: a reply of any kind proves the port is open, the
 mission is loaded and the HTTP Server block is running. A connection
 refused or a timeout means it is not. `/info` serves the same purpose
@@ -284,8 +285,10 @@ and returns something useful, which is what this crate uses.
 **Description**: Gracefully shut down the RTSA-Suite application. **This
 targets the RTSA application's HTTP control surface — *not* the HTTP
 server block embedded in a mission graph.** Both expose REST endpoints
-on different ports, and sending this PUT to a mission's HTTP server
-block has no effect.
+on different ports (RTSA-Suite REST server defaults to TCP `42442` and
+RTSA Tablet to `42447`, previously `55442` / `55447`; the HTTP Server
+block defaults to `42664`, previously `54664`), and sending this PUT to
+a mission's HTTP server block has no effect.
 
 **Body**:
 ```json
@@ -529,7 +532,7 @@ unlike a partial capture request, which is accepted and ignored.
   "name": "Block_HTTPServer_0",
   "title": "HTTP Server",
   "uuid": "aaf2a8f7-11fa-45a3-bcfc-26aaf5957629",
-  "port": 54664,
+  "port": 42664,
   "mission": ""
 }
 ```

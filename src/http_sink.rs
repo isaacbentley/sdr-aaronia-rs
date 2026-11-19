@@ -19,7 +19,7 @@ pub struct HttpSinkBuilder {
 
 impl Default for HttpSinkBuilder {
     fn default() -> Self {
-        Self::new("http://localhost:54664")
+        Self::new(crate::DEFAULT_HTTP_URL)
     }
 }
 
@@ -347,6 +347,12 @@ impl Kernel for HttpSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_builder_uses_current_rtsa_http_port() {
+        let builder = HttpSinkBuilder::default();
+        assert_eq!(builder.base_url, crate::DEFAULT_HTTP_URL);
+    }
 
     /// Regression: if the background sender task is gone (aborted or
     /// panicked), `push_batch` must still count the batch as dropped

@@ -812,7 +812,7 @@ impl SpectranSource {
         }
 
         // Fallback to localhost HTTP
-        info!("Using localhost HTTP fallback: http://localhost:54664");
+        info!("Using localhost HTTP fallback: {}", crate::DEFAULT_HTTP_URL);
         Ok(SourceType::Http)
     }
 
@@ -939,10 +939,13 @@ impl SpectranSource {
     async fn init_http_source(&mut self) -> Result<()> {
         info!("Initializing HTTP source");
 
-        // Use provided URL or default to localhost:54664
+        // Use provided URL or default to localhost:42664
         let base_url = self.config.http_base_url.clone().unwrap_or_else(|| {
-            info!("No HTTP URL provided, using localhost default: http://localhost:54664");
-            "http://localhost:54664".to_string()
+            info!(
+                "No HTTP URL provided, using localhost default: {}",
+                crate::DEFAULT_HTTP_URL
+            );
+            crate::DEFAULT_HTTP_URL.to_string()
         });
 
         let client = HttpEndpointsClient::new(base_url.clone(), self.http_auth.clone())?;
@@ -953,7 +956,18 @@ impl SpectranSource {
         // server isn't running".
         retry_connect("Connection test", || client.test_connection())
             .await
-            .map_err(|e| Error::Protocol(format!("Failed to connect to Aaronia RTSA Suite Pro at {}. Is it running and accessible? Error: {}", base_url, e)))?;
+            .map_err(|e| {
+                let mut msg = format!(
+                    "Failed to connect to Aaronia RTSA Suite Pro at {base_url}. \
+                     Is it running and accessible? Error: {e}"
+                );
+                if let Some(hint) = crate::http_port_mismatch_hint(&base_url) {
+                    msg.push_str(" (");
+                    msg.push_str(hint);
+                    msg.push(')');
+                }
+                Error::Protocol(msg)
+            })?;
 
         if !self.listen_only {
             // Tune the hardware to the requested frequency *before* opening the
