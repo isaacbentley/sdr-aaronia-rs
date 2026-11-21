@@ -17,6 +17,8 @@ sdr-aaronia-rs = { version = "0.10", features = ["seify"] }
 
 Instantiate the device with `SpectranSeifyDevice::from_args` and use it directly (or via `seify::dev::DynDeviceBackend`). The backend is **not** part of seify's built-in enumeration registry — `seify::enumerate()` will not discover it.
 
+The backend implements seify 0.26's traits, and seify types (`Args`, `Range`, the device and streamer traits) appear in its API, so depend on the same seify release. seify 0.26 ranges cannot be empty, so a frequency, sample-rate or gain range the source does not report — any of them during `file=` playback, or one the device's configuration or health status leaves out — is an `Error::Unsupported` for that capability instead of an empty `Range`.
+
 `url=` selects the HTTP backend and `file=` playback. `sdk=true` (or
 `serial=<device serial>`) selects the Aaronia native SDK; that needs the
 crate built with both features — `features = ["seify", "native-sdk"]` —

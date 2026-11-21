@@ -8,8 +8,8 @@ recorded `.rtsa` files, into NumPy or Apache Arrow.
 
 - **PyPI package:** `python-aaronia` · **importable module:** `aaronia`
 - **Wheels:** abi3, CPython ≥ 3.9, one wheel per OS and architecture,
-  plus an sdist for other platforms. Building from the sdist requires a
-  Rust toolchain.
+  plus an sdist for other platforms. Building from the sdist requires
+  Rust 1.100 or newer.
 - **License:** GPL-3.0-or-later
 
 ## Install

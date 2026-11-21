@@ -1,7 +1,5 @@
 use futuresdr::blocks::VectorSource;
-use futuresdr::macros::connect;
-use futuresdr::runtime::Flowgraph;
-use futuresdr::runtime::Runtime;
+use futuresdr::prelude::{Flowgraph, Runtime, connect};
 use num_complex::Complex32;
 use sdr_aaronia_rs::http_endpoints::AuthMethod;
 use sdr_aaronia_rs::http_sink::HttpSinkBuilder;

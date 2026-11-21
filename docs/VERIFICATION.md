@@ -49,7 +49,7 @@ agree; the gap logic itself is unit-tested.
 ## Running them
 
 ```bash
-cargo test --all-features --test live_smoke -- --ignored --test-threads=1
+cargo test --features http,file --test live_smoke -- --ignored --test-threads=1
 ```
 
 The native-SDK set needs the machine the device is attached to, with

@@ -11,8 +11,9 @@
 //! cargo bench --bench deinterleave_dual_iq
 //! ```
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use sdr_aaronia_rs::utils::deinterleave_dual_iq;
+use std::hint::black_box;
 
 /// One SDK packet's worth of samples. Real `spectranv6/raw` packets
 /// observed on hardware carry tens of thousands of samples; 16384 is a

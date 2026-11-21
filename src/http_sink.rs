@@ -1,5 +1,9 @@
 use crate::Result;
-use futuresdr::prelude::*;
+// FutureSDR 0.10 keeps the block-author API under `runtime::dev`.
+use futuresdr::runtime::dev::{
+    BlockMeta, BufferReader, CpuBufferReader, DefaultCpuReader, Kernel, MessageOutputs, WorkIo,
+};
+use futuresdr::runtime::macros::Block;
 use num_complex::Complex32;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -109,11 +113,12 @@ pub struct HttpSink {
     tx: Option<tokio::sync::mpsc::Sender<(Vec<f32>, f64, f64)>>, // (samples, start_time, end_time)
     dropped_samples: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Handle to the background task that drains `tx` and performs the
-    /// HTTP pushes. Awaited in `Kernel::finish` so queued batches flush
-    /// before flowgraph teardown, and aborted in `Drop` if dropped early.
+    /// HTTP pushes. Awaited by `flush_and_drain_sender` when `work()` sees
+    /// the input finish, so queued batches flush before the block reports
+    /// itself finished, and aborted in `Drop` if dropped early.
     sender_task: Option<tokio::task::JoinHandle<()>>,
     #[input]
-    input: futuresdr::runtime::buffer::DefaultCpuReader<Complex32>,
+    input: DefaultCpuReader<Complex32>,
 }
 
 impl HttpSink {
@@ -207,7 +212,7 @@ impl HttpSink {
             tx: Some(tx),
             dropped_samples,
             sender_task: Some(sender_task),
-            input: futuresdr::runtime::buffer::DefaultCpuReader::default(),
+            input: DefaultCpuReader::default(),
         })
     }
 
@@ -300,9 +305,9 @@ impl Drop for HttpSink {
 impl Kernel for HttpSink {
     async fn work(
         &mut self,
-        io: &mut futuresdr::runtime::WorkIo,
-        _mio: &mut futuresdr::runtime::MessageOutputs,
-        _meta: &mut futuresdr::runtime::BlockMeta,
+        io: &mut WorkIo,
+        _mio: &mut MessageOutputs,
+        _meta: &BlockMeta,
     ) -> anyhow::Result<()> {
         let input_len = self.input.slice().len();
 

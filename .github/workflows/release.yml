@@ -65,10 +65,19 @@ jobs:
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@cargo-semver-checks
 
+      # Every feature except `futuresdr` (ci.yml's STABLE_FEATURES).
+      # semver-checks' default heuristic would enable `futuresdr` too, and
+      # FutureSDR 0.10 builds only on nightly (E0554 on this stable
+      # toolchain). Running this job on the pinned nightly instead does not
+      # work while the baseline is v0.14.0 or older: it must build as well,
+      # and its futuresdr 0.0.39 pulls futuredsp 0.0.8, whose nightly-only
+      # `fadd_fast` path current nightlies reject (see ci.yml's Miri pin).
+      # The FutureSDR block API is therefore the one surface not checked.
       - name: cargo semver-checks
         run: |
           baseline=$(git describe --tags --match 'v*' --abbrev=0 "$GITHUB_SHA^")
-          cargo semver-checks check-release --baseline-rev "$baseline"
+          cargo semver-checks check-release --baseline-rev "$baseline" \
+            --only-explicit-features --features http,file,ffi,seify,native-sdk
 
   validate:
     name: Release CI

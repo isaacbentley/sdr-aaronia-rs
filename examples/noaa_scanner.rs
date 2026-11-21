@@ -26,7 +26,7 @@
 
 use anyhow::{Context, Result};
 use futuresdr::blocks::{Apply, FirBuilder, VectorSource, audio::AudioSink};
-use futuresdr::runtime::{Flowgraph, Runtime};
+use futuresdr::prelude::{Flowgraph, Runtime, connect};
 use sdr_aaronia_rs::{Complex32, SpectranSourceBuilder};
 use std::{env, time::Duration};
 
@@ -307,17 +307,17 @@ impl NoaaScanner {
         let resample_ratio = 5; // 240 kHz 48 kHz
         let resampler = FirBuilder::resampling::<f32, f32>(1, resample_ratio);
 
-        // Audio output
-        let audio_sink = AudioSink::new(self.config.audio_rate_hz as u32, 1);
+        // Audio output: fails here when no output device takes 48 kHz mono or stereo
+        let audio_sink = AudioSink::new(self.config.audio_rate_hz as u32, 1)?;
 
         // Connect the pipeline with clean, readable calls
-        let source_id = flowgraph.add_block(iq_source);
-        let demod_id = flowgraph.add_block(fm_demod);
-        let resamp_id = flowgraph.add_block(resampler);
-        let audio_id = flowgraph.add_block(audio_sink);
+        let source_id = flowgraph.add(iq_source)?;
+        let demod_id = flowgraph.add(fm_demod)?;
+        let resamp_id = flowgraph.add(resampler)?;
+        let audio_id = flowgraph.add(audio_sink)?;
 
         // Simple, linear connection pattern
-        futuresdr::macros::connect!(flowgraph, source_id > demod_id > resamp_id > audio_id);
+        connect!(flowgraph, source_id > demod_id > resamp_id > audio_id);
 
         Ok(flowgraph)
     }

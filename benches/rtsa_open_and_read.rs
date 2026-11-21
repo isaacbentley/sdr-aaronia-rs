@@ -13,8 +13,9 @@
 //! cargo bench --bench rtsa_open_and_read
 //! ```
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use sdr_aaronia_rs::file_source::RtsaSource;
+use std::hint::black_box;
 use std::path::PathBuf;
 
 fn cw_iq_capture_path() -> PathBuf {

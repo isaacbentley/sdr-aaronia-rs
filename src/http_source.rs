@@ -1,5 +1,10 @@
 use crate::{Error, Result};
-use futuresdr::prelude::*;
+// FutureSDR 0.10 keeps the block-author API — `Kernel`, the buffer traits,
+// `WorkIo`/`MessageOutputs`/`BlockMeta` — under `runtime::dev`.
+use futuresdr::runtime::dev::{
+    BlockMeta, BufferWriter, CpuBufferWriter, DefaultCpuWriter, Kernel, MessageOutputs, WorkIo,
+};
+use futuresdr::runtime::macros::Block;
 
 use num_complex::Complex32;
 
@@ -74,11 +79,12 @@ fn copy_out(buffer: &mut std::collections::VecDeque<Complex32>, out: &mut [Compl
 ///
 /// **It does not gate `work()`.** That is what the name and the original
 /// comment here claimed, and it is not what `set_min_items` does: in
-/// FutureSDR 0.0.39 the circular buffer reads `min_items` only in
-/// `Writer::connect`, where the buffer is sized `writer.min_items +
-/// reader.min_items - 1` items rounded up to a page. Nothing consults it
-/// afterwards, and the block loop runs `work()` on any buffer notification
-/// regardless of how much room there is. What this constant buys is a
+/// FutureSDR (0.0.39 and 0.10 alike) the circular buffer reads `min_items`
+/// only when the writer is connected, where the buffer is sized
+/// `writer.min_items + reader.min_items - 1` items rounded up to a page.
+/// Nothing consults it afterwards, and the block loop runs `work()` on any
+/// buffer notification regardless of how much room there is. What this
+/// constant buys is a
 /// *buffer* big enough that the writer and the reader each get a useful
 /// block without waiting on the other — with the pipeline asking for the
 /// same figure, the connection is 131072 samples, so the source can be
@@ -279,7 +285,7 @@ impl LinkCheck {
 #[derive(Block)]
 pub struct HttpSource {
     #[output]
-    output: futuresdr::runtime::buffer::DefaultCpuWriter<Complex32>,
+    output: DefaultCpuWriter<Complex32>,
     /// Control plane: the device tune, input discovery, health reads.
     endpoints_client: HttpEndpointsClient,
     /// The stream, across its connections. Driven from `work()`.
@@ -536,8 +542,7 @@ impl HttpSource {
         // Do not run `work()` until there is a worthwhile block of room
         // downstream — see `SOURCE_MIN_OUTPUT_SAMPLES`. Set before the port is
         // connected, which is the only time it takes effect.
-        let mut output: futuresdr::runtime::buffer::DefaultCpuWriter<Complex32> =
-            Default::default();
+        let mut output: DefaultCpuWriter<Complex32> = Default::default();
         output.set_min_items(SOURCE_MIN_OUTPUT_SAMPLES);
 
         Ok(Self {
@@ -612,7 +617,7 @@ impl HttpSource {
                     if !inputs.is_empty() {
                         info!("Available inputs: {:?}", inputs);
                         // Use "main" input if available, otherwise first available
-                        let selected = if inputs.contains(&"main".to_string()) {
+                        let selected = if inputs.iter().any(|i| i == "main") {
                             "main".to_string()
                         } else {
                             inputs[0].clone()
@@ -2040,6 +2045,13 @@ impl HttpSource {
     }
 }
 
+/// Enters the Tokio runtime the block was built in for each poll of `future`.
+///
+/// Still needed under FutureSDR 0.10: its default scheduler
+/// (`SmolScheduler`) polls blocks on its own `async-executor` worker
+/// threads, which carry no Tokio context, and 0.10 has no Tokio scheduler
+/// at all. The stream engine's reqwest client and Tokio timers panic without
+/// one, so every engine future a kernel callback awaits is wrapped in this.
 struct WithTokioHandle<F> {
     handle: Option<tokio::runtime::Handle>,
     future: F,
@@ -2060,11 +2072,7 @@ impl<F: std::future::Future> std::future::Future for WithTokioHandle<F> {
 }
 
 impl Kernel for HttpSource {
-    async fn init(
-        &mut self,
-        _mio: &mut futuresdr::runtime::MessageOutputs,
-        _meta: &mut futuresdr::runtime::BlockMeta,
-    ) -> anyhow::Result<()> {
+    async fn init(&mut self, _mio: &mut MessageOutputs, _meta: &BlockMeta) -> anyhow::Result<()> {
         info!("HttpSource: INITIALIZED - Starting HTTP stream connection");
         // Enter the Tokio runtime context on each poll via `WithTokioHandle`
         // rather than calling `block_on`: `init` is an `async fn` whose future
@@ -2082,9 +2090,9 @@ impl Kernel for HttpSource {
 
     async fn work(
         &mut self,
-        io: &mut futuresdr::runtime::WorkIo,
-        _mio: &mut futuresdr::runtime::MessageOutputs,
-        _meta: &mut futuresdr::runtime::BlockMeta,
+        io: &mut WorkIo,
+        _mio: &mut MessageOutputs,
+        _meta: &BlockMeta,
     ) -> anyhow::Result<()> {
         let mut restart_triggered = false;
         // A poisoned lock still carries the request; skipping it would
@@ -2128,12 +2136,13 @@ impl Kernel for HttpSource {
         }
         let o_len = self.output.slice().len();
         // Learn the connected buffer's size once, for `buffer_capacity`.
-        // `max_items` is `usize::MAX` on an unconnected writer, so guard it.
-        if self.downstream_capacity == 0 {
-            let max = self.output.max_items();
-            if max != usize::MAX {
-                self.downstream_capacity = max;
-            }
+        // Connecting records it as the writer's `min_buffer_size_in_items`;
+        // an unconnected writer has none (0.0.39's `max_items()` reported
+        // that as `usize::MAX`, which this used to guard against).
+        if self.downstream_capacity == 0
+            && let Some(max) = self.output.buffer_requirements().min_buffer_size_in_items()
+        {
+            self.downstream_capacity = max;
         }
 
         // Keep the buffer stocked rather than topping it up only when it is
@@ -4780,5 +4789,71 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// The block in a FutureSDR 0.10 flowgraph, end to end. It is built in
+    /// a Tokio runtime and then polled on FutureSDR's own `SmolScheduler`
+    /// workers, which carry no Tokio context — what `WithTokioHandle` is
+    /// for — and it must stream the server's IQ out of its `"output"` port
+    /// as `Complex32`, report the opening geometry at sample 0, and finish
+    /// when the consumer does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_block_streams_iq_through_a_flowgraph() {
+        use futuresdr::blocks::{Head, VectorSink};
+        use futuresdr::prelude::{Flowgraph, Runtime};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PAIRS: usize = 1_024;
+        const PACKETS: usize = 8;
+        let server = MockServer::start().await;
+        let body: Vec<u8> = (0..PACKETS)
+            .flat_map(|k| wire_iq_packet(k, PAIRS, 1e6))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        // Listen only and a named input: the start reads `/info` (refused
+        // here, which it tolerates) and opens `/stream`, nothing else.
+        let breaks = std::sync::Arc::new(RecordingBreakSink::new());
+        let source = HttpSourceBuilder::new(&server.uri())
+            .format(StreamFormat::Int16)
+            .input("main")
+            .listen_only(true)
+            .with_stream_breaks(breaks.clone())
+            .build()
+            .expect("Should create HttpSource");
+
+        // Half of what one connection carries, so no reconnect is needed.
+        let want = PACKETS * PAIRS / 2;
+        let mut fg = Flowgraph::new();
+        let src = fg.add(source).expect("an HttpSource is a Send kernel");
+        let head = fg.add(Head::<Complex32>::new(want as u64)).unwrap();
+        let snk = fg.add(VectorSink::<Complex32>::new(want)).unwrap();
+        // By name, as Specola wires it.
+        fg.stream_dyn(src, "output", head, "input")
+            .expect("the source's stream output is named \"output\"");
+        fg.stream_dyn(head, "output", snk, "input").unwrap();
+
+        let fg = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Runtime::new().run_async(fg),
+        )
+        .await
+        .expect("the flowgraph finishes once the consumer has its samples")
+        .expect("the flowgraph runs");
+
+        assert_eq!(fg.block(&snk).unwrap().items().len(), want);
+        assert!(
+            matches!(
+                breaks.breaks().first(),
+                Some((0, StreamDiscontinuity::Initial { .. }))
+            ),
+            "the opening geometry is reported at sample 0: {:?}",
+            breaks.breaks()
+        );
     }
 }

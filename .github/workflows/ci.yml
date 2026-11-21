@@ -1,16 +1,32 @@
 name: CI
 
-# Five-job pipeline for the standalone aaronia-rs crate. Designed to
+# CI pipeline for the standalone aaronia-rs crate. Designed to
 # move cleanly when the crate is extracted from the orecchiette
 # monorepo: this workflow stays alongside `Cargo.toml`, so a
 # `git subtree split` or directory copy carries it intact.
 #
 # Job overview:
-#   test     — cargo fmt/clippy + test + coverage on Linux/macOS/Windows x stable
+#   test     — cargo fmt/clippy + test + coverage on Linux/macOS/Windows x stable,
+#              every feature except `futuresdr`
+#   nightly  — clippy + test --all-features (`futuresdr` included) on
+#              Linux/Windows x the pinned nightly
 #   miri     — cargo miri test on the FFI-free modules (Linux nightly)
 #   deny     — cargo-deny advisories check (RUSTSEC vulnerabilities)
-#   hack     — cargo hack check --each-feature (per-feature build isolation)
+#   hack     — cargo hack check --each-feature (per-feature build isolation),
+#              `futuresdr` excluded
 #   machete  — cargo machete (unused dependency check)
+#   python   — maturin build + pytest of the Python bindings
+#   soapy    — SoapySDR plugin cmake build + load check (Linux/macOS)
+#
+# Stable/nightly split: FutureSDR 0.10 enables unstable language
+# features, so anything that compiles the `futuresdr` feature fails on
+# stable with E0554. The stable jobs name every other feature
+# (`STABLE_FEATURES` below) instead of passing `--all-features`, so the
+# configurations downstream users build on stable (http + file +
+# native-sdk) stay covered on stable, and the `nightly` job covers
+# `futuresdr`. A new Cargo feature goes into `STABLE_FEATURES` (and the
+# copies in scripts/ci-local.sh and release.yml's semver-checks step)
+# unless it needs nightly too.
 #
 # `cargo semver-checks` runs at release time (see release.yml), not here:
 # with `continue-on-error: true` it could never gate a merge, so running it
@@ -42,6 +58,10 @@ env:
   # via `gh workflow run ci.yml -f proptest_cases=4096` once dispatch
   # inputs are wired up. For now the default is fine for PRs.
   PROPTEST_CASES: "256"
+  # Every Cargo feature except `futuresdr`, which needs nightly (see the
+  # header). Steps expand it as `${{ env.STABLE_FEATURES }}`, not
+  # `$STABLE_FEATURES`, so it reads the same in the Windows legs' pwsh.
+  STABLE_FEATURES: "http,file,ffi,seify,native-sdk"
 
 jobs:
   test:
@@ -84,7 +104,8 @@ jobs:
         # --workspace: python-aaronia is a workspace member that no other
         # job lints (the python job only builds/tests it). clippy compiles
         # without linking, so the pyo3 cdylib is safe to include here.
-        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        # Not --all-features: `futuresdr` needs nightly (the `nightly` job).
+        run: cargo clippy --workspace --features ${{ env.STABLE_FEATURES }} --all-targets -- -D warnings
 
       - name: Install cargo-llvm-cov
         if: matrix.os == 'ubuntu-latest'
@@ -92,11 +113,11 @@ jobs:
 
       - name: cargo test (macOS/Windows)
         if: matrix.os != 'ubuntu-latest'
-        run: cargo test --all-features
+        run: cargo test --features ${{ env.STABLE_FEATURES }}
 
       - name: cargo test + coverage (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+        run: cargo llvm-cov --features ${{ env.STABLE_FEATURES }} --lcov --output-path lcov.info
 
       - name: Upload to Codecov
         if: matrix.os == 'ubuntu-latest'
@@ -105,6 +126,60 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false  # coverage drop != broken build
 
+  # The `futuresdr` half of the stable/nightly split (see the header):
+  # FutureSDR 0.10 builds only on nightly, so this is the one job that
+  # compiles `--all-features`. Linux and Windows because `SdkSinkBlock`
+  # (futuresdr + native-sdk) exists only there; macOS is left out because
+  # the rest of the futuresdr code is platform-independent and the Linux
+  # leg already builds it.
+  nightly:
+    name: Nightly all-features (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Longer cap than `test`: this leg compiles the workspace twice
+    # (clippy, then test) on an uncached toolchain, Windows included.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-build-deps
+
+      # Pinned, not `nightly`: a moving nightly breaks the build whenever
+      # an unstable feature FutureSDR uses changes shape (as `fadd_fast`
+      # did for the Miri job's pin). This is the nightly the FutureSDR
+      # 0.10 port was verified on; bump it deliberately, together with
+      # NIGHTLY_TOOLCHAIN in scripts/ci-local.sh and CONTRIBUTING.md.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-21
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy --all-features
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+      - name: cargo test --all-features
+        run: cargo test --all-features
+
+      # The stable `hack` job excludes `futuresdr`; this is the remainder,
+      # `futuresdr` on its own (--no-default-features --features futuresdr).
+      - name: Install cargo-hack
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: cargo hack (futuresdr alone)
+        if: runner.os == 'Linux'
+        run: |
+          cargo hack check --each-feature --no-dev-deps --include-features futuresdr
+          cargo hack check --each-feature --all-targets --include-features futuresdr
 
   miri:
     name: Miri (decompression + http_streaming + utils)
@@ -134,11 +209,13 @@ jobs:
       # Allowlist of modules that don't touch FFI / mmap / syscalls.
       # Miri refuses to interpret FFI calls, so the native_sdk / file_source
       # paths are intentionally excluded.
+      # --ignore-rust-version: the pinned nightly is 1.94, older than the
+      # crate's `rust-version` (1.100), which cargo would otherwise refuse.
       - name: cargo miri test (allowlisted modules)
         run: |
-          cargo miri test --lib decompression
-          cargo miri test --lib http_streaming
-          cargo miri test --lib utils
+          cargo miri test --ignore-rust-version --lib decompression
+          cargo miri test --ignore-rust-version --lib http_streaming
+          cargo miri test --ignore-rust-version --lib utils
 
   deny:
     name: cargo-deny
@@ -176,10 +253,13 @@ jobs:
       - name: Install cargo-hack
         uses: taiki-e/install-action@cargo-hack
 
+      # --exclude-features futuresdr: it needs nightly, so the `nightly`
+      # job checks it on its own. Excluding it also drops cargo-hack's
+      # --all-features run, which the `nightly` job's clippy covers.
       - name: cargo hack
         run: |
-          cargo hack check --each-feature --no-dev-deps
-          cargo hack check --each-feature --all-targets
+          cargo hack check --each-feature --no-dev-deps --exclude-features futuresdr
+          cargo hack check --each-feature --all-targets --exclude-features futuresdr
 
   machete:
     name: cargo-machete (unused dependencies)

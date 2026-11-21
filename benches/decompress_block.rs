@@ -13,8 +13,9 @@
 //! cargo bench --bench decompress_block
 //! ```
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use sdr_aaronia_rs::decompression::Decompressor;
+use std::hint::black_box;
 
 /// Linear congruential generator. Stable across platforms and
 /// Rust versions, so the byte sequence the bench feeds the

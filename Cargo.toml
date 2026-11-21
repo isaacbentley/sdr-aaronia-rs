@@ -4,6 +4,7 @@ description = "Unified Rust interface for Aaronia Spectran Spectrum Analyzers / 
 license = "GPL-3.0-or-later"
 version = "0.14.0"
 edition = "2024"
+rust-version = "1.100"
 repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
 readme = "README.md"
 keywords = ["sdr", "aaronia", "spectran", "rf", "iq"]
@@ -28,24 +29,24 @@ reqwest = { version = "0.13", features = ["blocking", "json", "stream", "deflate
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 thiserror = "2.0"
-bytes = { version = "1.0", optional = true }
-tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time", "macros"], optional = true }
+bytes = { version = "1.12", optional = true }
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "macros"], optional = true }
 tracing = "0.1"
-url = { version = "2.4", optional = true }
-futuresdr = { version = "0.0.39", default-features = false, features = ["audio"], optional = true }
+url = { version = "2.5", optional = true }
+futuresdr = { version = "0.10", default-features = false, features = ["audio"], optional = true }
 futures = { version = "0.3", optional = true }
 byteorder = { version = "1.5", optional = true }
-bitflags = { version = "2.0", optional = true }
-half = { version = "2.3", optional = true }
+bitflags = { version = "2.13", optional = true }
+half = { version = "2.7", optional = true }
 
 num-complex = "0.4"
-tempfile = { version = "3.8", optional = true }
+tempfile = { version = "3.27", optional = true }
 anyhow = { version = "1.0", optional = true }
 # default-features = false: seify's defaults include its own driver
 # backends (soapy -> soapysdr-sys, which needs system SoapySDR +
 # libclang at build time and is BSL-1.0-licensed). We only need the
 # core traits for our backend impl.
-seify = { version = "0.21", optional = true, default-features = false }
+seify = { version = "0.26", optional = true, default-features = false }
 
 [dev-dependencies]
 anyhow = "1.0"
@@ -56,14 +57,14 @@ tracing-subscriber = "0.3"  # For examples
 # plugin is covered by ci.yml's dedicated `soapy` job (cmake build +
 # SoapySDRUtil load check) and by live testing through SoapySDRUtil.
 
-proptest = "1.5"
-criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.12"
+criterion = { version = "0.8", features = ["html_reports"] }
 wiremock = "0.6" # For HTTP endpoint resiliency testing
 
 # The native-SDK live suite uses `#[tokio::test]`, and must build in a
 # `--no-default-features --features native-sdk` configuration where the
 # `http` feature is not pulling `dep:tokio` in.
-tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 # Each `[[bench]]` declares one criterion harness binary. Run with
 # `cargo bench --bench <name>`. Coverage:
@@ -181,8 +182,8 @@ required-features = ["http", "file"]
 
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
-libloading = { version = "0.7", optional = true }
-widestring = { version = "1.1", optional = true }
+libloading = { version = "0.9", optional = true }
+widestring = { version = "1.2", optional = true }
 
 [workspace]
 members = ["python-aaronia"]

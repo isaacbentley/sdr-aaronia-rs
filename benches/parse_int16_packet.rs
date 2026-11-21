@@ -17,8 +17,9 @@
 //! ```
 
 use bytes::Bytes;
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use sdr_aaronia_rs::http_streaming::{StreamFormat, StreamParser};
+use std::hint::black_box;
 
 /// Build one int16 packet: JSON header + 0x1E + `samples` IQ pairs.
 /// Each IQ pair is 4 bytes (2 × i16). The encode scale is handed to

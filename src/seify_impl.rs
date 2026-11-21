@@ -79,6 +79,24 @@ where
     }
 }
 
+/// Build a seify [`Range`] from a reported capability. seify 0.26 ranges
+/// are nonempty and finite by construction, so a bound the device does not
+/// report is [`seify::Error::Unsupported`] for that capability instead of
+/// the empty range earlier seify releases allowed.
+fn capability_range(
+    capability: seify::Capability,
+    what: &str,
+    items: Vec<RangeItem>,
+) -> std::result::Result<Range, seify::Error> {
+    if items.is_empty() {
+        return Err(seify::Error::unsupported_reason(
+            capability,
+            format!("the device does not report a {what} range"),
+        ));
+    }
+    Range::new(items)
+}
+
 /// Seify device wrapper around [`SpectranSource`]. `Clone` shares the
 /// underlying source/tuning (required by seify's `Device::from_impl`).
 #[derive(Clone)]
@@ -208,13 +226,15 @@ impl FrequencyControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(Range::new(
+        capability_range(
+            seify::Capability::Frequency,
+            "centre frequency",
             self.capabilities
                 .center_frequency_hz
                 .into_iter()
                 .map(|r| RangeItem::Interval(r.min, r.max))
                 .collect(),
-        ))
+        )
     }
 
     fn frequency_components(
@@ -301,14 +321,16 @@ impl SampleRateControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(Range::new(
+        capability_range(
+            seify::Capability::SampleRate,
+            "sample-rate",
             self.capabilities
                 .sample_rates()
                 .unwrap_or_default()
                 .into_iter()
                 .map(RangeItem::Value)
                 .collect(),
-        ))
+        )
     }
 
     fn set_sample_rate(
@@ -373,13 +395,15 @@ impl GainControl for SpectranSeifyDevice {
         if direction != Direction::Rx || channel != 0 {
             return Err(seify::Error::invalid_channel(direction, channel, 1));
         }
-        Ok(Range::new(
+        capability_range(
+            seify::Capability::Gain,
+            "reference-level",
             self.capabilities
                 .reference_level_dbm
                 .into_iter()
                 .map(|r| RangeItem::Interval(r.min, r.max))
                 .collect(),
-        ))
+        )
     }
 
     fn set_gain_element(
@@ -565,5 +589,38 @@ impl RxStreamer for SpectranSeifyRxStreamer {
         }
 
         Ok(read)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_range_reports_a_missing_range_as_unsupported() {
+        let err = capability_range(seify::Capability::SampleRate, "sample-rate", Vec::new())
+            .expect_err("seify 0.26 has no empty Range");
+        assert!(
+            matches!(
+                err,
+                seify::Error::Unsupported {
+                    capability: seify::Capability::SampleRate,
+                    reason: Some(_),
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn capability_range_keeps_the_reported_items() {
+        let items = vec![RangeItem::Value(1e6), RangeItem::Interval(9e3, 6e9)];
+        let range = capability_range(
+            seify::Capability::Frequency,
+            "centre frequency",
+            items.clone(),
+        )
+        .expect("finite, ordered items are a valid Range");
+        assert_eq!(range.items(), items.as_slice());
     }
 }

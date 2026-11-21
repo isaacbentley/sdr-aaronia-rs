@@ -1337,7 +1337,8 @@ impl HttpEndpointsClient {
     }
 
     /// The base URL every endpoint is built on, without a trailing slash.
-    #[cfg(test)]
+    /// Read only by `HttpStreamEngine::stream_url`, an `HttpSource` test aid.
+    #[cfg(all(test, feature = "futuresdr"))]
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
     }

@@ -712,7 +712,8 @@ impl HttpStreamEngine {
         });
     }
 
-    /// The URL the next connection opens.
+    /// The URL the next connection opens. Only `HttpSource`'s tests ask.
+    #[cfg(feature = "futuresdr")]
     pub(crate) fn stream_url(&self) -> String {
         self.params.stream_url(self.stream_client.base_url())
     }

@@ -303,16 +303,18 @@ async fn main() -> Result<()> {
 
 ## FutureSDR integration
 
-For existing [FutureSDR](https://github.com/FutureSDR/FutureSDR) users, the low-level block API integrates high-throughput streams (both RX and TX) into a flowgraph. `HttpSourceBuilder`, `HttpSinkBuilder`, and the corresponding blocks require the `futuresdr` feature:
+For existing [FutureSDR](https://github.com/FutureSDR/FutureSDR) users, the low-level block API integrates high-throughput streams (both RX and TX) into a flowgraph. `HttpSourceBuilder`, `HttpSinkBuilder`, and the corresponding blocks require the `futuresdr` feature, which builds against FutureSDR 0.10 — and FutureSDR 0.10 compiles only on a nightly toolchain (it enables unstable language features), so a build with this feature needs one too. The blocks are ordinary 0.10 kernels: `HttpSource` has one `Complex32` stream output named `"output"`, `HttpSink` and `SdkSinkBlock` one `Complex32` input named `"input"`. Both HTTP blocks must be built inside a Tokio runtime; they keep its handle and enter it while FutureSDR polls them on its own worker threads.
 
 ```rust,no_run
 # #[cfg(feature = "futuresdr")]
 # mod gated {
 use sdr_aaronia_rs::{HttpSourceBuilder, HttpSinkBuilder};
-use futuresdr::runtime::Flowgraph;
+use futuresdr::blocks::{NullSink, VectorSource};
+use futuresdr::prelude::{Complex32, Flowgraph, Runtime, connect};
 use anyhow::Result;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Low-level FutureSDR blocks
     let source = HttpSourceBuilder::new("http://127.0.0.1:42664")
         .center_frequency_hz(146.52e6)
@@ -324,12 +326,20 @@ fn main() -> Result<()> {
         .sample_rate_hz(1e6)
         .build()?;
 
-    // Use in FutureSDR flowgraph
+    // Use in a FutureSDR 0.10 flowgraph. By port name, as a source chosen
+    // at run time is wired: `add` returns a typed `BlockRef`, and
+    // `stream_dyn` (0.0.39's `connect_dyn`) connects it.
     let mut fg = Flowgraph::new();
-    let _src = fg.add_block(source);
-    let _sink = fg.add_block(sink);
-    // ... connect to other blocks
+    let src = fg.add(source)?;
+    let rx = fg.add(NullSink::<Complex32>::new())?;
+    fg.stream_dyn(src, "output", rx, "input")?;
 
+    // By type, through the macro.
+    let burst = VectorSource::<Complex32>::new(vec![Complex32::new(1.0, 0.0); 4096]);
+    connect!(fg, burst > sink);
+
+    // The source streams until the flowgraph is stopped.
+    Runtime::new().run_async(fg).await?;
     Ok(())
 }
 # }

@@ -119,3 +119,15 @@ FutureSDR integration is available under the `futuresdr` feature gate. The crate
 │                 │    │ HttpStreamEngine   │
 └─────────────────┘    └────────────────────┘
 ```
+
+The blocks target FutureSDR 0.10. Each is a `#[derive(Block)]` struct implementing `futuresdr::runtime::dev::Kernel`; the stream ports are `circular` CPU buffers (`DefaultCpuWriter`/`DefaultCpuReader`) of `Complex32`:
+
+| Block | Ports | Kernel callbacks |
+|---|---|---|
+| `HttpSource` | output `"output"` | `init` opens the first connection (and the one-shot tune); `work` drives the engine, refills the sample buffer and publishes breaks before the samples they precede |
+| `HttpSink` | input `"input"` | `work` batches `buffer_size` samples per `/sample` push, timed `end = start + n / rate` back to back; on input end it flushes and drains its sender task before finishing |
+| `SdkSinkBlock` (`native-sdk`, Linux/Windows) | input `"input"` | `work` sends up to `samples_per_burst` samples as one `TxBurst`, scheduled monotonically against the device's master stream clock |
+
+None declares message ports; retunes reach `HttpSource` through the shared `StreamStats::restart_pending` flag, not a message handler. FutureSDR's default scheduler polls blocks on its own `async-executor` worker threads, which have no Tokio context, while the engine's reqwest client and timers need one. `HttpSource` therefore keeps the handle of the Tokio runtime it was built in (building outside one is an error) and enters it on every poll of an engine future (`WithTokioHandle`); `HttpSink` spawns its sender task on that runtime at build time. `Flowgraph::add` requires a `Send` kernel with `Send` futures, so `SdkSinkBlock` carries an `unsafe impl Send` over the SDK's raw handles.
+
+FutureSDR 0.10 enables unstable language features (`return_type_notation`, `specialization` and others), so it, and with it this crate's `futuresdr` feature, builds only on a nightly toolchain. Everything else builds on stable.

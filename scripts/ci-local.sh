@@ -19,9 +19,16 @@
 #   scripts/ci-local.sh            # run everything (recommended pre-push)
 #   SKIP="miri hack" scripts/ci-local.sh   # skip named steps
 #
-# Tools beyond stable cargo: cargo-deny, cargo-hack, cargo-machete, and
-# the pinned miri nightly. The preflight check below prints the install
-# command for anything missing.
+# Stable/nightly split, as in ci.yml: FutureSDR 0.10 builds only on
+# nightly (E0554 on stable), so the stable steps name every feature but
+# `futuresdr` ($STABLE_FEATURES) instead of passing --all-features, and
+# the `nightly` step runs the --all-features checks on the pinned
+# $NIGHTLY_TOOLCHAIN.
+#
+# Tools beyond stable cargo: cargo-deny, cargo-hack, cargo-machete, the
+# pinned futuresdr nightly (with clippy) and the pinned miri nightly.
+# The preflight check below prints the install command for anything
+# missing.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -33,6 +40,12 @@ export PROPTEST_CASES="${PROPTEST_CASES:-256}"
 # the futuredsp `fadd_fast` breakage on current nightlies). Bump both
 # together.
 MIRI_TOOLCHAIN=nightly-2026-01-01
+
+# ci.yml's STABLE_FEATURES (every feature except `futuresdr`; release.yml's
+# semver-checks step carries a copy too) and the `nightly` job's pinned
+# toolchain. Bump/extend them together.
+STABLE_FEATURES=http,file,ffi,seify,native-sdk
+NIGHTLY_TOOLCHAIN=nightly-2026-11-21
 
 SKIP="${SKIP:-}"
 skipped() { [[ " $SKIP " == *" $1 "* ]]; }
@@ -56,12 +69,17 @@ require() { # require <step> <probe...> -- <install hint>
 # "no such command: miri" — so resolve the toolchain bin dir explicitly
 # and prepend it.
 miri_bin() { dirname "$(rustup which --toolchain "$MIRI_TOOLCHAIN" cargo 2>/dev/null)"; }
+# Same for the futuresdr nightly.
+nightly_bin() { dirname "$(rustup which --toolchain "$NIGHTLY_TOOLCHAIN" cargo 2>/dev/null)"; }
 
 require deny    cargo deny --version           -- "cargo install cargo-deny"
 require hack    cargo hack --version           -- "cargo install cargo-hack"
 require machete cargo machete --version        -- "cargo install cargo-machete"
 require miri    env PATH="$(miri_bin):$PATH" cargo miri --version \
         -- "rustup toolchain install $MIRI_TOOLCHAIN --component miri"
+require nightly env PATH="$(nightly_bin):$PATH" cargo clippy --version \
+        -- "rustup toolchain install $NIGHTLY_TOOLCHAIN --component clippy"
+require nightly cargo hack --version           -- "cargo install cargo-hack"
 if [[ $missing -ne 0 ]]; then
     echo "aborting before running anything; install the tools above or SKIP the steps." >&2
     exit 1
@@ -75,8 +93,9 @@ fi
 
 if ! skipped clippy; then
     # --workspace pulls in python-aaronia, which no other step lints.
-    step "cargo clippy --workspace --all-features --all-targets -- -D warnings"
-    cargo clippy --workspace --all-features --all-targets -- -D warnings
+    # Not --all-features: `futuresdr` needs nightly (the nightly step).
+    step "cargo clippy --workspace --features $STABLE_FEATURES --all-targets -- -D warnings"
+    cargo clippy --workspace --features "$STABLE_FEATURES" --all-targets -- -D warnings
 fi
 
 # ---- untagged markdown fences --------------------------------------
@@ -102,8 +121,21 @@ fi
 if ! skipped test; then
     # CI's Linux leg wraps this in cargo-llvm-cov for coverage; the
     # test outcome is identical, so plain `cargo test` suffices here.
-    step "cargo test --all-features  (PROPTEST_CASES=$PROPTEST_CASES)"
-    cargo test --all-features
+    step "cargo test --features $STABLE_FEATURES  (PROPTEST_CASES=$PROPTEST_CASES)"
+    cargo test --features "$STABLE_FEATURES"
+fi
+
+# ---- nightly job (--all-features, futuresdr included) --------------
+# CI runs this on ubuntu + windows; on macOS --all-features silently
+# skips the native-sdk modules, SdkSinkBlock included (the vm step
+# covers the Linux side). The hack pair is CI's ubuntu-only remainder
+# of the stable hack job: `futuresdr` on its own.
+if ! skipped nightly; then
+    step "cargo clippy/test --all-features + hack (futuresdr alone) on $NIGHTLY_TOOLCHAIN"
+    PATH="$(nightly_bin):$PATH" cargo clippy --workspace --all-features --all-targets -- -D warnings
+    PATH="$(nightly_bin):$PATH" cargo test --all-features
+    PATH="$(nightly_bin):$PATH" cargo hack check --each-feature --no-dev-deps --include-features futuresdr
+    PATH="$(nightly_bin):$PATH" cargo hack check --each-feature --all-targets --include-features futuresdr
 fi
 
 # ---- deny job ------------------------------------------------------
@@ -116,9 +148,10 @@ fi
 
 # ---- hack job ------------------------------------------------------
 if ! skipped hack; then
-    step "cargo hack check --each-feature (--no-dev-deps + --all-targets)"
-    cargo hack check --each-feature --no-dev-deps
-    cargo hack check --each-feature --all-targets
+    # futuresdr excluded: the nightly step checks it on its own.
+    step "cargo hack check --each-feature --exclude-features futuresdr (--no-dev-deps + --all-targets)"
+    cargo hack check --each-feature --no-dev-deps --exclude-features futuresdr
+    cargo hack check --each-feature --all-targets --exclude-features futuresdr
 fi
 
 # ---- machete job ---------------------------------------------------
@@ -130,9 +163,11 @@ fi
 # ---- miri job (FFI-free module allowlist, pinned nightly) ----------
 if ! skipped miri; then
     step "cargo miri test (decompression, http_streaming, utils) on $MIRI_TOOLCHAIN"
-    PATH="$(miri_bin):$PATH" cargo miri test --lib decompression
-    PATH="$(miri_bin):$PATH" cargo miri test --lib http_streaming
-    PATH="$(miri_bin):$PATH" cargo miri test --lib utils
+    # --ignore-rust-version: the pinned nightly predates the crate's
+    # `rust-version`, as in ci.yml.
+    PATH="$(miri_bin):$PATH" cargo miri test --ignore-rust-version --lib decompression
+    PATH="$(miri_bin):$PATH" cargo miri test --ignore-rust-version --lib http_streaming
+    PATH="$(miri_bin):$PATH" cargo miri test --ignore-rust-version --lib utils
 fi
 
 # ---- OS-gated native-sdk code (compiled only on CI's linux/windows) -
@@ -162,7 +197,7 @@ fi
 # (~/Documents ⇒ EDEADLK), hence the rsync to /private/tmp first.
 if ! skipped vm; then
     if container system status >/dev/null 2>&1; then
-        step "CI ubuntu leg in Linux VM: clippy --workspace --all-features --all-targets + cargo test --all-features"
+        step "CI ubuntu legs in Linux VM: clippy --workspace --all-targets + cargo test, stable ($STABLE_FEATURES) and $NIGHTLY_TOOLCHAIN (--all-features)"
         # Dedicated directory: nothing else may write here (a shared
         # scratch copy once had another tool rsync over it mid-run).
         vm_dir=/private/tmp/aaronia-ci-vm
@@ -170,7 +205,10 @@ if ! skipped vm; then
             --exclude .git --exclude .claude ./ "$vm_dir/"
         # The full --all-targets matters: an OS-gated *example* with a
         # stale call signature shipped red to CI past a --lib-only VM
-        # run. This mirrors CI's ubuntu leg command-for-command.
+        # run. This mirrors CI's ubuntu `test` and `nightly` legs
+        # command-for-command (the nightly leg is where SdkSinkBlock,
+        # futuresdr + native-sdk, compiles). The pinned nightly is
+        # installed per run too: --rm discards it with the container.
         # rust:slim lacks what the GitHub ubuntu runner image ships
         # preinstalled: clippy, pkg-config, ALSA headers (futuresdr's
         # audio feature -> alsa-sys), and python3 (pyo3's build script
@@ -183,12 +221,17 @@ if ! skipped vm; then
         # python-aaronia's Python-side behavior is covered by the
         # python step below and CI's maturin+pytest job.
         container run --rm --memory 8g --cpus 4 \
-            -v "$vm_dir":/w -w /w -e PROPTEST_CASES="$PROPTEST_CASES" rust:slim \
+            -v "$vm_dir":/w -w /w -e PROPTEST_CASES="$PROPTEST_CASES" \
+            -e STABLE_FEATURES="$STABLE_FEATURES" -e NIGHTLY_TOOLCHAIN="$NIGHTLY_TOOLCHAIN" rust:slim \
             sh -c 'rustup component add clippy >/dev/null 2>&1; \
+                   rustup toolchain install "$NIGHTLY_TOOLCHAIN" --profile minimal \
+                       --component clippy >/dev/null 2>&1; \
                    apt-get update -qq >/dev/null && \
                    apt-get install -y -qq pkg-config libasound2-dev python3 >/dev/null; \
-                   cargo clippy --workspace --all-features --all-targets -- -D warnings \
-                   && cargo test --all-features'
+                   cargo clippy --workspace --features "$STABLE_FEATURES" --all-targets -- -D warnings \
+                   && cargo test --features "$STABLE_FEATURES" \
+                   && cargo +"$NIGHTLY_TOOLCHAIN" clippy --workspace --all-features --all-targets -- -D warnings \
+                   && cargo +"$NIGHTLY_TOOLCHAIN" test --all-features'
     else
         echo "vm step: 'container system start' not running — skipping" \
              "(gated-module tests only compile on CI's linux/windows legs)" >&2

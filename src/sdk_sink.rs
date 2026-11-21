@@ -324,15 +324,14 @@ impl Default for SdkSink {
 #[cfg(feature = "futuresdr")]
 pub mod futuresdr_sink {
     use super::*;
-    // `BufferReader`/`CpuBufferReader` provide the `init`/`validate`/
-    // `finish`/`notify_finished`/`slice`/`finished`/`consume` methods that
-    // the `#[derive(Block)]` expansion below calls on the `#[input]`
-    // field. The traits are implemented for `circular::Reader<D>` (the
-    // concrete type behind `DefaultCpuReader`) but must be explicitly in
-    // scope for the derive-generated code to see them.
-    use futuresdr::macros::Block;
-    use futuresdr::prelude::{BufferReader, CpuBufferReader};
-    use futuresdr::runtime::Kernel;
+    // `BufferReader`/`CpuBufferReader` provide the `slice`/`finished`/
+    // `consume` methods `work()` calls on the `#[input]` field. FutureSDR
+    // 0.10 keeps them, `Kernel` and the `work()` argument types under
+    // `runtime::dev`; the `#[derive(Block)]` expansion names its own paths.
+    use futuresdr::runtime::dev::{
+        BlockMeta, BufferReader, CpuBufferReader, DefaultCpuReader, Kernel, MessageOutputs, WorkIo,
+    };
+    use futuresdr::runtime::macros::Block;
     use tracing::{error, warn};
 
     /// How far ahead of the device's master stream time a burst is
@@ -371,20 +370,20 @@ pub mod futuresdr_sink {
         samples_per_burst: usize,
         next_tx_time_s: Option<f64>,
         #[input]
-        input: futuresdr::runtime::buffer::DefaultCpuReader<Complex32>,
+        input: DefaultCpuReader<Complex32>,
     }
 
     // SAFETY: `SdkSink` owns a `NativeSdkSource`, which in turn owns
     // `AARTSAAPI_Handle`/`AARTSAAPI_Device`/`AARTSAAPI_Config` — thin
     // wrappers around a raw `*mut c_void` into the vendor SDK's internal
-    // state — so `Send`/`Sync` are not auto-derived. `futuresdr::runtime::
-    // Kernel: Send` requires the whole block to be `Send` because the
-    // executor may move a block to a different worker thread between
-    // polls; `Kernel::work` takes `&mut self`, so the block is never
-    // accessed concurrently from two threads at once (the same reasoning
-    // `TxStream` above uses for its own `unsafe impl Send`). `Sync` is
-    // deliberately not implemented, since nothing here takes `&self`
-    // concurrently.
+    // state — so `Send`/`Sync` are not auto-derived. FutureSDR 0.10's
+    // `Flowgraph::add` (and the `connect!` macro) accept only `Send` blocks
+    // with `Send` futures, because the normal-domain executor may move a
+    // block to a different worker thread between polls; `Kernel::work`
+    // takes `&mut self`, so the block is never accessed concurrently from
+    // two threads at once (the same reasoning `TxStream` above uses for its
+    // own `unsafe impl Send`). `Sync` is deliberately not implemented,
+    // since nothing here takes `&self` concurrently.
     //
     // What this does NOT verify: whether the Aaronia vendor SDK's C API
     // tolerates a device handle being *used* from a different OS thread
@@ -393,7 +392,9 @@ pub mod futuresdr_sink {
     // hardware-unverified — consistent with this crate's existing
     // caveats on other unverified hardware paths (`RxChannel::Rx2`/
     // `Rx1And2`, the TX burst path, `configure_sweepsa`). Revisit if a
-    // real device exhibits cross-thread handle issues.
+    // real device exhibits cross-thread handle issues: FutureSDR 0.10's
+    // local domains (`Flowgraph::local_domain`) run a block on one thread
+    // for its whole life, which would pin the handle without this impl.
     unsafe impl Send for SdkSinkBlock {}
 
     impl SdkSinkBlock {
@@ -403,7 +404,7 @@ pub mod futuresdr_sink {
                 channel,
                 samples_per_burst: samples_per_burst.max(1),
                 next_tx_time_s: None,
-                input: futuresdr::runtime::buffer::DefaultCpuReader::default(),
+                input: DefaultCpuReader::default(),
             }
         }
     }
@@ -411,9 +412,9 @@ pub mod futuresdr_sink {
     impl Kernel for SdkSinkBlock {
         async fn work(
             &mut self,
-            io: &mut futuresdr::runtime::WorkIo,
-            _mio: &mut futuresdr::runtime::MessageOutputs,
-            _meta: &mut futuresdr::runtime::BlockMeta,
+            io: &mut WorkIo,
+            _mio: &mut MessageOutputs,
+            _meta: &BlockMeta,
         ) -> anyhow::Result<()> {
             // `input_len` is captured as a plain `usize` (not a held slice
             // reference) so nothing borrows `self.input` across the later
@@ -498,6 +499,32 @@ pub mod futuresdr_sink {
                 io.call_again = true;
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use futuresdr::blocks::VectorSource;
+        use futuresdr::prelude::Flowgraph;
+
+        /// FutureSDR 0.10 checks that a block and its futures are `Send`
+        /// where the block is added to a flowgraph, not at the `impl Kernel`
+        /// as 0.0.39 did, and nothing else in this crate adds an
+        /// `SdkSinkBlock` to one. This is that check, plus the input's port
+        /// name. No device is touched: an unopened `SdkSink` holds no SDK
+        /// handle, and the flowgraph is never run.
+        #[test]
+        fn the_block_joins_a_flowgraph_by_its_input_name() {
+            let mut fg = Flowgraph::new();
+            let src = fg
+                .add(VectorSource::<Complex32>::new(Vec::new()))
+                .expect("a vector source joins the flowgraph");
+            let sink = fg
+                .add(SdkSinkBlock::new(SdkSink::new(), 0, 1024))
+                .expect("an SdkSinkBlock is a Send kernel");
+            fg.stream_dyn(src, "output", sink, "input")
+                .expect("the stream input is named \"input\"");
         }
     }
 }

@@ -34,8 +34,8 @@ selects a backend and presents the same interface either way.
   and Linux, including transmit. The SDK is not available for macOS.
 - **Controls and monitors the device**: streaming parameters, health,
   input enumeration and the configuration tree.
-- **Plugs into FutureSDR** with `HttpSource` and `HttpSink` flowgraph
-  blocks.
+- **Plugs into FutureSDR** 0.10 with `HttpSource` and `HttpSink` flowgraph
+  blocks (the `futuresdr` feature, which needs a nightly toolchain).
 - **Says whether the link can carry the span** before a capture is
   wasted: `link_budget` measures the path end to end and names the
   widest span on the device's decimation ladder that fits it.
@@ -243,7 +243,8 @@ Add the following to your `Cargo.toml`:
 sdr-aaronia-rs = "0.14"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
-# To enable additional backends, opt into their features (e.g. native-sdk, futuresdr)
+# To enable additional backends, opt into their features (e.g. native-sdk, futuresdr;
+# futuresdr needs a nightly toolchain, see Feature Flags)
 # sdr-aaronia-rs = { version = "0.14", features = ["native-sdk", "futuresdr"] }
 ```
 
@@ -405,14 +406,15 @@ behaviour of `auto_reconnect(false)`.
 
 ## Feature Flags
 
-Functionality is grouped behind Cargo features so unused dependencies stay out of your build:
+Functionality is grouped behind Cargo features so unused dependencies stay out of your build. Every feature except `futuresdr` builds on stable Rust (MSRV 1.100); `futuresdr` needs a nightly toolchain, and CI tests it on `nightly-2026-11-21`.
 
 | Feature | Description | Default |
 |---|---|---|
 | `http` | HTTP streaming via `reqwest` and `tokio`. | **Yes** |
 | `file` | Buffered RTSA file parsing. | **Yes** |
 | `native-sdk` | Links the proprietary Aaronia C++ SDK. Windows/Linux only. | No |
-| `futuresdr` | Enables the FutureSDR block API: `HttpSource`, `HttpSink`, and their builders. Implies `http`. | No |
+| `futuresdr` | Enables the FutureSDR 0.10 block API: `HttpSource`, `HttpSink`, and their builders (plus `SdkSinkBlock` with `native-sdk`). Implies `http`. FutureSDR 0.10 uses unstable language features, so this feature builds only on a nightly toolchain. | No |
+| `seify` | `SpectranSeifyDevice`, a seify 0.26 driver (see [seify](#seify-rust-native)). Implies `http` and `file`. | No |
 | `ffi` | Builds the C-API export layer. | **Yes** |
 
 ## Testing & Contributing

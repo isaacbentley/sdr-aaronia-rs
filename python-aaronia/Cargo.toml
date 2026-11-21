@@ -2,6 +2,7 @@
 name = "python-aaronia"
 version = "0.14.0"
 edition = "2024"
+rust-version = "1.100"
 description = "Python bindings for sdr-aaronia-rs (Aaronia SPECTRAN V6 SDR source)"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/isaacbentley/sdr-aaronia-rs"
@@ -25,7 +26,7 @@ sdr-aaronia-rs = { path = "../" }
 # single cp311 wheel the pinned-interpreter build produced.
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 numpy = "0.29"
-arrow = { version = "59.2", features = ["pyarrow"] }
+arrow = { version = "60.1", features = ["pyarrow"] }
 num-complex = "0.4"
-tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "macros"] }
 pyo3-log = "0.13"

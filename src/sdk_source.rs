@@ -464,7 +464,7 @@ mod tests {
     /// wrapped in `async fn` purely to match the rest of the crate's
     /// async surface — so the first `poll` always resolves.
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-        let mut fut = Box::pin(fut);
+        let mut fut = std::pin::pin!(fut);
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
         match fut.as_mut().poll(&mut cx) {

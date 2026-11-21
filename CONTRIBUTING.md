@@ -2,7 +2,13 @@
 
 First off, thank you for considering contributing to `sdr-aaronia-rs`! This document explains how the test suite is organized, which tools you'll need, and how to verify your changes locally before opening a pull request.
 
-**Toolchain:** the crate uses the 2024 edition, so you need Rust 1.85 or newer. There is no pinned `rust-toolchain.toml`; CI tracks the latest `stable`.
+**Toolchain:** the minimum supported Rust version is 1.100 (`rust-version` in `Cargo.toml` and `python-aaronia/Cargo.toml`). There is no pinned `rust-toolchain.toml`; CI tracks the latest `stable`. The `futuresdr` feature is the exception: FutureSDR 0.10 enables unstable language features and builds only on a nightly toolchain, so every command that turns it on — `--all-features` included — needs a nightly (a stable compiler stops in `futuresdr` with `E0554`). CI pins `nightly-2026-11-21` for it; use the same pin locally:
+
+```bash
+rustup toolchain install nightly-2026-11-21 --component clippy
+```
+
+So the checks split in two. On **stable**, name every feature except `futuresdr` — `--features http,file,ffi,seify,native-sdk` — wherever you would have passed `--all-features`. On the **pinned nightly**, `cargo +nightly-2026-11-21 … --all-features` covers everything, `futuresdr` included. (If a Homebrew or other non-rustup `cargo` comes first on your `PATH`, `+toolchain` is not understood; `scripts/ci-local.sh` resolves the toolchain's own `cargo` with `rustup which` for this reason.)
 
 ## Quick Start
 
@@ -10,14 +16,19 @@ First off, thank you for considering contributing to `sdr-aaronia-rs`! This docu
 git clone https://github.com/isaacbentley/sdr-aaronia-rs.git
 cd sdr-aaronia-rs
 
-# Run the standard validation suite
+# Run the standard validation suite (stable: every feature but futuresdr)
 cargo test                                        # unit + integration + properties (default features)
 cargo test --test spec_coverage -- --nocapture    # spec inventory report
-cargo clippy --workspace --all-features --all-targets -- -D warnings
+cargo test --features http,file,ffi,seify,native-sdk
+cargo clippy --workspace --features http,file,ffi,seify,native-sdk --all-targets -- -D warnings
 cargo fmt --all --check
+
+# The futuresdr feature too (pinned nightly)
+cargo +nightly-2026-11-21 clippy --workspace --all-features --all-targets -- -D warnings
+cargo +nightly-2026-11-21 test --all-features
 ```
 
-Note that a plain `cargo test` builds with the default features; suites gated on non-default features (e.g. `http_sink_test`, which needs `futuresdr`) are skipped. CI runs `cargo test --all-features`.
+Note that a plain `cargo test` builds with the default features; suites gated on non-default features (e.g. `http_sink_test`, which needs `futuresdr`, and so the nightly) are skipped. CI runs `cargo test --features http,file,ffi,seify,native-sdk` on stable (Linux, macOS, Windows) and `cargo test --all-features` on the pinned nightly (Linux, Windows).
 
 ## Pre-push: mirror CI locally
 
@@ -28,18 +39,25 @@ scripts/ci-local.sh
 ```
 
 It reproduces the **exact** command each GitHub Actions job runs — fmt,
-clippy, `cargo test --all-features`, `cargo deny --all-features check`,
-`cargo hack check --each-feature --no-dev-deps`, `cargo machete`, and
+clippy and `cargo test` with every feature but `futuresdr` on stable,
+`cargo deny --all-features check`, `cargo hack check --each-feature
+--no-dev-deps --exclude-features futuresdr`, `cargo machete`, the
+`nightly` step (`clippy` and `test` with `--all-features`, plus
+`futuresdr` on its own through cargo-hack, on `nightly-2026-11-21`), and
 the pinned-nightly Miri module suite — and fails fast with install
 hints for any missing tool. Skip individual steps with e.g.
 `SKIP="miri hack" scripts/ci-local.sh` when iterating.
 
-The `--all-features` flags matter: several CI jobs validate the
-*all-features* dependency graph and feature set, so a default-features
+The feature flags matter: several CI jobs validate the full feature set
+and the *all-features* dependency graph, so a default-features
 `cargo test` / `cargo deny check` passing locally does **not** imply CI
-will pass. If you edit `.github/workflows/ci.yml`, update
-`scripts/ci-local.sh` in the same commit (and vice versa), and run
-`actionlint .github/workflows/ci.yml`.
+will pass. `cargo deny` stays on `--all-features` on stable because it
+only resolves metadata and never compiles `futuresdr`. The feature list
+the stable steps pass (`STABLE_FEATURES` in `ci.yml` and the script) is
+every Cargo feature but `futuresdr`, so a new feature goes into both,
+and into release.yml's `cargo semver-checks` step. If
+you edit `.github/workflows/ci.yml`, update `scripts/ci-local.sh` in the
+same commit (and vice versa), and run `actionlint .github/workflows/*.yml`.
 
 Two steps exist because macOS builds skip the OS-gated native-SDK
 modules entirely (`cfg(any(windows, linux))`), which CI's ubuntu and
@@ -50,12 +68,16 @@ windows legs do compile:
   `stable` toolchain (install the targets with `rustup target add
   <triple> --toolchain stable`). Lib only — the gated *test* code needs
   a real Linux environment.
-- **vm** — runs `cargo test --features native-sdk --lib` inside a Linux
-  VM via Apple's `container` CLI (`container system start` first; the
-  step auto-skips when the tooling isn't running). This is the only
-  local step that compiles and runs `#[cfg(test)]` code inside the
-  gated modules — a missed struct field in exactly such a test once
-  shipped red to CI past every other local check.
+- **vm** — runs CI's ubuntu legs inside a Linux VM via Apple's
+  `container` CLI (`container system start` first; the step auto-skips
+  when the tooling isn't running): `clippy --workspace --all-targets`
+  and `cargo test` with every feature but `futuresdr` on stable, then
+  both again with `--all-features` on `nightly-2026-11-21`, which the
+  step installs inside the VM. This is the only local step that
+  compiles and runs `#[cfg(test)]` code inside the gated modules, and
+  the only one that builds `SdkSinkBlock` (`futuresdr` + `native-sdk`)
+  — a missed struct field in exactly such a test once shipped red to CI
+  past every other local check.
 
 Tiers 1–4 below are the core of the suite; the later tiers are optional but recommended if your pull request touches the parser, decompressor, or FFI surface.
 
@@ -99,13 +121,13 @@ Run: `cargo test --test spec_coverage -- --nocapture`
 
 ### 5. Miri (Nightly)
 
-Catches undefined behavior in safe Rust code. Because Miri refuses to interpret FFI, we only run it on the pure-Rust modules. CI pins `nightly-2026-01-01` because newer nightlies changed the `fadd_fast` intrinsic signature, which breaks the `futuredsp` dependency's build — use the same pin locally:
+Catches undefined behavior in safe Rust code. Because Miri refuses to interpret FFI, we only run it on the pure-Rust modules. CI pins `nightly-2026-01-01` because newer nightlies changed the `fadd_fast` intrinsic signature, which breaks the `futuredsp` dependency's build — use the same pin locally. That nightly is 1.94, older than the MSRV, so the commands pass `--ignore-rust-version`:
 
 ```bash
 rustup toolchain install nightly-2026-01-01 --component miri
-cargo +nightly-2026-01-01 miri test --lib decompression
-cargo +nightly-2026-01-01 miri test --lib http_streaming
-cargo +nightly-2026-01-01 miri test --lib utils
+cargo +nightly-2026-01-01 miri test --ignore-rust-version --lib decompression
+cargo +nightly-2026-01-01 miri test --ignore-rust-version --lib http_streaming
+cargo +nightly-2026-01-01 miri test --ignore-rust-version --lib utils
 ```
 
 ### 6. Code Coverage
@@ -170,7 +192,8 @@ Three additional CI jobs gate every PR; run their tools locally if your change t
 ```bash
 cargo install cargo-deny cargo-hack cargo-machete
 cargo deny check                                  # licenses/advisories/bans, driven by deny.toml
-cargo hack check --each-feature --no-dev-deps     # every feature combination compiles
+cargo hack check --each-feature --no-dev-deps --exclude-features futuresdr   # every feature compiles on its own
+cargo +nightly-2026-11-21 hack check --each-feature --no-dev-deps --include-features futuresdr   # ... futuresdr too
 cargo machete                                     # no unused dependencies
 ```
 
