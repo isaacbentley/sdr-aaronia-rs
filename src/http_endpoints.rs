@@ -76,11 +76,12 @@ impl std::fmt::Debug for AuthMethod {
 /// The `reqwest` client settings every RTSA connection shares, with the
 /// connect timeout as the one per-caller knob.
 ///
-/// One definition rather than three: the endpoints client, the
-/// `HttpSource` streaming client and the link-budget probe each used to
-/// hand-roll their own builder with a different subset of these
-/// settings, so an "RTSA-compatible" fix landed in one and silently
-/// missed the others.
+/// One definition for both of the crate's clients: the endpoints client
+/// (which also opens every streaming source's `/stream`, with the
+/// connect timeout its caller chose) and the link-budget probe. They used
+/// to hand-roll their own builders with different subsets of these
+/// settings, so an "RTSA-compatible" fix landed in one and silently missed
+/// the others.
 ///
 /// Deliberately **no** client-level `.timeout(...)`: it would apply to
 /// the whole response body and terminate a long-lived `/stream`
@@ -353,8 +354,9 @@ pub struct CaptureControl {
 /// connection after a network change — parks the reader forever, and the
 /// source produces nothing and never reconnects. A live stream delivers a
 /// chunk every few milliseconds at any usable rate, so several seconds of
-/// nothing is not a slow link. Giving up hands the source to its ordinary
-/// reconnect path.
+/// nothing is not a slow link. Giving up hands the stream to the stream
+/// engine's ordinary reconnect path (`crate::http_engine`), which both
+/// streaming sources run on.
 pub(crate) const STREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The error for a `/stream` connection that went [`STREAM_STALL_TIMEOUT`]
@@ -1118,8 +1120,9 @@ impl StreamParams {
     /// The full `/stream` URL these parameters select on `base_url`.
     ///
     /// `pub(crate)` so every `/stream` URL in the crate — the endpoints
-    /// client, `HttpSource`, and the link-budget probe — is assembled by
-    /// this one function and cannot drift. The query is never empty
+    /// client, which both streaming sources open through, and the
+    /// link-budget probe — is assembled by this one function and cannot
+    /// drift. The query is never empty
     /// (`format` is always present), so the `?` is unconditional.
     pub(crate) fn stream_url(&self, base_url: &str) -> String {
         format!(
@@ -1136,9 +1139,10 @@ impl StreamParams {
     /// where `0` is caught: it is not "no reduction" — that is `1`, or
     /// omitting the parameter — and sending it on would fail the stream
     /// open with an opaque HTTP error, or worse, be read by the server
-    /// in some way this crate does not model. Every `/stream` opener
-    /// (`HttpEndpointsClient::start_stream`, `HttpSource`, the
-    /// link-budget probe) calls this, so the value cannot reach the wire.
+    /// in some way this crate does not model. Both `/stream` openers
+    /// (`HttpEndpointsClient`, which every streaming source opens through,
+    /// and the link-budget probe) call this, so the value cannot reach the
+    /// wire.
     pub fn validate(&self) -> crate::Result<()> {
         Self::validate_rate_reduction(self.rate_reduction)
     }
@@ -1302,12 +1306,22 @@ impl HttpEndpointsClient {
     /// * `base_url` - The base URL of the Aaronia RTSA device (e.g., "http://127.0.0.1:8080").
     /// * `auth` - The authentication method to use.
     pub fn new(base_url: String, auth: AuthMethod) -> Result<Self> {
+        // 5 s connect: fast failure on an unreachable server.
+        Self::with_connect_timeout(base_url, auth, std::time::Duration::from_secs(5))
+    }
+
+    /// [`Self::new`] with its own connect timeout — for the FutureSDR
+    /// block, whose builder lets the caller choose one for its stream.
+    pub(crate) fn with_connect_timeout(
+        base_url: String,
+        auth: AuthMethod,
+        connect_timeout: std::time::Duration,
+    ) -> Result<Self> {
         validate_base_url(&base_url)?;
 
         // Shared RTSA client settings; see `rtsa_client_builder` for why
-        // there is no client-level timeout. 5 s connect: fast failure on
-        // an unreachable server.
-        let client = rtsa_client_builder(std::time::Duration::from_secs(5)).build()?;
+        // there is no client-level timeout.
+        let client = rtsa_client_builder(connect_timeout).build()?;
 
         // Every endpoint is `{base_url}/name`, and a trailing slash on
         // the base makes that `//name` — which the RTSA server answers
@@ -1320,6 +1334,12 @@ impl HttpEndpointsClient {
             base_url,
             auth,
         })
+    }
+
+    /// The base URL every endpoint is built on, without a trailing slash.
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Tests the connection to the RTSA device by fetching the `/info` endpoint.
@@ -2412,28 +2432,7 @@ impl HttpEndpointsClient {
         use crate::http_streaming::StreamParser;
         use futures::stream::StreamExt;
 
-        params.validate()?;
-        let url = params.stream_url(&self.base_url);
-
-        info!(
-            "Starting stream from {} with format: {:?}",
-            url, params.format
-        );
-
-        // Deliberately `apply_auth`, not `control_request`: a per-request
-        // timeout would cover the whole streamed body and kill the
-        // connection mid-stream.
-        let request = self.apply_auth(self.client.get(&url));
-        // The headers, though, are bounded: a server that accepts the
-        // connection and never answers would otherwise hold the caller
-        // here forever, before any reconnect logic can run.
-        let response = tokio::time::timeout(STREAM_STALL_TIMEOUT, request.send())
-            .await
-            .map_err(|_| stream_stalled(&format!("Stream request to {url}: no response")))??;
-        let response = Self::ensure_success(&format!("Stream request to {url}"), response)?;
-
-        // Get the byte stream
-        let byte_stream = response.bytes_stream();
+        let byte_stream = self.open_stream(&params).await?.bytes_stream();
 
         // Create parser for the specified format
         let mut parser = StreamParser::new(params.format, params.scale)?;
@@ -2457,6 +2456,35 @@ impl HttpEndpointsClient {
             });
 
         Ok(Box::new(packet_stream.boxed()))
+    }
+
+    /// Open `/stream` with `params` and return the response, its body
+    /// unread.
+    ///
+    /// The one `/stream` request in the crate: [`Self::start_stream`] and
+    /// the stream engine both open through here. The response headers must
+    /// arrive within [`STREAM_STALL_TIMEOUT`]; a non-success status is
+    /// `Error::Http`, as on every other request.
+    pub(crate) async fn open_stream(&self, params: &StreamParams) -> Result<reqwest::Response> {
+        params.validate()?;
+        let url = params.stream_url(&self.base_url);
+
+        info!(
+            "Starting stream from {} with format: {:?}",
+            url, params.format
+        );
+
+        // Deliberately `apply_auth`, not `control_request`: a per-request
+        // timeout would cover the whole streamed body and kill the
+        // connection mid-stream.
+        let request = self.apply_auth(self.client.get(&url));
+        // The headers, though, are bounded: a server that accepts the
+        // connection and never answers would otherwise hold the caller
+        // here forever, before any reconnect logic can run.
+        let response = tokio::time::timeout(STREAM_STALL_TIMEOUT, request.send())
+            .await
+            .map_err(|_| stream_stalled(&format!("Stream request to {url}: no response")))??;
+        Self::ensure_success(&format!("Stream request to {url}"), response)
     }
 
     /// Creates a new `StreamParamsBuilder` to construct streaming parameters.

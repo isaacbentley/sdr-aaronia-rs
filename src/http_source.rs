@@ -7,9 +7,12 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 use tracing::{debug, info, trace, warn};
 
-// Import our new advanced streaming capabilities
-use crate::http_endpoints::{AuthMethod, HttpEndpointsClient, STREAM_STALL_TIMEOUT};
-use crate::http_streaming::{DropDetector, StreamFormat, StreamParser, rate_moved};
+use crate::http_endpoints::{AuthMethod, HttpEndpointsClient};
+use crate::http_engine::{
+    CHUNK_CHANNEL_DEPTH, Chunks, EngineOptions, HttpStreamEngine, ReconnectPolicy, StreamEvent,
+    StreamGap,
+};
+use crate::http_streaming::{PayloadType, StreamFormat, rate_moved};
 use crate::stream_break::StreamDiscontinuity;
 
 /// How many of the largest observed packets the sample buffer must be able to
@@ -30,15 +33,16 @@ const PACKET_CAPACITY_FACTOR: usize = 4;
 /// reservation nothing will fill. 128 MiB of `Complex32`.
 const MAX_PREALLOCATED_SAMPLES: usize = 1 << 24;
 
-/// Depth of the channel between the socket reader task and `work()`, in
-/// chunks, and the most chunks one `fetch_samples` sweep takes from it.
-///
-/// The bound on the sweep is what makes [`HttpSource::buffer_capacity`]'s
-/// catch-up headroom exact: a sweep starts below the refill target and can
-/// add at most this many chunks' worth of samples, so a catch-up after the
-/// consumer stalls always fits under the trim. Chunks queued past it wait
-/// for the next sweep of the same `work()` call.
-const CHUNK_CHANNEL_DEPTH: usize = 64;
+/// How the block reconnects: every second, for as long as the flowgraph
+/// runs. A source block that gave up would end the flowgraph's input for
+/// good, so there is no budget; and nothing re-tunes on a reconnect (see
+/// [`HttpSource::configure_rtsa_device`]).
+const RECONNECT: ReconnectPolicy = ReconnectPolicy {
+    first_delay: std::time::Duration::from_secs(1),
+    max_delay: std::time::Duration::from_secs(1),
+    attempts: None,
+    healthy_after: std::time::Duration::from_secs(30),
+};
 
 /// Move as many samples as fit from the front of `buffer` into `out`,
 /// returning how many moved.
@@ -94,13 +98,15 @@ const SOURCE_MIN_OUTPUT_SAMPLES: usize = 65536;
 /// a full buffer, so the buffer's capacity stops the loop first in practice.
 const MAX_FETCHES_PER_WORK: usize = 16;
 
-/// Longest a `work()` call will park waiting for the next stream chunk.
+/// Longest a `work()` call will park waiting for the next stream chunk, or
+/// for a reconnect to come due.
 ///
 /// Not a rate limit: the wait ends the moment a chunk arrives, which at any
 /// real stream rate is well under a millisecond. It bounds how long the
 /// block can go without servicing its message inbox, since FutureSDR only
 /// reads that between `work()` calls — so it is a shutdown valve, and short
-/// enough that Ctrl+C and `--duration-secs` stay prompt.
+/// enough that Ctrl+C and `--duration-secs` stay prompt, reconnect backoff
+/// included.
 const CHUNK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// How long the passive link-budget check counts bytes before deciding
@@ -135,48 +141,6 @@ const LINK_BUDGET_TOLERANCE: f64 = 0.98;
 /// consumer builds from this span hundreds of kilohertz — and far above the
 /// round-off, so it separates the two without a judgement call.
 const CENTER_CHANGE_HZ: f64 = 1.0;
-
-/// Drain `stream` into `tx` until it ends, errors, stalls for `stall`, or
-/// the receiver is dropped. Dropping `tx` on return is what tells the
-/// source to reconnect.
-async fn read_stream_into<S, E>(
-    stream: S,
-    tx: tokio::sync::mpsc::Sender<Bytes>,
-    stall: std::time::Duration,
-) where
-    S: futures::Stream<Item = std::result::Result<Bytes, E>>,
-    E: std::fmt::Display,
-{
-    use futures::StreamExt;
-    let mut stream = std::pin::pin!(stream);
-    loop {
-        match tokio::time::timeout(stall, stream.next()).await {
-            Ok(Some(Ok(chunk))) => {
-                // `send` awaits when the channel is full — this is the
-                // backpressure point, and where TCP flow control kicks in.
-                // A send error means the receiver was dropped, so the
-                // source is gone and the task should end.
-                if tx.send(chunk).await.is_err() {
-                    break;
-                }
-            }
-            Ok(Some(Err(e))) => {
-                warn!("Stream chunk error in reader task: {}", e);
-                break;
-            }
-            Ok(None) => break,
-            Err(_) => {
-                warn!(
-                    "Aaronia stream delivered nothing for {:.1} s; dropping the \
-                     connection so the source reconnects",
-                    stall.as_secs_f64()
-                );
-                break;
-            }
-        }
-    }
-    debug!("Aaronia stream reader task ended");
-}
 
 /// Stream statistics for monitoring.
 ///
@@ -305,17 +269,25 @@ impl LinkCheck {
 /// This block provides an adapter between the RTSA HTTP streaming protocol and
 /// a `FutureSDR` flowgraph. For most direct asynchronous streaming use cases,
 /// the core path is [`HttpEndpointsClient::start_stream`] instead of this block.
+///
+/// The stream itself — opening it, the stall timeouts, decoding, gap
+/// detection, reconnecting — is the crate's shared stream engine, the same
+/// one `SpectranSource`'s HTTP backend runs on. This block drives it from
+/// `work()` and owns what is particular to a flowgraph source: the sample
+/// buffer and its capacity, stream-break indices, the one-shot device tune,
+/// the link-budget check and the shared [`StreamStats`].
 #[derive(Block)]
 pub struct HttpSource {
     #[output]
     output: futuresdr::runtime::buffer::DefaultCpuWriter<Complex32>,
-    // Connection configuration
-    base_url: String,
-    // Note: actual frequency and sample_rate come from stream metadata
-
-    // Enhanced HTTP client with endpoint support
+    /// Control plane: the device tune, input discovery, health reads.
     endpoints_client: HttpEndpointsClient,
-    streaming_client: reqwest::Client,
+    /// The stream, across its connections. Driven from `work()`.
+    engine: HttpStreamEngine,
+    /// The engine's connection count when the link-budget check was last
+    /// armed — a change means a new connection, whose connect backlog a fresh
+    /// settle window has to cover.
+    link_check_connection: u64,
 
     // Internal buffer for samples
     sample_buffer: VecDeque<Complex32>,
@@ -344,15 +316,10 @@ pub struct HttpSource {
 
     // Advanced streaming configuration
     stream_format: StreamFormat,
-    stream_parser: StreamParser,
     input_name: Option<String>,  // Selected input stream
     rate_reduction: Option<u32>, // Sample rate reduction factor
-    /// Server-side `?scale=N` query parameter for `/stream` (v9 PDF).
-    /// Independent of the per-packet `scale` carried in JSON metadata.
-    scale: Option<f64>,
 
     // Stream state
-    stream_active: bool,
     current_frequency: f64,
     current_sample_rate: f64,
     /// The centre and rate this source was built to request, which the
@@ -360,17 +327,6 @@ pub struct HttpSource {
     /// stream.
     configured_center_hz: f64,
     configured_rate_hz: f64,
-    /// Raw stream chunks from the background reader task.
-    ///
-    /// The socket used to be read one chunk per `work()` call, so throughput
-    /// was capped by how often the scheduler ran the block — measured at a
-    /// tenth of what `curl` pulls from the same endpoint, because between
-    /// calls the socket was not read and the server's stream backed up. A
-    /// dedicated task now drains the socket continuously into this bounded
-    /// channel; `work()` only sweeps already-received chunks and parses them.
-    /// The bound provides backpressure: if the consumer falls behind the
-    /// channel fills, the reader blocks on `send`, and TCP flow control does
-    /// the rest — no unbounded memory.
     /// Total samples dropped by the capacity trim, and the next count that
     /// warrants a log line. See the trim site for why this is rate-limited.
     overflow_samples: u64,
@@ -386,8 +342,8 @@ pub struct HttpSource {
     /// count that warrants a log line. See `note_lost_packet`.
     packets_lost_to_parse_errors: u64,
     next_parse_loss_report: u64,
-    /// Passive link-budget check, armed at stream start and settled into
-    /// its verdict at most once per configuration.
+    /// Passive link-budget check, armed as each connection opens and
+    /// settled into its verdict at most once per configuration.
     ///
     /// The complement of `DropDetector`: that one reports gaps the server
     /// left, after the fact. This one counts the IQ payload actually
@@ -409,11 +365,6 @@ pub struct HttpSource {
     /// by the 0.96 MS/s rung, a 4% gap against a 2% tolerance) would warn
     /// on every healthy link.
     link_device_rate: Option<f64>,
-    chunk_rx: Option<tokio::sync::mpsc::Receiver<bytes::Bytes>>,
-    /// Handle to the reader task, kept so it can be aborted on reconnect or
-    /// retune. Dropping the receiver also ends the task (its `send` fails),
-    /// but an explicit abort is prompt and unambiguous.
-    reader_task: Option<tokio::task::JoinHandle<()>>,
 
     // Configuration
     buffer_size: usize,
@@ -427,13 +378,10 @@ pub struct HttpSource {
     /// and `CaptureConfig` leaves `None` fields untouched.
     reference_level_dbm: Option<f64>,
 
-    // Authentication
-    auth_method: AuthMethod,
     tokio_handle: Option<tokio::runtime::Handle>,
 
-    // Shared statistics and drop detection
+    // Shared statistics
     shared_stats: Option<std::sync::Arc<std::sync::RwLock<StreamStats>>>,
-    drop_detector: DropDetector,
 
     /// Whether the one-shot device retune in [`Self::configure_rtsa_device`]
     /// has already been attempted (successful or not). The tune applies the builder's centre / rate /
@@ -441,11 +389,13 @@ pub struct HttpSource {
     /// (triggered via `shared_stats.restart_pending` after an external
     /// retune) must only reconnect the `/stream`, never re-push this
     /// source's now-stale target, which would undo that retune.
+    ///
+    /// Listen only — the engine's flag, set by
+    /// [`HttpSourceBuilder::listen_only`] — writes nothing to the device: no
+    /// connect/run switch, no tune, no reference level, and no `/control`
+    /// streaming start or stop around any connection. The stream is read as
+    /// the device is running it, for an analyser shared with others.
     initial_tune_done: bool,
-    /// Listen only: never write to the device. No connect/run switch, no
-    /// tune, no reference level, and no stop at the end — the stream is
-    /// read as the device is running it, for an analyser shared with others.
-    listen_only: bool,
 
     /// Where stream breaks are reported, or `None` when nobody asked.
     ///
@@ -536,19 +486,43 @@ impl HttpSource {
         // Create HTTP endpoints client for advanced control
         let endpoints_client = HttpEndpointsClient::new(base_url.clone(), auth_method.clone())?;
 
-        // Streaming client: the shared RTSA settings (which deliberately
-        // set no total timeout — it would cover the whole streamed body),
-        // with the caller's connect timeout.
-        let streaming_client = crate::http_endpoints::rtsa_client_builder(
+        // The stream opens through a client of its own only for the
+        // caller's connect timeout; the settings are the shared RTSA ones,
+        // which deliberately set no total timeout (it would cover the whole
+        // streamed body).
+        let stream_client = HttpEndpointsClient::with_connect_timeout(
+            base_url,
+            auth_method,
             std::time::Duration::from_millis(timeout_ms.min(30000)),
-        )
-        .build()?;
-
-        // Initialize stream parser for chosen format. The parser must know
-        // the server-side `?scale=N` encode multiplier requested for the
-        // stream, or int16 decoding falls back to the full-scale default
-        // and every sample is off by a factor of 32768/N.
-        let stream_parser = StreamParser::new(stream_format, scale)?;
+        )?;
+        // `/stream` parameters through the shared serializer, so this URL,
+        // the endpoints client's and the link-budget probe's cannot drift
+        // apart. The input may still be auto-selected at the first start.
+        let mut params = HttpEndpointsClient::stream_params().format(stream_format);
+        if let Some(input) = &input_name {
+            params = params.input(input.clone());
+        }
+        if let Some(reduction) = rate_reduction {
+            params = params.rate_reduction(reduction);
+        }
+        // Server-side scale (?scale=N) for the int16 path, per v9 PDF.
+        // The engine's parser decodes with it too.
+        if let Some(scale) = scale {
+            params = params.scale(scale);
+        }
+        let engine = HttpStreamEngine::new(EngineOptions {
+            stream_client,
+            control_client: endpoints_client.clone(),
+            params: params.build(),
+            listen_only: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reconnect: RECONNECT,
+            // Never: a reconnect must not re-push this source's target over
+            // an external retune. See `configure_rtsa_device`.
+            retune_on_reconnect: None,
+            // A `/control` streaming start before each connection and a stop
+            // after it, as this block has always written.
+            streaming_control: true,
+        })?;
 
         // `start_stream` spawns the reader task on Tokio; without a runtime
         // it would panic inside `init()`. Refuse at build time instead, as
@@ -568,9 +542,9 @@ impl HttpSource {
 
         Ok(Self {
             output,
-            base_url,
             endpoints_client,
-            streaming_client,
+            engine,
+            link_check_connection: 0,
             sample_buffer: VecDeque::with_capacity(
                 buffer_size.saturating_mul(2).min(MAX_PREALLOCATED_SAMPLES),
             ),
@@ -578,11 +552,8 @@ impl HttpSource {
             max_chunk_bytes: 0,
             downstream_capacity: 0,
             stream_format,
-            stream_parser,
             input_name,
             rate_reduction,
-            scale,
-            stream_active: false,
             current_frequency: center_frequency_hz,
             current_sample_rate: sample_rate_hz,
             configured_center_hz: center_frequency_hz,
@@ -596,16 +567,11 @@ impl HttpSource {
             next_parse_loss_report: 1,
             link_check: LinkCheck::Unmeasured,
             link_device_rate: None,
-            chunk_rx: None,
-            reader_task: None,
             buffer_size,
             reference_level_dbm,
-            auth_method,
             tokio_handle,
             shared_stats: None,
-            drop_detector: DropDetector::default(),
             initial_tune_done: false,
-            listen_only: false,
             break_sink: None,
             produced: 0,
             pending_breaks: VecDeque::new(),
@@ -615,20 +581,15 @@ impl HttpSource {
         })
     }
 
+    /// The first start: report the server, pick an input if none was
+    /// asked for, write the one-shot device tune, and open the stream.
+    ///
+    /// Only this start can fail the block: a reconnect after it is the
+    /// engine's, driven from `work()`, and never ends the flowgraph.
     async fn start_stream(&mut self) -> Result<()> {
-        // The `native_client` field is still populated by the
-        // `with_native_sdk(true)` builder method for API compatibility,
-        // but the high-level convenience methods (`init`, `start_stream`,
-        // `get_sample_rate`, `get_frequency`, `get_iq_samples`) that the
-        // old fallback branch called against `NativeSdkClient` were
-        // removed when the FFI surface was flattened to its current
-        // low-level form. Routing HTTP streaming through the native SDK
-        // now lives in `sdk_source.rs` and `unified_source.rs`; this
-        // path always falls through to plain HTTP.
         info!("Initializing advanced Aaronia HTTP streaming");
         info!("Stream format: {}", self.stream_format.as_str());
 
-        // Get server info to verify connection using Tokio runtime handle
         match self.endpoints_client.get_info().await {
             Ok(server_info) => {
                 info!(
@@ -657,6 +618,7 @@ impl HttpSource {
                             inputs[0].clone()
                         };
                         info!("Selected input: {}", selected);
+                        self.engine.set_input(selected.clone());
                         self.input_name = Some(selected);
                     }
                 }
@@ -666,7 +628,7 @@ impl HttpSource {
             }
         }
 
-        if self.listen_only {
+        if self.engine.is_listen_only() {
             // A shared analyser is read as it runs: nothing is written to it,
             // on this start or any reconnect, and the tune is marked done so
             // no later path attempts one.
@@ -677,222 +639,76 @@ impl HttpSource {
                 );
             }
             self.initial_tune_done = true;
-        } else {
-            // Configure RTSA device to enable connection and streaming
-            // Warn on the first start, where it decides what the whole run
-            // streams; a reconnect repeating the same refusal says nothing new,
-            // and a stalled or paused mission reconnects every few seconds.
-            let first_start = !self.initial_tune_done;
-            if let Err(e) = self.configure_rtsa_device().await {
-                if first_start {
-                    warn!(
-                        "Could not set the RTSA block's connect/run switches ({e}); \
-                         streaming from whatever state the mission is in"
-                    );
-                } else {
-                    debug!("Could not set the RTSA block's connect/run switches on reconnect: {e}");
-                }
-            }
-
-            // Try to start streaming via control endpoint
-            match self.endpoints_client.control_streaming(true).await {
-                Ok(_) => info!("Started streaming via control endpoint"),
-                Err(e) => debug!(
-                    "Could not control streaming (device may already be streaming): {}",
-                    e
-                ),
-            }
+        } else if let Err(e) = self.configure_rtsa_device().await {
+            // A warning: this one write decides what the whole run streams,
+            // and no reconnect repeats it.
+            warn!(
+                "Could not set the RTSA block's connect/run switches ({e}); \
+                 streaming from whatever state the mission is in"
+            );
         }
 
-        // Build the streaming URL through the shared `StreamParams`
-        // serializer — the one `/stream` query-string implementation in
-        // the crate, so this URL, the endpoints client's and the
-        // link-budget probe's cannot drift apart. Values are
-        // percent-encoded: input names come from the server and may
-        // contain characters that would corrupt a hand-built query
-        // string.
-        let stream_url = {
-            let mut params =
-                crate::http_endpoints::StreamParamsBuilder::new().format(self.stream_format);
-            if let Some(ref input) = self.input_name {
-                params = params.input(input.clone());
-            }
-            if let Some(reduction) = self.rate_reduction {
-                params = params.rate_reduction(reduction);
-            }
-            // Server-side scale (?scale=N) for the int16 path, per v9 PDF.
-            if let Some(scale) = self.scale {
-                params = params.scale(scale);
-            }
-            params.build().stream_url(&self.base_url)
-        };
+        // The `/control` streaming start, unless listening only, then the
+        // open — the engine's, as on every reconnect.
+        self.engine.connect().await?;
+        self.arm_link_check();
 
-        info!("Constructed stream URL: {}", stream_url);
-
-        // Apply authentication — the shared definition on `AuthMethod`.
-        let request_builder = self
-            .auth_method
-            .apply_to(self.streaming_client.get(&stream_url));
-
-        info!("Sending stream request to {}.", stream_url);
-        info!("Sending HTTP request...");
-
-        // Bounded like the body reads below: a server that accepts the
-        // connection and never sends headers would otherwise hold `init`
-        // or a reconnect here forever.
-        let response = tokio::time::timeout(STREAM_STALL_TIMEOUT, request_builder.send())
-            .await
-            .map_err(|_| {
-                crate::http_endpoints::stream_stalled(&format!(
-                    "Stream request to {stream_url}: no response"
-                ))
-            })??;
-        info!("Received HTTP response status: {}", response.status());
-        // The shared status-to-error mapping, so a failed stream open is
-        // the same typed `Error::Http` a failed probe or control call is.
-        let response = HttpEndpointsClient::ensure_success(
-            &format!("Stream request to {stream_url}"),
-            response,
-        )?;
-
-        // Spawn a task that drains the socket continuously into a bounded
-        // channel, decoupling the read rate from how often `work()` runs.
-        //
-        // 64 chunks is enough slack that ordinary scheduling jitter never
-        // stalls the socket, while still bounding memory and giving real
-        // backpressure when the consumer cannot keep up. Measured against a
-        // live server, hyper's adaptive read settles at 64 KiB a chunk (71%
-        // of them; 32 KiB for most of the rest), so the queue holds roughly
-        // 4 MB — about 45 ms at the 88 MB/s a WiFi 6E path delivers. The
-        // task ends when the stream does, or when the receiver is dropped
-        // on reconnect/retune.
-        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(CHUNK_CHANNEL_DEPTH);
-        let task = tokio::spawn(read_stream_into(
-            response.bytes_stream(),
-            tx,
-            STREAM_STALL_TIMEOUT,
-        ));
-        self.chunk_rx = Some(rx);
-        self.reader_task = Some(task);
-
-        // Arm the passive link-budget check on the stream we have just
-        // opened, unless the current configuration already has its
-        // verdict (a reconnect loop must not repeat the same warning; a
-        // configuration restart resets to `Unmeasured` first). The
-        // settle window is anchored here, at the response, so the
-        // backlog the server is about to hand over — faster than real
-        // time, and the reason a naive measurement reads high — falls
-        // inside it.
-        if !matches!(self.link_check, LinkCheck::Done(_)) {
-            if self.link_check_measurable() {
-                self.link_check = LinkCheck::armed();
-            } else {
-                debug!(
-                    "Link-budget check skipped: no honest byte requirement exists for \
-                     format {} with rate_reduction {:?}",
-                    self.stream_format.as_str(),
-                    self.rate_reduction,
-                );
-                self.link_check = LinkCheck::Done(None);
-            }
-        }
-
-        self.stream_active = true;
         info!("Advanced Aaronia HTTP streaming initialized");
-
         Ok(())
     }
 
-    /// Move every queued chunk into `sample_buffer`, returning how many
-    /// samples were added.
+    /// Arm the passive link-budget check on the connection the engine has
+    /// just opened, unless the current configuration already has its
+    /// verdict (a reconnect loop must not repeat the same warning; a
+    /// configuration restart resets to `Unmeasured` first). The settle
+    /// window is anchored at the connection's open, so the backlog the
+    /// server hands over first — faster than real time, and the reason a
+    /// naive measurement reads high — falls inside it.
+    fn arm_link_check(&mut self) {
+        let (connections, opened) = self.engine.connections();
+        self.link_check_connection = connections;
+        if matches!(self.link_check, LinkCheck::Done(_)) {
+            return;
+        }
+        if self.link_check_measurable() {
+            self.link_check = LinkCheck::armed_at(opened.unwrap_or_else(std::time::Instant::now));
+        } else {
+            debug!(
+                "Link-budget check skipped: no honest byte requirement exists for \
+                 format {} with rate_reduction {:?}",
+                self.stream_format.as_str(),
+                self.rate_reduction,
+            );
+            self.link_check = LinkCheck::Done(None);
+        }
+    }
+
+    /// Move one sweep of queued chunks into `sample_buffer`, returning how
+    /// many samples were added.
     ///
-    /// `wait` is what an idle caller should do when the channel is empty:
-    /// `Some(d)` parks on the channel for up to `d`, `None` returns
-    /// immediately. Parking here — rather than on a clock in `work()` — is
+    /// `wait` is what an idle caller should do when nothing is queued:
+    /// `Some(d)` parks on the engine for up to `d`, `None` returns
+    /// immediately. Parking there — rather than on a clock in `work()` — is
     /// the difference between waking on the next chunk (sub-millisecond at
     /// any real rate) and sleeping through 50 ms of stream. See the call
     /// site for the measurement.
-    async fn fetch_samples(&mut self, wait: Option<std::time::Duration>) -> Result<usize> {
-        {
-            debug!("fetch_samples() called");
-        }
+    ///
+    /// A lost connection is the engine's to replace: this sweep simply comes
+    /// back with nothing while it does, and the first sweep on a new
+    /// connection re-arms the link-budget check.
+    async fn fetch_samples(&mut self, wait: Option<std::time::Duration>) -> usize {
         trace!("Fetching samples from stream...");
 
-        // Sibling note to `start_stream`: the native-SDK sample-fetch
-        // branch was deleted when `NativeSdkClient`'s `get_iq_samples`
-        // helper was replaced by the lower-level `to_sample_*` config
-        // operations. Use `sdk_source.rs` for native-SDK streaming.
-
-        // Drain every chunk the reader task has queued, parsing each in turn.
-        // Sweeping all available chunks (rather than one per call) is what
-        // lets a single `work()` move a substantial block, and it keeps the
-        // channel from filling and stalling the socket.
-        let Some(rx) = self.chunk_rx.as_mut() else {
-            warn!("No active stream available for reading");
-            return Err(Error::Protocol("No active stream".to_string()));
+        // At most one channel's depth per sweep — the bound
+        // `catch_up_headroom` is sized by.
+        let wait = wait.unwrap_or(std::time::Duration::ZERO);
+        let chunks = match self.engine.next_chunks(Some(wait)).await {
+            Chunks::Got(chunks) => chunks,
+            // `Finished` cannot happen under this block's unlimited policy.
+            Chunks::Idle | Chunks::Finished => Vec::new(),
         };
-
-        // Collect first, then parse, so the `&mut self` borrow for parsing
-        // does not overlap the `&mut self.chunk_rx` borrow above.
-        let mut chunks: Vec<bytes::Bytes> = Vec::new();
-        // At most one channel's depth per sweep: the reader task refills the
-        // channel as this drains it, so an unbounded loop could take more
-        // than the catch-up headroom in `buffer_capacity` allows for.
-        while chunks.len() < CHUNK_CHANNEL_DEPTH {
-            match rx.try_recv() {
-                Ok(chunk) => chunks.push(chunk),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // The reader task ended (stream closed or errored). Report
-                    // it so `work()` reconnects, distinct from a healthy read
-                    // that simply had nothing ready.
-                    if chunks.is_empty() {
-                        self.cleanup_stream().await;
-                        return Err(Error::StreamClosed("stream reader task ended".to_string()));
-                    }
-                    break;
-                }
-            }
-        }
-
-        // Nothing was queued and the caller has nothing to flush: park on the
-        // channel until the reader task delivers, rather than returning empty
-        // and letting the caller sleep on a clock.
-        //
-        // `recv` is cancel-safe, so losing the race to the timeout cannot
-        // consume a chunk. The timeout is not a rate limit — it is a
-        // shutdown valve, because the block's message loop only runs
-        // between `work()` calls and an unbounded await would defer
-        // `Terminate`.
-        let mut reader_task_ended = false;
-        if chunks.is_empty()
-            && let Some(timeout) = wait
-        {
-            // Scoped so the borrow of `self.chunk_rx` held by the pinned
-            // future is released before anything below touches `&mut self`.
-            // `Some(v)` is "the channel resolved", `None` is "the timeout won".
-            let received: Option<Option<Bytes>> = {
-                use futures::future::Either;
-                let mut recv = std::pin::pin!(rx.recv());
-                match futures::future::select(recv.as_mut(), futures_timer::Delay::new(timeout))
-                    .await
-                {
-                    Either::Left((v, _)) => Some(v),
-                    Either::Right(_) => None,
-                }
-            };
-            match received {
-                Some(Some(chunk)) => chunks.push(chunk),
-                // The reader task ended; same report as `Disconnected`, but
-                // flagged rather than handled here so `cleanup_stream` can
-                // take `&mut self` once the borrow above is gone.
-                Some(None) => reader_task_ended = true,
-                None => {}
-            }
-        }
-        if reader_task_ended {
-            self.cleanup_stream().await;
-            return Err(Error::StreamClosed("stream reader task ended".to_string()));
+        if self.engine.connections().0 != self.link_check_connection {
+            self.arm_link_check();
         }
 
         // Before parsing, so the chunk that widens the headroom is itself
@@ -904,15 +720,13 @@ impl HttpSource {
         // the reader was waiting on this consumer.
         let channel_was_full = chunks.len() >= CHUNK_CHANNEL_DEPTH;
 
-        // Parse first, then feed the link-budget meter, then report — in
-        // that order for two reasons. A parse error must not discard a
-        // finished measurement: the error is held until the report has
-        // run, or the reconnect would replace a completed meter with a
-        // fresh one and the check could stay silent forever on a stream
-        // whose parse errors recur faster than a measurement window.
+        // Parse first, then feed the link-budget meter, then report. A
+        // stream that lost its framing still reports: the engine replaces
+        // the connection, and a finished measurement must not be discarded
+        // with it, or the check could stay silent forever on a stream whose
+        // framing errors recur faster than a measurement window.
         let mut samples_added = 0usize;
         let mut iq_samples = 0usize;
-        let mut parse_error = None;
         for chunk in &chunks {
             trace!("Received HTTP stream chunk: {} bytes", chunk.len());
             match self.process_advanced_stream_data(chunk) {
@@ -920,10 +734,9 @@ impl HttpSource {
                     samples_added += added;
                     iq_samples += iq;
                 }
-                Err(e) => {
-                    parse_error = Some(e);
-                    break;
-                }
+                // The rest of this sweep came from the connection the
+                // engine has just given up.
+                Err(_) => break,
             }
         }
 
@@ -964,11 +777,8 @@ impl HttpSource {
         }
         self.report_link_budget();
 
-        if let Some(e) = parse_error {
-            return Err(e);
-        }
         trace!("Added {} samples from stream", samples_added);
-        Ok(samples_added)
+        samples_added
     }
 
     /// Whether an honest link-budget measurement is possible for the
@@ -1183,7 +993,6 @@ impl HttpSource {
         self.link_device_rate = Some(inferred_rate);
     }
 
-    /// Clean up the stream when it fails or ends
     /// Ask the device whether a stream gap was its own doing, and say so.
     ///
     /// Runs on every gap *report*, so it inherits that report's geometric
@@ -1281,45 +1090,6 @@ impl HttpSource {
         });
     }
 
-    async fn cleanup_stream(&mut self) {
-        // Stop streaming via control endpoint to prevent device from continuing to stream —
-        // unless this source only listened, in which case the device is left running.
-        if self.stream_active && !self.listen_only {
-            match self.endpoints_client.control_streaming(false).await {
-                Ok(_) => info!("Stopped streaming via control endpoint"),
-                Err(e) => debug!(
-                    "Could not stop streaming via control endpoint (device may handle this automatically): {}",
-                    e
-                ),
-            }
-        }
-
-        // End the reader task and drop the channel. Aborting is prompt;
-        // dropping the receiver would also end it (its next `send` fails) but
-        // not until the next chunk arrives.
-        if let Some(task) = self.reader_task.take() {
-            task.abort();
-        }
-        self.chunk_rx = None;
-        self.stream_active = false;
-        // The next connection starts a new packet sequence: drop any
-        // partial packet from the old one, or its header would be applied
-        // to the new stream's first bytes, and let the drop detector
-        // re-seed its timestamp history instead of blaming the gap on
-        // the link.
-        self.stream_parser.reset();
-        self.drop_detector.resync();
-        // Whatever comes back on the next connection does not continue what
-        // was on this one: the server restarts its stream at the present
-        // moment, the partial packet just dropped took some samples with it,
-        // and the drop detector has deliberately forgotten the timestamp that
-        // would have measured the hole. Recorded here rather than at each
-        // reconnect site so no path can add one and forget; repeated gaps at
-        // one position collapse, so the error path calling this twice reports
-        // one break.
-        self.note_break(StreamDiscontinuity::Gap);
-    }
-
     /// Parse one stream chunk into the sample buffer.
     ///
     /// Returns `(samples_added, iq_samples)`: everything queued for the
@@ -1336,156 +1106,43 @@ impl HttpSource {
     /// A packet the parser could not decode is skipped too, and marked as
     /// a gap where it sat — its samples are gone, so the packets either
     /// side of it are not contiguous. Only an unrecoverable framing error
-    /// is returned as `Err`.
+    /// is returned as `Err`, and the engine has given the connection up.
     fn process_advanced_stream_data(&mut self, data: &Bytes) -> Result<(usize, usize)> {
-        // All stream formats use JSON+binary format
-        // even binary formats like float16/float32/int16 when streaming via /stream endpoint
-        // This means JSON metadata followed by record separator (ASCII 30) then binary data
-
-        // Only build the (allocating) hex/ASCII preview when DEBUG logging
-        // is actually enabled — this runs on every chunk of the hot path.
-        if !data.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
-            let preview_len = std::cmp::min(100, data.len());
-            let preview_bytes: Vec<u8> = data[..preview_len].to_vec();
-            let preview_ascii: String = preview_bytes
-                .iter()
-                .map(|&b| {
-                    if (32..=126).contains(&b) {
-                        b as char
-                    } else {
-                        '.'
-                    }
-                })
-                .collect();
-            debug!(
-                "Data preview: {}B | First 20 bytes: {:?} | ASCII: {}",
-                data.len(),
-                &preview_bytes[..std::cmp::min(20, preview_len)],
-                &preview_ascii[..std::cmp::min(50, preview_len)]
-            );
-        }
-
-        let items = self.stream_parser.process_data_recovering(data)?;
+        let events = self.engine.decode(data)?;
 
         let mut total_samples_added = 0;
         let mut iq_samples_added = 0;
 
-        // Gaps the *server* left in the stream, from the packet timestamps.
-        //
-        // This result used to be discarded, so the only loss the log ever
-        // mentioned was our own capacity trim. That is the less important
-        // half: once the trim is sized to the consumer, a gap here is what
-        // remains, it is invisible in the sample count (the samples were
-        // never sent), and it is exactly the unsignalled discontinuity that
-        // breaks a demodulator's symbol timing. It appears whenever the
-        // device produces more than the link and the RTSA server can carry —
-        // at 4 bytes a sample, 30.7 MS/s is 123 MB/s, past what a gigabit
-        // link delivers — and an operator seeing undecodable digital traffic
-        // needs to know that is why. Same geometric schedule as the trim,
-        // for the same reason.
-        //
-        // Detection sits inside the same loop that queues the samples, so
-        // the gap can be keyed on the position it happened at. A separate
-        // pass over the batch would measure every packet's gap against the
-        // buffer length *before* any of the batch had been appended, which
-        // is the right answer only for the first packet in it.
-
-        for item in items {
-            let packet = match item {
-                crate::http_streaming::ParsedItem::Packet(packet) => packet,
-                crate::http_streaming::ParsedItem::Lost(e) => {
-                    self.note_lost_packet(&e);
+        // Every break arrives in stream order, between the packets it
+        // separates, so each is keyed on the position it happened at: the
+        // buffer length when it is processed, before the packet after it is
+        // appended.
+        for event in events {
+            let packet = match event {
+                StreamEvent::Iq(packet) => packet,
+                StreamEvent::Break(gap) => {
+                    self.note_stream_gap(gap);
                     continue;
                 }
-                // A non-IQ packet this source would have skipped anyway,
-                // and whose loss cost only its own bytes: the IQ either
-                // side is as contiguous as its timestamps say, which the
-                // drop detector goes on to check. No break.
-                crate::http_streaming::ParsedItem::Skipped { payload, reason } => {
+                // A non-IQ packet this source skips anyway, and whose loss
+                // (if it could not be decoded) cost only its own bytes: the
+                // IQ either side is as contiguous as its timestamps say,
+                // which the engine's drop detector goes on to check. No break.
+                StreamEvent::NonIq {
+                    payload,
+                    undecoded: Some(reason),
+                } => {
                     self.note_undecoded_non_iq_packet(&payload, &reason);
                     continue;
                 }
+                StreamEvent::NonIq {
+                    payload,
+                    undecoded: None,
+                } => {
+                    self.note_non_iq_packet(&payload);
+                    continue;
+                }
             };
-            if packet.metadata.payload != crate::http_streaming::PayloadType::Iq {
-                self.note_non_iq_packet(&packet);
-                continue;
-            }
-
-            let drop = self.drop_detector.observe(&packet);
-            if let crate::http_streaming::DropResult::Backward { overlap_seconds } = drop {
-                // No signal is missing, but the packets do not follow one
-                // another either, and a demodulator cannot tell an
-                // overlap from a splice. The same break as a gap, then,
-                // without adding to the server-gap totals.
-                self.note_break(StreamDiscontinuity::Gap);
-                // A clock that steps back does it again: 1, 2, 4, 8, ...
-                let steps = self.drop_detector.backward_steps();
-                if steps.is_power_of_two() {
-                    warn!(
-                        "Stream timestamps stepped backwards by {:.6} s between two IQ \
-                         packets ({steps} so far); each is marked as a break in the stream",
-                        overlap_seconds,
-                    );
-                }
-            }
-            if let crate::http_streaming::DropResult::Drop { gap_seconds } = drop {
-                self.stream_gap_seconds += gap_seconds;
-                // Where it happened, not just that it did. The samples
-                // already queued are sound; everything from the next one
-                // on belongs to a later moment in time, and only an index
-                // can say which is which.
-                self.note_break(StreamDiscontinuity::Gap);
-                let drops = self.drop_detector.drops();
-                if drops >= self.next_gap_report {
-                    // When the link-budget check has already measured this
-                    // path short, say so — with the verdict's own figures,
-                    // not a pointer at a log line possibly hours up the
-                    // scroll: otherwise the operator gets two warnings
-                    // that read like two separate problems, when one is
-                    // the prediction and this is it coming true. The
-                    // verdict is per-configuration (a retune resets it),
-                    // so it always describes the span currently streaming.
-                    let predicted = match &self.link_check {
-                        LinkCheck::Done(Some(v)) if v.short => {
-                            let fix = match v.fit_bandwidth_hz {
-                                Some(bandwidth) => {
-                                    format!(
-                                        " — narrowing to {:.3} MHz of span would fit",
-                                        bandwidth / 1e6
-                                    )
-                                }
-                                None => String::new(),
-                            };
-                            format!(
-                                " The link-budget check measured this path short at \
-                                 connect ({:.1} MB/s delivered against the {:.1} MB/s \
-                                 that {:.2} MS/s needs{fix}); this is that shortfall \
-                                 arriving as lost signal.",
-                                v.measured.byte_rate / 1e6,
-                                v.required_byte_rate / 1e6,
-                                v.sample_rate_hz / 1e6,
-                            )
-                        }
-                        _ => String::new(),
-                    };
-                    warn!(
-                        "Stream gap: the server has skipped {drops} times \
-                         ({:.2} s of signal in total, {:.3} s this time). The \
-                         samples were never sent, so this is loss upstream of \
-                         this process — more is being produced than the path \
-                         can carry. Digital decoding cannot survive it: every \
-                         gap is an unsignalled discontinuity to the \
-                         demodulator. Narrow the span or use a faster link.\
-                         {predicted}",
-                        self.stream_gap_seconds, gap_seconds,
-                    );
-                    self.next_gap_report = drops.saturating_mul(4);
-                    // Ask the device whether the loss is its own. The
-                    // answer arrives as its own line, just behind this
-                    // one — see `spawn_gap_health_probe`.
-                    self.spawn_gap_health_probe(drops);
-                }
-            }
 
             // Update current stream metadata from the parsed packet. The
             // packet reports its frequency *range*; the tuned frequency is
@@ -1621,17 +1278,111 @@ impl HttpSource {
         Ok((total_samples_added, iq_samples_added))
     }
 
+    /// Account for a break the engine reported, at the current end of the
+    /// buffer.
+    ///
+    /// Gaps the *server* left are the ones that matter most here. They are
+    /// invisible in the sample count (the samples were never sent), and each
+    /// is exactly the unsignalled discontinuity that breaks a demodulator's
+    /// symbol timing. They appear whenever the device produces more than the
+    /// link and the RTSA server can carry — at 4 bytes a sample, 30.7 MS/s is
+    /// 123 MB/s, past what a gigabit link delivers — and an operator seeing
+    /// undecodable digital traffic needs to know that is why. Reported on the
+    /// same geometric schedule as the trim, for the same reason.
+    fn note_stream_gap(&mut self, gap: StreamGap) {
+        match gap {
+            // Whatever comes back on a new connection does not continue what
+            // was on the old one: the server restarts its stream at the
+            // present moment, and the partial packet the engine dropped took
+            // some samples with it.
+            StreamGap::Reconnect => self.note_break(StreamDiscontinuity::Gap),
+            StreamGap::Lost(error) => self.note_lost_packet(&error),
+            StreamGap::Backward {
+                overlap_seconds,
+                steps,
+            } => {
+                // No signal is missing, but the packets do not follow one
+                // another either, and a demodulator cannot tell an overlap
+                // from a splice. The same break as a gap, then, without
+                // adding to the server-gap totals.
+                self.note_break(StreamDiscontinuity::Gap);
+                // A clock that steps back does it again: 1, 2, 4, 8, ...
+                if steps.is_power_of_two() {
+                    warn!(
+                        "Stream timestamps stepped backwards by {:.6} s between two IQ \
+                         packets ({steps} so far); each is marked as a break in the stream",
+                        overlap_seconds,
+                    );
+                }
+            }
+            StreamGap::Server { gap_seconds, drops } => {
+                self.stream_gap_seconds += gap_seconds;
+                // Where it happened, not just that it did. The samples
+                // already queued are sound; everything from the next one on
+                // belongs to a later moment in time, and only an index can
+                // say which is which.
+                self.note_break(StreamDiscontinuity::Gap);
+                if drops < self.next_gap_report {
+                    return;
+                }
+                // When the link-budget check has already measured this path
+                // short, say so — with the verdict's own figures, not a
+                // pointer at a log line possibly hours up the scroll:
+                // otherwise the operator gets two warnings that read like two
+                // separate problems, when one is the prediction and this is
+                // it coming true. The verdict is per-configuration (a retune
+                // resets it), so it always describes the span currently
+                // streaming.
+                let predicted = match &self.link_check {
+                    LinkCheck::Done(Some(v)) if v.short => {
+                        let fix = match v.fit_bandwidth_hz {
+                            Some(bandwidth) => format!(
+                                " — narrowing to {:.3} MHz of span would fit",
+                                bandwidth / 1e6
+                            ),
+                            None => String::new(),
+                        };
+                        format!(
+                            " The link-budget check measured this path short at \
+                             connect ({:.1} MB/s delivered against the {:.1} MB/s \
+                             that {:.2} MS/s needs{fix}); this is that shortfall \
+                             arriving as lost signal.",
+                            v.measured.byte_rate / 1e6,
+                            v.required_byte_rate / 1e6,
+                            v.sample_rate_hz / 1e6,
+                        )
+                    }
+                    _ => String::new(),
+                };
+                warn!(
+                    "Stream gap: the server has skipped {drops} times \
+                     ({:.2} s of signal in total, {:.3} s this time). The \
+                     samples were never sent, so this is loss upstream of \
+                     this process — more is being produced than the path \
+                     can carry. Digital decoding cannot survive it: every \
+                     gap is an unsignalled discontinuity to the \
+                     demodulator. Narrow the span or use a faster link.\
+                     {predicted}",
+                    self.stream_gap_seconds, gap_seconds,
+                );
+                self.next_gap_report = drops.saturating_mul(4);
+                // Ask the device whether the loss is its own. The answer
+                // arrives as its own line, just behind this one — see
+                // `spawn_gap_health_probe`.
+                self.spawn_gap_health_probe(drops);
+            }
+        }
+    }
+
     /// Account for a packet the parser framed but could not decode.
     ///
     /// Its samples are lost, so the stream breaks here exactly as it does
-    /// at a server gap. The drop detector is re-seeded because the next
-    /// packet's timestamp will show the hole, and it is ours to report, not
-    /// the server's. Its jitter calibration survives: losing a packet does
-    /// not change how the server stamps the ones after it.
+    /// at a server gap. The engine has re-seeded its drop detector, so the
+    /// hole is not counted again as a server gap when the next packet's
+    /// timestamp shows it: it is ours to report, not the server's.
     fn note_lost_packet(&mut self, error: &Error) {
         self.packets_lost_to_parse_errors = self.packets_lost_to_parse_errors.saturating_add(1);
         self.note_break(StreamDiscontinuity::Gap);
-        self.drop_detector.resync();
         if self.packets_lost_to_parse_errors >= self.next_parse_loss_report {
             warn!(
                 "Skipped an undecodable stream packet ({error}); {} lost so far. \
@@ -1650,11 +1401,7 @@ impl HttpSource {
     /// [`Self::note_lost_packet`]'s: the parser dropped only its bytes,
     /// and this source outputs none of that payload anyway, so there is no
     /// hole in the IQ to mark.
-    fn note_undecoded_non_iq_packet(
-        &mut self,
-        payload: &crate::http_streaming::PayloadType,
-        reason: &Error,
-    ) {
+    fn note_undecoded_non_iq_packet(&mut self, payload: &PayloadType, reason: &Error) {
         if self.non_iq_packets_skipped == 0 {
             warn!(
                 "The stream carries {payload:?} packets as well as IQ ({reason}); this source \
@@ -1670,12 +1417,11 @@ impl HttpSource {
     /// This block produces complex baseband, and those payloads are power
     /// scalars. They are counted so a mixed mission is visible in
     /// [`StreamStats::non_iq_packets_skipped`], and said once in the log.
-    fn note_non_iq_packet(&mut self, packet: &crate::http_streaming::StreamPacket) {
+    fn note_non_iq_packet(&mut self, payload: &PayloadType) {
         if self.non_iq_packets_skipped == 0 {
             warn!(
-                "The stream carries {:?} packets as well as IQ; this source outputs IQ only, \
-                 so they are skipped (counted in StreamStats::non_iq_packets_skipped)",
-                packet.metadata.payload,
+                "The stream carries {payload:?} packets as well as IQ; this source outputs IQ \
+                 only, so they are skipped (counted in StreamStats::non_iq_packets_skipped)",
             );
         }
         self.non_iq_packets_skipped = self.non_iq_packets_skipped.saturating_add(1);
@@ -1688,9 +1434,9 @@ impl HttpSource {
     /// every caller must call this *before* extending the buffer.
     ///
     /// Repeated gaps at the same offset collapse into one. Nothing separates
-    /// them: with no sample between two gaps there is one discontinuity, and a
-    /// reconnect that reports through `cleanup_stream` on both the error path
-    /// and the restart path would otherwise report it twice.
+    /// them: with no sample between two gaps there is one discontinuity — a
+    /// restart clearing the buffer and the reconnect the engine then reports,
+    /// say, or a lost packet as the first thing on a new connection.
     fn note_break(&mut self, cause: StreamDiscontinuity) {
         if self.break_sink.is_none() {
             return;
@@ -1979,9 +1725,9 @@ impl HttpSource {
 
     /// Get current stream statistics for monitoring
     pub fn get_stream_stats(&self) -> StreamStats {
-        let stats = self.stream_parser.stats();
+        let stats = self.engine.parser_stats();
         StreamStats {
-            active: self.stream_active,
+            active: self.engine.is_connected(),
             format: self.stream_format,
             current_frequency: self.current_frequency,
             current_sample_rate: self.current_sample_rate,
@@ -1989,7 +1735,7 @@ impl HttpSource {
             buffer_capacity: self.buffer_capacity(),
             input_name: self.input_name.clone(),
             input_msps: stats.samples_per_second / 1e6,
-            dropped_packets: self.drop_detector.drops(),
+            dropped_packets: self.engine.drops(),
             packet_rate: stats.packet_rate,
             restart_pending: false,
             link_budget: match &self.link_check {
@@ -2009,17 +1755,12 @@ impl HttpSource {
 
 impl Drop for HttpSource {
     fn drop(&mut self) {
-        // Ensure streaming is stopped when the source is dropped
-        if self.stream_active {
+        // The engine aborts its reader as it drops, which closes the
+        // `/stream` connection. No `/control` stop is written: a destructor
+        // cannot await one, and `block_on` here can panic during runtime
+        // shutdown.
+        if self.engine.is_connected() {
             info!("Dropping HttpSource - stopping stream");
-            // Don't use block_on in destructor as it can cause panics during runtime shutdown
-            // Just mark as inactive and let the response drop naturally
-            if let Some(task) = self.reader_task.take() {
-                task.abort();
-            }
-            self.chunk_rx = None;
-            self.stream_active = false;
-            debug!("HttpSource cleanup completed without blocking");
         }
     }
 }
@@ -2037,10 +1778,10 @@ impl HttpSource {
     /// later restart cannot fire it for the first time after an external
     /// retune it would undo.
     async fn configure_rtsa_device(&mut self) -> Result<()> {
-        // Only run connect/run and initial tune on the very first start.
-        // Reconnects (from `restart_pending` or transient stream drops) must
-        // neither hit `/remoteconfig` + sleep 500 ms nor overwrite an external
-        // retune.
+        // Only on the very first start. Reconnects — from `restart_pending`
+        // or a lost stream — are the engine's and never come here: they must
+        // neither hit `/remoteconfig` + sleep 500 ms nor overwrite an
+        // external retune. The guard keeps a second call from doing either.
         if self.initial_tune_done {
             debug!(
                 "Skipping device connect/run and retune on stream restart (already configured once)"
@@ -2366,23 +2107,17 @@ impl Kernel for HttpSource {
             // (The shared stats' copy refreshes with the next processed
             // chunk, via `get_stream_stats`.)
             self.link_check = LinkCheck::Unmeasured;
+            // The `/control` stop, then the old connection is gone with
+            // everything it had queued; the fetch loop below opens the new
+            // one at once, which re-arms the check.
             let handle = self.tokio_handle.clone();
             WithTokioHandle {
                 handle,
-                future: async {
-                    self.cleanup_stream().await;
-                    self.stream_active = false;
-                    self.sample_buffer.clear();
-                    self.note_buffer_cleared();
-                    if let Err(e) = self.start_stream().await {
-                        warn!(
-                            "Failed to restart stream during configuration change: {}",
-                            e
-                        );
-                    }
-                },
+                future: self.engine.restart(),
             }
             .await;
+            self.sample_buffer.clear();
+            self.note_buffer_cleared();
         }
 
         {
@@ -2446,59 +2181,28 @@ impl Kernel for HttpSource {
             // asleep the reader task filled the 64-chunk channel and blocked
             // on `send`, so TCP flow control throttled the server and the
             // stream was lost upstream as well.
+            //
+            // The same bounded park covers a lost connection: the engine
+            // waits out its reconnect delay a park at a time, so `work()`
+            // keeps returning — and servicing its inbox — until the
+            // reconnect is due, and makes it inside the fetch that finds it
+            // due.
             let wait = if self.sample_buffer.is_empty() {
                 Some(CHUNK_WAIT)
             } else {
                 None
             };
             let handle = self.tokio_handle.clone();
-            let fetch_res = WithTokioHandle {
+            let fetched = WithTokioHandle {
                 handle,
                 future: self.fetch_samples(wait),
             }
             .await;
-
-            match fetch_res {
-                Ok(fetched) => {
-                    if fetched == 0 {
-                        // Nothing queued, and the wait above (if any) also
-                        // came up empty: the stream is idle. Flush whatever
-                        // exists and let the next call try again.
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("Aaronia stream error: {}", e);
-                    self.stream_active = false;
-                    // Reap the old reader task before reconnecting. On a parse
-                    // error the task is still running; `start_stream` would
-                    // drop its channel, but a task blocked in `stream.next()`
-                    // on a stalled socket only notices at its next send — and
-                    // meanwhile it holds a server connection, which on the
-                    // free licence (one client) is the very connection the
-                    // reconnect needs. `cleanup_stream` aborts it, and is
-                    // idempotent when the StreamClosed path already ran it.
-                    let handle = self.tokio_handle.clone();
-                    WithTokioHandle {
-                        handle: handle.clone(),
-                        future: self.cleanup_stream(),
-                    }
-                    .await;
-                    // Try to reconnect after a delay
-                    futures_timer::Delay::new(std::time::Duration::from_millis(1000)).await;
-                    let reconnect_res = WithTokioHandle {
-                        handle,
-                        future: self.start_stream(),
-                    }
-                    .await;
-                    if let Err(reconnect_err) = reconnect_res {
-                        warn!("Failed to reconnect: {}", reconnect_err);
-                    }
-                    // Ask to be polled again so the (re)connected stream is
-                    // drained promptly instead of waiting on downstream demand.
-                    io.call_again = true;
-                    return Ok(()); // Don't fail the entire flowgraph
-                }
+            if fetched == 0 {
+                // Nothing queued, and the wait above (if any) also came up
+                // empty: the stream is idle, or between connections. Flush
+                // whatever exists and let the next call try again.
+                break;
             }
         }
 
@@ -2529,8 +2233,9 @@ impl Kernel for HttpSource {
         // `sample_buffer` mean the output filled up, and the runtime already
         // wakes this block when the reader consumes, so parking on the inbox
         // is both cheaper and no slower. An empty buffer is the opposite
-        // case: come straight back and wait on the socket instead, which
-        // `fetch_samples` does with a bounded park rather than a spin.
+        // case: come straight back and wait on the socket (or for a
+        // reconnect) instead, which `fetch_samples` does with a bounded park
+        // rather than a spin.
         io.call_again = self.sample_buffer.is_empty();
 
         Ok(())
@@ -2691,8 +2396,9 @@ impl HttpSourceBuilder {
     /// directly. It is also the write side of the retune mechanism: an
     /// external caller sets `restart_pending = true` on the shared
     /// `StreamStats`, and the next `work()` call notices it, tears down
-    /// the current `/stream` connection, and reconnects to pick up
-    /// whatever frequency/span configuration was applied in between.
+    /// the current `/stream` connection — discarding the samples it had
+    /// buffered — and reconnects to pick up whatever frequency/span
+    /// configuration was applied in between.
     #[must_use]
     pub fn with_shared_stats(
         mut self,
@@ -2730,8 +2436,9 @@ impl HttpSourceBuilder {
 
     /// Listen only: the device is never written to — no connect/run switch, no
     /// tune (the requested centre and rate describe what is expected, they are
-    /// not pushed), no reference level, and no stop when the stream ends.
-    /// For an analyser shared with others, whose settings are theirs.
+    /// not pushed), no reference level, and no `/control` streaming start or
+    /// stop around any connection, the first or a reconnect. For an analyser
+    /// shared with others, whose settings are theirs.
     #[must_use]
     pub fn listen_only(mut self, on: bool) -> Self {
         self.listen_only = on;
@@ -2755,7 +2462,7 @@ impl HttpSourceBuilder {
         )?;
         source.shared_stats = self.shared_stats;
         source.break_sink = self.break_sink;
-        source.listen_only = self.listen_only;
+        source.engine.set_listen_only(self.listen_only);
         Ok(source)
     }
 }
@@ -3175,16 +2882,15 @@ mod tests {
         assert!(source.build().is_ok());
     }
 
-    /// The `/stream` query string is assembled in `start_stream` from these
-    /// four fields, which needs a live server to exercise end-to-end. What
-    /// is checkable here is that every one of them survives the builder —
-    /// a dropped field would silently produce a URL missing that parameter.
+    /// Every `/stream` parameter the builder takes reaches the URL the
+    /// stream opens — a dropped one would silently produce a URL missing
+    /// that parameter.
     #[test]
     fn test_stream_url_construction() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
 
-        let block = HttpSourceBuilder::new("http://localhost:54664")
+        let block = HttpSourceBuilder::new("http://localhost:54664/")
             .format(StreamFormat::Float32)
             .input("main")
             .rate_reduction(4)
@@ -3192,13 +2898,13 @@ mod tests {
             .build()
             .expect("Should create HttpSource");
 
-        assert_eq!(block.base_url, "http://localhost:54664");
+        assert_eq!(
+            block.engine.stream_url(),
+            "http://localhost:54664/stream?format=float32&rate_reduction=4&input=main&scale=1000000",
+        );
         assert_eq!(block.stream_format, StreamFormat::Float32);
         assert_eq!(block.input_name.as_deref(), Some("main"));
         assert_eq!(block.rate_reduction, Some(4));
-        assert_eq!(block.scale, Some(1_000_000.0));
-        // `as_str()` is what lands in the query string.
-        assert_eq!(block.stream_format.as_str(), "float32");
     }
 
     /// The builder's `.scale(N)` must reach the block's internal
@@ -3253,10 +2959,7 @@ mod tests {
         // body — which is how the source is actually driven in `work()`.
         let mut added = 0;
         for _ in 0..100 {
-            added = source
-                .fetch_samples(None)
-                .await
-                .expect("the packet should decode");
+            added = source.fetch_samples(None).await;
             if added > 0 {
                 break;
             }
@@ -3412,12 +3115,9 @@ mod tests {
             tx.try_send(Bytes::from(packet))
                 .expect("room for a channel's depth");
         }
-        block.chunk_rx = Some(rx);
+        block.engine.attach(rx);
 
-        let added = block
-            .fetch_samples(None)
-            .await
-            .expect("a sweep of whole packets parses");
+        let added = block.fetch_samples(None).await;
         assert_eq!(
             added,
             CHUNK_CHANNEL_DEPTH * PAIRS,
@@ -3457,8 +3157,8 @@ mod tests {
             tx.try_send(Bytes::new())
                 .expect("room for a channel's depth");
         }
-        block.chunk_rx = Some(rx);
-        let _ = block.fetch_samples(None).await;
+        block.engine.attach(rx);
+        block.fetch_samples(None).await;
 
         match &block.link_check {
             LinkCheck::Measuring(meter) => assert!(
@@ -3467,35 +3167,6 @@ mod tests {
             ),
             other => panic!("the window should still be open: {other:?}"),
         }
-        drop(tx);
-    }
-
-    /// One sweep takes at most [`CHUNK_CHANNEL_DEPTH`] chunks, however many
-    /// are queued, which is what makes the headroom above an exact bound; the
-    /// rest wait for the next sweep.
-    #[tokio::test]
-    async fn a_sweep_takes_at_most_one_channel_depth_of_chunks() {
-        let mut block = HttpSourceBuilder::new("http://localhost:54664")
-            .format(StreamFormat::Int16)
-            .build()
-            .expect("Should create HttpSource");
-        let (tx, rx) = tokio::sync::mpsc::channel(CHUNK_CHANNEL_DEPTH * 2);
-        for _ in 0..CHUNK_CHANNEL_DEPTH + 10 {
-            tx.try_send(Bytes::new()).expect("room for every chunk");
-        }
-        block.chunk_rx = Some(rx);
-
-        let _ = block.fetch_samples(None).await;
-
-        let rx = block.chunk_rx.as_mut().expect("the stream is still open");
-        let mut left = 0;
-        while rx.try_recv().is_ok() {
-            left += 1;
-        }
-        assert_eq!(
-            left, 10,
-            "a sweep must leave everything past one channel's depth queued"
-        );
         drop(tx);
     }
 
@@ -3541,10 +3212,7 @@ mod tests {
         // firing. The chunk is in flight from the reader task.
         let timeout = std::time::Duration::from_secs(5);
         let start = std::time::Instant::now();
-        let added = source
-            .fetch_samples(Some(timeout))
-            .await
-            .expect("the packet should decode");
+        let added = source.fetch_samples(Some(timeout)).await;
         let elapsed = start.elapsed();
 
         assert_eq!(added, 1, "one IQ pair in the payload");
@@ -4080,7 +3748,7 @@ mod tests {
             .build()
             .expect("Should create HttpSource");
         let _ = block.start_stream().await;
-        block.cleanup_stream().await;
+        block.engine.disconnect().await;
         let wrote = writes(&normal).await;
         // The switches go to /remoteconfig; the tune's fallback and the streaming start
         // both go to /control, and either is a write this server would take.
@@ -4100,7 +3768,7 @@ mod tests {
         let started = block.start_stream().await;
         assert!(started.is_ok(), "the stream opens: {started:?}");
         assert!(block.initial_tune_done, "no tune is attempted later either");
-        block.cleanup_stream().await;
+        block.engine.disconnect().await;
         let wrote = writes(&quiet).await;
         assert!(
             wrote.is_empty(),
@@ -4160,31 +3828,6 @@ mod tests {
         block.apply_initial_tune().await;
         let requests = server.received_requests().await.unwrap_or_default();
         assert!(requests.iter().all(|r| r.url.path() != "/control"));
-    }
-
-    /// A server that stops sending while holding the socket open must not
-    /// park the reader forever: it gives up after the stall timeout and
-    /// drops its sender, which is what sends the source down its
-    /// reconnect path.
-    #[tokio::test]
-    async fn a_stalled_stream_ends_the_reader() {
-        use futures::StreamExt;
-        let chunks =
-            futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"one"))])
-                .chain(futures::stream::pending());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let reader = tokio::spawn(read_stream_into(
-            chunks,
-            tx,
-            std::time::Duration::from_millis(50),
-        ));
-
-        assert_eq!(rx.recv().await, Some(Bytes::from_static(b"one")));
-        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("the stalled reader must give up, not hang");
-        assert_eq!(ended, None, "the channel closes: the source reconnects");
-        reader.await.unwrap();
     }
 
     // ---------------------------------------------------------------
@@ -5001,11 +4644,15 @@ mod tests {
         );
         assert_eq!(built.buffer_size, 4096);
         assert_eq!(built.stream_format, StreamFormat::Int16);
-        assert!(matches!(built.auth_method, AuthMethod::None));
         assert_eq!(built.input_name, None, "input is auto-selected by default");
         assert_eq!(built.rate_reduction, None);
-        assert_eq!(built.scale, None);
-        assert!(!built.stream_active);
+        assert_eq!(
+            built.engine.stream_url(),
+            "http://localhost:54664/stream?format=int16",
+            "no input, rate reduction or scale on the wire unless asked for",
+        );
+        assert!(!built.engine.is_connected());
+        assert!(!built.engine.is_listen_only());
     }
 
     #[tokio::test]

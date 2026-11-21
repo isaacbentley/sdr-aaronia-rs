@@ -12,17 +12,19 @@
 
 use crate::utils::{RECEIVER_CLOCKS_HZ, validate_iq_mode};
 use crate::{Error, Result};
-use futures::stream::StreamExt;
 use num_complex::Complex32;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::file_source::RtsaSource;
 use crate::http_endpoints::HttpEndpointsClient;
+use crate::http_engine::{
+    CaptureTuning, Chunks, EngineOptions, HttpStreamEngine, ReconnectPolicy, StreamEvent, StreamGap,
+};
 
 #[cfg(all(
     feature = "native-sdk",
@@ -84,24 +86,24 @@ const CONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 /// Ceiling for the connect backoff.
 const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
 
-/// Reconnect attempts after a stream dies, before the reader task gives
-/// up and the source reports a closed stream.
-const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+/// How the HTTP reader reconnects with [`SpectranConfig::auto_reconnect`]:
+/// 5 attempts, 250 ms doubling to 4 s (≈8 s across all of them), before it
+/// gives up and reads report a closed stream. The ceiling is kept well
+/// inside the default [`DEFAULT_READ_TIMEOUT`] so a successful reconnect
+/// stays invisible to a caller blocked in `read_samples`. A connection that
+/// survives 30 s earns the budget back.
+const RECONNECT: ReconnectPolicy = ReconnectPolicy {
+    first_delay: Duration::from_millis(250),
+    max_delay: Duration::from_secs(4),
+    attempts: Some(5),
+    healthy_after: Duration::from_secs(30),
+};
 
-/// First delay before a reconnect attempt; doubles up to
-/// [`RECONNECT_BACKOFF_MAX`] (≈8 s across all attempts).
-const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
-
-/// Ceiling for the reconnect backoff. Kept well inside the default
-/// [`DEFAULT_READ_TIMEOUT`] so a successful reconnect stays invisible
-/// to a caller blocked in `read_samples`.
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(4);
-
-/// How long a connection must survive before it counts as healthy and
-/// earns back the full reconnect budget. Without this, a server that
-/// accepts a connection and immediately closes it would reset the
-/// attempt counter on every round and reconnect indefinitely.
-const RECONNECT_HEALTHY_AFTER: Duration = Duration::from_secs(30);
+/// One IQ packet from the HTTP reader task: its samples, whether a break in
+/// the stream precedes them, the drop detector's running total, the start
+/// timestamp in nanoseconds, and the centre frequency and sample rate it was
+/// captured at.
+type HttpPacket = (Vec<Complex32>, bool, u64, i64, f64, f64);
 
 /// What the server is actually delivering, read back from packet
 /// metadata.
@@ -118,39 +120,6 @@ struct ObservedStream {
     sample_rate_hz: f64,
     center_frequency_hz: f64,
     bandwidth_hz: f64,
-}
-
-/// Whether the reader task should attempt another reconnect, counting
-/// the attempt when it should. Split out so the "stream failed to
-/// start" and "stream died mid-flight" paths can't drift apart.
-fn should_reconnect(auto_reconnect: bool, attempts: &mut u32) -> bool {
-    if !auto_reconnect {
-        return false;
-    }
-    if *attempts >= MAX_RECONNECT_ATTEMPTS {
-        error!(
-            "HTTP stream did not recover after {MAX_RECONNECT_ATTEMPTS} reconnect attempts; \
-             giving up (reads will report a closed stream)"
-        );
-        return false;
-    }
-    *attempts += 1;
-    true
-}
-
-/// The capture tuning the reader task must restore after reconnecting.
-///
-/// Tuning lives on the device, not the stream, so a plain reconnect
-/// usually keeps it — but if the RTSA-Suite itself restarted, it comes
-/// back on the mission's configured frequency and the stream would
-/// silently deliver the wrong band. Shared with the retune setters so a
-/// reconnect re-applies the *current* tuning rather than whatever was
-/// configured at startup.
-#[derive(Debug, Clone, Copy)]
-struct CaptureTuning {
-    center_frequency_hz: f64,
-    sample_rate_hz: f64,
-    reference_level_dbm: f64,
 }
 
 /// Hard ceiling on the total time spent retrying, measured from the
@@ -226,6 +195,110 @@ where
     unreachable!("retry loop returns on the final attempt")
 }
 
+/// The HTTP backend's reader task: run `engine` until it gives up or the
+/// reads are gone, sending each IQ packet on with the geometry it was
+/// captured at and whether a break in the stream precedes it.
+///
+/// The capture frequency and rate ride with the samples they belong to.
+/// Reading them from shared state at consume time instead would race this
+/// task, which runs ahead of the reads: a buffer parsed before a retune
+/// would be tagged with the frequency after it.
+async fn forward_http_stream(
+    mut engine: HttpStreamEngine,
+    sender: tokio::sync::mpsc::Sender<HttpPacket>,
+    observed: Arc<Mutex<ObservedStream>>,
+    rate_bits: Arc<std::sync::atomic::AtomicU64>,
+) {
+    // A break the next packet must carry: a server gap or backward
+    // timestamp step, a lost packet, or a reconnect — samples were missed,
+    // or the packets either side do not follow one another, and a consumer
+    // stitching buffers needs to know where.
+    let mut break_pending = false;
+    // Whether any packet has reached the reads: nothing precedes the first
+    // one, so a break before it is no break at all.
+    let mut delivered_any = false;
+    let mut cumulative_drops = 0u64;
+    let mut warned_non_iq = false;
+    loop {
+        let chunks = match engine.next_chunks(None).await {
+            Chunks::Got(chunks) => chunks,
+            Chunks::Idle => continue,
+            // The budget is spent (or reconnecting is off): ending the task
+            // drops `sender`, which reads report as a closed stream.
+            Chunks::Finished => return,
+        };
+        for chunk in &chunks {
+            // `Err` gave the connection up; the rest of these chunks came
+            // from it.
+            let Ok(events) = engine.decode(chunk) else {
+                break;
+            };
+            for event in events {
+                let packet = match event {
+                    StreamEvent::Iq(packet) => packet,
+                    StreamEvent::Break(gap) => {
+                        if let StreamGap::Server { drops, .. } = gap {
+                            cumulative_drops = drops;
+                        }
+                        break_pending = true;
+                        continue;
+                    }
+                    StreamEvent::NonIq { payload, undecoded } => {
+                        if !std::mem::replace(&mut warned_non_iq, true) {
+                            warn!(
+                                "The HTTP stream carries {payload:?} packets as well as IQ{}; \
+                                 they are skipped",
+                                undecoded.map_or(String::new(), |e| format!(" ({e})")),
+                            );
+                        }
+                        continue;
+                    }
+                };
+                // Record what the server says it is sending, so callers see
+                // the real rate rather than the one they asked for.
+                {
+                    let cfg = &packet.sdr_config;
+                    let mut obs = observed.lock().unwrap_or_else(|p| p.into_inner());
+                    if cfg.sample_rate_hz.is_finite() && cfg.sample_rate_hz > 0.0 {
+                        obs.sample_rate_hz = cfg.sample_rate_hz;
+                        rate_bits.store(
+                            cfg.sample_rate_hz.to_bits(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    if cfg.center_frequency_hz.is_finite() && cfg.center_frequency_hz > 0.0 {
+                        obs.center_frequency_hz = cfg.center_frequency_hz;
+                    }
+                    if cfg.bandwidth_hz.is_finite() && cfg.bandwidth_hz > 0.0 {
+                        obs.bandwidth_hz = cfg.bandwidth_hz;
+                    }
+                }
+                let after_break = std::mem::take(&mut break_pending) && delivered_any;
+                let timestamp_ns =
+                    crate::utils::epoch_seconds_to_nanos(packet.metadata.start_time).unwrap_or(0);
+                let center_hz = packet.sdr_config.center_frequency_hz;
+                let rate_hz = packet.sdr_config.sample_rate_hz;
+                if sender
+                    .send((
+                        packet.samples,
+                        after_break,
+                        cumulative_drops,
+                        timestamp_ns,
+                        center_hz,
+                        rate_hz,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    info!("Receiver dropped, HTTP streaming task exiting.");
+                    return;
+                }
+                delivered_any = true;
+            }
+        }
+    }
+}
+
 /// Configuration for the unified Aaronia source
 #[derive(Debug, Clone)]
 pub struct SpectranConfig {
@@ -282,12 +355,13 @@ pub struct SpectranConfig {
     ///
     /// An RTSA-Suite restart or a brief network drop otherwise ends the
     /// session permanently: the reader task exits and every subsequent
-    /// read returns [`Error::Protocol`]. With this enabled the reader
-    /// retries a bounded number of times, re-applies the current tuning
-    /// (the server may have come back on its mission's frequency), and
-    /// flags the first packet after the gap as an overrun so callers can
-    /// tell that samples were missed. Once the attempts are exhausted
-    /// the stream ends exactly as it does with this disabled.
+    /// read reports a closed stream ([`Error::StreamClosed`]). With this
+    /// enabled the reader retries a bounded number of times, re-applies the
+    /// current tuning before each attempt (the server may have come back on
+    /// its mission's frequency) unless the source is listen-only, and flags
+    /// the first packet after the gap as an overrun so callers can tell
+    /// that samples were missed. Once the attempts are exhausted the stream
+    /// ends exactly as it does with this disabled.
     ///
     /// Ignored by the file and native-SDK backends.
     pub auto_reconnect: bool,
@@ -482,22 +556,19 @@ pub struct SpectranSource {
     /// The observed sample rate as `f64` bits, updated by the reader task,
     /// so per-packet readers (`sample_rate_hz`) take no lock.
     http_rate_bits: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// Tuning the HTTP reader task re-applies after a reconnect. Shared
-    /// with the retune setters, which write their *intent* here before
-    /// issuing the PUT — so a reconnect racing a user retune re-applies
-    /// the value the user asked for, not the one it replaced.
+    /// Tuning the HTTP reader task re-applies before each reconnect
+    /// attempt. Shared with the retune setters, which write their *intent*
+    /// here before issuing the PUT — so a reconnect racing a user retune
+    /// re-applies the value the user asked for, not the one it replaced.
     http_tuning: Option<Arc<Mutex<CaptureTuning>>>,
     file_source: Option<RtsaSource>,
-    /// Each item pairs a chunk of samples with whether the HTTP reader
-    /// task's `DropDetector` observed a timestamp gap ending at (or
-    /// before) that chunk — see `pending_overrun`.
-    #[allow(clippy::type_complexity)]
-    http_receiver: Option<tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64, f64, f64)>>,
-    /// Background task draining the HTTP `/stream` connection. Held so it
-    /// can be aborted on `stop_streaming` / drop — otherwise it lingers
-    /// parked on `next().await` (holding the open connection, so the
-    /// device keeps streaming) until a packet happens to arrive and the
-    /// dropped receiver is finally noticed.
+    /// IQ packets from the HTTP reader task, each flagged when a break in
+    /// the stream precedes it — see `pending_overrun`.
+    http_receiver: Option<tokio::sync::mpsc::Receiver<HttpPacket>>,
+    /// Background task running the HTTP stream engine. Held so it can be
+    /// aborted on `stop_streaming` / drop, which drops the engine and with
+    /// it the open `/stream` connection — otherwise the device keeps
+    /// streaming to a task nobody reads.
     http_task: Option<tokio::task::JoinHandle<()>>,
     /// Latches `true` when a received HTTP chunk carried a detected
     /// drop, until [`Self::take_overrun`] reads and clears it.
@@ -997,6 +1068,11 @@ impl SpectranSource {
                 Error::Protocol(msg)
             })?;
 
+        let initial_tuning = CaptureTuning {
+            center_frequency_hz: self.config.center_frequency_hz,
+            sample_rate_hz: self.config.sample_rate_hz,
+            reference_level_dbm: self.config.reference_level_dbm,
+        };
         if !self.is_listen_only() {
             // Tune the hardware to the requested frequency *before* opening the
             // stream. Without this the `/stream` endpoint returns whatever the
@@ -1009,24 +1085,17 @@ impl SpectranSource {
                 self.config.reference_level_dbm,
             );
             retry_connect("Initial tuning", || {
-                client.configure_capture(crate::http_endpoints::CaptureControl {
-                    frequency_center_hz: Some(self.config.center_frequency_hz),
-                    frequency_span_hz: Some(self.config.sample_rate_hz),
-                    reference_level_dbm: Some(self.config.reference_level_dbm as f32),
-                    control_type: crate::http_endpoints::ControlType::Capture,
-                    ..Default::default()
-                })
+                client.configure_capture(initial_tuning.control())
             })
             .await?;
         } else {
             info!("HTTP source in listen_only mode; skipping initial /control write");
         }
 
-        // Create a channel for sending samples from the async task to
-        // SpectranSource. Each item also carries whether the reader
-        // task's DropDetector flagged a gap ending at this packet, so
-        // `read_samples` can surface it as `IqPacket::overrun`.
-        let (sender, receiver) = tokio::sync::mpsc::channel(100); // Buffer up to 100 chunks
+        // Packets from the reader task to the reads. Each also carries
+        // whether a break in the stream precedes it, so `read_samples` can
+        // put it on a read boundary and surface it as `take_overrun`.
+        let (sender, receiver) = tokio::sync::mpsc::channel(100); // Buffer up to 100 packets
 
         // Honour the caller's requested wire format; default to Float32
         // (binary, lossless) rather than JSON, which is the slowest format
@@ -1039,250 +1108,42 @@ impl SpectranSource {
         if let Some(scale) = self.config.stream_scale {
             params_builder = params_builder.scale(scale);
         }
-        let stream_params = params_builder.build();
-        // Reuse the existing client for the reader task rather than building a
-        // second one: `HttpEndpointsClient` clones cheaply (its inner
-        // `reqwest::Client` is `Arc`-backed), so both share one connection
-        // pool instead of standing up a duplicate.
-        let client_for_task = client.clone();
 
         // Tuning shared with the retune setters so a reconnect restores
         // what the caller most recently asked for.
-        let tuning = Arc::new(Mutex::new(CaptureTuning {
-            center_frequency_hz: self.config.center_frequency_hz,
-            sample_rate_hz: self.config.sample_rate_hz,
-            reference_level_dbm: self.config.reference_level_dbm,
-        }));
-        let tuning_for_task = tuning.clone();
+        let tuning = Arc::new(Mutex::new(initial_tuning));
         let observed = Arc::new(Mutex::new(ObservedStream::default()));
-        let observed_for_task = observed.clone();
         let rate_bits = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let rate_bits_for_task = rate_bits.clone();
-        let auto_reconnect = self.config.auto_reconnect;
-        let listen_only = self.listen_only.clone();
 
-        // Spawn a task to continuously read from the HTTP stream and send samples
-        let reader_task = tokio::spawn(async move {
-            // Parse errors are recoverable (the parser resyncs at the next
-            // packet header), so don't kill the stream on the first one —
-            // only bail after a run of consecutive failures, which
-            // indicates the transport itself is broken.
-            const MAX_CONSECUTIVE_STREAM_ERRORS: u32 = 5;
-
-            let mut drop_detector = crate::http_streaming::DropDetector::default();
-            let mut reconnects = 0u32;
-            let mut backoff = RECONNECT_BACKOFF_INITIAL;
-            // Set after a reconnect so the first packet across the gap
-            // is reported as an overrun: samples *were* missed, and the
-            // DropDetector can't see it (its timestamp history is reset
-            // to avoid attributing the whole outage to one packet).
-            let mut flag_overrun_after_gap = false;
-            // Whether any packet has reached the consumer: a failed
-            // *first* connection loses nothing, so it is not a gap.
-            let mut delivered_any = false;
-
-            // Outer loop: one iteration per stream connection.
-            'reconnect: loop {
-                let mut http_stream =
-                    match client_for_task.start_stream(stream_params.clone()).await {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            error!("Failed to start HTTP stream: {:?}", e);
-                            // Fall through to the reconnect decision below
-                            // rather than returning: a server that is still
-                            // coming back up refuses this exactly as it
-                            // refuses a mid-stream reconnect.
-                            if !should_reconnect(auto_reconnect, &mut reconnects) {
-                                return;
-                            }
-                            tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                            flag_overrun_after_gap = delivered_any;
-                            continue 'reconnect;
-                        }
-                    };
-
-                let mut consecutive_errors = 0u32;
-                let connected_at = std::time::Instant::now();
-
-                // Inner loop: packets on the current connection.
-                loop {
-                    // A server that stops sending while the socket stays
-                    // open — a hung RTSA process, a half-open TCP
-                    // connection — would park this read forever. Silence
-                    // that long ends the connection like a closed stream.
-                    let next = match tokio::time::timeout(
-                        crate::http_endpoints::STREAM_STALL_TIMEOUT,
-                        http_stream.next(),
-                    )
-                    .await
-                    {
-                        Ok(next) => next,
-                        Err(_) => {
-                            warn!(
-                                "HTTP stream delivered nothing for {:?}; treating the \
-                                 connection as lost",
-                                crate::http_endpoints::STREAM_STALL_TIMEOUT
-                            );
-                            break;
-                        }
-                    };
-                    match next {
-                        Some(Ok(packet)) => {
-                            consecutive_errors = 0;
-                            // The HTTP stream already returns parsed StreamPacket objects
-                            if packet.metadata.payload == crate::http_streaming::PayloadType::Iq {
-                                // Record what the server says it is
-                                // sending, so callers see the real rate
-                                // rather than the one they asked for.
-                                {
-                                    let cfg = &packet.sdr_config;
-                                    let mut obs =
-                                        observed_for_task.lock().unwrap_or_else(|p| p.into_inner());
-                                    if cfg.sample_rate_hz.is_finite() && cfg.sample_rate_hz > 0.0 {
-                                        obs.sample_rate_hz = cfg.sample_rate_hz;
-                                        rate_bits_for_task.store(
-                                            cfg.sample_rate_hz.to_bits(),
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                    }
-                                    if cfg.center_frequency_hz.is_finite()
-                                        && cfg.center_frequency_hz > 0.0
-                                    {
-                                        obs.center_frequency_hz = cfg.center_frequency_hz;
-                                    }
-                                    if cfg.bandwidth_hz.is_finite() && cfg.bandwidth_hz > 0.0 {
-                                        obs.bandwidth_hz = cfg.bandwidth_hz;
-                                    }
-                                }
-
-                                // A backward timestamp step loses no
-                                // samples but is no less a discontinuity
-                                // to whoever stitches the buffers.
-                                let dropped = matches!(
-                                    drop_detector.observe(&packet),
-                                    crate::http_streaming::DropResult::Drop { .. }
-                                        | crate::http_streaming::DropResult::Backward { .. }
-                                ) || std::mem::take(&mut flag_overrun_after_gap);
-                                let timestamp_ns = crate::utils::epoch_seconds_to_nanos(
-                                    packet.metadata.start_time,
-                                )
-                                .unwrap_or(0);
-                                let cumulative_drops = drop_detector.drops();
-                                // The capture frequency rides with the
-                                // samples it belongs to. Reading it from
-                                // shared state at consume time instead
-                                // would race the reader task, which runs
-                                // ahead of the consumer: a buffer parsed
-                                // before a retune would be tagged with the
-                                // frequency after it.
-                                let packet_center_hz = packet.sdr_config.center_frequency_hz;
-                                if sender
-                                    .send((
-                                        packet.samples,
-                                        dropped,
-                                        cumulative_drops,
-                                        timestamp_ns,
-                                        packet_center_hz,
-                                        packet.sdr_config.sample_rate_hz,
-                                    ))
-                                    .await
-                                    .is_err()
-                                {
-                                    // Receiver dropped, task can exit
-                                    info!("Receiver dropped, HTTP streaming task exiting.");
-                                    return;
-                                }
-                                delivered_any = true;
-                            } else {
-                                warn!(
-                                    "HTTP streaming task received non-IQ payload type: {:?}",
-                                    packet.metadata.payload
-                                );
-                            }
-                        }
-                        Some(Err(e)) => {
-                            consecutive_errors += 1;
-                            if consecutive_errors >= MAX_CONSECUTIVE_STREAM_ERRORS {
-                                error!(
-                                    "HTTP stream failed {} times in a row: {:?}",
-                                    consecutive_errors, e
-                                );
-                                break;
-                            }
-                            warn!("Recoverable HTTP stream error: {:?}", e);
-                        }
-                        None => {
-                            info!("HTTP stream ended.");
-                            break; // Stream ended
-                        }
-                    }
+        // The engine opens, reads, decodes and reconnects; this backend only
+        // labels what it delivers. One `HttpEndpointsClient` for the stream
+        // and the control writes alike: it clones cheaply (its inner
+        // `reqwest::Client` is `Arc`-backed), so both share one connection
+        // pool instead of standing up a duplicate.
+        let engine = HttpStreamEngine::new(EngineOptions {
+            stream_client: client.clone(),
+            control_client: client.clone(),
+            params: params_builder.build(),
+            // Read before every re-tune, so `set_listen_only` reaches a
+            // stream that is already running.
+            listen_only: self.listen_only.clone(),
+            reconnect: if self.config.auto_reconnect {
+                RECONNECT
+            } else {
+                ReconnectPolicy {
+                    attempts: Some(0),
+                    ..RECONNECT
                 }
-                // Release the connection now rather than after the backoff:
-                // a stalled one still holds a server slot, and on a
-                // one-client licence that is the slot the reconnect needs.
-                drop(http_stream);
-
-                // A connection that stayed up this long was genuinely
-                // healthy, so a later outage starts from a full budget.
-                // Gating this on uptime rather than on "a packet
-                // arrived" matters: a server that accepts, sends one
-                // packet and hangs up would otherwise reset the counter
-                // every round and reconnect forever.
-                if connected_at.elapsed() >= RECONNECT_HEALTHY_AFTER {
-                    reconnects = 0;
-                    backoff = RECONNECT_BACKOFF_INITIAL;
-                }
-
-                // The connection is gone. Reconnect, or let the task end
-                // (dropping `sender`), which surfaces to readers as a
-                // closed stream — the pre-reconnect behaviour.
-                if !should_reconnect(auto_reconnect, &mut reconnects) {
-                    return;
-                }
-                warn!(
-                    "HTTP stream lost; reconnecting in {backoff:?} \
-                     (attempt {reconnects}/{MAX_RECONNECT_ATTEMPTS})"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-
-                if !listen_only.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Re-apply tuning: if the RTSA-Suite restarted, it came
-                    // back on its mission's frequency and would otherwise
-                    // stream the wrong band under the caller's nose. Best
-                    // effort — a failure here is reported and the stream is
-                    // attempted anyway, since a wrongly-tuned stream is
-                    // still more useful than none and the next reconnect
-                    // retries the tuning.
-                    let desired = *tuning_for_task
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Err(e) = client_for_task
-                        .configure_capture(crate::http_endpoints::CaptureControl {
-                            frequency_center_hz: Some(desired.center_frequency_hz),
-                            frequency_span_hz: Some(desired.sample_rate_hz),
-                            reference_level_dbm: Some(desired.reference_level_dbm as f32),
-                            control_type: crate::http_endpoints::ControlType::Capture,
-                            ..Default::default()
-                        })
-                        .await
-                    {
-                        warn!("Re-applying tuning after reconnect failed: {e}");
-                    }
-                }
-
-                // Timestamps restart across the gap; without this the
-                // detector would count the whole outage as one enormous
-                // drop. `flag_overrun_after_gap` carries the signal
-                // instead. `resync`, not `reset`: the latter also zeroes
-                // the cumulative counters, which consumers read as a
-                // monotonic total — rolling it back mid-session is worse
-                // than losing the gap.
-                drop_detector.resync();
-                flag_overrun_after_gap = true;
-            }
-        });
+            },
+            retune_on_reconnect: Some(tuning.clone()),
+            streaming_control: false,
+        })?;
+        let reader_task = tokio::spawn(forward_http_stream(
+            engine,
+            sender,
+            observed.clone(),
+            rate_bits.clone(),
+        ));
 
         self.http_client = Some(client);
         self.http_observed = Some(observed);
@@ -3538,9 +3399,7 @@ mod tests {
     /// An HTTP-backed source fed by `chunk_rx`, for the read-assembly
     /// tests. Factored out because three of them build the same thing
     /// and a new field otherwise has to be added in every copy.
-    fn http_test_source(
-        chunk_rx: tokio::sync::mpsc::Receiver<(Vec<Complex32>, bool, u64, i64, f64, f64)>,
-    ) -> SpectranSource {
+    fn http_test_source(chunk_rx: tokio::sync::mpsc::Receiver<HttpPacket>) -> SpectranSource {
         SpectranSource {
             config: SpectranConfig::default(),
             source_type: SourceType::Http,
@@ -3931,6 +3790,83 @@ mod tests {
         assert_eq!(
             source.detect_best_source_type().await.unwrap(),
             SourceType::Http
+        );
+    }
+
+    /// One int16 IQ packet as the wire carries it.
+    fn wire_iq_packet(start: f64, end: f64, pairs: usize) -> Vec<u8> {
+        let mut out = format!(
+            r#"{{"startTime":{start},"endTime":{end},"startFrequency":95e6,"endFrequency":105e6,"sampleFrequency":15360000,"samples":{pairs},"unit":"volt","payload":"iq","minPower":-120,"maxPower":0,"sampleSize":2}}"#
+        )
+        .into_bytes();
+        out.extend_from_slice(&[0x0A, 0x1E]);
+        out.extend(std::iter::repeat_n(0u8, pairs * 4));
+        out
+    }
+
+    /// The reader task flags the packet after each break the engine
+    /// reports — a lost packet, a server gap — except before the first
+    /// packet it delivers, which nothing precedes. A lost packet costs only
+    /// itself: its neighbours in the same chunk are delivered.
+    #[tokio::test]
+    async fn the_reader_task_flags_the_packet_after_each_break() {
+        let client = HttpEndpointsClient::new(
+            "http://localhost:54664".into(),
+            crate::http_endpoints::AuthMethod::None,
+        )
+        .unwrap();
+        let mut engine = HttpStreamEngine::new(EngineOptions {
+            stream_client: client.clone(),
+            control_client: client,
+            params: HttpEndpointsClient::stream_params()
+                .format(crate::http_streaming::StreamFormat::Int16)
+                .build(),
+            listen_only: Arc::new(AtomicBool::new(false)),
+            // Nothing to reconnect to: the task ends with the chunks.
+            reconnect: ReconnectPolicy {
+                attempts: Some(0),
+                ..RECONNECT
+            },
+            retune_on_reconnect: None,
+            streaming_control: false,
+        })
+        .unwrap();
+        let lost = format!(
+            r#"{{"startTime":0,"endTime":0,"startFrequency":95e6,"endFrequency":105e6,"sampleFrequency":15360000,"samples":{},"unit":"volt","payload":"iq","minPower":-120,"maxPower":0,"sampleSize":2}}"#,
+            u64::MAX
+        )
+        .into_bytes();
+        let mut first = lost.clone();
+        first.extend_from_slice(&[0x0A, 0x1E]);
+        first.extend(wire_iq_packet(100.000, 100.001, 2));
+        first.extend(lost);
+        first.extend_from_slice(&[0x0A, 0x1E]);
+        first.extend(wire_iq_packet(100.002, 100.003, 3));
+        // 100 ms the server never sent.
+        let second = wire_iq_packet(100.103, 100.104, 4);
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
+        chunk_tx.try_send(bytes::Bytes::from(first)).unwrap();
+        chunk_tx.try_send(bytes::Bytes::from(second)).unwrap();
+        drop(chunk_tx);
+        engine.attach(chunk_rx);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        forward_http_stream(
+            engine,
+            tx,
+            Arc::new(Mutex::new(ObservedStream::default())),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+        .await;
+        let mut delivered = Vec::new();
+        while let Ok((samples, after_break, drops, _, center_hz, rate_hz)) = rx.try_recv() {
+            assert_eq!((center_hz, rate_hz), (100e6, 15_360_000.0));
+            delivered.push((samples.len(), after_break, drops));
+        }
+        assert_eq!(
+            delivered,
+            [(2, false, 0), (3, true, 0), (4, true, 1)],
+            "nothing precedes the first packet; the lost one is a break, not a server gap",
         );
     }
 

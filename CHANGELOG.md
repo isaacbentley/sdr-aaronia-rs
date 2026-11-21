@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- `HttpSource` and `SpectranSource`'s HTTP backend run on one internal stream engine (`src/http_engine.rs`) instead of two separate clients: opening `/stream`, the 5 s header and stall timeouts, chunk decoding, gap detection, reconnecting with backoff, re-applying tuning on reconnect, the `listen_only` gate, restarts and stream-break events are implemented once. Each front-end keeps its own reconnect policy — `SpectranSource` 250 ms doubling to 4 s with 5 attempts (none with `auto_reconnect(false)`), `HttpSource` every second without limit — and the public API is unchanged. DESIGN.md §4.2 lists what each front-end still owns.
+- `HttpSource` no longer blocks `work()` for its one-second reconnect delay: it waits the delay out 20 ms at a time, servicing its inbox, so a flowgraph stops promptly while the server is away. It no longer reads `/info` on each reconnect, only at the first start.
+- The `futuresdr` feature no longer pulls in `futures-timer`.
+
+### Fixed
+- `SpectranSource` over HTTP decodes with the recovering parser, as `HttpSource` did: an undecodable packet no longer discards the packets decoded before it in the same chunk, it is flagged as a break (`take_overrun`) where it sat, and a run of them no longer forces a reconnect. Such a loss is no longer counted in `cumulative_drops`, which counts server gaps.
+- `SpectranSource` re-applies its tuning before every reconnect attempt. It used to try only once per outage, right after the connection was lost, so a server still down at that moment came back on its mission's frequency.
+- `SpectranSource`'s 5 s stall timeout counts bytes, as `HttpSource`'s did, rather than complete packets, so a live connection is not dropped for a packet that takes long to arrive.
+- `SpectranSource` warns once that the stream carries non-IQ packets, instead of once per packet.
+- `SpectranSource` no longer flags an overrun on its first packet when the connection before it delivered nothing.
+- `HttpSource` writes the `/control` streaming stop after every connection that ends, including one that lost its framing.
+
 ## [v0.14.0] - 2026-11-20
 
 ### Changed

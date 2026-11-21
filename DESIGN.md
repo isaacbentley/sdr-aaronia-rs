@@ -61,6 +61,28 @@ Available on Windows and Linux only, behind the non-default `native-sdk` feature
 - **Formats**: supports the `Json`, `Int16`, `Float16`, and `Float32` wire formats, maintaining a persistent chunked-transfer buffer across packet boundaries. The default is `Float32` (binary, lossless); `Int16` is opt-in via `SpectranConfig::stream_format()` / `stream_scale()`.
 - Beyond streaming, `HttpEndpointsClient` exposes device control and health telemetry (as a generic configuration tree) within a headless Rust process.
 
+#### The stream engine
+
+Both HTTP front-ends — `SpectranSource`'s HTTP backend and the FutureSDR `HttpSource` block — run on one internal stream engine, `HttpStreamEngine` in `src/http_engine.rs`. It owns everything between the socket and an IQ packet:
+
+- **Opening** `/stream` through `HttpEndpointsClient::open_stream`, the crate's one `/stream` request (`start_stream` uses it too): the response headers must arrive within 5 s.
+- **Reading** on a task per connection that drains the body into a 64-chunk channel — the backpressure point — and gives the connection up when it delivers no bytes for 5 s (a hung server, a half-open TCP connection).
+- **Decoding** with `StreamParser::process_data_recovering`, so an undecodable packet costs only itself, and a `DropDetector` over the IQ packets. Each chunk comes back as events in stream order: IQ packets, skipped non-IQ packets, and breaks — a server gap, a backward timestamp step, a lost packet, or a reconnect.
+- **Reconnecting** under the front-end's `ReconnectPolicy` (first delay, ceiling, attempt budget, and the uptime that earns the budget back). Before each reconnect attempt it re-applies the tuning the front-end shares with it, as a full `/control` capture tuple; around each connection it can write the `/control` streaming start and stop. While the shared `listen_only` flag is set it writes nothing.
+- **Restarting** on request, for a front-end that picks up a retune by reconnecting.
+
+The engine has no task of its own: the front-end polls it for chunks (which is where a lost connection is noticed and the next one opened) and decodes them. What differs between the two front-ends is configuration and what they do with the packets:
+
+| | `SpectranSource` (HTTP) | `HttpSource` (FutureSDR) |
+|---|---|---|
+| Drives the engine from | a spawned reader task feeding `read_samples` | `work()`, parking at most 20 ms at a time |
+| Reconnect policy | 250 ms doubling to 4 s, 5 attempts, budget back after 30 s up; none with `auto_reconnect(false)` | every 1 s, unlimited — a source block that gave up would end the flowgraph's input |
+| Re-tune before a reconnect | the current tuning, unless `listen_only` | never: a reconnect must not undo an external retune |
+| `/control` streaming start/stop around connections | no | yes, unless `listen_only` |
+| First tune | `/control` capture tuple, retried, at construction | `/remoteconfig` with read-back, `/control` fallback, first start only |
+| Retune | `/control` PUT; reads stop at the packet where the geometry changes | external, then `restart_pending` restarts the stream |
+| Breaks surface as | read boundaries plus `take_overrun()` | `StreamBreakSink` indices and `StreamStats` counters |
+
 ### 4.3 RTSA Files
 
 - Maps the RTSA file format to the `SdrSource` interface.
@@ -79,13 +101,13 @@ The hop loop itself — which channel next, how long to dwell there, and the ~75
 
 ## 6. Overrun Detection and Fault Handling
 
-The HTTP reader task (spawned by `init_http_source` in `unified_source.rs`) runs a `DropDetector` over each packet's `start_time`/`end_time` metadata. A timestamp gap larger than the tolerance latches `SpectranSource::pending_overrun`, which `take_overrun()` reads and clears. A consumer's read loop calls `take_overrun()` once per block it hands on, so a drop detected anywhere since the last read surfaces on the next block (Specola's adapter sets its `IqPacket::overrun` from it). This is a per-call signal, not a precise per-sample one, since drop timing is lost once chunks merge into the flat `sample_buffer`.
+Over HTTP, every break the stream engine reports — a server gap or backward step from the `DropDetector` over each packet's `start_time`/`end_time`, a packet the parser could not decode, or a reconnect — marks the next IQ packet. A read never spans one: assembly stops before the marked packet, and the read that begins with it latches `SpectranSource::pending_overrun`, which `take_overrun()` reads and clears. A consumer that resets its state between reads therefore resets exactly at the break (Specola's adapter sets its `IqPacket::overrun` from it). A break before the first packet the source ever delivered is not reported: nothing precedes it.
 
-The native-SDK and file backends do not populate this yet (`overrun` is always `false` for them). Native-SDK overrun detection would need the overflow/dropped warning bits from the packet `flags` field. The RX path reads and logs those at debug level, but does not yet latch them into `pending_overrun`.
+The native-SDK backend latches the same flag from its packets' overflow, dropped and time-discontinuity warning flags. File sources always report `false`.
 
 ## 7. FutureSDR Integration
 
-FutureSDR integration is available under the `futuresdr` feature gate. The crate exposes lower-level builder variants (e.g. `HttpSourceBuilder`) so `HttpSource` can be used as a source block in FutureSDR flowgraphs:
+FutureSDR integration is available under the `futuresdr` feature gate. The crate exposes lower-level builder variants (e.g. `HttpSourceBuilder`) so `HttpSource` can be used as a source block in FutureSDR flowgraphs. The block streams through the same engine as `SpectranSource` (§4.2) and adds what a flowgraph source needs: a sample buffer sized to the downstream buffer and the engine's sweep, stream-break indices in its own output, the passive link-budget check, and shared `StreamStats`:
 
 ```text
 ┌─────────────────┐    ┌────────────────────┐
@@ -94,6 +116,6 @@ FutureSDR integration is available under the `futuresdr` feature gate. The crate
 ├─────────────────┤    ├────────────────────┤
 │ HttpSource      │◄──►│ HttpSourceBuilder  │
 │ (Block)         │    │ StreamFormat       │
-│                 │    │ StreamParser       │
+│                 │    │ HttpStreamEngine   │
 └─────────────────┘    └────────────────────┘
 ```

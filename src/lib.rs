@@ -43,6 +43,10 @@ pub mod file_source;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub mod http_endpoints;
+// The `/stream` client `HttpSource` and `SpectranSource`'s HTTP backend
+// share: opening, stall timeouts, decoding, reconnecting.
+#[cfg(any(feature = "futuresdr", all(feature = "http", feature = "file")))]
+mod http_engine;
 #[cfg(feature = "futuresdr")]
 #[cfg_attr(docsrs, doc(cfg(feature = "futuresdr")))]
 pub mod http_sink;
