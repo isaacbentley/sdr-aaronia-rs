@@ -549,7 +549,7 @@ When `SAMP` chunks contain spectra and `mCompression` is non-zero, a three-step 
 
 Decompression is performed in the inverse order: Unpacking -> Dequantization -> Inverse Wavelet Transform.
 
-This crate implements the spectra decoder in `decompression.rs`, but currently applies it only on the HTTP streaming path. The file reader reads spectra `SAMP` payloads as raw `f32` without checking `mCompression` — compressed spectra in a file are not yet decoded.
+This crate implements the spectra decoder in `decompression.rs`, and the file reader uses it: a compressed spectra `SAMP` chunk holding a single wavelet block (1 to 16 spectra) is decoded in-band, and any other compressed spectra chunk is refused with an error that points at `RTSAFileTool`, rather than misread as raw `f32`. On the binary HTTP stream formats a compressed spectra packet carries no byte length to frame it by, so it is skipped and reported as lost.
 
 ### Compression of IQ Data (`DSPT_IQ`)
 
@@ -557,7 +557,7 @@ This crate implements the spectra decoder in `decompression.rs`, but currently a
 
 Empirical testing (specifically with CW signals) showed that compressed IQ datasets can sometimes be partially recovered by treating the payload as a flat Rice-coded bitstream, zero-padding the coefficient matrix, and applying a 2D inverse Haar wavelet transform. That fallback perfectly reconstructs sparse signals, but broadband captures decoded this way contain significant artifacts due to undocumented proprietary padding or block framing.
 
-**This crate does not implement that fallback.** `Decompressor::decompress` rejects `DSPT_IQ`-shaped inputs with an error, and the in-band read path likewise refuses compressed IQ chunks. Instead, `RtsaSource::open` shells out to Aaronia's own `RTSAFileTool repair -compress=0` (located via the RTSA-Suite installation directory or `AARONIA_SDK_PATH`) to rewrite the capture uncompressed into a temporary file, which is then reopened. Opening a compressed-IQ capture without `RTSAFileTool` installed fails with an actionable error.
+**This crate does not implement that fallback.** `Decompressor::decompress` implements only the documented spectra transform and cannot tell an IQ payload from a spectrum, so it is the in-band read path that refuses compressed IQ chunks. Instead, `RtsaSource::open` shells out to Aaronia's own `RTSAFileTool repair -compress=0` (located via the RTSA-Suite installation directory or `AARONIA_SDK_PATH`) to rewrite the capture uncompressed into a temporary file, which is then reopened. Opening a compressed-IQ capture without `RTSAFileTool` installed fails with an actionable error.
 
 ---
 

@@ -400,7 +400,9 @@ impl PySpectranConfig {
     }
 
     /// Stream from an HTTP server without issuing `/control` or
-    /// `/remoteconfig` writes (default `False`).
+    /// `/remoteconfig` writes (default `False`). HTTP only: combined with
+    /// `force_native_sdk` it makes `start_streaming` raise, and
+    /// auto-detection picks HTTP over an installed SDK.
     #[setter]
     fn set_listen_only(&mut self, enabled: bool) {
         self.listen_only = enabled;

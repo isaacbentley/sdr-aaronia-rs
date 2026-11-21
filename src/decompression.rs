@@ -11,12 +11,13 @@
 //! The `DSPT_IQ` compression, however, is a **proprietary, undocumented**
 //! Aaronia format. A clean-room reverse-engineering effort got as far as
 //! the 48-byte independent Rice block structure, but the coefficient
-//! transform remains unknown, so [`Decompressor::decompress`] **rejects**
-//! `DSPT_IQ`-shaped inputs (`num_rows == 1 && num_cols >= 128`) with an
-//! error rather than emitting wrong samples. Compressed-IQ files are
-//! handled at a higher level: `RtsaSource::open` transparently
-//! decompresses them through the official `RTSAFileTool` when the
-//! RTSA-Suite is installed.
+//! transform remains unknown, so this crate does not decode it.
+//! [`Decompressor::decompress`] implements only the documented spectra
+//! transform: it decodes whatever dimensions it is given and cannot tell
+//! an IQ payload from a spectrum, so callers must not pass it `DSPT_IQ`
+//! data. The file reader refuses compressed IQ chunks in-band, and
+//! `RtsaSource::open` transparently decompresses compressed-IQ files
+//! through the official `RTSAFileTool` when the RTSA-Suite is installed.
 
 use crate::{Error, Result};
 

@@ -240,14 +240,14 @@ Add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
 # By default, includes HTTP, File and C FFI backend support
-sdr-aaronia-rs = "0.13"
+sdr-aaronia-rs = "0.14"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
 # To enable additional backends, opt into their features (e.g. native-sdk, futuresdr)
-# sdr-aaronia-rs = { version = "0.13", features = ["native-sdk", "futuresdr"] }
+# sdr-aaronia-rs = { version = "0.14", features = ["native-sdk", "futuresdr"] }
 ```
 
-HTTP reads use one timeout budget for the entire requested block and return partial data at a timeout, frequency change, sample-rate change, or detected gap. `capture_frequency_hz()` and `capture_sample_rate_hz()` describe the returned samples even when newer packets are queued. File tuning setters preserve the recording's metadata.
+HTTP reads use one timeout budget for the entire requested block and return partial data at a timeout, frequency change, sample-rate change, or detected gap; native-SDK reads likewise stop at a timeout or a change of packet geometry (centre, span or rate). `capture_frequency_hz()` and `capture_sample_rate_hz()` describe the returned samples even when newer packets are queued. File tuning setters preserve the recording's metadata.
 
 ## Quickstart
 
@@ -393,12 +393,15 @@ its caller's per-call deadline instead.
 
 A dropped HTTP stream, from an RTSA restart or a network interruption,
 reconnects automatically. This is `SpectranConfig::auto_reconnect`,
-enabled by default. The reader reopens the stream, re-applies the
-current tuning (a restarted server returns to its mission's frequency),
-and flags the first packet after the gap as an overrun so callers know
-samples were missed. After 5 attempts, roughly 8 seconds of backoff, it
-stops and reads report a closed stream, matching the behaviour of
-`auto_reconnect(false)`.
+enabled by default. A stream that sends nothing for 5 seconds while its
+socket stays open (a hung server, a half-open TCP connection) counts as
+dropped, as does a `/stream` request that gets no response headers in
+that time. The reader reopens the stream, re-applies the current tuning
+(a restarted server returns to its mission's frequency) unless the source
+is `listen_only`, and flags the first packet after the gap as an overrun
+so callers know samples were missed. After 5 attempts, roughly 8 seconds
+of backoff, it stops and reads report a closed stream, matching the
+behaviour of `auto_reconnect(false)`.
 
 ## Feature Flags
 

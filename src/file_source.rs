@@ -2123,10 +2123,8 @@ impl RtsaSource {
                         }
                         let samples_in_chunk_before =
                             (self.current_sample_index - chunk_start_sample) as u32;
-                        let bytes_to_skip =
-                            samples_in_chunk_before as u64 * samp_chunk.sample_stride_bytes();
-                        let data_start_offset =
-                            offset + samp_chunk.header.header_size as u64 + bytes_to_skip;
+                        let (bytes_to_skip, data_start_offset) = samp_chunk
+                            .sample_position(offset, u64::from(samples_in_chunk_before))?;
                         self.reader.seek(SeekFrom::Start(data_start_offset))?;
 
                         let remaining_in_chunk = samp_chunk.num_samples - samples_in_chunk_before;
@@ -2410,10 +2408,9 @@ impl RtsaSource {
                     let chunk_end_sample = chunk_start_sample + samp_chunk.num_samples as u64;
                     if (chunk_start_sample..chunk_end_sample).contains(&sample_index) {
                         let samples_into_chunk = sample_index - chunk_start_sample;
-                        let byte_offset = samples_into_chunk * samp_chunk.sample_stride_bytes();
-                        let data_start = offset + samp_chunk.header.header_size as u64;
-                        self.reader
-                            .seek(SeekFrom::Start(data_start + byte_offset))?;
+                        let (_, position) =
+                            samp_chunk.sample_position(offset, samples_into_chunk)?;
+                        self.reader.seek(SeekFrom::Start(position))?;
                         self.current_sample_index = sample_index;
                         // The next read must rescan from the start: the seek
                         // may have moved backwards past the cursor hint.
@@ -2739,6 +2736,32 @@ impl SampChunk {
     /// `sampleSize`. The stride is that count times the value width.
     pub fn sample_stride_bytes(&self) -> u64 {
         self.sample_size as u64 * self.value_bytes()
+    }
+
+    /// Where sample `index` of this chunk sits, for a chunk that starts at
+    /// file offset `chunk_offset`: the payload bytes before it, and its
+    /// absolute file position.
+    ///
+    /// Stride and index both come from the file, so the arithmetic is
+    /// checked: numbers that overflow a file offset are a format error,
+    /// not a wrapped seek or a panic.
+    fn sample_position(&self, chunk_offset: u64, index: u64) -> Result<(u64, u64)> {
+        let overflow = || Error::FileFormat {
+            offset: chunk_offset,
+            reason: format!(
+                "SAMP chunk at 0x{chunk_offset:08X}: sample {index} at a {}-byte stride \
+                 lies beyond any file offset",
+                self.sample_stride_bytes()
+            ),
+        };
+        let before = index
+            .checked_mul(self.sample_stride_bytes())
+            .ok_or_else(overflow)?;
+        let position = chunk_offset
+            .checked_add(u64::from(self.header.header_size))
+            .and_then(|start| start.checked_add(before))
+            .ok_or_else(overflow)?;
+        Ok((before, position))
     }
 
     fn read_from<R: Read + Seek>(reader: &mut R, _size: u32, header_size: u16) -> Result<Self> {
@@ -3793,13 +3816,10 @@ mod tests {
         assert_eq!(anta.num_segments, 1);
 
         // Check identity matrix
-        for i in 0..4 {
-            for j in 0..4 {
-                if i == j {
-                    assert!((anta.transform[i][j] - 1.0).abs() < 0.0001);
-                } else {
-                    assert!((anta.transform[i][j] - 0.0).abs() < 0.0001);
-                }
+        for (i, row) in anta.transform.iter().enumerate() {
+            for (j, &value) in row.iter().enumerate() {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!((value - expected).abs() < 0.0001);
             }
         }
 
@@ -5115,5 +5135,47 @@ mod tests {
         // Since first chunk was invalid (size=0 < 16), it skipped byte by byte and eventually found the second chunk
         assert_eq!(samp_chunk_offsets.len(), 1);
         assert_eq!(samp_chunk_offsets[0].1.num_samples, 10);
+    }
+
+    /// A file-controlled stride large enough to overflow a file offset is
+    /// a format error, not a wrapped seek or an arithmetic panic.
+    #[test]
+    fn samp_sample_position_overflow_is_a_format_error() {
+        let chunk = SampChunk {
+            header: RtsaChunkHeader {
+                id: *b"SAMP",
+                size: 128,
+                flags: 0,
+                version: 1,
+                header_size: 64,
+            },
+            stream_id: 1,
+            sub_stream_id: 0,
+            sample_type: DspStreamSampleType::DsStF32,
+            sample_unit: DspStreamSampleUnit::DssuVolt,
+            payload_type: DspStreamPayloadType::DsptIq,
+            compression: 0,
+            packet_start_time: 0.0,
+            packet_end_time: 0.0,
+            packet_flags: DspPacketFlags::empty(),
+            sample_size: u32::MAX,
+            sample_depth: 32,
+            num_samples: u32::MAX,
+        };
+        assert_eq!(chunk.sample_position(100, 0).unwrap(), (0, 164));
+        assert!(matches!(
+            chunk.sample_position(100, u64::from(u32::MAX)),
+            Err(Error::FileFormat { offset: 100, .. })
+        ));
+        assert!(matches!(
+            chunk.sample_position(u64::MAX - 10, 0),
+            Err(Error::FileFormat { .. })
+        ));
+
+        let iq = SampChunk {
+            sample_size: 2,
+            ..chunk
+        };
+        assert_eq!(iq.sample_position(100, 3).unwrap(), (24, 188));
     }
 }

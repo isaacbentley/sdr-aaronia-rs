@@ -171,6 +171,8 @@ void spectran_source_builder_read_timeout_us(SpectranSourceBuilder* builder, uin
 void spectran_source_builder_auto_reconnect(SpectranSourceBuilder* builder, bool enabled);
 // Passive HTTP mode (default false). When true, never writes to /control or
 // /remoteconfig, allowing read-only attachment to shared or unlicensed servers.
+// HTTP only: with the native SDK backend forced, spectran_source_build fails
+// (returns NULL), and auto-detection picks HTTP over an installed SDK.
 void spectran_source_builder_listen_only(SpectranSourceBuilder* builder, bool enabled);
 SpectranSource* spectran_source_build(SpectranSourceBuilder* builder);
 
@@ -256,8 +258,8 @@ typedef struct SpectranSinkBuilder SpectranSinkBuilder;
 typedef struct SpectranSink SpectranSink; // Opaque UnifiedSink
 
 // TX packet-boundary flags for spectran_sink_write_samples. Pass
-// START|END|PUSH for a self-contained burst; continuous multi-packet
-// streams mark only the first/last packet.
+// SEGMENT_START|SEGMENT_END|PUSH for a self-contained burst; continuous
+// multi-packet streams mark only the first/last packet.
 #define SPECTRAN_TX_STREAM_START  ((uint64_t)0x00000001)
 #define SPECTRAN_TX_STREAM_END    ((uint64_t)0x00000002)
 #define SPECTRAN_TX_SEGMENT_START ((uint64_t)0x00000004)

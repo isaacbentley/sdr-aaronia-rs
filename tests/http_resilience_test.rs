@@ -447,3 +447,138 @@ async fn auto_reconnect_disabled_keeps_fail_fast() {
         "auto_reconnect(false) must not reopen the stream"
     );
 }
+
+/// Serve `/info`, and a `/stream` that sends its headers and then nothing
+/// while holding the socket open — a hung RTSA process, or a half-open
+/// TCP connection after a network change. Counts `/stream` opens.
+///
+/// A plain socket rather than `wiremock`, which always completes the
+/// body it is given.
+fn serve_stalled_stream() -> (String, Arc<AtomicUsize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let opens = Arc::new(AtomicUsize::new(0));
+    let stream_opens = opens.clone();
+    std::thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { return };
+            let stream_opens = stream_opens.clone();
+            std::thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                if request.starts_with("GET /stream") {
+                    stream_opens.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                          Transfer-Encoding: chunked\r\n\r\n",
+                    );
+                    // Hold the connection open, sending nothing, until the
+                    // client gives up on it.
+                    let _ = socket.read(&mut buf);
+                } else if request.starts_with("GET /info") {
+                    let body = info_body().to_string();
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                } else {
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            });
+        }
+    });
+    (url, opens)
+}
+
+/// A stream that goes silent with the socket still open is a lost
+/// connection: the reader gives up on it after the stall bound and
+/// reconnects, instead of waiting on it forever.
+#[tokio::test]
+async fn a_silent_stream_is_abandoned_and_reopened() {
+    let (url, opens) = serve_stalled_stream();
+    // listen_only: the mock has no `/control`, and a reconnect must not
+    // need one.
+    let config = SpectranConfig::from_http(&url).read_timeout(Duration::from_secs(1));
+    let mut source = SpectranSource::new_with_options(
+        config,
+        sdr_aaronia_rs::http_endpoints::AuthMethod::None,
+        true,
+    )
+    .await
+    .expect("source");
+    source.start_streaming().await.expect("start_streaming");
+
+    let started = Instant::now();
+    while opens.load(Ordering::SeqCst) < 2 && started.elapsed() < Duration::from_secs(15) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        opens.load(Ordering::SeqCst) >= 2,
+        "the reader stayed parked on a stream that sent nothing"
+    );
+}
+
+/// `set_listen_only(true)` on a running source reaches the reader task, so
+/// a later reconnect re-applies no tuning.
+#[tokio::test]
+async fn listen_only_set_after_start_holds_across_a_reconnect() {
+    let server = MockServer::start().await;
+    let opens = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(info_body()))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/control"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/stream"))
+        .respond_with(BurstyStream {
+            opens: opens.clone(),
+            packets_per_open: 1,
+            samples_per_packet: 4,
+        })
+        .mount(&server)
+        .await;
+
+    let config = SpectranConfig::from_http(&server.uri())
+        .stream_format(StreamFormat::Json)
+        .read_timeout(Duration::from_secs(10));
+    let mut source = SpectranSource::new(config).await.expect("source");
+    source.start_streaming().await.expect("start_streaming");
+    source.set_listen_only(true);
+    let puts_before = full_tuple_control_puts(&server).await;
+
+    // Each connection carries one packet, so the second read can only be
+    // served after a reconnect.
+    let mut buffer = Vec::new();
+    for _ in 0..2 {
+        source
+            .read_samples(&mut buffer, 4)
+            .await
+            .expect("reads continue across the reconnect");
+    }
+    assert!(opens.load(Ordering::SeqCst) >= 2, "no reconnect happened");
+    assert_eq!(
+        full_tuple_control_puts(&server).await,
+        puts_before,
+        "a reconnect after set_listen_only(true) must not write /control"
+    );
+}

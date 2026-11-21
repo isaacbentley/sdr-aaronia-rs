@@ -332,6 +332,14 @@ impl SampleRateControl for SpectranSeifyDevice {
     }
 }
 
+/// RX "gain" is the Spectran's **reference level, in dBm**, not an
+/// amplifier gain: [`GainControl::set_gain`] sets it,
+/// [`GainControl::gain`] reports the last value applied, and
+/// [`GainControl::gain_range`] gives the device's reference-level bounds.
+/// The sense is inverted from a gain — raising the reference level lowers
+/// sensitivity — so a generic gain slider moves the wrong way. There are
+/// no named gain elements. The SoapySDR plugin exposes the same value as
+/// its `REF` element.
 impl GainControl for SpectranSeifyDevice {
     fn gain(
         &self,

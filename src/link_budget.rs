@@ -94,7 +94,9 @@ use tracing::{debug, info};
 /// [`crate::HttpSourceBuilder`] streams by default — so it is the format
 /// whose arithmetic an operator is actually asking about, and the three
 /// cannot drift apart. Use the `_for_format` variants for anything else:
-/// `float32` is 8 bytes a sample and needs twice the link.
+/// `float32` is 8 bytes a sample and needs twice the link. That includes
+/// [`crate::SpectranSource`], whose HTTP backend streams `float32` unless
+/// its config names a format.
 pub const DEFAULT_LINK_FORMAT: StreamFormat = StreamFormat::CAPTURE_DEFAULT;
 
 /// How much of a freshly-opened stream to throw away before counting,

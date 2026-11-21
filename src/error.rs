@@ -47,14 +47,20 @@ pub enum Error {
     SdkNotInstalled,
 
     /// Native SDK loading error (libloading).
-    #[cfg(feature = "native-sdk")]
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
+    ))]
     #[error(transparent)]
     SdkLoader(#[from] libloading::Error),
 
     /// Native SDK operation failed with a specific API error code.
-    #[cfg(feature = "native-sdk")]
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(all(
+        feature = "native-sdk",
+        any(target_os = "windows", target_os = "linux"),
+        target_pointer_width = "64"
+    ))]
     #[error("SDK error during {operation}: {code}")]
     SdkApi {
         /// The operation that failed (e.g. "AARTSAAPI_Init").

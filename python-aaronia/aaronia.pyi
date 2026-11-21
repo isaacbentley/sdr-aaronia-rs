@@ -110,7 +110,9 @@ class SpectranConfig:
     """Reconnect the HTTP stream after a drop (default ``True``)."""
     listen_only: bool
     """Stream from an HTTP server without issuing ``/control`` or
-    ``/remoteconfig`` writes (default ``False``)."""
+    ``/remoteconfig`` writes (default ``False``). HTTP only: combined
+    with ``force_native_sdk`` it makes ``start_streaming`` raise, and
+    auto-detection picks HTTP over an installed SDK."""
 
 class SpectranSource:
     """A streaming IQ source.
@@ -205,7 +207,7 @@ class SpectranSource:
 
     def last_timestamp_ns(self) -> int:
         """Epoch-nanosecond timestamp of the most recent block.
-        HTTP backend only; 0 otherwise."""
+        HTTP and native-SDK backends; 0 when unavailable."""
 
     def master_stream_time_ns(self) -> Optional[int]:
         """The device's master stream clock, in epoch nanoseconds.
@@ -247,6 +249,7 @@ def open(
     both raises ``ValueError``, as does passing both ``url`` and
     ``file``. With neither ``url`` nor ``file``, connects to
     ``http://localhost:42664`` (older saved RTSA missions use port ``54664``).
+    ``listen_only`` is HTTP-only; passing it with ``sdk=True`` raises.
     """
 
 def sample_rates() -> List[float]:

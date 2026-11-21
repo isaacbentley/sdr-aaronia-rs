@@ -631,6 +631,10 @@ pub unsafe extern "C" fn spectran_source_builder_auto_reconnect(
 /// the source never writes to `/control` or `/remoteconfig`, allowing
 /// passive attachment to shared or unlicensed RTSA servers.
 ///
+/// HTTP only: with the native SDK backend forced, [`spectran_source_build`]
+/// returns `NULL` with a configuration error, and auto-detection picks
+/// HTTP over an installed SDK.
+///
 /// # Safety
 /// `builder` must be a live pointer from [`spectran_source_builder_new`].
 #[unsafe(no_mangle)]

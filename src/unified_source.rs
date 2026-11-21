@@ -16,6 +16,7 @@ use futures::stream::StreamExt;
 use num_complex::Complex32;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -469,7 +470,10 @@ pub struct SpectranSource {
     native_source: Option<NativeSdkSource>,
 
     http_auth: crate::http_endpoints::AuthMethod,
-    listen_only: bool,
+    /// Shared with the HTTP reader task, which reads it before
+    /// re-applying tuning on a reconnect, so [`Self::set_listen_only`]
+    /// reaches a stream that is already running.
+    listen_only: Arc<AtomicBool>,
     http_client: Option<HttpEndpointsClient>,
     /// Stream parameters as the server reports them, updated by the HTTP
     /// reader task. Preferred over the configured values when reporting
@@ -610,6 +614,12 @@ impl SpectranSource {
     /// Create a new unified Aaronia source with explicit HTTP authentication
     /// and optional `listen_only` mode (suppresses `/control` and `/remoteconfig`
     /// writes on HTTP sources).
+    ///
+    /// `listen_only` is an HTTP-backend mode: the native SDK backend has
+    /// to configure the device it opens. Forcing
+    /// [`SourceType::NativeSdk`] with `listen_only` is a
+    /// [`Error::Config`], and auto-detection with `listen_only` skips the
+    /// native SDK and falls back to localhost HTTP.
     pub async fn new_with_options(
         config: SpectranConfig,
         http_auth: crate::http_endpoints::AuthMethod,
@@ -633,7 +643,7 @@ impl SpectranSource {
             native_source: None,
 
             http_auth,
-            listen_only,
+            listen_only: Arc::new(AtomicBool::new(listen_only)),
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -651,6 +661,15 @@ impl SpectranSource {
         // Determine the best source type
         let source_type = if let Some(forced_type) = &config.force_source_type {
             info!("Forcing source type: {:?}", forced_type);
+            // Opening a device through the SDK writes its centre, span
+            // and reference level; there is no passive way to attach.
+            if listen_only && *forced_type == SourceType::NativeSdk {
+                return Err(Error::Config(
+                    "listen_only is an HTTP-backend mode; the native SDK backend must \
+                     configure the device it opens"
+                        .into(),
+                ));
+            }
             forced_type.clone()
         } else {
             source.detect_best_source_type().await?
@@ -752,13 +771,18 @@ impl SpectranSource {
 
     /// Configure whether an HTTP source operates in read-only (`listen_only`)
     /// mode without issuing `/control` or `/remoteconfig` writes.
+    ///
+    /// Takes effect on a running stream too: the reader task checks it
+    /// before re-applying tuning on a reconnect. HTTP backend only; the
+    /// file and native SDK backends ignore it.
     pub fn set_listen_only(&mut self, enabled: bool) {
-        self.listen_only = enabled;
+        self.listen_only
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Return whether `listen_only` mode is enabled.
     pub fn is_listen_only(&self) -> bool {
-        self.listen_only
+        self.listen_only.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Detect the best available source type based on configuration
@@ -787,14 +811,18 @@ impl SpectranSource {
         // Rule 3: No specific source provided - auto-detect SDK or fallback to localhost HTTP
         info!("No specific source provided - checking SDK then localhost HTTP fallback");
 
-        // Check for Native SDK first
+        // Check for Native SDK first, unless the caller asked not to
+        // write device settings: only the HTTP backend can attach
+        // without configuring the device.
         #[cfg(all(
             feature = "native-sdk",
             any(target_os = "windows", target_os = "linux"),
             target_pointer_width = "64"
         ))]
         {
-            if is_sdk_installed() {
+            if self.is_listen_only() {
+                info!("listen_only requested - skipping the native SDK for localhost HTTP");
+            } else if is_sdk_installed() {
                 info!("Native SDK detected and available");
                 return Ok(SourceType::NativeSdk);
             } else {
@@ -969,7 +997,7 @@ impl SpectranSource {
                 Error::Protocol(msg)
             })?;
 
-        if !self.listen_only {
+        if !self.is_listen_only() {
             // Tune the hardware to the requested frequency *before* opening the
             // stream. Without this the `/stream` endpoint returns whatever the
             // RTSA Suite is already configured to, completely ignoring the
@@ -1031,7 +1059,7 @@ impl SpectranSource {
         let rate_bits = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rate_bits_for_task = rate_bits.clone();
         let auto_reconnect = self.config.auto_reconnect;
-        let listen_only = self.listen_only;
+        let listen_only = self.listen_only.clone();
 
         // Spawn a task to continuously read from the HTTP stream and send samples
         let reader_task = tokio::spawn(async move {
@@ -1079,7 +1107,27 @@ impl SpectranSource {
 
                 // Inner loop: packets on the current connection.
                 loop {
-                    match http_stream.next().await {
+                    // A server that stops sending while the socket stays
+                    // open — a hung RTSA process, a half-open TCP
+                    // connection — would park this read forever. Silence
+                    // that long ends the connection like a closed stream.
+                    let next = match tokio::time::timeout(
+                        crate::http_endpoints::STREAM_STALL_TIMEOUT,
+                        http_stream.next(),
+                    )
+                    .await
+                    {
+                        Ok(next) => next,
+                        Err(_) => {
+                            warn!(
+                                "HTTP stream delivered nothing for {:?}; treating the \
+                                 connection as lost",
+                                crate::http_endpoints::STREAM_STALL_TIMEOUT
+                            );
+                            break;
+                        }
+                    };
+                    match next {
                         Some(Ok(packet)) => {
                             consecutive_errors = 0;
                             // The HTTP stream already returns parsed StreamPacket objects
@@ -1170,6 +1218,10 @@ impl SpectranSource {
                         }
                     }
                 }
+                // Release the connection now rather than after the backoff:
+                // a stalled one still holds a server slot, and on a
+                // one-client licence that is the slot the reconnect needs.
+                drop(http_stream);
 
                 // A connection that stayed up this long was genuinely
                 // healthy, so a later outage starts from a full budget.
@@ -1195,7 +1247,7 @@ impl SpectranSource {
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
 
-                if !listen_only {
+                if !listen_only.load(std::sync::atomic::Ordering::Relaxed) {
                     // Re-apply tuning: if the RTSA-Suite restarted, it came
                     // back on its mission's frequency and would otherwise
                     // stream the wrong band under the caller's nose. Best
@@ -1392,7 +1444,9 @@ impl SpectranSource {
     /// application's `timeoutUs`.
     ///
     /// Both vectors grow by exactly the returned count, so they stay
-    /// index-aligned in time even on a partial read. Hitting the
+    /// index-aligned in time even on a partial read. Like the mono read,
+    /// it never spans a frequency or sample-rate change: the pairs after
+    /// one are held for the next call. Hitting the
     /// deadline with some pairs collected returns them; only a deadline
     /// with **zero** pairs yields `Error::Io(TimedOut)`. A `timeout` of
     /// zero drains what is already buffered without waiting.
@@ -1413,31 +1467,12 @@ impl SpectranSource {
                 target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
-                let deadline = deadline_after(timeout);
-                let start_len = rx1.len();
+                let deadline = deadline_after(timeout).into_std();
                 let source = self.native_source.as_mut().ok_or_else(|| {
                     Error::Config("Native SDK source not initialized".to_string())
                 })?;
-                crate::utils::maybe_block_in_place(|| {
-                    loop {
-                        let budget =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        let want = max_samples - (rx1.len() - start_len);
-                        let n = unsafe { source.read_samples_dual_within(rx1, rx2, want, budget)? };
-                        let total = rx1.len() - start_len;
-                        if total >= max_samples
-                            || tokio::time::Instant::now() >= deadline
-                            || (n == 0 && total > 0)
-                        {
-                            if total == 0 && max_samples > 0 {
-                                return Err(Error::Io(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "no sample pairs arrived within the read deadline",
-                                )));
-                            }
-                            return Ok(total);
-                        }
-                    }
+                crate::utils::maybe_block_in_place(|| unsafe {
+                    source.read_samples_dual_until(rx1, rx2, max_samples, deadline)
                 })
             }
             _ => {
@@ -1622,10 +1657,16 @@ impl SpectranSource {
                         "no samples arrived within the read deadline",
                     )));
                 }
-                if batch_freq_hz > 0.0 {
-                    self.last_read_frequency_hz = batch_freq_hz;
-                }
+                // Both describe the samples just returned, so a read whose
+                // packets carried no valid centre reports 0.0 rather than
+                // the previous hop's frequency.
                 if collected > 0 {
+                    self.last_read_frequency_hz =
+                        if batch_freq_hz.is_finite() && batch_freq_hz > 0.0 {
+                            batch_freq_hz
+                        } else {
+                            0.0
+                        };
                     self.last_read_sample_rate_hz = batch_rate_hz;
                 }
                 Ok(buffer.len() - start_len)
@@ -1636,33 +1677,16 @@ impl SpectranSource {
                 target_pointer_width = "64"
             ))]
             SourceType::NativeSdk => {
-                let start_len = buffer.len();
                 let source = self.native_source.as_mut().ok_or_else(|| {
                     Error::Config("Native SDK source not initialized".to_string())
                 })?;
-                crate::utils::maybe_block_in_place(|| {
-                    loop {
-                        // Bound the SDK poll by what is left of the deadline,
-                        // so a zero timeout drains without waiting as the C
-                        // header promises.
-                        let budget =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        let want = max_samples - (buffer.len() - start_len);
-                        let n = unsafe { source.read_samples_within(buffer, want, budget)? };
-                        let total = buffer.len() - start_len;
-                        if total >= max_samples
-                            || tokio::time::Instant::now() >= deadline
-                            || (n == 0 && total > 0)
-                        {
-                            if total == 0 && max_samples > 0 {
-                                return Err(Error::Io(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "no samples arrived within the read deadline",
-                                )));
-                            }
-                            return Ok(total);
-                        }
-                    }
+                // The SDK poll is bounded by what is left of the deadline,
+                // so a zero timeout drains without waiting as the C header
+                // promises, and stops at a packet-geometry change so the
+                // observed frequency describes every sample returned.
+                let deadline = deadline.into_std();
+                crate::utils::maybe_block_in_place(|| unsafe {
+                    source.read_samples_until(buffer, max_samples, deadline)
                 })
             }
             _ => Box::pin(self.read_samples(buffer, max_samples)).await,
@@ -2050,7 +2074,7 @@ impl SpectranSource {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
-                if self.listen_only {
+                if self.is_listen_only() {
                     return Err(Error::Config(
                         "cannot modify device settings on a listen_only HTTP source".into(),
                     ));
@@ -2095,7 +2119,7 @@ impl SpectranSource {
         // receiver clock so wideband V6 / V6 PLUS units are accepted while
         // impossible rates are rejected before hitting the wire.
         if self.source_type == SourceType::Http {
-            if self.listen_only {
+            if self.is_listen_only() {
                 return Err(Error::Config(
                     "cannot modify device settings on a listen_only HTTP source".into(),
                 ));
@@ -2289,7 +2313,7 @@ impl SpectranSource {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
-                if self.listen_only {
+                if self.is_listen_only() {
                     return Err(Error::Config(
                         "cannot modify device settings on a listen_only HTTP source".into(),
                     ));
@@ -2351,7 +2375,7 @@ impl SpectranSource {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
-                if self.listen_only {
+                if self.is_listen_only() {
                     return Err(Error::Config(
                         "cannot modify device settings on a listen_only HTTP source".into(),
                     ));
@@ -2410,7 +2434,7 @@ impl SpectranSource {
                 return Err(Error::Config("Native SDK not available".to_string()));
             }
             SourceType::Http => {
-                if self.listen_only {
+                if self.is_listen_only() {
                     return Err(Error::Config(
                         "cannot modify device settings on a listen_only HTTP source".into(),
                     ));
@@ -2494,7 +2518,7 @@ impl SpectranSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
-                if self.listen_only {
+                if self.is_listen_only() {
                     return Ok(client.detect_remote_config_license().await);
                 }
                 Ok(client.probe_remote_config_write_license().await)
@@ -2826,6 +2850,11 @@ impl SpectranSourceBuilder {
     ///
     /// When enabled, `SpectranSource` streams from `/stream` without issuing
     /// `/control` or `/remoteconfig` writes on startup or reconnect.
+    ///
+    /// The native SDK backend cannot attach without configuring the
+    /// device, so building with this and a forced native SDK backend fails
+    /// with [`Error::Config`], and auto-detection picks HTTP over an
+    /// installed SDK.
     pub fn listen_only(&mut self, enabled: bool) -> &mut Self {
         self.listen_only = enabled;
         self
@@ -3146,7 +3175,7 @@ mod tests {
             ))]
             native_source: None,
             http_auth: crate::http_endpoints::AuthMethod::None,
-            listen_only: false,
+            listen_only: Arc::new(AtomicBool::new(false)),
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3235,7 +3264,7 @@ mod tests {
             ))]
             native_source: None,
             http_auth: crate::http_endpoints::AuthMethod::None,
-            listen_only: false,
+            listen_only: Arc::new(AtomicBool::new(false)),
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3276,7 +3305,7 @@ mod tests {
             ))]
             native_source: None,
             http_auth: crate::http_endpoints::AuthMethod::None,
-            listen_only: false,
+            listen_only: Arc::new(AtomicBool::new(false)),
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3319,7 +3348,7 @@ mod tests {
             ))]
             native_source: None,
             http_auth: crate::http_endpoints::AuthMethod::None,
-            listen_only: false,
+            listen_only: Arc::new(AtomicBool::new(false)),
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3528,7 +3557,7 @@ mod tests {
             ))]
             native_source: None,
             http_auth: crate::http_endpoints::AuthMethod::None,
-            listen_only: false,
+            listen_only: Arc::new(AtomicBool::new(false)),
             http_client: None,
             http_observed: None,
             http_rate_bits: None,
@@ -3867,5 +3896,62 @@ mod tests {
         assert!(source.set_reference_level_dbm(-30.0).await.is_err());
         assert!(source.set_clock_source("Oscillator").await.is_err());
         assert!(source.set_gps_mode("Time").await.is_err());
+    }
+
+    /// Opening a device through the SDK writes its tuning, so a caller
+    /// asking for a passive attachment must hear that it cannot have one
+    /// there, before anything is opened.
+    #[tokio::test]
+    async fn listen_only_with_a_forced_native_sdk_is_a_config_error() {
+        let config = SpectranConfig::default().force_native_sdk();
+        match SpectranSource::new_with_options(
+            config,
+            crate::http_endpoints::AuthMethod::None,
+            true,
+        )
+        .await
+        {
+            Err(Error::Config(message)) => assert!(
+                message.contains("listen_only"),
+                "the error must name the conflicting option: {message}"
+            ),
+            Err(other) => panic!("expected a configuration error, got {other:?}"),
+            Ok(_) => panic!("listen_only must not open a native SDK source"),
+        }
+    }
+
+    /// With no URL or file, detection would take an installed SDK — the
+    /// one backend that cannot attach passively. `listen_only` keeps it
+    /// on HTTP.
+    #[tokio::test]
+    async fn listen_only_auto_detection_prefers_http() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut source = http_test_source(rx);
+        source.set_listen_only(true);
+        assert_eq!(
+            source.detect_best_source_type().await.unwrap(),
+            SourceType::Http
+        );
+    }
+
+    /// A read whose samples carry no valid centre reports 0.0, not the
+    /// frequency of the read before it.
+    #[tokio::test]
+    async fn a_read_without_a_valid_centre_does_not_keep_the_last_label() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut source = http_test_source(rx);
+        tx.send((vec![Complex32::new(1.0, 0.0)], false, 0, 1, 915e6, 1e6))
+            .await
+            .unwrap();
+        let mut buffer = Vec::new();
+        assert_eq!(source.read_samples(&mut buffer, 1).await.unwrap(), 1);
+        assert_eq!(source.capture_frequency_hz(), 915e6);
+
+        tx.send((vec![Complex32::new(2.0, 0.0)], false, 0, 2, 0.0, 1e6))
+            .await
+            .unwrap();
+        buffer.clear();
+        assert_eq!(source.read_samples(&mut buffer, 1).await.unwrap(), 1);
+        assert_eq!(source.capture_frequency_hz(), 0.0);
     }
 }

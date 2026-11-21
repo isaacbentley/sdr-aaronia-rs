@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.14.0] - 2026-11-20
+
+### Changed
+- The default RTSA HTTP Server URL is now `http://localhost:42664`, RTSA-Suite's current default, instead of port `54664`: the `SpectranSource` localhost fallback, `HttpSinkBuilder::default`, Python `open()` and `diagnose()`, and the SoapySDR plugin's default `url` all use it. Missions saved with an earlier RTSA-Suite keep `54664` and need that URL passed explicitly; a failed connection to either port names the other in its error and in `aaronia-doctor`'s fix.
+- `listen_only` is HTTP-only. With the native SDK backend forced, `SpectranSource::new_with_options` (and so `spectran_source_build` and Python `start_streaming`) fails with `Error::Config` instead of opening the device and writing its centre, span and reference level; auto-detection with `listen_only` picks localhost HTTP over an installed SDK.
+
+### Added
+- `DEFAULT_HTTP_PORT`, `DEFAULT_HTTP_URL`, `LEGACY_HTTP_PORT` and `http_port_mismatch_hint` at the crate root.
+
+### Fixed
+- Native-SDK deadline reads (`SpectranSource::read_samples`, `read_samples_deadline`, `read_samples_dual_deadline`, and the C ABI, SoapySDR and seify reads over them) no longer return samples from two packet geometries. A retune that landed while a read was still polling, or right after a carried packet tail, was appended to the same buffer and `capture_frequency_hz()` labelled all of it with the new centre; the read now stops at the boundary and the new-geometry samples start the next one.
+- `SpectranSource::set_listen_only(true)` on a running HTTP source reaches the reader task, so a later reconnect no longer re-applies tuning with a `/control` PUT.
+- The unified HTTP reader abandons a `/stream` connection that delivers nothing for 5 s (a hung server, a half-open TCP connection) and takes its reconnect path, and `HttpEndpointsClient::start_stream` fails with `Error::Io` of kind `TimedOut` when no response headers arrive within 5 s. `HttpSource` bounds its `/stream` open the same way, so neither `init` nor a reconnect can wait forever for headers.
+- `HttpSink` starts each TX batch at the previous batch's exclusive end time, closing a one-sample hole between batches.
+- A `/stream` packet header that is well-formed JSON but not the packet schema is logged with its serde error (on the first occurrence, then every 1000th) rather than only counted as a parse error while the stream yields nothing.
+- `parse_frequency` no longer panics on input whose last character is multi-byte, such as `"433㎒"`.
+- `native-sdk` builds on 32-bit Linux and Windows: `Error::SdkLoader` and `Error::SdkApi` share the native module's 64-bit gate.
+- `HttpEndpointsClient::find_iq_demodulator_block_name` and the `/remoteconfig` read-back used by block discovery map a non-success status such as 401 or 403 to `Error::Http`, like every other request, instead of `Error::Transport`.
+- `HttpSource` recovers a poisoned shared-stats lock instead of silently skipping stats refreshes, link-budget verdicts, device-health readings and consumer restart requests.
+- A huge `HttpSourceBuilder::buffer_size` no longer overflows or aborts the build: the up-front buffer reservation saturates and is capped.
+- An RTSA `SAMP` chunk whose stride and sample index overflow a file offset is an `Error::FileFormat` on read and seek, not a wrapped seek or an arithmetic panic.
+- `SpectranSource::capture_frequency_hz()` reports `0.0` after an HTTP read whose packets carried no valid centre, instead of the previous read's frequency.
+- SoapySDR `writeStream` passes the burst's end time (`start + duration`) to `spectran_sink_write_samples`, which takes an end time, not a duration; `setBandwidth` ignores a non-finite bandwidth.
+- Documentation brought in line with the code: `Decompressor::decompress` does not itself reject `DSPT_IQ`-shaped input (the file reader refuses compressed IQ chunks), the file reader decodes single-block compressed spectra (`docs/FILESPEC.md`), the dual-channel interleave is `Rx12`, `AARTSAAPI_DeviceInfo` flags are C++ `bool` bytes, the Windows SDK load uses `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | USER_DIRS | SYSTEM32` and deliberately not `DEFAULT_DIRS` (`docs/SDKSPEC.md`), `open_detected_device` maps `raw` to the ECO's `iqreceiver`, seify RX gain is the reference level in dBm, Python `last_timestamp_ns` covers the native SDK too, the `spectran.h` TX-flag example uses the `SEGMENT_*` flags, and `DEFAULT_LINK_FORMAT` notes that `SpectranSource` streams `float32` by default.
+
 ## [v0.13.3] - 2026-11-10
 
 ### Added

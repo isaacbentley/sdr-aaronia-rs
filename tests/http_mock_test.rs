@@ -653,3 +653,53 @@ async fn set_clock_source_errors_when_the_device_did_not_take_it() {
         "error should list the sources this device does offer: {msg}"
     );
 }
+
+/// An auth failure on the `/remoteconfig` reads is the typed
+/// `Error::Http` every other endpoint returns, so a 401 is not retried as
+/// a transport fault and callers can match it.
+#[tokio::test]
+async fn remoteconfig_reads_map_auth_failures_to_http_errors() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/remoteconfig"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mock_server)
+        .await;
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+
+    match client.find_iq_demodulator_block_name().await {
+        Err(Error::Http { status, .. }) => assert_eq!(status.as_u16(), 401),
+        other => panic!("expected Error::Http 401, got {other:?}"),
+    }
+    match client.find_block_name_with_field("centerfreq0").await {
+        Err(Error::Http { status, .. }) => assert_eq!(status.as_u16(), 401),
+        other => panic!("expected Error::Http 401, got {other:?}"),
+    }
+}
+
+/// A server that accepts the `/stream` request and never answers must not
+/// hold the caller forever: the open gives up once the stall bound passes.
+#[tokio::test]
+async fn stream_open_gives_up_on_a_server_that_never_answers() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/stream"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .mount(&mock_server)
+        .await;
+    let client = HttpEndpointsClient::new(mock_server.uri(), AuthMethod::None).unwrap();
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.start_stream(HttpEndpointsClient::stream_params().build()),
+    )
+    .await
+    .expect("start_stream must time out on its own");
+    match result {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+        Err(other) => panic!("expected a timed-out I/O error, got {other:?}"),
+        Ok(_) => panic!("a server that never answers must not yield a stream"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(15));
+}

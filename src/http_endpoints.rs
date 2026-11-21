@@ -343,6 +343,29 @@ pub struct CaptureControl {
     pub control_type: ControlType,
 }
 
+/// How long a `/stream` connection may deliver nothing — no response
+/// headers after the request, no data after them — before its reader gives
+/// up on it.
+///
+/// The streaming clients deliberately have no total timeout (it would cover
+/// the whole body), so without this a server that stops sending while
+/// keeping the socket open — a hung RTSA process, a half-open TCP
+/// connection after a network change — parks the reader forever, and the
+/// source produces nothing and never reconnects. A live stream delivers a
+/// chunk every few milliseconds at any usable rate, so several seconds of
+/// nothing is not a slow link. Giving up hands the source to its ordinary
+/// reconnect path.
+pub(crate) const STREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The error for a `/stream` connection that went [`STREAM_STALL_TIMEOUT`]
+/// without delivering anything, `what` naming the step that stalled.
+pub(crate) fn stream_stalled(what: &str) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("{what} within {STREAM_STALL_TIMEOUT:?}"),
+    ))
+}
+
 /// How far the read-back `centerfreq0` may sit from the requested value
 /// before [`HttpEndpointsClient::apply_capture_config`] warns. The field's
 /// step is 1 kHz, so one step of slack absorbs any device-side rounding
@@ -1707,11 +1730,8 @@ impl HttpEndpointsClient {
     /// recurses through every nested `items` array.
     pub async fn find_iq_demodulator_block_name(&self) -> Result<String> {
         let url = format!("{}/remoteconfig", self.base_url);
-        let bytes = self
-            .control_request(self.client.get(&url))
-            .send()
-            .await?
-            .error_for_status()?
+        let response = self.control_request(self.client.get(&url)).send().await?;
+        let bytes = Self::ensure_success("Remote config request", response)?
             .bytes()
             .await?;
         let document: serde_json::Value =
@@ -1739,11 +1759,8 @@ impl HttpEndpointsClient {
     /// full schema being modelled.
     async fn get_remoteconfig_document(&self) -> Result<serde_json::Value> {
         let url = format!("{}/remoteconfig", self.base_url);
-        let bytes = self
-            .control_request(self.client.get(&url))
-            .send()
-            .await?
-            .error_for_status()?
+        let response = self.control_request(self.client.get(&url)).send().await?;
+        let bytes = Self::ensure_success("Remote config request", response)?
             .bytes()
             .await?;
         serde_json::from_slice(&bytes).map_err(|e| Error::Protocol(e.to_string()))
@@ -2380,6 +2397,12 @@ impl HttpEndpointsClient {
     /// Starts a real-time data stream from the `/stream` endpoint.
     ///
     /// Returns a `Stream` of `StreamPacket`s.
+    ///
+    /// The response headers must arrive within five seconds: a server that
+    /// accepts the connection and never answers fails with
+    /// [`Error::Io`] of kind `TimedOut`. The returned stream has no such
+    /// bound, since a body is open-ended; a reader that must notice a
+    /// silent server times its own `next()` calls.
     pub async fn start_stream(
         &self,
         params: StreamParams,
@@ -2401,8 +2424,13 @@ impl HttpEndpointsClient {
         // timeout would cover the whole streamed body and kill the
         // connection mid-stream.
         let request = self.apply_auth(self.client.get(&url));
-        let response =
-            Self::ensure_success(&format!("Stream request to {url}"), request.send().await?)?;
+        // The headers, though, are bounded: a server that accepts the
+        // connection and never answers would otherwise hold the caller
+        // here forever, before any reconnect logic can run.
+        let response = tokio::time::timeout(STREAM_STALL_TIMEOUT, request.send())
+            .await
+            .map_err(|_| stream_stalled(&format!("Stream request to {url}: no response")))??;
+        let response = Self::ensure_success(&format!("Stream request to {url}"), response)?;
 
         // Get the byte stream
         let byte_stream = response.bytes_stream();

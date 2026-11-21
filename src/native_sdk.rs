@@ -282,15 +282,15 @@ pub struct AARTSAAPI_DeviceInfo {
 }
 
 impl AARTSAAPI_DeviceInfo {
-    /// Device is ready and booted. Normalises the raw 32-bit slot to a
-    /// Rust `bool` (any non-zero value is "true", matching the Win32
-    /// `BOOL` convention the SDK uses).
+    /// Device is ready and booted. Normalises the raw C++ `bool` byte to
+    /// a Rust `bool`: any non-zero byte is "true", since foreign code
+    /// guarantees only zero/non-zero.
     pub fn ready(&self) -> bool {
         self.ready != 0
     }
 
     /// Device has a second USB connector (V6 feature). See [`Self::ready`]
-    /// for the truthy-slot rationale.
+    /// for the non-zero-byte rationale.
     pub fn boost(&self) -> bool {
         self.boost != 0
     }
@@ -1806,6 +1806,11 @@ pub struct NativeSdkSource {
     /// sample. The `read_mode` latch enforces that a stream uses one
     /// path or the other, never both.
     dual_sample_buffer: VecDeque<(Complex32, Complex32)>,
+    /// Geometry of the packet the carried tail came from, for whichever
+    /// carry buffer the latched `read_mode` uses. A read that already
+    /// holds samples of another geometry stops before draining it, the
+    /// same way it stops before a queued packet of another geometry.
+    carry_geometry: Option<crate::stream_geometry::IqGeometry>,
     /// Which read path this streaming session uses, latched on the
     /// first successful read call and cleared by
     /// [`Self::stop_streaming`]. Mixing `read_samples` and
@@ -1855,6 +1860,44 @@ pub struct NativeSdkSource {
 enum ReadMode {
     Mono,
     Dual,
+}
+
+/// The packet geometry one logical read has committed to.
+///
+/// A logical read can take several calls into the packet loop — the
+/// deadline-bounded reads keep polling until the caller is satisfied —
+/// and its samples must all share one geometry, or the frequency and
+/// rate reported for them describe only some of them. The state rides
+/// across those calls so a later call checks its first packet, and the
+/// carried tail, against what an earlier call already returned.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ReadGeometry {
+    /// Nothing returned yet; the first samples set the geometry.
+    Open,
+    /// Samples of this geometry have been returned.
+    Committed(Option<crate::stream_geometry::IqGeometry>),
+    /// The next samples have another geometry and were left for the
+    /// next read.
+    Boundary,
+}
+
+impl ReadGeometry {
+    /// Whether samples of `geometry` may join this read.
+    fn admits(self, geometry: Option<crate::stream_geometry::IqGeometry>) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Committed(committed) => committed == geometry,
+            Self::Boundary => false,
+        }
+    }
+}
+
+/// The error a deadline-bounded read returns when nothing arrived.
+fn read_deadline_error(what: &str) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("no {what} arrived within the read deadline"),
+    ))
 }
 
 /// Device temperatures and power from the SDK's `AARTSAAPI_ConfigHealth`
@@ -1952,6 +1995,7 @@ impl NativeSdkSource {
             device_connected: false,
             sample_buffer: VecDeque::new(),
             dual_sample_buffer: VecDeque::new(),
+            carry_geometry: None,
             read_mode: None,
             receiver_clock_hz: None,
             observed_sample_rate_hz: None,
@@ -2234,10 +2278,13 @@ impl NativeSdkSource {
     /// family.
     ///
     /// `mode` is the suffix, for example `"raw"` or `"iqreceiver"`. The
-    /// family is detected first, then joined to it. Note the two
-    /// families do not offer identical modes: the V6 has `raw`, while
-    /// the ECO's equivalent is `rtsa`, so pass a mode the detected
-    /// family supports or use [`Self::open_device`] directly.
+    /// family is detected first, then joined to it. The two families do
+    /// not offer identical modes, so `"raw"` is translated to the
+    /// family's raw-IQ mode: `raw` on the V6, `iqreceiver` on the ECO
+    /// (whose own `raw` ignores the requested rate, and whose `rtsa` is
+    /// its spectrum pipeline). Any other mode is passed through as given,
+    /// so pass one the detected family supports or use
+    /// [`Self::open_device`] directly.
     ///
     /// # Safety
     /// Same contract as [`Self::open_device`].
@@ -2259,7 +2306,8 @@ impl NativeSdkSource {
                     ))
                 })?
             };
-            // `raw` is the V6's name for the pipeline the ECO calls `rtsa`.
+            // `raw` names the raw-IQ pipeline, which the ECO opens as
+            // `iqreceiver`.
             let mode = if mode == "raw" {
                 raw_mode_for_family(family)
             } else {
@@ -3163,6 +3211,17 @@ impl NativeSdkSource {
         self.observed_sample_rate_hz
     }
 
+    /// Commit `span` to the carried tail's geometry once it has been
+    /// handed out, and report that geometry as observed: it is the
+    /// geometry of the samples just returned.
+    fn commit_carry_geometry(&mut self, span: &mut ReadGeometry) {
+        let geometry = self.carry_geometry;
+        *span = ReadGeometry::Committed(geometry);
+        self.observed_sample_rate_hz = geometry.map(|g| g.sample_rate_hz);
+        self.observed_bandwidth_hz = geometry.and_then(|g| g.bandwidth_hz);
+        self.observed_center_frequency_hz = geometry.and_then(|g| g.center_frequency_hz);
+    }
+
     /// Packets the device flagged as dropped or time-discontinuous
     /// since this source was created. See the field.
     pub fn cumulative_drops(&self) -> u64 {
@@ -3428,6 +3487,63 @@ impl NativeSdkSource {
         max_samples: usize,
         poll_budget: std::time::Duration,
     ) -> Result<usize> {
+        let mut span = ReadGeometry::Open;
+        unsafe { self.read_samples_span(buffer, max_samples, poll_budget, &mut span) }
+    }
+
+    /// Append up to `max_samples` samples, polling the device until
+    /// `deadline`, as one read of one packet geometry.
+    ///
+    /// The read keeps polling while the caller wants more, but stops at
+    /// the first packet, or carried tail, whose geometry differs from the
+    /// samples it already returned, and leaves those for the next call.
+    /// [`Self::observed_center_frequency_hz`] and the other observed
+    /// values therefore describe everything one call returned. Reaching
+    /// the deadline with some samples returns them; with none it is
+    /// `Error::Io(TimedOut)`.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::read_samples`].
+    pub(crate) unsafe fn read_samples_until(
+        &mut self,
+        buffer: &mut Vec<Complex32>,
+        max_samples: usize,
+        deadline: std::time::Instant,
+    ) -> Result<usize> {
+        let start_len = buffer.len();
+        let mut span = ReadGeometry::Open;
+        loop {
+            // Bound each poll by what is left of the deadline, so a zero
+            // timeout drains without waiting.
+            let budget = deadline.saturating_duration_since(std::time::Instant::now());
+            let want = max_samples - (buffer.len() - start_len);
+            let n = unsafe { self.read_samples_span(buffer, want, budget, &mut span)? };
+            let total = buffer.len() - start_len;
+            if total >= max_samples
+                || span == ReadGeometry::Boundary
+                || std::time::Instant::now() >= deadline
+                || (n == 0 && total > 0)
+            {
+                if total == 0 && max_samples > 0 {
+                    return Err(read_deadline_error("samples"));
+                }
+                return Ok(total);
+            }
+        }
+    }
+
+    /// One pass of the mono packet loop, continuing the logical read
+    /// whose geometry is `span`.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::read_samples`].
+    unsafe fn read_samples_span(
+        &mut self,
+        buffer: &mut Vec<Complex32>,
+        max_samples: usize,
+        poll_budget: std::time::Duration,
+        span: &mut ReadGeometry,
+    ) -> Result<usize> {
         unsafe {
             if !self.stream_active {
                 return Err(Error::Sdk("Streaming not active".to_string()));
@@ -3458,7 +3574,14 @@ impl NativeSdkSource {
                 remaining,
             } = plan_read(self.sample_buffer.len(), max_samples);
             if from_carry > 0 {
+                // The tail is the rest of a packet, so it belongs to this
+                // read only if that packet's geometry does.
+                if !span.admits(self.carry_geometry) {
+                    *span = ReadGeometry::Boundary;
+                    return Ok(0);
+                }
                 buffer.extend(self.sample_buffer.drain(0..from_carry));
+                self.commit_carry_geometry(span);
             }
             if remaining == 0 || from_carry > 0 {
                 // Fully satisfied from carry-over (or `max_samples == 0`).
@@ -3496,7 +3619,6 @@ impl NativeSdkSource {
             // so `got_packet` tracks whether at least one queued packet has
             // yielded samples in this call.
             let mut got_packet = false;
-            let mut read_geometry = None;
 
             while remaining > 0 {
                 let packet = match self.client.get_packet(device, 0, 0)? {
@@ -3537,9 +3659,11 @@ impl NativeSdkSource {
                 // Leave the first packet of a new geometry in the SDK queue.
                 // Each returned buffer, including a carried packet tail, has
                 // one frequency mapping. Do not relabel old IQ with new metadata.
-                // Only check geometry once we already have valid samples in hand
-                // and the incoming packet also carries valid samples.
-                if got_packet && has_valid_samples && read_geometry != geometry {
+                // `span` carries the geometry of samples this read returned
+                // in earlier calls, so the check holds across calls too. A
+                // packet without valid samples adds none and is not checked.
+                if has_valid_samples && !span.admits(geometry) {
+                    *span = ReadGeometry::Boundary;
                     break;
                 }
                 if !packet.fp32.is_null() && packet.num > 0 && !valid_iq_stride {
@@ -3699,7 +3823,10 @@ impl NativeSdkSource {
                     self.observed_bandwidth_hz = geometry.and_then(|g| g.bandwidth_hz);
                     self.observed_center_frequency_hz =
                         geometry.and_then(|g| g.center_frequency_hz);
-                    read_geometry = geometry;
+                    *span = ReadGeometry::Committed(geometry);
+                    if self.sample_buffer.len() > prev_carry_len {
+                        self.carry_geometry = geometry;
+                    }
                     if packet.end_time.is_finite() && packet.end_time > 0.0 {
                         self.last_packet_end_time_s = packet.end_time;
                     }
@@ -3711,7 +3838,9 @@ impl NativeSdkSource {
                 }
             }
 
-            if !got_packet {
+            // A boundary at the first packet is not idleness: the packet
+            // is there, and belongs to the next read.
+            if !got_packet && *span != ReadGeometry::Boundary {
                 debug!(
                     "read_samples: no packet within {:?} (stream live but idle)",
                     poll_budget
@@ -3778,6 +3907,56 @@ impl NativeSdkSource {
         max_samples: usize,
         poll_budget: std::time::Duration,
     ) -> Result<usize> {
+        let mut span = ReadGeometry::Open;
+        unsafe { self.read_samples_dual_span(rx1, rx2, max_samples, poll_budget, &mut span) }
+    }
+
+    /// The dual counterpart of [`Self::read_samples_until`]: up to
+    /// `max_samples` pairs, polling until `deadline`, all of one packet
+    /// geometry. Both vectors grow by exactly the returned count.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::read_samples_dual`].
+    pub(crate) unsafe fn read_samples_dual_until(
+        &mut self,
+        rx1: &mut Vec<Complex32>,
+        rx2: &mut Vec<Complex32>,
+        max_samples: usize,
+        deadline: std::time::Instant,
+    ) -> Result<usize> {
+        let start_len = rx1.len();
+        let mut span = ReadGeometry::Open;
+        loop {
+            let budget = deadline.saturating_duration_since(std::time::Instant::now());
+            let want = max_samples - (rx1.len() - start_len);
+            let n = unsafe { self.read_samples_dual_span(rx1, rx2, want, budget, &mut span)? };
+            let total = rx1.len() - start_len;
+            if total >= max_samples
+                || span == ReadGeometry::Boundary
+                || std::time::Instant::now() >= deadline
+                || (n == 0 && total > 0)
+            {
+                if total == 0 && max_samples > 0 {
+                    return Err(read_deadline_error("sample pairs"));
+                }
+                return Ok(total);
+            }
+        }
+    }
+
+    /// One pass of the dual packet loop, continuing the logical read
+    /// whose geometry is `span`.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::read_samples_dual`].
+    unsafe fn read_samples_dual_span(
+        &mut self,
+        rx1: &mut Vec<Complex32>,
+        rx2: &mut Vec<Complex32>,
+        max_samples: usize,
+        poll_budget: std::time::Duration,
+        span: &mut ReadGeometry,
+    ) -> Result<usize> {
         unsafe {
             if !self.stream_active {
                 return Err(Error::Sdk("Streaming not active".to_string()));
@@ -3802,10 +3981,17 @@ impl NativeSdkSource {
                 remaining,
             } = plan_read(self.dual_sample_buffer.len(), max_samples);
             if from_carry > 0 {
+                // As in the mono path: the tail joins this read only if
+                // the packet it came from does.
+                if !span.admits(self.carry_geometry) {
+                    *span = ReadGeometry::Boundary;
+                    return Ok(0);
+                }
                 for (a, b) in self.dual_sample_buffer.drain(0..from_carry) {
                     rx1.push(a);
                     rx2.push(b);
                 }
+                self.commit_carry_geometry(span);
             }
             if remaining == 0 || from_carry > 0 {
                 return Ok(from_carry);
@@ -3826,7 +4012,6 @@ impl NativeSdkSource {
             // caller draining a backlog never sleeps out the deadline.
             let mut remaining = remaining;
             let mut got_packet = false;
-            let mut read_geometry = None;
 
             while remaining > 0 {
                 let packet = match self.client.get_packet(device, 0, 0)? {
@@ -3853,7 +4038,9 @@ impl NativeSdkSource {
                 // Leave the first packet of a new geometry in the SDK queue.
                 // Each returned buffer, including a carried packet tail, has
                 // one frequency mapping. Do not relabel old IQ with new metadata.
-                if got_packet && has_valid_samples && read_geometry != geometry {
+                // `span` holds across calls, as in the mono path.
+                if has_valid_samples && !span.admits(geometry) {
+                    *span = ReadGeometry::Boundary;
                     break;
                 }
                 // Decode packet flags on every consumed packet, including
@@ -3990,7 +4177,10 @@ impl NativeSdkSource {
                     self.observed_bandwidth_hz = geometry.and_then(|g| g.bandwidth_hz);
                     self.observed_center_frequency_hz =
                         geometry.and_then(|g| g.center_frequency_hz);
-                    read_geometry = geometry;
+                    *span = ReadGeometry::Committed(geometry);
+                    if self.dual_sample_buffer.len() > prev_carry_len {
+                        self.carry_geometry = geometry;
+                    }
                     if packet.end_time.is_finite() && packet.end_time > 0.0 {
                         self.last_packet_end_time_s = packet.end_time;
                     }
@@ -4002,7 +4192,9 @@ impl NativeSdkSource {
                 }
             }
 
-            if !got_packet {
+            // A boundary at the first packet is not idleness: the packet
+            // is there, and belongs to the next read.
+            if !got_packet && *span != ReadGeometry::Boundary {
                 debug!(
                     "read_samples_dual: no packet within {:?} (stream live but idle)",
                     poll_budget
@@ -4079,6 +4271,7 @@ impl NativeSdkSource {
             self.device_connected = false;
             self.sample_buffer.clear();
             self.dual_sample_buffer.clear();
+            self.carry_geometry = None;
             self.read_mode = None;
             self.observed_sample_rate_hz = None;
             self.observed_bandwidth_hz = None;
@@ -5062,6 +5255,7 @@ mod tests {
             device_connected: false,
             sample_buffer: VecDeque::new(),
             dual_sample_buffer: VecDeque::new(),
+            carry_geometry: None,
             read_mode: None,
             receiver_clock_hz: None,
             observed_sample_rate_hz: None,

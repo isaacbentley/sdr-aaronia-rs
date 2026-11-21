@@ -468,6 +468,48 @@ pub(crate) enum HeaderScan {
     Incomplete { skippable: usize, rejected: usize },
 }
 
+/// Header candidates, process-wide, that were well-formed JSON but not a
+/// [`PacketMetadata`]. Counts only to rate-limit the warning below.
+static SCHEMA_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Warn — on the first occurrence, then every
+/// [`SCHEMA_MISMATCH_REPORT_EVERY`]th — when a rejected header candidate
+/// was well-formed JSON.
+///
+/// Corruption and stray braces in binary payloads fail as syntax errors
+/// and are routine during a resync. A complete JSON document that does
+/// not deserialize is different: it is what a server speaking a header
+/// schema this crate does not know looks like, and every packet it sends
+/// is discarded, so the stream yields no samples at all. The parse-error
+/// counter alone cannot tell the two apart.
+fn note_schema_mismatch(candidate: &[u8], error: &serde_json::Error) {
+    if !is_schema_mismatch(candidate, error) {
+        return;
+    }
+    let seen = SCHEMA_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if seen.is_multiple_of(SCHEMA_MISMATCH_REPORT_EVERY) {
+        tracing::warn!(
+            "RTSA stream sent a JSON header this crate cannot read ({error}); its packet \
+             is discarded, so a server sending only these yields no samples \
+             ({} such header(s) so far)",
+            seen + 1
+        );
+    }
+}
+
+/// See [`note_schema_mismatch`].
+const SCHEMA_MISMATCH_REPORT_EVERY: u64 = 1000;
+
+/// Whether `error`, from deserializing `candidate` as a header, means a
+/// well-formed JSON document of the wrong shape.
+fn is_schema_mismatch(candidate: &[u8], error: &serde_json::Error) -> bool {
+    // `Data` is the category for a well-formed document of the wrong
+    // shape; the second parse rules out one whose shape error came before
+    // a syntax error further on, and runs only for those.
+    error.classify() == serde_json::error::Category::Data
+        && serde_json::from_slice::<serde::de::IgnoredAny>(candidate).is_ok()
+}
+
 /// Scan `buf` for the first complete packet JSON header, decoding no
 /// payload.
 ///
@@ -526,19 +568,22 @@ pub(crate) fn scan_packet_header(buf: &[u8]) -> HeaderScan {
         // Every `{` in `start..end` is a candidate ending at `end`.
         let mut candidate = start;
         loop {
-            if let Ok(metadata) = serde_json::from_slice::<PacketMetadata>(&buf[candidate..end]) {
-                let mut payload_start = end + 1;
-                if buf[end] == ASCII_LINE_FEED
-                    && buf.get(payload_start) == Some(&ASCII_RECORD_SEPARATOR)
-                {
-                    payload_start += 1;
+            match serde_json::from_slice::<PacketMetadata>(&buf[candidate..end]) {
+                Ok(metadata) => {
+                    let mut payload_start = end + 1;
+                    if buf[end] == ASCII_LINE_FEED
+                        && buf.get(payload_start) == Some(&ASCII_RECORD_SEPARATOR)
+                    {
+                        payload_start += 1;
+                    }
+                    return HeaderScan::Header {
+                        metadata: Box::new(metadata),
+                        json: candidate..end,
+                        payload_start,
+                        rejected,
+                    };
                 }
-                return HeaderScan::Header {
-                    metadata: Box::new(metadata),
-                    json: candidate..end,
-                    payload_start,
-                    rejected,
-                };
+                Err(error) => note_schema_mismatch(&buf[candidate..end], &error),
             }
             rejected += 1;
             match buf[candidate + 1..end].iter().position(|&b| b == b'{') {
@@ -2180,6 +2225,41 @@ mod tests {
                 rejected: 0
             }
         ));
+    }
+
+    /// A well-formed header in a schema the crate does not know is told
+    /// apart from corruption, so it can be reported rather than silently
+    /// counted with the garbage a resync skips.
+    #[test]
+    fn a_well_formed_header_of_another_schema_is_a_schema_mismatch() {
+        let mismatch = |candidate: &[u8]| {
+            let error = serde_json::from_slice::<PacketMetadata>(candidate)
+                .expect_err("not a header this crate reads");
+            is_schema_mismatch(candidate, &error)
+        };
+        // Missing every required field; an unknown payload kind.
+        assert!(mismatch(br#"{"timestamp":1.0,"rate":15360000}"#));
+        let header = String::from_utf8(scan_header(1)).unwrap();
+        assert!(mismatch(
+            header.replace(r#""iq""#, r#""quantum""#).as_bytes()
+        ));
+        // Corruption, and a shape error followed by junk, are not.
+        assert!(!mismatch(b"{junk}"));
+        assert!(!mismatch(br#"{"samples":"x" \x00\x01"#));
+        assert!(!mismatch(b"{}trailing"));
+
+        // A mismatched candidate is still rejected, and the scan goes on
+        // to the real header behind it.
+        let mut wire = br#"{"timestamp":1.0}"#.to_vec();
+        wire.push(ASCII_LINE_FEED);
+        let header_at = wire.len();
+        wire.extend_from_slice(&scan_header(1));
+        wire.push(ASCII_LINE_FEED);
+        let HeaderScan::Header { json, rejected, .. } = scan_packet_header(&wire) else {
+            panic!("the header after the mismatch must be found");
+        };
+        assert_eq!(json.start, header_at);
+        assert_eq!(rejected, 1);
     }
 
     /// Brace-dense garbage without a terminator is the shape that made a

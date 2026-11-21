@@ -245,7 +245,10 @@ impl HttpSink {
         let duration = num_complex as f64 / self.sample_rate_hz;
         let end_time = start_time + duration;
 
-        self.last_transmission_end_time = end_time + (1.0 / self.sample_rate_hz);
+        // `end_time` is already exclusive — one sample period past the
+        // last sample — so the next batch starts exactly there. Adding
+        // another period left a one-sample hole between batches.
+        self.last_transmission_end_time = end_time;
 
         let sent = match self.tx.as_ref() {
             Some(tx) => tx.send((samples_vec, start_time, end_time)).await.is_ok(),
@@ -391,5 +394,34 @@ mod tests {
             sink.sample_buffer.is_empty(),
             "buffer must still be cleared after the failed push"
         );
+    }
+
+    /// Back-to-back batches are contiguous: the second starts at the first
+    /// one's exclusive end, the same `start == previous end` the RX drop
+    /// detector reads as no gap.
+    #[tokio::test]
+    async fn consecutive_batches_leave_no_gap() {
+        let mut sink = HttpSinkBuilder::new("http://127.0.0.1:9")
+            .sample_rate_hz(1e3)
+            .buffer_size(1000)
+            .build()
+            .expect("HttpSink should build inside a tokio runtime");
+        if let Some(task) = sink.sender_task.take() {
+            task.abort();
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        sink.tx = Some(tx);
+
+        // One second of samples each, far longer than the streaming
+        // delay, so the second batch is scheduled by the first one's end
+        // rather than by the clock.
+        for _ in 0..2 {
+            sink.sample_buffer = vec![Complex32::new(1.0, 0.0); 1000];
+            sink.push_batch().await.unwrap();
+        }
+        let (_, first_start, first_end) = rx.recv().await.unwrap();
+        let (_, second_start, _) = rx.recv().await.unwrap();
+        assert!((first_end - first_start - 1.0).abs() < 1e-6);
+        assert_eq!(second_start, first_end);
     }
 }

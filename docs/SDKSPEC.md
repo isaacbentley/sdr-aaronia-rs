@@ -94,10 +94,16 @@ RTSA-Suite PRO 3.0.3.16655 for Linux (2026-09-07):
   neither the DLL's own directory nor its parent, so on a stock install
   the load failed with a bare `LoadLibraryExW failed` after detection had
   found the file. The crate now adds the install root with
-  `AddDllDirectory` and loads with `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
-  LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`, so neither `PATH` nor the working
-  directory is consulted; putting the root on `PATH` was the only way to
-  make it load before that.
+  `AddDllDirectory` and loads with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+  LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_SYSTEM32`: the DLL's
+  own directory, the added root, and System32, so neither `PATH` nor the
+  working directory is consulted; putting the root on `PATH` was the only
+  way to make it load before that. `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` is
+  deliberately not used: it also searches the host application's
+  directory, ahead of the added root, and a host such as radioconda's
+  `SoapySDRUtil` ships its own builds of several of the SDK's
+  dependencies (Qt6Core, Qt6Gui, hdf5, …) under the same names, which
+  then load in their place and fail the SDK.
 - **`gpssats`** is the samples' name for the satellite count under
   `AARTSAAPI_ConfigHealth`; the HTTP tree calls it `satellites`. The
   health walker accepts both. No sample reads a temperature field, so

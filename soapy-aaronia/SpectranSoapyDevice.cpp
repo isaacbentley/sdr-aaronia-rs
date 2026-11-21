@@ -475,10 +475,10 @@ int SpectranSoapyDevice::readStream(
         if (spectran_source_take_overrun(_source)) {
             flags |= SOAPY_SDR_END_ABRUPT;
         }
-        // Timestamp of the most recently received network block — an
-        // approximation for the first returned sample when older
-        // buffered samples are included (HTTP backend only; 0 when
-        // unavailable, in which case HAS_TIME stays unset).
+        // Timestamp of the most recently received block (HTTP: that
+        // block's start; native SDK: its end) — an approximation for the
+        // first returned sample when older buffered samples are included.
+        // 0 when unavailable, in which case HAS_TIME stays unset.
         timeNs = spectran_source_get_last_timestamp_ns(_source);
         if (timeNs != 0) flags |= SOAPY_SDR_HAS_TIME;
     }
@@ -547,7 +547,7 @@ int SpectranSoapyDevice::writeStream(
         _sink,
         0,
         start_s,
-        duration_s,
+        start_s + duration_s,
         burstFlags,
         cappedElems > 0 ? static_cast<const FfiComplex*>(buffs[0]) : nullptr,
         cappedElems
@@ -1002,7 +1002,7 @@ SoapySDR::Range SpectranSoapyDevice::getGainRange(const int direction, const siz
 // ---------------------------------------------------------------------
 
 void SpectranSoapyDevice::setBandwidth(const int direction, const size_t channel, const double bw) {
-    if (bw <= 0.0 || direction != SOAPY_SDR_RX) return;
+    if (!std::isfinite(bw) || bw <= 0.0 || direction != SOAPY_SDR_RX) return;
     if (_sourceType == NativeSdk) {
         std::lock_guard<std::mutex> lock(_mutex);
         if (spectran_source_set_rf_span_hz(_source, bw) != Success)

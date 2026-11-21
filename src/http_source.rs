@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use tracing::{debug, info, trace, warn};
 
 // Import our new advanced streaming capabilities
-use crate::http_endpoints::{AuthMethod, HttpEndpointsClient};
+use crate::http_endpoints::{AuthMethod, HttpEndpointsClient, STREAM_STALL_TIMEOUT};
 use crate::http_streaming::{DropDetector, StreamFormat, StreamParser, rate_moved};
 use crate::stream_break::StreamDiscontinuity;
 
@@ -22,6 +22,13 @@ use crate::stream_break::StreamDiscontinuity;
 /// buffer grow unbounded (packet size is the device's choice and small — a
 /// few tens of thousands of samples).
 const PACKET_CAPACITY_FACTOR: usize = 4;
+
+/// Most samples the sample buffer reserves up front, whatever
+/// `buffer_size` asks for. The reservation is only a hint — the buffer
+/// grows on demand and [`HttpSource::buffer_capacity`] governs what it may
+/// hold — so an absurd `buffer_size` must not abort the build on a
+/// reservation nothing will fill. 128 MiB of `Complex32`.
+const MAX_PREALLOCATED_SAMPLES: usize = 1 << 24;
 
 /// Depth of the channel between the socket reader task and `work()`, in
 /// chunks, and the most chunks one `fetch_samples` sweep takes from it.
@@ -128,19 +135,6 @@ const LINK_BUDGET_TOLERANCE: f64 = 0.98;
 /// consumer builds from this span hundreds of kilohertz — and far above the
 /// round-off, so it separates the two without a judgement call.
 const CENTER_CHANGE_HZ: f64 = 1.0;
-
-/// How long the `/stream` body may deliver nothing before the reader gives
-/// up on the connection.
-///
-/// The streaming client deliberately has no total timeout (it would cover
-/// the whole body), so without this a server that stops sending while
-/// keeping the socket open — a hung RTSA process, a half-open TCP
-/// connection after a network change — parks the reader forever, and the
-/// source produces nothing and never reconnects. A live stream delivers a
-/// chunk every few milliseconds at any usable rate, so several seconds of
-/// nothing is not a slow link. Ending the reader hands the source to its
-/// ordinary reconnect path.
-const STREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Drain `stream` into `tx` until it ends, errors, stalls for `stall`, or
 /// the receiver is dropped. Dropping `tx` on return is what tells the
@@ -577,7 +571,9 @@ impl HttpSource {
             base_url,
             endpoints_client,
             streaming_client,
-            sample_buffer: VecDeque::with_capacity(buffer_size * 2),
+            sample_buffer: VecDeque::with_capacity(
+                buffer_size.saturating_mul(2).min(MAX_PREALLOCATED_SAMPLES),
+            ),
             max_packet_samples: 0,
             max_chunk_bytes: 0,
             downstream_capacity: 0,
@@ -741,7 +737,16 @@ impl HttpSource {
         info!("Sending stream request to {}.", stream_url);
         info!("Sending HTTP request...");
 
-        let response = request_builder.send().await?;
+        // Bounded like the body reads below: a server that accepts the
+        // connection and never sends headers would otherwise hold `init`
+        // or a reconnect here forever.
+        let response = tokio::time::timeout(STREAM_STALL_TIMEOUT, request_builder.send())
+            .await
+            .map_err(|_| {
+                crate::http_endpoints::stream_stalled(&format!(
+                    "Stream request to {stream_url}: no response"
+                ))
+            })??;
         info!("Received HTTP response status: {}", response.status());
         // The shared status-to-error mapping, so a failed stream open is
         // the same typed `Error::Http` a failed probe or control call is.
@@ -1061,9 +1066,10 @@ impl HttpSource {
         // Publish promptly: the per-chunk stats refresh would carry it on
         // the next packet anyway, but a consumer polling right after the
         // log line should see the same verdict the line describes.
-        if let Some(ref shared) = self.shared_stats
-            && let Ok(mut stats) = shared.write()
-        {
+        // A poisoned lock still holds usable stats; a writer that panicked
+        // elsewhere must not stop the verdict from being published.
+        if let Some(ref shared) = self.shared_stats {
+            let mut stats = shared.write().unwrap_or_else(|p| p.into_inner());
             stats.link_budget = Some(verdict.clone());
         }
 
@@ -1265,12 +1271,12 @@ impl HttpSource {
             // Last writer is not necessarily latest: a probe fired at
             // drops=4 can finish after the one fired at drops=16. Keep
             // whichever describes the later gap.
-            if let Some(shared) = shared
-                && let Ok(mut stats) = shared.write()
-                && stats.device_health_drops <= drops
-            {
-                stats.device_health = Some(blocks);
-                stats.device_health_drops = drops;
+            if let Some(shared) = shared {
+                let mut stats = shared.write().unwrap_or_else(|p| p.into_inner());
+                if stats.device_health_drops <= drops {
+                    stats.device_health = Some(blocks);
+                    stats.device_health_drops = drops;
+                }
             }
         });
     }
@@ -1590,9 +1596,11 @@ impl HttpSource {
             }
         }
 
-        if let Some(ref shared) = self.shared_stats
-            && let Ok(mut stats) = shared.write()
-        {
+        // Recover a poisoned lock rather than skip the refresh: one
+        // writer's panic would otherwise freeze the stats every consumer
+        // sees for the rest of the stream.
+        if let Some(ref shared) = self.shared_stats {
+            let mut stats = shared.write().unwrap_or_else(|p| p.into_inner());
             // This replaces the whole snapshot, so every field the block
             // does not itself hold has to be carried across by hand.
             // `restart_pending` is the consumer's request to us;
@@ -2338,12 +2346,14 @@ impl Kernel for HttpSource {
         _meta: &mut futuresdr::runtime::BlockMeta,
     ) -> anyhow::Result<()> {
         let mut restart_triggered = false;
-        if let Some(ref shared) = self.shared_stats
-            && let Ok(mut stats) = shared.write()
-            && stats.restart_pending
-        {
-            stats.restart_pending = false;
-            restart_triggered = true;
+        // A poisoned lock still carries the request; skipping it would
+        // drop a retune the consumer asked for.
+        if let Some(ref shared) = self.shared_stats {
+            let mut stats = shared.write().unwrap_or_else(|p| p.into_inner());
+            if stats.restart_pending {
+                stats.restart_pending = false;
+                restart_triggered = true;
+            }
         }
 
         if restart_triggered {
@@ -2948,6 +2958,20 @@ mod tests {
                 "capacity must never be 0 — consumers divide by it (buffer_size={buffer_size})"
             );
         }
+    }
+
+    /// An absurd `buffer_size` builds: the up-front reservation is a hint,
+    /// so it neither overflows the doubling nor reserves the whole request.
+    #[test]
+    fn a_huge_buffer_size_does_not_overflow_or_reserve_it_all() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let block = HttpSourceBuilder::new("http://localhost:54664")
+            .buffer_size(usize::MAX)
+            .build()
+            .expect("Should create HttpSource");
+        assert!(block.sample_buffer.capacity() <= 2 * MAX_PREALLOCATED_SAMPLES);
+        assert_eq!(block.buffer_capacity(), usize::MAX);
     }
 
     /// A packet bigger than the configured capacity must not be guillotined

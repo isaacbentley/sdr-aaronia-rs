@@ -129,8 +129,9 @@ impl RxChannel {
 
 /// Deinterleave one dual-channel IQ packet into per-channel sample pairs.
 ///
-/// In `Rx1+Rx2` capture the SDK delivers both receivers in a single
-/// packet: each sample occupies `stride` floats, laid out
+/// In `Rx12` capture ([`RxChannel::Rx1And2`]) the SDK delivers both
+/// receivers interleaved in a single packet: each sample occupies
+/// `stride` floats, laid out
 /// `[I1, Q1, I2, Q2, ...pad]` (channel 1 in floats 0–1, channel 2 in
 /// floats 2–3; any remaining floats up to `stride` are padding). On
 /// success this yields `(rx1, rx2)` pairs in sample order — as a
@@ -141,7 +142,7 @@ impl RxChannel {
 /// the last sample's four channel floats — and `stride` must be ≥ 4;
 /// anything less cannot be a dual-channel layout, and callers should
 /// treat it as "the stream is not dual-channel" (e.g.
-/// `device/receiverchannel` was not set to `Rx1+Rx2`). All bounds are
+/// `device/receiverchannel` was not set to `Rx12`). All bounds are
 /// validated up front, so the iterator itself never panics.
 pub fn deinterleave_dual_iq<'a>(
     floats: &'a [f32],
@@ -205,10 +206,11 @@ pub fn parse_frequency(s: &str) -> Result<f64> {
     let s = s.trim();
     // Strip optional trailing "Hz" (case-insensitive) so both "146.52M" and
     // "146.52MHz" / "100Hz" parse cleanly.
-    let without_hz = if s.len() >= 2 && s[s.len() - 2..].eq_ignore_ascii_case("hz") {
-        s[..s.len() - 2].trim_end()
-    } else {
-        s
+    // `get`, not indexing: two bytes from the end need not be a char
+    // boundary ("433㎒"), and a byte-range index panics there.
+    let without_hz = match s.len().checked_sub(2).and_then(|at| s.get(at..)) {
+        Some(tail) if tail.eq_ignore_ascii_case("hz") => s[..s.len() - 2].trim_end(),
+        _ => s,
     };
 
     let (value_str, scale) = if let Some(rest) = without_hz
@@ -1068,6 +1070,17 @@ mod tests {
         assert_eq!(parse_frequency("2.4G").unwrap(), 2_400_000_000.0);
         assert_eq!(parse_frequency("162.5k").unwrap(), 162_500.0);
         assert_eq!(parse_frequency("100000").unwrap(), 100_000.0);
+        assert_eq!(parse_frequency("146.52 MHz").unwrap(), 146_520_000.0);
+        assert_eq!(parse_frequency("100Hz").unwrap(), 100.0);
+    }
+
+    /// A multi-byte last character is an invalid value, not a panic on
+    /// a byte slice that splits it.
+    #[test]
+    fn parse_frequency_rejects_a_multibyte_suffix_without_panicking() {
+        for input in ["433㎒", "㎒", "1é", "2.4 GHz€"] {
+            assert!(parse_frequency(input).is_err(), "{input:?}");
+        }
     }
 
     #[test]

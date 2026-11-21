@@ -4,11 +4,47 @@ use std::cell::{Cell, RefCell};
 
 static LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// One queued IQ packet for the fake `GetPacket`/`ConsumePackets`.
+struct FakePacket {
+    start_frequency: f64,
+    step_frequency: f64,
+    span_frequency: f64,
+    /// Floats per sample: 2 for mono IQ, 4 for the dual interleave.
+    stride: i64,
+    floats: Vec<f32>,
+    /// `GetPacket` calls answered `EMPTY` before this packet shows: a
+    /// packet that arrives while a read is already polling.
+    empty_polls_before: u32,
+}
+
+impl FakePacket {
+    /// `samples` IQ samples of `value`, `stride` floats apart, under the
+    /// geometry of a `span` centred on `center`.
+    fn iq(center: f64, span: f64, stride: i64, samples: usize, value: f32) -> Self {
+        Self {
+            start_frequency: center - span / 2.0,
+            step_frequency: span,
+            span_frequency: span,
+            stride,
+            floats: vec![value; samples * stride as usize],
+            empty_polls_before: 0,
+        }
+    }
+}
+
 thread_local! {
     static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static FAIL: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static CONFIG_AVAILABLE: Cell<bool> = const { Cell::new(false) };
     static LAST_OPEN_SERIAL: RefCell<Option<String>> = const { RefCell::new(None) };
+    static PACKETS: RefCell<std::collections::VecDeque<FakePacket>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+}
+fn queue(packet: FakePacket) {
+    PACKETS.with(|packets| packets.borrow_mut().push_back(packet));
+}
+fn queued() -> usize {
+    PACKETS.with(|packets| packets.borrow().len())
 }
 fn call(name: &'static str) -> u32 {
     CALLS.with(|calls| calls.borrow_mut().push(name));
@@ -25,6 +61,7 @@ fn reset(fail: &[&'static str]) -> std::sync::MutexGuard<'static, ()> {
     LAST_OPEN_SERIAL.with(|serial| *serial.borrow_mut() = None);
     CALLS.with(|calls| calls.borrow_mut().clear());
     FAIL.with(|failed| *failed.borrow_mut() = fail.to_vec());
+    PACKETS.with(|packets| packets.borrow_mut().clear());
     guard
 }
 fn calls() -> Vec<&'static str> {
@@ -234,16 +271,43 @@ unsafe extern "C" fn mock_get_packet(
     _device: *mut AARTSAAPI_Device,
     _channel: i32,
     _index: i32,
-    _packet: *mut AARTSAAPI_Packet,
+    packet: *mut AARTSAAPI_Packet,
 ) -> u32 {
-    AARTSAAPI_ERROR_NOT_FOUND
+    PACKETS.with(|packets| {
+        let mut packets = packets.borrow_mut();
+        let Some(head) = packets.front_mut() else {
+            return AARTSAAPI_EMPTY;
+        };
+        if head.empty_polls_before > 0 {
+            head.empty_polls_before -= 1;
+            return AARTSAAPI_EMPTY;
+        }
+        // The floats stay in the queue, unmoved, until consumed: the
+        // same lifetime the SDK gives a packet's buffer.
+        unsafe {
+            (*packet).start_frequency = head.start_frequency;
+            (*packet).step_frequency = head.step_frequency;
+            (*packet).span_frequency = head.span_frequency;
+            (*packet).num = head.floats.len() as i64 / head.stride;
+            (*packet).stride = head.stride;
+            (*packet).size = head.stride;
+            (*packet).fp32 = head.floats.as_mut_ptr();
+        }
+        AARTSAAPI_OK
+    })
 }
 unsafe extern "C" fn mock_consume_packets(
     _device: *mut AARTSAAPI_Device,
     _channel: i32,
-    _num: i32,
+    num: i32,
 ) -> u32 {
-    AARTSAAPI_ERROR_NOT_FOUND
+    PACKETS.with(|packets| {
+        let mut packets = packets.borrow_mut();
+        for _ in 0..num {
+            packets.pop_front();
+        }
+    });
+    AARTSAAPI_OK
 }
 unsafe extern "C" fn mock_get_master_stream_time(
     _device: *mut AARTSAAPI_Device,
@@ -505,4 +569,134 @@ fn missing_explicit_sweep_reference_metadata_fails_before_writes() {
             .is_err()
     );
     assert!(!calls().contains(&"config_write"));
+}
+
+const DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A deadline read keeps polling for more after the queue drains. A
+/// packet of a new geometry that arrives during that poll — the first
+/// packet after a retune — must end the read, not join it under the new
+/// centre: the label would then describe only part of the buffer.
+#[test]
+fn a_deadline_read_stops_at_a_retune_that_arrives_mid_poll() {
+    let _guard = reset(&[]);
+    let mut source = source(true, true);
+    queue(FakePacket::iq(915e6, 15.36e6, 2, 4, 1.0));
+    queue(FakePacket {
+        empty_polls_before: 1,
+        ..FakePacket::iq(2_400e6, 15.36e6, 2, 4, 2.0)
+    });
+
+    let mut buffer = Vec::new();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let n = unsafe { source.read_samples_until(&mut buffer, 8, deadline) }.unwrap();
+    assert_eq!(n, 4, "the read must stop before the retuned packet");
+    assert!(buffer.iter().all(|s| s.re == 1.0));
+    assert_eq!(source.observed_center_frequency_hz(), Some(915e6));
+    assert_eq!(
+        queued(),
+        1,
+        "the retuned packet stays queued for the next read"
+    );
+
+    buffer.clear();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let n = unsafe { source.read_samples_until(&mut buffer, 8, deadline) }.unwrap();
+    assert_eq!(n, 4);
+    assert!(buffer.iter().all(|s| s.re == 2.0));
+    assert_eq!(source.observed_center_frequency_hz(), Some(2_400e6));
+}
+
+/// A carried tail and the packet after it are separate geometries when a
+/// retune falls between them; the read drains the tail and stops.
+#[test]
+fn a_deadline_read_does_not_join_a_carried_tail_to_a_retuned_packet() {
+    let _guard = reset(&[]);
+    let mut source = source(true, true);
+    queue(FakePacket::iq(915e6, 15.36e6, 2, 8, 1.0));
+
+    let mut buffer = Vec::new();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let n = unsafe { source.read_samples_until(&mut buffer, 4, deadline) }.unwrap();
+    assert_eq!(n, 4, "half the packet is carried");
+
+    queue(FakePacket::iq(2_400e6, 15.36e6, 2, 4, 2.0));
+    buffer.clear();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let n = unsafe { source.read_samples_until(&mut buffer, 8, deadline) }.unwrap();
+    assert_eq!(n, 4, "only the carried tail belongs to this read");
+    assert!(buffer.iter().all(|s| s.re == 1.0));
+    assert_eq!(source.observed_center_frequency_hz(), Some(915e6));
+
+    buffer.clear();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let n = unsafe { source.read_samples_until(&mut buffer, 8, deadline) }.unwrap();
+    assert_eq!(n, 4);
+    assert!(buffer.iter().all(|s| s.re == 2.0));
+    assert_eq!(source.observed_center_frequency_hz(), Some(2_400e6));
+}
+
+/// Packets of one geometry still fill a read across polls.
+#[test]
+fn a_deadline_read_keeps_filling_from_one_geometry() {
+    let _guard = reset(&[]);
+    let mut source = source(true, true);
+    queue(FakePacket::iq(915e6, 15.36e6, 2, 4, 1.0));
+    queue(FakePacket {
+        empty_polls_before: 1,
+        ..FakePacket::iq(915e6, 15.36e6, 2, 4, 1.0)
+    });
+    let mut buffer = Vec::new();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let n = unsafe { source.read_samples_until(&mut buffer, 8, deadline) }.unwrap();
+    assert_eq!(n, 8);
+    assert_eq!(queued(), 0);
+}
+
+/// The dual path holds the same line, for its carried pairs and for a
+/// packet that arrives mid-poll.
+#[test]
+fn a_dual_deadline_read_stops_at_a_retune() {
+    let _guard = reset(&[]);
+    let mut source = source(true, true);
+    queue(FakePacket::iq(915e6, 15.36e6, 4, 8, 1.0));
+
+    let (mut rx1, mut rx2) = (Vec::new(), Vec::new());
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let n = unsafe { source.read_samples_dual_until(&mut rx1, &mut rx2, 4, deadline) }.unwrap();
+    assert_eq!(n, 4, "half the packet is carried");
+
+    queue(FakePacket {
+        empty_polls_before: 1,
+        ..FakePacket::iq(2_400e6, 15.36e6, 4, 4, 2.0)
+    });
+    rx1.clear();
+    rx2.clear();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let n = unsafe { source.read_samples_dual_until(&mut rx1, &mut rx2, 8, deadline) }.unwrap();
+    assert_eq!(n, 4, "only the carried pairs belong to this read");
+    assert_eq!((rx1.len(), rx2.len()), (4, 4));
+    assert!(rx1.iter().chain(&rx2).all(|s| s.re == 1.0));
+    assert_eq!(source.observed_center_frequency_hz(), Some(915e6));
+
+    rx1.clear();
+    rx2.clear();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let n = unsafe { source.read_samples_dual_until(&mut rx1, &mut rx2, 8, deadline) }.unwrap();
+    assert_eq!(n, 4);
+    assert!(rx1.iter().chain(&rx2).all(|s| s.re == 2.0));
+    assert_eq!(source.observed_center_frequency_hz(), Some(2_400e6));
+}
+
+/// Nothing within the deadline is a timeout, as the unified read promises.
+#[test]
+fn a_deadline_read_with_nothing_queued_times_out() {
+    let _guard = reset(&[]);
+    let mut source = source(true, true);
+    let mut buffer = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    match unsafe { source.read_samples_until(&mut buffer, 8, deadline) } {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+        other => panic!("expected a timeout, got {other:?}"),
+    }
 }
