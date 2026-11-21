@@ -240,12 +240,12 @@ Add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
 # By default, includes HTTP, File and C FFI backend support
-sdr-aaronia-rs = "0.14"
+sdr-aaronia-rs = "0.15"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
 # To enable additional backends, opt into their features (e.g. native-sdk, futuresdr;
 # futuresdr needs a nightly toolchain, see Feature Flags)
-# sdr-aaronia-rs = { version = "0.14", features = ["native-sdk", "futuresdr"] }
+# sdr-aaronia-rs = { version = "0.15", features = ["native-sdk", "futuresdr"] }
 ```
 
 HTTP reads use one timeout budget for the entire requested block and return partial data at a timeout, frequency change, sample-rate change, or detected gap; native-SDK reads likewise stop at a timeout or a change of packet geometry (centre, span or rate). `capture_frequency_hz()` and `capture_sample_rate_hz()` describe the returned samples even when newer packets are queued. File tuning setters preserve the recording's metadata.

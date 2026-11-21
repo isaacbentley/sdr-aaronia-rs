@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.15.0] - 2026-11-21
+
 ### Changed
 - `HttpSource` and `SpectranSource`'s HTTP backend run on one internal stream engine (`src/http_engine.rs`) instead of two separate clients: opening `/stream`, the 5 s header and stall timeouts, chunk decoding, gap detection, reconnecting with backoff, re-applying tuning on reconnect, the `listen_only` gate, restarts and stream-break events are implemented once. Each front-end keeps its own reconnect policy — `SpectranSource` 250 ms doubling to 4 s with 5 attempts (none with `auto_reconnect(false)`), `HttpSource` every second without limit — and the public API is unchanged. DESIGN.md §4.2 lists what each front-end still owns.
 - `HttpSource` no longer blocks `work()` for its one-second reconnect delay: it waits the delay out 20 ms at a time, servicing its inbox, so a flowgraph stops promptly while the server is away. It no longer reads `/info` on each reconnect, only at the first start.
