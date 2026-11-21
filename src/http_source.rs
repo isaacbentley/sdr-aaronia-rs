@@ -597,12 +597,16 @@ impl HttpSource {
 
         match self.endpoints_client.get_info().await {
             Ok(server_info) => {
+                // Server-supplied text is logged escaped (`{:?}`), here and
+                // for the input names below: a hostile server must not be
+                // able to forge log lines or drive a terminal with newlines
+                // and escape sequences.
                 info!(
-                    "Connected to RTSA server: {} ({})",
+                    "Connected to RTSA server: {:?} ({:?})",
                     server_info.title, server_info.name
                 );
                 if !server_info.mission.is_empty() {
-                    info!("Active mission: {}", server_info.mission);
+                    info!("Active mission: {:?}", server_info.mission);
                 }
             }
             Err(e) => {
@@ -622,7 +626,7 @@ impl HttpSource {
                         } else {
                             inputs[0].clone()
                         };
-                        info!("Selected input: {}", selected);
+                        info!("Selected input: {:?}", selected);
                         self.engine.set_input(selected.clone());
                         self.input_name = Some(selected);
                     }
@@ -1851,7 +1855,7 @@ impl HttpSource {
 
         let target_block = match find_connect_run_block(&config.config, None) {
             Some((block, Some(true), Some(true))) => {
-                info!("RTSA block {block} already has connect=true, run=true; skipping write");
+                info!("RTSA block {block:?} already has connect=true, run=true; skipping write");
                 return Ok(());
             }
             Some((block, _, _)) => block,
@@ -1883,7 +1887,7 @@ impl HttpSource {
         self.endpoints_client
             .update_config(config.request + 1, &target_block, rtsa_config)
             .await?;
-        info!("Successfully configured RTSA block {target_block}: connect=true, run=true");
+        info!("Successfully configured RTSA block {target_block:?}: connect=true, run=true");
         // Give device a moment to process the configuration
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         Ok(())
@@ -1956,7 +1960,7 @@ impl HttpSource {
             Ok(applied) => {
                 info!(
                     "RTSA device reports center={:?} Hz, decimation={:?}, \
-                     ref_level={:?} dBm (block {})",
+                     ref_level={:?} dBm (block {:?})",
                     applied.center_frequency_hz,
                     applied.decimation_index,
                     applied.reference_level_dbm,

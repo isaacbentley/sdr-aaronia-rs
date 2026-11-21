@@ -397,10 +397,14 @@ reconnects automatically. This is `SpectranConfig::auto_reconnect`,
 enabled by default. A stream that sends nothing for 5 seconds while its
 socket stays open (a hung server, a half-open TCP connection) counts as
 dropped, as does a `/stream` request that gets no response headers in
-that time. The reader reopens the stream, re-applies the current tuning
-(a restarted server returns to its mission's frequency) unless the source
-is `listen_only`, and flags the first packet after the gap as an overrun
-so callers know samples were missed. After 5 attempts, roughly 8 seconds
+that time. The reader reopens the stream, re-applies the tuning this
+source last applied (a restarted server returns to its mission's
+frequency) unless the source is `listen_only`, and flags the first packet
+after the gap as an overrun so callers know samples were missed. What it
+re-applies is only ever a tuning the device accepted: a retune that
+failed is not restored, and a source that started `listen_only` has
+applied none, so it re-applies nothing, even with `listen_only` switched
+off again, until one of its setters has succeeded. After 5 attempts, roughly 8 seconds
 of backoff, it stops and reads report a closed stream, matching the
 behaviour of `auto_reconnect(false)`.
 

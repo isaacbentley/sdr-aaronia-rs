@@ -16,7 +16,7 @@ jobs:
     name: Tag matches Cargo.toml version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           lfs: false
       - name: Compare tag and manifest versions
@@ -50,7 +50,7 @@ jobs:
     needs: tag_version_guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           lfs: false
           fetch-depth: 0
@@ -58,12 +58,16 @@ jobs:
       - name: Install Linux Dependencies
         uses: ./.github/actions/linux-build-deps
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@cargo-semver-checks
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
+        with:
+          tool: cargo-semver-checks
 
       # Every feature except `futuresdr` (ci.yml's STABLE_FEATURES).
       # semver-checks' default heuristic would enable `futuresdr` too, and
@@ -88,15 +92,27 @@ jobs:
     name: Publish to crates.io
     needs: [semver_checks, validate]
     runs-on: ubuntu-latest
+    # The registry token is the one long-lived credential this workflow
+    # holds. Running the job in an environment lets the repository owner
+    # put required reviewers and a tag rule on it, and scope the secret
+    # to the environment instead of the repository — until then any
+    # workflow run by anyone with write access can read it. Create the
+    # `crates-io` environment under Settings -> Environments and move
+    # CARGO_REGISTRY_TOKEN into it; GitHub creates it unprotected on
+    # first use otherwise.
+    environment:
+      name: crates-io
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           lfs: false
 
       - name: Install Linux Dependencies
         uses: ./.github/actions/linux-build-deps
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
 
       # `--locked` refuses to publish if Cargo.lock is out of date with
       # Cargo.toml, so a release can't accidentally ship against
@@ -129,7 +145,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           lfs: false
 
@@ -137,7 +153,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/linux-build-deps
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
@@ -146,29 +162,31 @@ jobs:
       # is only the build host.
       - name: Build wheels (Linux / Windows)
         if: runner.os != 'macOS'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: build
-          args: --release --features native-sdk --manifest-path python-aaronia/Cargo.toml --out dist
+          # --locked: the wheel ships with exactly the dependency
+          # versions in Cargo.lock, the ones the gates above tested.
+          args: --release --locked --features native-sdk --manifest-path python-aaronia/Cargo.toml --out dist
 
       - name: Build wheels (macOS)
         if: runner.os == 'macOS'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: build
-          args: --release --manifest-path python-aaronia/Cargo.toml --out dist
+          args: --release --locked --manifest-path python-aaronia/Cargo.toml --out dist
 
       # Source distribution: pip's fallback for platforms/pythons the
       # wheel matrix doesn't cover.
       - name: Build sdist
         if: runner.os == 'Linux'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
           args: --manifest-path python-aaronia/Cargo.toml --out dist
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-wheels-${{ matrix.os }}
           path: |
@@ -183,7 +201,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           lfs: false
 
@@ -221,8 +239,14 @@ jobs:
           xcodebuild -version
           ld -v 2>&1 | head -2 || true
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+
+      # No rust-cache here, nor in build-python: these jobs produce the
+      # binaries that are published, and a restored `target/` is build
+      # output from an earlier run that nothing in this one verifies.
+      # A clean build costs a few minutes per release.
 
       # CMake drives the cargo build itself (static lib, linked into
       # the module — the shipped artifact has no Rust dylib dependency).
@@ -354,7 +378,7 @@ jobs:
           ls -lh "$stage".*
 
       - name: Upload Plugin
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: soapy-plugin-${{ matrix.os }}
           path: |
@@ -368,9 +392,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Build-provenance attestations: an OIDC token to sign with, and
+      # the right to store the result against this repository.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
           merge-multiple: true
@@ -426,13 +454,37 @@ jobs:
       # can. Its only reader is whoever updates the tap, and they can
       # take it from here.
       - name: Upload Homebrew formula
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: homebrew-formula
           path: formula/soapy-aaronia.rb
 
+      # One checksum file over everything on the release page, so a
+      # download can be checked without the GitHub CLI.
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd artifacts
+          shopt -s nullglob
+          files=(*.whl *.dmg *.tar.gz *.zip)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no release assets to checksum" >&2
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      # Signed provenance for the same files: `gh attestation verify
+      # <file> --repo <owner>/<repo>` proves an asset was built by this
+      # workflow from this repository at this tag, which a checksum file
+      # sitting beside the asset cannot.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: artifacts/SHA256SUMS
+
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           # *.tar.gz covers both the Python sdist and the Linux plugin
           # archive; macOS ships as *.dmg and Windows as *.zip.
@@ -441,6 +493,7 @@ jobs:
             artifacts/*.dmg
             artifacts/*.tar.gz
             artifacts/*.zip
+            artifacts/SHA256SUMS
           body_path: release-notes.md
           generate_release_notes: true
 
@@ -453,14 +506,14 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: python-wheels-*
           path: dist
           merge-multiple: true
 
       - name: Publish package
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           # A re-run of a partially failed release must not go red on
           # the files that already made it to PyPI.

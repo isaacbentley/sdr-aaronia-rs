@@ -552,10 +552,27 @@ unsafe extern "system" {
 /// dependencies live in `<root>` either way, so step out of a `sdk`
 /// directory when that is where the library was found. `lib_path` is
 /// already absolute — `AddDllDirectory` requires it — and the `sdk`
-/// name is compared case-insensitively, as the filesystem is. The
-/// entry is deliberately
-/// not removed after loading: Qt resolves its plugins later, from the
-/// same directory.
+/// name is compared case-insensitively, as the filesystem is.
+///
+/// The entry is deliberately not removed after loading (the cookie
+/// `AddDllDirectory` returns is dropped rather than handed to
+/// `RemoveDllDirectory`). The vendor library does not finish loading its
+/// dependencies inside `LoadLibraryExW`: Qt resolves its platform and
+/// image plugins later, on first use, and those plugins import further
+/// libraries from this same root. Removing the entry once the first load
+/// returns would make those later loads depend on the host's search path
+/// again, which is the failure this function exists to prevent, and
+/// there is no point after which the SDK is known to be done.
+///
+/// The cost is that the root stays on the process's user-directory list:
+/// any later load in the host that asks for
+/// `LOAD_LIBRARY_SEARCH_USER_DIRS` or `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`
+/// (CPython's extension-module imports do) can resolve a dependency from
+/// the Aaronia install root, which ships its own Qt, libcrypto and hdf5.
+/// That directory is the one the SDK itself was just loaded from, so it
+/// is as trusted as the library is — see the `AARONIA_SDK_PATH` note in
+/// [`crate::detection`] — but a host that needs a different build of one
+/// of those libraries should load it before opening a native-SDK source.
 #[cfg(target_os = "windows")]
 fn add_sdk_root_to_dll_search_path(lib_path: &str) {
     let Some(dir) = std::path::Path::new(lib_path).parent() else {
@@ -613,10 +630,11 @@ impl NativeSdkClient {
                         .to_string(),
                 )
             })?;
-            // Fully qualify it once, here, before anything derives from
-            // it: a relative `AARONIA_SDK_PATH` yields a relative library
-            // path, which `LoadLibraryExW` rejects outright under the
-            // `LOAD_LIBRARY_SEARCH_*` flags, and whose parent-of-parent
+            // `detection` already ignores a relative `AARONIA_SDK_PATH`,
+            // so this is absolute by now. Qualify it anyway before
+            // anything derives from it: a relative library path is one
+            // `LoadLibraryExW` rejects outright under the
+            // `LOAD_LIBRARY_SEARCH_*` flags, and its parent-of-parent
             // is `""` — the working directory — which must never reach
             // the search list.
             let lib_path = std::path::absolute(&lib_path)
@@ -1368,12 +1386,18 @@ impl NativeSdkClient {
         config: &mut AARTSAAPI_Config,
     ) -> Result<String> {
         unsafe {
-            // The wrapper signature takes a wchar_t* but no explicit length; the
-            // SDK fills up to 80 wchar elements per the AARTSAAPI_ConfigInfo
-            // `name` field, so allocate the same.
-            let mut buffer = vec![0 as WideChar; 80];
+            // `AARTSAAPI_ConfigGetName` takes a `wchar_t*` and no length,
+            // so no buffer size can be proven sufficient from this side.
+            // The vendor's bound is the 80 elements of
+            // `AARTSAAPI_ConfigInfo::name`; a buffer of exactly 80 has
+            // no margin for a build that writes a longer name or omits
+            // the terminator, so allocate well past it and terminate the
+            // last element ourselves.
+            const NAME_BUFFER_LEN: usize = 1024;
+            let mut buffer = vec![0 as WideChar; NAME_BUFFER_LEN];
             let result = (self.config_get_name)(device, config, buffer.as_mut_ptr());
             check_res(result, "AARTSAAPI_ConfigGetName")?;
+            buffer[NAME_BUFFER_LEN - 1] = 0;
             Ok(wide_to_string(&buffer))
         }
     }
@@ -2224,6 +2248,16 @@ impl NativeSdkSource {
                 );
                 devices.push(device_info);
                 index += 1;
+                // The loop ends on the SDK's `EMPTY`; a build that never
+                // returns it must not enumerate forever.
+                if index >= Self::MAX_ENUMERATED_DEVICES {
+                    warn!(
+                        "Stopping {} enumeration at {} devices",
+                        device_type,
+                        Self::MAX_ENUMERATED_DEVICES
+                    );
+                    break;
+                }
             }
 
             info!("Found {} {} devices", devices.len(), device_type);
@@ -3095,6 +3129,14 @@ impl NativeSdkSource {
 
     /// Configure the device for IQ transmission.
     ///
+    /// All three nodes — `main/centerfreq`, `main/spanfreq` and
+    /// `main/transgain` — are resolved before any is written, and a
+    /// device that lacks one is an error: a transmitter left on whatever
+    /// frequency or gain it last held must not be started as if it had
+    /// been tuned. The gain is checked against the range the device
+    /// declares for `main/transgain`; a device that declares no usable
+    /// range is refused for the same reason.
+    ///
     /// > [!WARNING]
     /// > Hardware-unverified: the `main/transgain` configuration has not been
     /// > confirmed against a live TX-capable device.
@@ -3125,32 +3167,33 @@ impl NativeSdkSource {
 
             let mut root = self.client.get_config_root(device)?;
 
-            if let Ok(mut config) = self
-                .client
-                .find_config(device, &mut root, "main/centerfreq")
-            {
-                self.client
-                    .set_config_float(device, &mut config, center_frequency_hz)?;
-                info!("Set TX center frequency to {} Hz", center_frequency_hz);
-            } else {
-                warn!("Could not find main/centerfreq config");
-            }
+            // Resolve every node first, so a device missing one is
+            // refused before anything has been written to it.
+            let client = &self.client;
+            let mut node = |path: &str| -> Result<AARTSAAPI_Config> {
+                client.find_config(device, &mut root, path).map_err(|e| {
+                    Error::Sdk(format!(
+                        "TX config node `{path}` is not available on this device ({e}); \
+                         refusing to configure the transmitter with it left unset"
+                    ))
+                })
+            };
+            let mut center = node("main/centerfreq")?;
+            let mut span = node("main/spanfreq")?;
+            let mut gain = node("main/transgain")?;
 
-            if let Ok(mut config) = self.client.find_config(device, &mut root, "main/spanfreq") {
-                self.client
-                    .set_config_float(device, &mut config, sample_rate_hz)?;
-                info!("Set TX sample rate to {} Hz", sample_rate_hz);
-            } else {
-                warn!("Could not find main/spanfreq config");
-            }
+            let gain_info = self.client.get_config_info(device, &mut gain)?;
+            validate_tx_gain_db(trans_gain_db, gain_info.min_value, gain_info.max_value)?;
 
-            if let Ok(mut config) = self.client.find_config(device, &mut root, "main/transgain") {
-                self.client
-                    .set_config_float(device, &mut config, trans_gain_db)?;
-                info!("Set TX gain to {} dB", trans_gain_db);
-            } else {
-                warn!("Could not find main/transgain config");
-            }
+            self.client
+                .set_config_float(device, &mut center, center_frequency_hz)?;
+            info!("Set TX center frequency to {} Hz", center_frequency_hz);
+            self.client
+                .set_config_float(device, &mut span, sample_rate_hz)?;
+            info!("Set TX sample rate to {} Hz", sample_rate_hz);
+            self.client
+                .set_config_float(device, &mut gain, trans_gain_db)?;
+            info!("Set TX gain to {} dB", trans_gain_db);
 
             Ok(())
         }
@@ -3193,6 +3236,18 @@ impl NativeSdkSource {
     /// total wait so a stalled device can't block the caller indefinitely.
     pub const READ_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
     pub const READ_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// Most devices one [`Self::find_devices`] call enumerates.
+    pub const MAX_ENUMERATED_DEVICES: i32 = 64;
+
+    /// Packets without samples (a null buffer, a zero count, an invalid
+    /// layout) one pass of a read loop consumes before the poll budget
+    /// applies to them too. Such a packet is consumed without sleeping,
+    /// so a device producing nothing else would otherwise hold a read —
+    /// and whatever lock its caller holds — past its deadline. The
+    /// allowance keeps a zero-budget drain from stopping at a stray
+    /// metadata packet ahead of real data.
+    const MAX_SAMPLELESS_PACKETS: usize = 64;
 
     /// The sample rate the device reports in its packets, once one has
     /// been read — see the field for why this, not the configured span,
@@ -3619,8 +3674,12 @@ impl NativeSdkSource {
             // so `got_packet` tracks whether at least one queued packet has
             // yielded samples in this call.
             let mut got_packet = false;
+            let mut sampleless = 0usize;
 
             while remaining > 0 {
+                if sampleless >= Self::MAX_SAMPLELESS_PACKETS && started.elapsed() >= poll_budget {
+                    break;
+                }
                 let packet = match self.client.get_packet(device, 0, 0)? {
                     Some(p) => p,
                     // Queue drained: hand back what we have rather than
@@ -3813,6 +3872,9 @@ impl NativeSdkSource {
                     buffer.truncate(prev_buf_len);
                     self.sample_buffer.truncate(prev_carry_len);
                     return Err(e);
+                }
+                if !has_valid_samples {
+                    sampleless += 1;
                 }
 
                 if has_valid_samples {
@@ -4012,8 +4074,12 @@ impl NativeSdkSource {
             // caller draining a backlog never sleeps out the deadline.
             let mut remaining = remaining;
             let mut got_packet = false;
+            let mut sampleless = 0usize;
 
             while remaining > 0 {
+                if sampleless >= Self::MAX_SAMPLELESS_PACKETS && started.elapsed() >= poll_budget {
+                    break;
+                }
                 let packet = match self.client.get_packet(device, 0, 0)? {
                     Some(p) => p,
                     None if got_packet => break,
@@ -4078,6 +4144,7 @@ impl NativeSdkSource {
                         self.drop_events += 1;
                         self.overrun_pending = true;
                         self.client.consume_packets(device, 0, 1)?;
+                        sampleless += 1;
                         continue;
                     }
                     const MAX_IQ_STRIDE: i64 = 4096;
@@ -4089,6 +4156,7 @@ impl NativeSdkSource {
                         self.drop_events += 1;
                         self.overrun_pending = true;
                         self.client.consume_packets(device, 0, 1)?;
+                        sampleless += 1;
                         continue;
                     }
                     const MAX_SAMPLES: usize = 1 << 24;
@@ -4167,6 +4235,9 @@ impl NativeSdkSource {
                     rx2.truncate(prev_rx2_len);
                     self.dual_sample_buffer.truncate(prev_carry_len);
                     return Err(e);
+                }
+                if !has_valid_samples {
+                    sampleless += 1;
                 }
 
                 if has_valid_samples {
@@ -4362,6 +4433,31 @@ impl Drop for NativeSdkSource {
             }
         }
     }
+}
+
+/// Check a requested TX gain against the range the device declares for
+/// `main/transgain`.
+///
+/// A gain outside the range is refused rather than left to the device to
+/// clamp, and so is a device that declares no usable range (`min >= max`
+/// or a non-finite bound): there is then nothing to say the request is
+/// one the transmitter can honour.
+pub(crate) fn validate_tx_gain_db(gain_db: f64, min_db: f64, max_db: f64) -> Result<()> {
+    if !gain_db.is_finite() {
+        return Err(Error::Config("TX gain must be finite".into()));
+    }
+    if !min_db.is_finite() || !max_db.is_finite() || min_db >= max_db {
+        return Err(Error::Sdk(format!(
+            "the device declares no usable `main/transgain` range \
+             (min {min_db}, max {max_db}); refusing to set TX gain"
+        )));
+    }
+    if gain_db < min_db || gain_db > max_db {
+        return Err(Error::Config(format!(
+            "TX gain {gain_db} dB is outside the device's range {min_db} to {max_db} dB"
+        )));
+    }
+    Ok(())
 }
 
 fn require_enabled_option(

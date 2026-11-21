@@ -2711,6 +2711,101 @@ pub unsafe extern "C" fn spectran_sink_get_master_stream_time_ns(
     })
 }
 
+/// Read the sink's configured TX centre frequency, sample rate and gain.
+///
+/// These are what [`spectran_sink_initialize`] will apply and what
+/// [`spectran_sink_write_samples`] labels each burst with — the sink
+/// builder's own defaults unless set — so a front-end that reports a TX
+/// tuning reads it here rather than assuming it matches the receiver's.
+/// Each out-pointer may be null to skip that value. Returns `false`
+/// (writing nothing) for a null or unaligned pointer.
+///
+/// # Safety
+/// `ptr` must be a live pointer from [`spectran_sink_build`], not used
+/// concurrently from another thread; each non-null out-pointer must
+/// point to a writable, aligned `f64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_sink_get_config(
+    ptr: *mut c_void,
+    out_center_frequency_hz: *mut f64,
+    out_sample_rate_hz: *mut f64,
+    out_trans_gain_db: *mut f64,
+) -> bool {
+    catch_ffi("spectran_sink_get_config", false, || {
+        let sink_ptr = ptr as *const UnifiedSink;
+        if sink_ptr.is_null() || !sink_ptr.is_aligned() {
+            return false;
+        }
+        let outs = [
+            out_center_frequency_hz,
+            out_sample_rate_hz,
+            out_trans_gain_db,
+        ];
+        if outs.iter().any(|p| !p.is_null() && !p.is_aligned()) {
+            return false;
+        }
+        let config = unsafe { &*sink_ptr }.config();
+        let values = [
+            config.center_frequency_hz,
+            config.sample_rate_hz,
+            config.trans_gain_db,
+        ];
+        for (out, value) in outs.into_iter().zip(values) {
+            if !out.is_null() {
+                unsafe { *out = value };
+            }
+        }
+        true
+    })
+}
+
+/// Parse a boolean device argument the way every front-end of this
+/// library does: `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`,
+/// ignoring ASCII case and surrounding whitespace.
+///
+/// On success writes `*out` and returns `Success`. Any other value
+/// returns `InvalidString` and leaves `*out` untouched, with a message
+/// naming `key` and the value in [`spectran_last_error`]; `key` is used
+/// only for that message and may be null.
+///
+/// # Safety
+/// `value` must be a valid NUL-terminated C string; `key` must be one or
+/// null; `out` must point to a writable `bool`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spectran_parse_bool_arg(
+    key: *const c_char,
+    value: *const c_char,
+    out: *mut bool,
+) -> SpectranFfiError {
+    catch_ffi(
+        "spectran_parse_bool_arg",
+        SpectranFfiError::InternalError,
+        || {
+            clear_last_error();
+            if value.is_null() || out.is_null() {
+                set_last_error("spectran_parse_bool_arg: value or out pointer is null");
+                return SpectranFfiError::NullPointer;
+            }
+            let key = if key.is_null() {
+                std::borrow::Cow::Borrowed("argument")
+            } else {
+                unsafe { CStr::from_ptr(key) }.to_string_lossy()
+            };
+            let value = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+            match crate::kwargs::parse_bool(&key, &value) {
+                Ok(parsed) => {
+                    unsafe { *out = parsed };
+                    SpectranFfiError::Success
+                }
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    SpectranFfiError::InvalidString
+                }
+            }
+        },
+    )
+}
+
 /// Queue one burst of interleaved IQ samples for transmission.
 ///
 /// `start_time_s`/`end_time_s` are in device **master stream time**
@@ -2788,6 +2883,78 @@ pub unsafe extern "C" fn spectran_sink_write_samples(
 mod tests {
     use super::*;
     use std::ptr;
+
+    /// The plugin reports its TX tuning from this, so it has to be the
+    /// sink's own configuration: the builder's defaults until set, then
+    /// whatever the builder or a setter wrote.
+    #[test]
+    fn sink_get_config_reports_what_the_sink_will_transmit_with() {
+        unsafe {
+            let builder = spectran_sink_builder_new();
+            let sink = spectran_sink_build(builder);
+            let (mut hz, mut rate, mut gain) = (0.0, 0.0, 0.0);
+            assert!(spectran_sink_get_config(
+                sink, &mut hz, &mut rate, &mut gain
+            ));
+            let defaults = crate::unified_sink::UnifiedSinkConfig::default();
+            assert_eq!(hz, defaults.center_frequency_hz);
+            assert_eq!(rate, defaults.sample_rate_hz);
+            assert_eq!(gain, defaults.trans_gain_db);
+            spectran_sink_free(sink);
+
+            spectran_sink_builder_center_frequency_hz(builder, 915e6);
+            spectran_sink_builder_trans_gain_db(builder, -30.0);
+            let sink = spectran_sink_build(builder);
+            // Null out-pointers skip a value rather than fail the call.
+            assert!(spectran_sink_get_config(
+                sink,
+                &mut hz,
+                ptr::null_mut(),
+                &mut gain
+            ));
+            assert_eq!((hz, gain), (915e6, -30.0));
+            assert!(!spectran_sink_get_config(
+                ptr::null_mut(),
+                &mut hz,
+                &mut rate,
+                &mut gain
+            ));
+            spectran_sink_free(sink);
+            spectran_sink_builder_free(builder);
+        }
+    }
+
+    #[test]
+    fn parse_bool_arg_accepts_the_shared_spellings_and_refuses_the_rest() {
+        unsafe {
+            let mut out = false;
+            assert!(matches!(
+                spectran_parse_bool_arg(c"tx".as_ptr(), c"Yes".as_ptr(), &mut out),
+                SpectranFfiError::Success
+            ));
+            assert!(out);
+            assert!(matches!(
+                spectran_parse_bool_arg(ptr::null(), c"off".as_ptr(), &mut out),
+                SpectranFfiError::Success
+            ));
+            assert!(!out);
+
+            out = true;
+            assert!(matches!(
+                spectran_parse_bool_arg(c"tx".as_ptr(), c"maybe".as_ptr(), &mut out),
+                SpectranFfiError::InvalidString
+            ));
+            assert!(out, "a refused value leaves the output untouched");
+            let msg = spectran_last_error();
+            assert!(CStr::from_ptr(msg).to_string_lossy().contains("tx="));
+            spectran_string_free(msg);
+
+            assert!(matches!(
+                spectran_parse_bool_arg(c"tx".as_ptr(), ptr::null(), &mut out),
+                SpectranFfiError::NullPointer
+            ));
+        }
+    }
 
     /// The capabilities struct owns three C strings and a heap array,
     /// and the free function has to give every one of them back. A

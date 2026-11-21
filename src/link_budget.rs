@@ -764,7 +764,9 @@ pub async fn measure_link_throughput_with(
     let client = rtsa_client_builder(Duration::from_secs(5)).build()?;
 
     params.validate()?;
-    let url = params.stream_url(base_url);
+    let request_url = params.stream_url(base_url);
+    // For every message below: the base URL may carry credentials.
+    let url = crate::http_endpoints::redact_url(&request_url);
 
     info!(
         "Measuring link throughput from {url}: discarding {:.2} s of connect backlog, \
@@ -773,7 +775,7 @@ pub async fn measure_link_throughput_with(
         duration.as_secs_f64(),
     );
 
-    let response = auth.apply_to(client.get(&url)).send().await?;
+    let response = auth.apply_to(client.get(&request_url)).send().await?;
     let mut response =
         HttpEndpointsClient::ensure_success(&format!("Link throughput probe of {url}"), response)?;
 

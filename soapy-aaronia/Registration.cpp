@@ -3,16 +3,55 @@
 #include <SoapySDR/Logger.hpp>
 #include <cmath>
 
+// Read the boolean device argument `key`. Returns whether it was given,
+// writing its value to `out` when it was.
+//
+// Parsed by the library (spectran_parse_bool_arg), the same parser the
+// seify backend uses: true/1/yes/on and false/0/no/off, in any case.
+// Anything else throws, naming the argument: read as false, a mistyped
+// `sdk` opens localhost HTTP instead of the device asked for, and read as
+// true, a mistyped `listen_only` or `tx` does the opposite of what was
+// meant. One parser for all four keeps them from disagreeing.
+static bool parseArgBool(const SoapySDR::Kwargs &args, const char *key, bool &out) {
+    const auto it = args.find(key);
+    if (it == args.end()) return false;
+    bool value = false;
+    if (spectran_parse_bool_arg(key, it->second.c_str(), &value) != Success) {
+        char *msg = spectran_last_error();
+        std::string err = msg ? msg
+                              : std::string("invalid boolean value for device arg '") + key + "'";
+        if (msg) spectran_string_free(msg);
+        throw std::runtime_error(err);
+    }
+    out = value;
+    return true;
+}
+
 // Whether the args ask for the native SDK: a serial names an SDK device,
 // and `sdk` must be truthy — `sdk=false` is a request *not* to use it, so
 // checking mere presence would advertise/open the SDK for `sdk=false`.
+// Throws on an `sdk` value that is not a boolean.
 static bool wantsNativeSdk(const SoapySDR::Kwargs &args) {
+    bool sdk = false;
+    parseArgBool(args, "sdk", sdk);
     if (args.count("serial") != 0) return true;
-    auto it = args.find("sdk");
-    return it != args.end() && (it->second == "true" || it->second == "1");
+    return sdk;
 }
 
+static std::vector<SoapySDR::Kwargs> findAaroniaChecked(const SoapySDR::Kwargs &args);
+
+// Enumeration must not throw into the host for arguments that are merely
+// wrong: a malformed boolean matches no device, and says why.
 static std::vector<SoapySDR::Kwargs> findAaronia(const SoapySDR::Kwargs &args) {
+    try {
+        return findAaroniaChecked(args);
+    } catch (const std::exception &e) {
+        SoapySDR::logf(SOAPY_SDR_ERROR, "aaronia: %s", e.what());
+        return {};
+    }
+}
+
+static std::vector<SoapySDR::Kwargs> findAaroniaChecked(const SoapySDR::Kwargs &args) {
     std::vector<SoapySDR::Kwargs> results;
 
     // If driver filter specified and it's not aaronia, skip
@@ -114,6 +153,21 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
     const bool hasRate = args.count("rate") != 0;
     const double freq = hasFreq ? parseArgDouble(args, "freq") : 0.0;
     const double rate = hasRate ? parseArgDouble(args, "rate") : 0.0;
+    // Likewise every boolean, so a malformed one is refused before
+    // anything is opened rather than read as either answer.
+    bool reconnect = true, listenOnly = false, wantsTx = false;
+    const bool hasReconnect = parseArgBool(args, "reconnect", reconnect);
+    const bool hasListenOnly = parseArgBool(args, "listen_only", listenOnly);
+    parseArgBool(args, "tx", wantsTx);
+    const bool hasTxGain = args.count("tx_gain") != 0;
+    const double txGain = hasTxGain ? parseArgDouble(args, "tx_gain") : -20.0;
+    if (hasTxGain && (txGain < SpectranSoapyDevice::kTxGainMinDb ||
+                      txGain > SpectranSoapyDevice::kTxGainMaxDb)) {
+        throw std::runtime_error(
+            "tx_gain must be between " + std::to_string(SpectranSoapyDevice::kTxGainMinDb) +
+            " and " + std::to_string(SpectranSoapyDevice::kTxGainMaxDb) + " dB: " +
+            args.at("tx_gain"));
+    }
 
     SpectranSourceBuilder* builder = spectran_source_builder_new();
     if (!builder) {
@@ -203,16 +257,8 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
     // reconnect=0 opts out of automatic stream reconnection (on by
     // default): a dropped stream then ends the session instead of
     // recovering, and readStream reports an error.
-    if (args.count("reconnect") != 0) {
-        const std::string &v = args.at("reconnect");
-        const bool enabled = !(v == "0" || v == "false" || v == "no");
-        spectran_source_builder_auto_reconnect(builder, enabled);
-    }
-    if (args.count("listen_only") != 0) {
-        const std::string &v = args.at("listen_only");
-        const bool enabled = !(v == "0" || v == "false" || v == "no");
-        spectran_source_builder_listen_only(builder, enabled);
-    }
+    if (hasReconnect) spectran_source_builder_auto_reconnect(builder, reconnect);
+    if (hasListenOnly) spectran_source_builder_listen_only(builder, listenOnly);
 
     const auto nativeArg = [&](const char *name) -> const char * {
         return args.count(name) ? args.at(name).c_str() : nullptr;
@@ -249,11 +295,9 @@ static SoapySDR::Device *makeAaronia(const SoapySDR::Kwargs &args) {
     // query this crate does not yet make.
     bool txPossible = false;
     std::string resolvedSerial = args.count("serial") != 0 ? args.at("serial") : "";
-    const bool hasTxGain = args.count("tx_gain") != 0;
-    const double txGain = hasTxGain ? parseArgDouble(args, "tx_gain") : -20.0;
     if (FfiSourceInfo* info = spectran_source_get_source_info(source.p)) {
         // Receive discovery must never open a transmitter as a side effect.
-        txPossible = info->source_type == NativeSdk && args.count("tx") && args.at("tx") == "true";
+        txPossible = info->source_type == NativeSdk && wantsTx;
         if (resolvedSerial.empty() && info->device_serial && info->device_serial[0] != '\0') {
             resolvedSerial = info->device_serial;
         }

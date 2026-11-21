@@ -25,6 +25,15 @@ crate built with both features — `features = ["seify", "native-sdk"]` —
 on Windows or Linux with RTSA-Suite PRO installed. Without the feature
 the request is a clean error, never a fallback to HTTP.
 
+`freq=`, `rate=` and `ref_level=` set the initial tuning; an argument
+that is absent leaves the library's default in place (2.44 GHz,
+15.36 MS/s, -20 dBm) rather than a value of the backend's own.
+`listen_only=true` leaves the device's tuning alone on the HTTP backend.
+Boolean arguments (`sdk`, `listen_only`) accept `true`/`1`/`yes`/`on` and
+`false`/`0`/`no`/`off` in any letter case; any other value is
+`seify::Error::InvalidArgument`, not a silent `false`. The SoapySDR
+plugin parses its booleans with the same code.
+
 `SpectranSeifyDevice` owns a tokio runtime. Drop it from synchronous
 code: dropping it inside an `async` context (a `#[tokio::test]`, a task)
 is a tokio panic, "Cannot drop a runtime in a context where blocking is
@@ -171,8 +180,15 @@ native-SDK backend — a build configured with `-DAARONIA_NATIVE_SDK=ON`
 on Windows or Linux, with the Aaronia SDK installed. A device opened
 over `url=` or `file=` has no transmit path and the probe shows `0 Tx`;
 `setupStream(TX)` is never reachable there. Bursts are sent for immediate
-transmission; timed TX is not supported. The whole TX path is
-hardware-unverified. See [docs/VERIFICATION.md](docs/VERIFICATION.md).
+transmission; timed TX is not supported, and a `writeStream` flagged
+`SOAPY_SDR_HAS_TIME` returns `SOAPY_SDR_NOT_SUPPORTED` without sending.
+The TX frequency, rate and gain the plugin reports are the transmitter's
+own (`freq=`/`rate=`/`tx_gain=` where given, otherwise 1 GHz, 10 MS/s and
+-20 dB), not the receiver's, and the TX setters throw when a value is
+refused. The library will not configure a transmitter that lacks a
+frequency, rate or gain setting, or with a gain outside the range the
+device declares. The whole TX path is hardware-unverified. See
+[docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 ## 4. Metrics and Error Handling
 

@@ -18,7 +18,7 @@ brew install isaacbentley/tap/soapy-aaronia
 ```
 
 Homebrew pulls in SoapySDR, drops the module into
-`lib/SoapySDR/modules0.8`, and its `brew test` step confirms
+`lib/SoapySDR/modules<ABI>`, and its `brew test` step confirms
 `SoapySDRUtil --check=aaronia` reports the driver as present.
 
 ## Each release
@@ -46,5 +46,15 @@ the platforms the release builds. Elsewhere, `brew` has nothing to
 install and the plugin has to be built from source; see
 [soapy-aaronia/README.md](../../soapy-aaronia/README.md).
 
-The module directory is pinned to `modules0.8`, which is SoapySDR's ABI
-0.8 path. A future SoapySDR ABI bump requires changing that line.
+The module directory follows the installed SoapySDR: the formula reads
+the ABI version from `SoapySDRUtil --info` and installs into
+`modules<ABI>`, falling back to `modules0.8` only when that output cannot
+be parsed. A SoapySDR ABI bump needs no change here.
+
+The two `sha256` lines in the checked-in formula are placeholders, not
+checksums. Homebrew refuses a formula whose `sha256` is not 64 hex digits,
+so the file as it sits in this repository cannot install anything; only
+the copy the release workflow renders can. The same release also
+publishes `SHA256SUMS` and a build-provenance attestation, so the archive
+checksums in the rendered formula can be checked against either
+(`gh attestation verify <archive> --repo isaacbentley/sdr-aaronia-rs`).

@@ -37,6 +37,12 @@ thread_local! {
     static FAIL: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static CONFIG_AVAILABLE: Cell<bool> = const { Cell::new(false) };
     static LAST_OPEN_SERIAL: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Config paths `ConfigFind` reports as absent while the rest of the
+    /// tree is available.
+    static MISSING_CONFIG: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    /// Rescan succeeds and `EnumDevice` answers every index with a
+    /// device, never `EMPTY`.
+    static ENUMERATE_FOREVER: Cell<bool> = const { Cell::new(false) };
     static PACKETS: RefCell<std::collections::VecDeque<FakePacket>> =
         const { RefCell::new(std::collections::VecDeque::new()) };
 }
@@ -59,6 +65,8 @@ fn reset(fail: &[&'static str]) -> std::sync::MutexGuard<'static, ()> {
     *SDK_LIVE_INITS.lock().unwrap_or_else(|p| p.into_inner()) = 0;
     CONFIG_AVAILABLE.with(|available| available.set(false));
     LAST_OPEN_SERIAL.with(|serial| *serial.borrow_mut() = None);
+    MISSING_CONFIG.with(|missing| missing.borrow_mut().clear());
+    ENUMERATE_FOREVER.with(|forever| forever.set(false));
     CALLS.with(|calls| calls.borrow_mut().clear());
     FAIL.with(|failed| *failed.borrow_mut() = fail.to_vec());
     PACKETS.with(|packets| packets.borrow_mut().clear());
@@ -89,6 +97,9 @@ unsafe extern "C" fn mock_close(_handle: *mut AARTSAAPI_Handle) -> u32 {
     call("close")
 }
 unsafe extern "C" fn mock_rescan_devices(_handle: *mut AARTSAAPI_Handle, _timeout: i32) -> u32 {
+    if ENUMERATE_FOREVER.with(Cell::get) {
+        return AARTSAAPI_OK;
+    }
     AARTSAAPI_ERROR_NOT_FOUND
 }
 unsafe extern "C" fn mock_reset_devices(_handle: *mut AARTSAAPI_Handle) -> u32 {
@@ -100,6 +111,9 @@ unsafe extern "C" fn mock_enum_device(
     _index: i32,
     _info: *mut AARTSAAPI_DeviceInfo,
 ) -> u32 {
+    if ENUMERATE_FOREVER.with(Cell::get) {
+        return AARTSAAPI_OK;
+    }
     AARTSAAPI_ERROR_NOT_FOUND
 }
 unsafe extern "C" fn mock_open_device(
@@ -193,6 +207,10 @@ unsafe extern "C" fn mock_config_find(
     _config: *mut AARTSAAPI_Config,
     _path: *const WideChar,
 ) -> u32 {
+    let path = unsafe { widestring::WideCStr::from_ptr_str(_path) }.to_string_lossy();
+    if MISSING_CONFIG.with(|missing| missing.borrow().contains(&path.as_str())) {
+        return AARTSAAPI_ERROR_NOT_FOUND;
+    }
     if CONFIG_AVAILABLE.with(Cell::get) {
         unsafe {
             (*_config).d = std::ptr::dangling_mut::<u8>().cast();
@@ -699,4 +717,140 @@ fn a_deadline_read_with_nothing_queued_times_out() {
         Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
         other => panic!("expected a timeout, got {other:?}"),
     }
+}
+
+/// A transmitter must not be started on a frequency or gain that was
+/// never written. A device missing any one of the three TX nodes is
+/// refused before the other two are touched.
+#[test]
+fn tx_configuration_refuses_a_missing_node_before_any_write() {
+    for missing in ["main/centerfreq", "main/spanfreq", "main/transgain"] {
+        let _guard = reset(&[]);
+        CONFIG_AVAILABLE.with(|available| available.set(true));
+        MISSING_CONFIG.with(|m| m.borrow_mut().push(missing));
+        let mut source = source(false, false);
+        let err = unsafe { source.configure_iq_transmitter(915e6, 10e6, -20.0) }
+            .expect_err("a missing TX node is an error");
+        assert!(err.to_string().contains(missing), "{err}");
+        assert!(!calls().contains(&"config_write"), "{missing}");
+    }
+}
+
+/// The mock declares -55 to +23 for every node. A gain outside what the
+/// device declares is refused before anything is written; one inside it
+/// writes centre, span and gain.
+#[test]
+fn tx_gain_is_checked_against_the_device_range_before_any_write() {
+    let _guard = reset(&[]);
+    for gain in [-56.0, 24.0, 1e6] {
+        CONFIG_AVAILABLE.with(|available| available.set(true));
+        CALLS.with(|calls| calls.borrow_mut().clear());
+        let mut source = source(false, false);
+        assert!(matches!(
+            unsafe { source.configure_iq_transmitter(915e6, 10e6, gain) },
+            Err(Error::Config(_))
+        ));
+        assert!(!calls().contains(&"config_write"));
+    }
+    CONFIG_AVAILABLE.with(|available| available.set(true));
+    CALLS.with(|calls| calls.borrow_mut().clear());
+    let mut source = source(false, false);
+    unsafe { source.configure_iq_transmitter(915e6, 10e6, -20.0) }.unwrap();
+    assert_eq!(
+        calls()
+            .iter()
+            .filter(|&&call| call == "config_write")
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn tx_gain_validation_refuses_a_device_without_a_usable_range() {
+    assert!(validate_tx_gain_db(-20.0, -50.0, 10.0).is_ok());
+    assert!(validate_tx_gain_db(-50.0, -50.0, 10.0).is_ok());
+    assert!(validate_tx_gain_db(10.0, -50.0, 10.0).is_ok());
+    assert!(validate_tx_gain_db(10.5, -50.0, 10.0).is_err());
+    assert!(validate_tx_gain_db(f64::NAN, -50.0, 10.0).is_err());
+    // No range to check against: nothing says the request can be met.
+    assert!(validate_tx_gain_db(0.0, 0.0, 0.0).is_err());
+    assert!(validate_tx_gain_db(0.0, f64::NAN, 10.0).is_err());
+    assert!(validate_tx_gain_db(0.0, 10.0, -50.0).is_err());
+}
+
+/// A packet with no samples, as the SDK queues for metadata.
+fn sampleless(stride: i64) -> FakePacket {
+    FakePacket::iq(915e6, 15.36e6, stride, 0, 0.0)
+}
+
+/// A few sample-less packets ahead of real data do not end a
+/// zero-budget drain: the data behind them is already queued.
+#[test]
+fn a_drain_reads_past_a_few_sampleless_packets() {
+    let _guard = reset(&[]);
+    let mut source = source(true, true);
+    for _ in 0..3 {
+        queue(sampleless(2));
+    }
+    queue(FakePacket::iq(915e6, 15.36e6, 2, 4, 1.0));
+    let mut buffer = Vec::new();
+    let n =
+        unsafe { source.read_samples_within(&mut buffer, 4, std::time::Duration::ZERO) }.unwrap();
+    assert_eq!(n, 4);
+    assert_eq!(queued(), 0);
+}
+
+/// A device that queues nothing but sample-less packets cannot hold a
+/// read past its budget: each is consumed without sleeping, so only the
+/// budget check ends the loop.
+#[test]
+fn sampleless_packets_cannot_outlast_the_poll_budget() {
+    let _guard = reset(&[]);
+    let mut source = source(true, true);
+    let allowance = NativeSdkSource::MAX_SAMPLELESS_PACKETS;
+    for _ in 0..allowance + 5 {
+        queue(sampleless(2));
+    }
+    let mut buffer = Vec::new();
+    let n =
+        unsafe { source.read_samples_within(&mut buffer, 4, std::time::Duration::ZERO) }.unwrap();
+    assert_eq!(n, 0);
+    assert_eq!(queued(), 5, "the read stopped at the allowance");
+
+    // The deadline read reports that as the timeout it is.
+    match unsafe { source.read_samples_until(&mut buffer, 4, std::time::Instant::now()) } {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+}
+
+/// The dual loop has the same bound.
+#[test]
+fn sampleless_packets_cannot_outlast_the_dual_poll_budget() {
+    let _guard = reset(&[]);
+    let mut source = source(true, true);
+    let allowance = NativeSdkSource::MAX_SAMPLELESS_PACKETS;
+    for _ in 0..allowance + 5 {
+        queue(sampleless(4));
+    }
+    let (mut rx1, mut rx2) = (Vec::new(), Vec::new());
+    let n = unsafe {
+        source.read_samples_dual_within(&mut rx1, &mut rx2, 4, std::time::Duration::ZERO)
+    }
+    .unwrap();
+    assert_eq!(n, 0);
+    assert_eq!(queued(), 5);
+}
+
+/// Enumeration ends on the SDK's `EMPTY`; the mock never returns it.
+#[test]
+fn device_enumeration_is_capped() {
+    let _guard = reset(&[]);
+    ENUMERATE_FOREVER.with(|forever| forever.set(true));
+    let mut source = source(false, false);
+    let devices = unsafe { source.find_devices("spectranv6") }.unwrap();
+    assert_eq!(
+        devices.len(),
+        NativeSdkSource::MAX_ENUMERATED_DEVICES as usize
+    );
 }

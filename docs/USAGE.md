@@ -376,6 +376,8 @@ fn main() -> Result<()> {
 # fn main() {}
 ```
 
+The HTTP client treats the server as untrusted. It follows no redirects (a 3xx answer is an `Error::Http`, on control requests and `/stream` alike), so a server cannot send a `PUT` or the stream to another host. Credentials sent over plain `http://` to anything but loopback are warned about once per host, since anyone on the path can read them; use `https://` there. Credentials written into the URL itself (`http://user:password@host`) work as Basic auth and are replaced with `[REDACTED]` wherever the crate logs or reports the URL. A `/stream` packet declaring more than 16 MiB of payload is dropped as lost rather than buffered.
+
 ## Low-level asynchronous stream reading
 
 ```rust,no_run
@@ -458,8 +460,19 @@ async fn main() -> Result<()> {
 
 | Variable | Effect |
 |---|---|
-| `AARONIA_SDK_PATH` | Overrides the RTSA-Suite installation directory used for SDK / `RTSAFileTool` detection. Works on every platform. On macOS — which has no default install path and no native SDK build — it only affects `RTSAFileTool` and XML-config detection. |
+| `AARONIA_SDK_PATH` | Overrides the RTSA-Suite installation directory used for SDK / `RTSAFileTool` detection. Works on every platform. On macOS — which has no default install path and no native SDK build — it only affects `RTSAFileTool` and XML-config detection. Must be an absolute path: a relative value is ignored with a warning. **Trusted**: see below. |
 | `AARONIA_USER_AGENT` | Overrides the HTTP `User-Agent` string sent by every outbound request (default: `sdr-aaronia-rs/<version>`). |
+
+`AARONIA_SDK_PATH` names a directory code is loaded and run from: the
+vendor library (with the libraries it loads beside it) and
+`RTSAFileTool`. Nothing checks who owns that directory, and it takes
+precedence over the administrator-owned default install path, so treat it
+like `PATH` or `LD_LIBRARY_PATH`: a service or other process that runs
+with more privilege than whoever controls its environment should clear
+it. On Windows the install root also stays on the process's DLL search
+list after the SDK loads (its Qt plugins resolve from there later), so a
+host that needs its own build of Qt, libcrypto or hdf5 should load it
+before opening a native-SDK source.
 
 ## Runnable examples
 

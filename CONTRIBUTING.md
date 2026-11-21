@@ -59,6 +59,22 @@ and into release.yml's `cargo semver-checks` step. If
 you edit `.github/workflows/ci.yml`, update `scripts/ci-local.sh` in the
 same commit (and vice versa), and run `actionlint .github/workflows/*.yml`.
 
+Every third-party action in `.github/workflows/` is pinned to a full
+commit SHA, with the release it corresponds to in a trailing comment
+(`uses: owner/action@<40 hex digits> # v1.2.3`). A tag or branch can be
+moved to different code after review; a commit cannot. To update one,
+look the new SHA up (`gh api repos/<owner>/<action>/commits/<tag> --jq
+.sha`) and change the SHA and the comment together. Two actions select
+their behaviour from the ref when used by branch, so pinned they take it
+as an input instead: `dtolnay/rust-toolchain` needs `with: toolchain:`
+and `taiki-e/install-action` needs `with: tool:`.
+
+The release workflow builds what it publishes with `--locked` and
+without `rust-cache`, writes `SHA256SUMS`, and attests the release
+assets' build provenance. Its crates.io job runs in the `crates-io`
+GitHub environment and its PyPI job in `pypi`; protection rules and the
+registry secret belong on those environments, not on the repository.
+
 Two steps exist because macOS builds skip the OS-gated native-SDK
 modules entirely (`cfg(any(windows, linux))`), which CI's ubuntu and
 windows legs do compile:

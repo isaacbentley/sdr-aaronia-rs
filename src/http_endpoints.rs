@@ -118,6 +118,82 @@ pub(crate) fn rtsa_client_builder(connect_timeout: std::time::Duration) -> reqwe
         // ambient HTTP_PROXY/ALL_PROXY breaks local connections and adds
         // proxy buffering to real-time IQ streams.
         .no_proxy()
+        // The server is not trusted to say where a request goes. Followed
+        // (reqwest's default is ten hops), a 307/308 from a hostile server —
+        // or anyone on a plain-`http://` path — replays a `/control` or
+        // `/remoteconfig` `PUT`, body and all, at whatever host it names,
+        // and a redirected `/stream` quietly takes its IQ from somewhere
+        // else, an `https://` URL downgraded to `http://` included. RTSA
+        // never redirects; a 3xx is an error like any other non-success.
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+/// `url` with any credentials in its authority (`user:password@`) replaced,
+/// for log lines and error messages.
+///
+/// `reqwest` accepts `http://user:password@host` and sends it as Basic
+/// auth, so a base URL can carry a secret — and base URLs are quoted in
+/// this crate's logs and errors. Works on text, not a parsed URL, because
+/// one of its callers is the error for a URL that would not parse; for the
+/// same reason it errs toward redacting: everything from the scheme to the
+/// last `@` ahead of the query goes, so a password with an unencoded `/`
+/// is still covered.
+pub(crate) fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
+    let Some(scheme_end) = url.find("://") else {
+        return std::borrow::Cow::Borrowed(url);
+    };
+    let after_scheme = scheme_end + 3;
+    let rest = &url[after_scheme..];
+    let before_query = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    match before_query.rfind('@') {
+        Some(at) => std::borrow::Cow::Owned(format!(
+            "{}[REDACTED]@{}",
+            &url[..after_scheme],
+            &rest[at + 1..]
+        )),
+        None => std::borrow::Cow::Borrowed(url),
+    }
+}
+
+/// Whether requests to `url` with `auth` put credentials on the wire in the
+/// clear: plain `http://`, to a host other than this machine, with either
+/// an [`AuthMethod`] or credentials in the URL itself.
+fn sends_credentials_in_clear(url: &url::Url, auth: &AuthMethod) -> bool {
+    let has_credentials =
+        !matches!(auth, AuthMethod::None) || !url.username().is_empty() || url.password().is_some();
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        None => false,
+    };
+    url.scheme() == "http" && has_credentials && !loopback
+}
+
+/// Warn, once per host, that credentials for it travel unencrypted.
+fn warn_if_credentials_in_clear(url: &url::Url, auth: &AuthMethod) {
+    if !sends_credentials_in_clear(url, auth) {
+        return;
+    }
+    // Clients are built freely (one per capability or sensor query), and
+    // the same warning on each would bury the log it is meant to stand out
+    // in.
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let host = url.host_str().unwrap_or_default().to_string();
+    let mut warned = WARNED.lock().unwrap_or_else(|p| p.into_inner());
+    if warned.contains(&host) {
+        return;
+    }
+    if warned.len() < 64 {
+        warned.push(host.clone());
+    }
+    warn!(
+        "Credentials for {host:?} are sent over plain http://: anyone on the path can read \
+         and replay them. Use https://, or keep authenticated RTSA access to localhost"
+    );
 }
 
 /// Validate a base URL before any RTSA connection is opened: parseable,
@@ -130,8 +206,9 @@ pub(crate) fn rtsa_client_builder(connect_timeout: std::time::Duration) -> reqwe
 /// link-budget probe both call it, so a future tightening (scheme, host
 /// policy) cannot apply to one path and not the other.
 pub(crate) fn validate_base_url(base_url: &str) -> Result<url::Url> {
-    let parsed_url = url::Url::parse(base_url)
-        .map_err(|_| Error::Protocol(format!("Invalid base URL format: {}", base_url)))?;
+    let parsed_url = url::Url::parse(base_url).map_err(|_| {
+        Error::Protocol(format!("Invalid base URL format: {}", redact_url(base_url)))
+    })?;
 
     match parsed_url.scheme() {
         "http" | "https" => {}
@@ -177,12 +254,27 @@ pub struct ServerInfo {
 }
 
 /// Represents user information and authentication token from the `/user` endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` prints the token as `[REDACTED]`: it is a credential (the
+/// `RToken` of [`AuthMethod::Token`]), and a derived `Debug` put it in any
+/// log line or panic message that formatted the struct.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UserInfo {
     pub name: String,
     pub email: Option<String>,
     pub token: String,
     pub groups: Vec<String>,
+}
+
+impl std::fmt::Debug for UserInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserInfo")
+            .field("name", &self.name)
+            .field("email", &self.email)
+            .field("token", &"[REDACTED]")
+            .field("groups", &self.groups)
+            .finish()
+    }
 }
 
 /// Remote Config licensing status detection result
@@ -1317,7 +1409,8 @@ impl HttpEndpointsClient {
         auth: AuthMethod,
         connect_timeout: std::time::Duration,
     ) -> Result<Self> {
-        validate_base_url(&base_url)?;
+        let parsed_url = validate_base_url(&base_url)?;
+        warn_if_credentials_in_clear(&parsed_url, &auth);
 
         // Shared RTSA client settings; see `rtsa_client_builder` for why
         // there is no client-level timeout.
@@ -1345,7 +1438,7 @@ impl HttpEndpointsClient {
 
     /// Tests the connection to the RTSA device by fetching the `/info` endpoint.
     pub async fn test_connection(&self) -> Result<()> {
-        info!("Testing connection to {}...", self.base_url);
+        info!("Testing connection to {}...", redact_url(&self.base_url));
         let url = format!("{}/info", self.base_url);
         let response = self.control_request(self.client.get(&url)).send().await?;
         Self::ensure_success("Connection test", response)?;
@@ -1392,7 +1485,10 @@ impl HttpEndpointsClient {
         let response = Self::ensure_success("Info request", response)?;
 
         let info: ServerInfo = response.json().await?;
-        debug!("Retrieved server info: {} ({})", info.title, info.name);
+        // Server-supplied text is logged escaped (`{:?}`): a hostile server
+        // must not be able to forge log lines or drive a terminal with
+        // newlines and escape sequences.
+        debug!("Retrieved server info: {:?} ({:?})", info.title, info.name);
         Ok(info)
     }
 
@@ -1406,7 +1502,7 @@ impl HttpEndpointsClient {
         // Never log any part of the token — even a prefix narrows a
         // brute-force search and tends to end up in shipped log files.
         debug!(
-            "Retrieved user info: {} (token: [REDACTED, {} chars])",
+            "Retrieved user info: {:?} (token: [REDACTED, {} chars])",
             user.name,
             user.token.len()
         );
@@ -1447,7 +1543,7 @@ impl HttpEndpointsClient {
             .ok_or_else(|| Error::Protocol("Invalid create input response".to_string()))?
             .to_string();
 
-        info!("Created new input stream: {}", new_input_name);
+        info!("Created new input stream: {:?}", new_input_name);
         Ok(new_input_name)
     }
 
@@ -1650,7 +1746,7 @@ impl HttpEndpointsClient {
         let got = caps.clock_source;
         match got.as_deref() {
             Some(g) if g.eq_ignore_ascii_case(source) => {
-                info!("RTSA {block}: sclksource = {g} (requested {source})");
+                info!("RTSA {block:?}: sclksource = {g:?} (requested {source:?})");
                 Ok(got)
             }
             // The device answered and is demonstrably on something else, so
@@ -1673,7 +1769,7 @@ impl HttpEndpointsClient {
             // re-read if it must be certain.
             None => {
                 warn!(
-                    "RTSA {block}: could not confirm sclksource (leaf absent, or the read-back \
+                    "RTSA {block:?}: could not confirm sclksource (leaf absent, or the read-back \
                      failed); the write itself was accepted"
                 );
                 Ok(got)
@@ -1713,7 +1809,7 @@ impl HttpEndpointsClient {
         let got = caps.gps_mode;
         match got.as_deref() {
             Some(g) if g.eq_ignore_ascii_case(source) => {
-                info!("RTSA {block}: gpsmode = {g} (requested {source})");
+                info!("RTSA {block:?}: gpsmode = {g:?} (requested {source:?})");
                 Ok(got)
             }
             Some(g) => Err(Error::Config(format!(
@@ -1727,7 +1823,7 @@ impl HttpEndpointsClient {
             ))),
             None => {
                 warn!(
-                    "RTSA {block}: could not confirm gpsmode (leaf absent, or the read-back \
+                    "RTSA {block:?}: could not confirm gpsmode (leaf absent, or the read-back \
                      failed); the write itself was accepted"
                 );
                 Ok(got)
@@ -1875,37 +1971,37 @@ impl HttpEndpointsClient {
         if let Some(want) = request.center_frequency_hz {
             match applied.center_frequency_hz {
                 Some(got) if (got - want).abs() <= CENTERFREQ_CONFIRM_TOLERANCE_HZ => {
-                    info!("RTSA {block}: centerfreq0 = {got:.0} Hz (requested {want:.0})");
+                    info!("RTSA {block:?}: centerfreq0 = {got:.0} Hz (requested {want:.0})");
                 }
                 Some(got) => warn!(
-                    "RTSA {block}: centerfreq0 did not take — requested {want:.0} Hz, device \
+                    "RTSA {block:?}: centerfreq0 did not take — requested {want:.0} Hz, device \
                      reports {got:.0} Hz (wrong receiverName, or the field is locked?)"
                 ),
-                None => warn!("RTSA {block}: centerfreq0 missing from read-back"),
+                None => warn!("RTSA {block:?}: centerfreq0 missing from read-back"),
             }
         }
         if let Some(want) = request.decimation_index {
             match applied.decimation_index {
                 Some(got) if got == want => {
-                    info!("RTSA {block}: decimation0 = {got} (requested {want})");
+                    info!("RTSA {block:?}: decimation0 = {got} (requested {want})");
                 }
                 Some(got) => warn!(
-                    "RTSA {block}: decimation0 did not take — requested index {want}, device \
+                    "RTSA {block:?}: decimation0 did not take — requested index {want}, device \
                      reports {got}"
                 ),
-                None => warn!("RTSA {block}: decimation0 missing from read-back"),
+                None => warn!("RTSA {block:?}: decimation0 missing from read-back"),
             }
         }
         if let Some(want) = request.reference_level_dbm {
             match applied.reference_level_dbm {
                 Some(got) if (got - want).abs() <= REFLEVEL_CONFIRM_TOLERANCE_DB => {
-                    info!("RTSA {block}: reflevel0 = {got} dBm (requested {want})");
+                    info!("RTSA {block:?}: reflevel0 = {got} dBm (requested {want})");
                 }
                 Some(got) => warn!(
-                    "RTSA {block}: reflevel0 did not take — requested {want} dBm, device reports \
+                    "RTSA {block:?}: reflevel0 did not take — requested {want} dBm, device reports \
                      {got} dBm"
                 ),
-                None => warn!("RTSA {block}: reflevel0 missing from read-back"),
+                None => warn!("RTSA {block:?}: reflevel0 missing from read-back"),
             }
         }
 
@@ -2126,7 +2222,7 @@ impl HttpEndpointsClient {
         let response = Self::ensure_success("Config update", request.send().await?)?;
 
         let config: ConfigResponse = response.json().await?;
-        info!("Updated configuration for block: {}", block_name);
+        info!("Updated configuration for block: {:?}", block_name);
         Ok(config)
     }
 
@@ -2469,10 +2565,12 @@ impl HttpEndpointsClient {
     pub(crate) async fn open_stream(&self, params: &StreamParams) -> Result<reqwest::Response> {
         params.validate()?;
         let url = params.stream_url(&self.base_url);
+        // For messages: the base URL may carry credentials.
+        let shown = redact_url(&url);
 
         info!(
             "Starting stream from {} with format: {:?}",
-            url, params.format
+            shown, params.format
         );
 
         // Deliberately `apply_auth`, not `control_request`: a per-request
@@ -2484,8 +2582,8 @@ impl HttpEndpointsClient {
         // here forever, before any reconnect logic can run.
         let response = tokio::time::timeout(STREAM_STALL_TIMEOUT, request.send())
             .await
-            .map_err(|_| stream_stalled(&format!("Stream request to {url}: no response")))??;
-        Self::ensure_success(&format!("Stream request to {url}"), response)
+            .map_err(|_| stream_stalled(&format!("Stream request to {shown}: no response")))??;
+        Self::ensure_success(&format!("Stream request to {shown}"), response)
     }
 
     /// Creates a new `StreamParamsBuilder` to construct streaming parameters.
@@ -2605,6 +2703,152 @@ fn read_config_leaf_value(items: &[serde_json::Value], field: &str) -> Option<f6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server-issued redirect is not followed, for a read or a write: a
+    /// 307 replays a `PUT` and its body at whatever host the server names,
+    /// and a redirected `/stream` would take its samples from there.
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let elsewhere = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&elsewhere)
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/taken", elsewhere.uri())),
+            )
+            .mount(&server)
+            .await;
+
+        let client = HttpEndpointsClient::new(server.uri(), AuthMethod::None).unwrap();
+        let put = client.control_streaming(true).await;
+        assert!(
+            matches!(&put, Err(Error::Http { status, .. }) if status.as_u16() == 307),
+            "{put:?}"
+        );
+        let stream = client
+            .open_stream(&HttpEndpointsClient::stream_params().build())
+            .await;
+        assert!(
+            matches!(&stream, Err(Error::Http { status, .. }) if status.as_u16() == 307),
+            "a redirected stream is an error, not another origin's samples"
+        );
+        assert!(client.test_connection().await.is_err());
+        assert!(
+            elsewhere
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "nothing may reach the redirect's target"
+        );
+    }
+
+    /// Credentials in a URL's authority never reach a log line or an error
+    /// message — including the error for a URL that would not parse.
+    #[test]
+    fn urls_are_redacted_for_messages() {
+        assert_eq!(redact_url("http://host:42664"), "http://host:42664");
+        assert_eq!(
+            redact_url("http://user:hunter2@host:42664/stream?format=int16"),
+            "http://[REDACTED]@host:42664/stream?format=int16"
+        );
+        assert_eq!(
+            redact_url("https://tokenonly@host"),
+            "https://[REDACTED]@host"
+        );
+        // An unencoded `/` in the password: not a valid URL, still covered.
+        assert_eq!(
+            redact_url("http://user:pa/ss@host/x"),
+            "http://[REDACTED]@host/x"
+        );
+        // An `@` in the query is not an authority.
+        assert_eq!(
+            redact_url("http://host/stream?input=a@b"),
+            "http://host/stream?input=a@b"
+        );
+        assert_eq!(redact_url("not a url"), "not a url");
+
+        let error = validate_base_url("http://user:hunter2@ho st").unwrap_err();
+        let shown = error.to_string();
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("[REDACTED]"), "{shown}");
+    }
+
+    /// `UserInfo` carries the session token; formatting it must not.
+    #[test]
+    fn user_info_debug_redacts_the_token() {
+        let user = UserInfo {
+            name: "operator".into(),
+            email: None,
+            token: "s3cr3t-token".into(),
+            groups: vec!["admin".into()],
+        };
+        let shown = format!("{user:?}");
+        assert!(!shown.contains("s3cr3t-token"), "{shown}");
+        assert!(shown.contains("[REDACTED]"), "{shown}");
+        assert!(shown.contains("operator") && shown.contains("admin"));
+    }
+
+    /// Credentials over plain http to another machine are warned about;
+    /// TLS, loopback and unauthenticated access are not.
+    #[test]
+    fn credentials_in_clear_are_recognised() {
+        let basic = AuthMethod::Basic {
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let token = AuthMethod::Token { token: "t".into() };
+        let url = |s: &str| url::Url::parse(s).unwrap();
+
+        assert!(sends_credentials_in_clear(
+            &url("http://192.168.1.20:42664"),
+            &basic
+        ));
+        assert!(sends_credentials_in_clear(
+            &url("http://rtsa.local:42664"),
+            &token
+        ));
+        assert!(sends_credentials_in_clear(
+            &url("http://[fe80::1]:42664"),
+            &token
+        ));
+        assert!(
+            sends_credentials_in_clear(&url("http://u:p@192.168.1.20:42664"), &AuthMethod::None),
+            "credentials in the URL count"
+        );
+
+        assert!(!sends_credentials_in_clear(
+            &url("https://192.168.1.20:42664"),
+            &basic
+        ));
+        assert!(!sends_credentials_in_clear(
+            &url("http://192.168.1.20:42664"),
+            &AuthMethod::None
+        ));
+        for loopback in [
+            "http://127.0.0.1:42664",
+            "http://localhost:42664",
+            "http://LOCALHOST.:42664",
+            "http://rtsa.localhost:42664",
+            "http://[::1]:42664",
+        ] {
+            assert!(
+                !sends_credentials_in_clear(&url(loopback), &basic),
+                "{loopback}"
+            );
+        }
+        assert!(
+            sends_credentials_in_clear(&url("http://localhost.example.com"), &basic),
+            "a name that merely starts with localhost is not this machine"
+        );
+    }
 
     /// A `/healthstatus` tree shaped like the one a live V6 ECO serves:
     /// one block, `info` / `health` / `status` subgroups, counters typed

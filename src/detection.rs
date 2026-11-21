@@ -7,6 +7,23 @@
 //! 2. The platform default install path from the official SDK
 //!    documentation (Windows and Linux only).
 //!
+//! # `AARONIA_SDK_PATH` is trusted
+//!
+//! Whatever directory this variable names is where the vendor library is
+//! loaded from (with every dependency the library pulls in beside it)
+//! and where `RTSAFileTool` is *executed* from. Nothing checks who owns
+//! that directory or who can write to it, and it takes precedence over
+//! the administrator-owned default install path. It is therefore a trust
+//! anchor on a par with `PATH` or `LD_LIBRARY_PATH`: a process running
+//! with more privilege than whoever controls its environment (a service,
+//! a setuid helper, a `sudo` that preserves the environment) must clear
+//! it or set it itself.
+//!
+//! The value must be an absolute path. A relative one would resolve
+//! against the working directory — "load code from wherever the process
+//! happens to be started" — so it is ignored, with a warning, and
+//! detection falls back to the default install path.
+//!
 //! **Native SDK support is Windows/Linux only, full stop.** Aaronia
 //! publishes SDK binaries for exactly those two platforms; this crate's
 //! FFI bindings ([`crate::native_sdk`], [`crate::sdk_source`]) are gated
@@ -34,11 +51,25 @@ pub fn is_sdk_installed() -> bool {
 ///
 /// Checks [`SDK_PATH_ENV`] first (any platform), then the documented
 /// per-platform default install locations.
+///
+/// A relative [`SDK_PATH_ENV`] is ignored: see the module documentation
+/// for why the variable is trusted and why it must be absolute.
 pub fn get_sdk_path() -> Option<String> {
     if let Some(os_val) = std::env::var_os(SDK_PATH_ENV) {
         match os_val.into_string() {
             Ok(env_path) => {
                 if !env_path.trim().is_empty() {
+                    // Relative to what? The working directory, which is
+                    // not something to load a library or run a tool from.
+                    if !Path::new(env_path.trim()).is_absolute() {
+                        tracing::warn!(
+                            "{} is set to the relative path {:?}; it must be absolute. \
+                             Falling back to the default install path",
+                            SDK_PATH_ENV,
+                            env_path.trim()
+                        );
+                        return default_sdk_path();
+                    }
                     if Path::new(&env_path).is_dir() {
                         return Some(env_path);
                     }
@@ -303,6 +334,18 @@ mod tests {
             let found = get_sdk_library_path().expect("library must be discovered");
             assert!(found.ends_with(lib_name));
             assert!(is_sdk_installed());
+        }
+
+        // 3b. A relative path is refused even when it names a real
+        // directory: `.` always exists, and accepting it would load the
+        // library from wherever the process was started.
+        for relative in [".", "sdk", "./"] {
+            unsafe { std::env::set_var(SDK_PATH_ENV, relative) };
+            assert_eq!(
+                get_sdk_path(),
+                default_sdk_path(),
+                "relative {relative:?} must fall back to the default install path"
+            );
         }
 
         // 4. Pointing `AARONIA_SDK_PATH` directly at `<install>/sdk` must

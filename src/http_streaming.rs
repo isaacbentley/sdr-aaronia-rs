@@ -946,6 +946,19 @@ pub struct StreamParser {
     started_at: Instant,
 }
 
+/// Whether `scale` can be used as an int16 encode scale: finite, positive,
+/// and with a reciprocal — the multiplier every sample is decoded with —
+/// that is a normal `f32`.
+///
+/// The last part is what the first two miss. `1e-40` is finite and
+/// positive, but its reciprocal overflows `f32` to `inf`, so every non-zero
+/// sample decodes to `±inf` and every zero one to `NaN`; `1e40` underflows
+/// it to `0.0` and silences the packet. The float formats sanitise
+/// non-finite samples on the way in; this is the int16 path's equivalent.
+fn usable_int16_encode_scale(scale: f64) -> bool {
+    scale.is_finite() && scale > 0.0 && ((1.0 / scale) as f32).is_normal()
+}
+
 impl StreamParser {
     /// `scale` is the server-side `?scale=N` encode multiplier, if one was
     /// requested — see `Self::int16_decode_scale` for the semantics.
@@ -992,11 +1005,18 @@ impl StreamParser {
     /// The wire's encode scale for this packet: the per-packet `scale`
     /// field, else the `?scale=N` the stream was opened with, else the
     /// full-scale default (32768).
+    ///
+    /// A scale is used only if it is usable ([`usable_int16_encode_scale`]):
+    /// the per-packet field is the server's to set on every packet, and one
+    /// whose reciprocal is not a normal `f32` would turn every sample of the
+    /// packet into `inf`, `NaN` or zero.
     fn int16_encode_scale(&self, metadata: &PacketMetadata) -> f64 {
         metadata
             .scale
-            .or(self.default_encode_scale)
-            .filter(|s| s.is_finite() && *s > 0.0)
+            .filter(|s| usable_int16_encode_scale(*s))
+            .or(self
+                .default_encode_scale
+                .filter(|s| usable_int16_encode_scale(*s)))
             .unwrap_or(DEFAULT_INT16_ENCODE_SCALE)
     }
 
@@ -1102,7 +1122,16 @@ impl StreamParser {
     /// attacker-/corruption-controlled, so an insane `samples` count must
     /// error instead of making the parser wait forever (and buffer
     /// gigabytes) for a payload that will never arrive.
-    const MAX_BINARY_PAYLOAD: usize = 256 * 1024 * 1024;
+    ///
+    /// 16 MiB: some forty times the largest packet a V6 has been seen to
+    /// send — 49 152 float32 IQ pairs at full span is 384 KiB, a
+    /// 512-frame × 88-bin spectra packet 176 KiB — and still room for a
+    /// spectra block with a far larger FFT. It was 256 MiB, which let one
+    /// header make the parser buffer that much and then decode it into as
+    /// much as a gigabyte of `Complex32`; every bound downstream of the
+    /// parser counts packets, so the size of one packet is the unit of
+    /// everything a hostile server can make this process hold.
+    pub(crate) const MAX_BINARY_PAYLOAD: usize = 16 * 1024 * 1024;
 
     /// Compact the buffer once this many consumed bytes have accumulated.
     /// Deferring the memmove keeps single-byte resync steps O(1) amortised
@@ -2396,6 +2425,76 @@ mod tests {
         let s = &packets[0].samples[0];
         assert!((s.re - 1.0).abs() < 1e-6, "1000 / 1000 = 1.0");
         assert!((s.im - -1.0).abs() < 1e-6);
+    }
+
+    /// A per-packet scale is the server's to choose, and one whose
+    /// reciprocal is not a normal `f32` — `1e-40` overflows it to `inf`,
+    /// `1e40` underflows it to zero — must not be decoded with: it would
+    /// hand the consumer `inf`/`NaN` (0 × inf), or silence. Such a scale
+    /// falls back to the one the stream was opened with.
+    #[test]
+    fn test_int16_scale_with_an_unusable_reciprocal_is_ignored() {
+        assert!(usable_int16_encode_scale(32768.0));
+        assert!(usable_int16_encode_scale(1.0));
+        for bad in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            1e-40,
+            1e-300,
+            1e40,
+            1e300,
+        ] {
+            assert!(!usable_int16_encode_scale(bad), "{bad}");
+        }
+
+        for bad in [1e-40, 1e-300, 1e40] {
+            let payload = iq_packet_bytes(&[1000, 0, -1000, 32767], Some(bad));
+            let mut parser = StreamParser::new(StreamFormat::Int16, Some(1000.0)).unwrap();
+            let packets = parser.process_data(&Bytes::from(payload)).unwrap();
+            let s = &packets[0].samples;
+            assert!(
+                s.iter().all(|c| c.re.is_finite() && c.im.is_finite()),
+                "scale {bad}: {s:?}"
+            );
+            assert!((s[0].re - 1.0).abs() < 1e-6, "decoded with ?scale=1000");
+            assert_eq!(s[0].im, 0.0);
+        }
+
+        // With no usable stream scale either, the full-scale default.
+        let payload = iq_packet_bytes(&[16384, -16384], Some(1e-40));
+        let mut parser = StreamParser::new(StreamFormat::Int16, Some(f64::NAN)).unwrap();
+        let packets = parser.process_data(&Bytes::from(payload)).unwrap();
+        assert!((packets[0].samples[0].re - 0.5).abs() < 1e-6);
+    }
+
+    /// The payload cap is what bounds the memory one header can claim: a
+    /// packet just over it is a loss and nothing is buffered for it, while
+    /// the largest packets a V6 really sends sit far below it.
+    #[test]
+    fn test_payload_cap_sits_between_real_packets_and_a_hostile_one() {
+        // 49 152 float32 IQ pairs: the largest IQ packet seen live.
+        const { assert!(49_152 * 8 * 16 <= StreamParser::MAX_BINARY_PAYLOAD) };
+        const { assert!(StreamParser::MAX_BINARY_PAYLOAD <= 32 * 1024 * 1024) };
+
+        let pairs = StreamParser::MAX_BINARY_PAYLOAD / 4 + 1;
+        let mut wire = format!(
+            r#"{{"startTime":0.0,"endTime":1.0,"startFrequency":0.0,"endFrequency":1.0,"samples":{pairs},"unit":"volt","payload":"iq","minPower":-100,"maxPower":0,"sampleSize":2}}"#
+        )
+        .into_bytes();
+        wire.push(ASCII_RECORD_SEPARATOR);
+        wire.extend(iq_packet_bytes(&[1, 2], None));
+        let mut parser = StreamParser::new(StreamFormat::Int16, None).unwrap();
+        let items = parser
+            .process_data_recovering(&Bytes::from(wire))
+            .expect("an oversized packet is a loss, not a dead stream");
+        assert!(matches!(items[0], ParsedItem::Lost(_)), "{items:?}");
+        assert!(
+            matches!(&items[1], ParsedItem::Packet(p) if p.samples.len() == 1),
+            "the packet behind it is found: {items:?}"
+        );
+        assert!(parser.pending().is_empty(), "nothing waits for the payload");
     }
 
     /// A header that parses but whose body cannot be decoded must be

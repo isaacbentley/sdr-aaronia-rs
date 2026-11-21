@@ -294,6 +294,14 @@ SpectranFfiError spectran_sink_set_center_frequency_hz(SpectranSink* sink, doubl
 SpectranFfiError spectran_sink_set_sample_rate_hz(SpectranSink* sink, double hz);
 SpectranFfiError spectran_sink_set_trans_gain_db(SpectranSink* sink, double db);
 bool spectran_sink_get_master_stream_time_ns(SpectranSink* sink, int64_t* out_time_ns);
+// The sink's configured TX centre frequency (Hz), IQ sample rate (Hz) and
+// gain (dB): what spectran_sink_initialize applies and what each burst is
+// labelled with. These are the sink builder's own defaults unless set, and
+// are independent of the receiver's tuning, so read them here rather than
+// assuming the two match. Any out-pointer may be NULL to skip that value.
+// Returns false for a NULL sink.
+bool spectran_sink_get_config(SpectranSink* sink, double* out_center_frequency_hz,
+                              double* out_sample_rate_hz, double* out_trans_gain_db);
 // start_time_s / end_time_s are in device MASTER STREAM TIME seconds,
 // not wall-clock epoch time. Samples use the same FfiComplex layout as
 // the read path. Pass samples == NULL with num_samples == 0 for a 0-sample
@@ -330,6 +338,13 @@ SpectranFfiError spectran_source_rf_span_range(SpectranSource *source, double *m
 SpectranFfiError spectran_source_set_rf_span_hz(SpectranSource *source, double hz);
 SpectranFfiError spectran_source_builder_native_options(SpectranSourceBuilder *builder,
     const char *family, const char *mode, double rf_span_hz, const char *clock, uint32_t decimation);
+
+// Parses a boolean device argument the way every front-end of this
+// library does: true/1/yes/on and false/0/no/off, ignoring ASCII case and
+// surrounding whitespace. Writes *out and returns Success; any other value
+// returns InvalidString, leaves *out untouched and records a message naming
+// `key` (used only for that message; may be NULL) in spectran_last_error().
+SpectranFfiError spectran_parse_bool_arg(const char* key, const char* value, bool* out);
 
 void spectran_string_free(char* s);
 // Takes the code as an int so any value is safe to pass; unknown codes

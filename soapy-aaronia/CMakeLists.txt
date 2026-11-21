@@ -107,8 +107,21 @@ set(CARGO_FEATURES "")
 if (AARONIA_NATIVE_SDK)
     set(CARGO_FEATURES --features native-sdk)
 endif()
+# Build against exactly the dependency versions in the committed
+# Cargo.lock. Without --locked, cargo re-resolves when the lock file and
+# the manifests disagree, and the module links whatever it picked — not
+# what CI tested. A checkout or release tarball always carries a lock
+# file that matches; turn this off only when editing dependencies:
+#   -DAARONIA_CARGO_LOCKED=OFF
+option(AARONIA_CARGO_LOCKED
+    "Pass --locked to cargo, so the plugin builds with the dependency versions in Cargo.lock"
+    ON)
+set(CARGO_LOCKED "")
+if (AARONIA_CARGO_LOCKED)
+    set(CARGO_LOCKED --locked)
+endif()
 add_custom_target(sdr_aaronia_rs_static ALL
-    COMMAND cargo build --release -p sdr-aaronia-rs --target-dir ${CARGO_TARGET_DIR} ${CARGO_FEATURES}
+    COMMAND cargo build --release ${CARGO_LOCKED} -p sdr-aaronia-rs --target-dir ${CARGO_TARGET_DIR} ${CARGO_FEATURES}
     WORKING_DIRECTORY ${CARGO_MANIFEST_DIR}
     COMMENT "cargo build --release -p sdr-aaronia-rs (static lib for SoapyAaronia)"
     VERBATIM

@@ -79,6 +79,22 @@ where
     }
 }
 
+/// Read the boolean device argument `key`: `None` when absent, an
+/// [`seify::Error`] naming the argument when present but not one of the
+/// spellings [`crate::kwargs::parse_bool`] accepts.
+///
+/// An unknown spelling is an error rather than `false`: a `listen_only`
+/// read as false retunes a shared device the caller asked to leave
+/// alone.
+fn bool_arg(args: &Args, key: &str) -> std::result::Result<Option<bool>, seify::Error> {
+    let Ok(value) = args.get::<String>(key) else {
+        return Ok(None);
+    };
+    crate::kwargs::parse_bool(key, &value)
+        .map(Some)
+        .map_err(|e| seify::Error::invalid_argument(key, e.to_string()))
+}
+
 /// Build a seify [`Range`] from a reported capability. seify 0.26 ranges
 /// are nonempty and finite by construction, so a bound the device does not
 /// report is [`seify::Error::Unsupported`] for that capability instead of
@@ -113,6 +129,11 @@ impl SpectranSeifyDevice {
 
         let mut builder = SpectranSourceBuilder::new();
 
+        // Read before the backend is chosen, so a malformed value is
+        // refused whichever backend the other arguments select.
+        let sdk = bool_arg(args, "sdk")?;
+        let listen_only = bool_arg(args, "listen_only")?;
+
         if let Ok(url) = args.get::<String>("url") {
             builder.http_source(url);
         } else if let Ok(file) = args.get::<String>("file") {
@@ -120,35 +141,29 @@ impl SpectranSeifyDevice {
         } else if let Ok(serial) = args.get::<String>("serial") {
             builder.force_source_type(SourceType::NativeSdk);
             builder.device_serial(serial);
-        } else if let Ok(sdk) = args.get::<String>("sdk")
-            && (sdk == "true" || sdk == "1")
-        {
+        } else if sdk == Some(true) {
             builder.force_source_type(SourceType::NativeSdk);
         }
 
-        if let Ok(listen_only) = args.get::<String>("listen_only")
-            && (listen_only == "true" || listen_only == "1")
-        {
-            builder.listen_only(true);
+        if let Some(listen_only) = listen_only {
+            builder.listen_only(listen_only);
         }
 
-        let mut center_frequency_hz = 100e6;
-        let mut sample_rate_hz = 1e6;
-        let mut reference_level_dbm = -20.0;
-
+        // Only what the caller gave. An absent argument leaves the
+        // builder's default in place, the one every other front-end
+        // opens with and a rate the device has.
         if let Ok(freq) = args.get::<f64>("freq") {
-            center_frequency_hz = freq;
+            builder.center_frequency_hz(freq);
         }
         if let Ok(rate) = args.get::<f64>("rate") {
-            sample_rate_hz = rate;
+            builder.sample_rate_hz(rate);
         }
         if let Ok(ref_level) = args.get::<f64>("ref_level") {
-            reference_level_dbm = ref_level;
+            builder.reference_level_dbm(ref_level);
         }
-
-        builder.center_frequency_hz(center_frequency_hz);
-        builder.sample_rate_hz(sample_rate_hz);
-        builder.reference_level_dbm(reference_level_dbm);
+        let center_frequency_hz = builder.config.center_frequency_hz;
+        let sample_rate_hz = builder.config.sample_rate_hz;
+        let reference_level_dbm = builder.config.reference_level_dbm;
 
         builder.native_options(crate::capabilities::NativeReceiverOptions {
             family: args.get::<String>("family").ok(),
@@ -595,6 +610,29 @@ impl RxStreamer for SpectranSeifyRxStreamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boolean_arguments_use_the_shared_parser() {
+        let args = Args::from("listen_only=yes, sdk=0, tx=maybe").unwrap();
+        assert_eq!(bool_arg(&args, "listen_only").unwrap(), Some(true));
+        assert_eq!(bool_arg(&args, "sdk").unwrap(), Some(false));
+        assert_eq!(bool_arg(&args, "absent").unwrap(), None);
+        let err = bool_arg(&args, "tx").expect_err("an unknown value is refused");
+        assert!(err.to_string().contains("tx"), "{err}");
+    }
+
+    /// An argument the caller did not give is not written over the
+    /// builder's defaults, and a boolean that is not one is refused
+    /// before anything is opened.
+    #[test]
+    fn from_args_refuses_a_malformed_boolean_before_opening_anything() {
+        let args = Args::from("file=/nonexistent/capture.rtsa, listen_only=perhaps").unwrap();
+        let err = match SpectranSeifyDevice::from_args(&args) {
+            Ok(_) => panic!("a malformed listen_only must not open a device"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("listen_only"), "{err}");
+    }
 
     #[test]
     fn capability_range_reports_a_missing_range_as_unsupported() {

@@ -62,7 +62,10 @@ must be launched after `SOAPY_SDR_PLUGIN_PATH` is set.
 
 Requirements: CMake ≥ 3.14, a C++17 compiler, SoapySDR ≥ 0.7 with dev
 headers (`libsoapysdr-dev` / `brew install soapysdr` / vcpkg `soapysdr`),
-and a Rust toolchain. CMake invokes `cargo build --release` itself.
+and a Rust toolchain. CMake invokes `cargo build --release --locked`
+itself, so the module is built with the dependency versions in the
+repository's `Cargo.lock`; pass `-DAARONIA_CARGO_LOCKED=OFF` only when you
+are changing dependencies.
 
 ```bash
 cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release
@@ -95,10 +98,19 @@ sudo cmake --install soapy-aaronia/build
 | `family`, `mode` | Optional native family and receive-only `raw` or `iqreceiver` mode |
 | `rf_span_hz` | Native IQ receiver RF span, Hz; separate from `rate` |
 | `receiver_clock`, `decimation` | Enabled raw SDK clock label and power-of-two factor |
+| `sdk` | `true` selects the native-SDK backend without naming a serial |
+| `listen_only` | `true` leaves the device's tuning alone (HTTP backend): nothing is written on open, retune or reconnect |
 | `tx` | Explicit `true` opts into TX setup on compatible licensed native hardware |
+| `tx_gain` | Initial TX gain in dB, within the advertised -50 to +10 dB range |
 | `rx_channel` | `Rx1` (default), `Rx2`, or `Rx1And2` (native SDK, full V6 only) |
 | `read_timeout` | Seconds the crate's own blocking reads wait (default 30). `readStream` always uses SoapySDR's per-call `timeoutUs`, so this rarely matters here |
-| `reconnect` | `1` (default) reconnects the stream automatically after a drop; `0` restores fail-fast behaviour |
+| `reconnect` | `true` (default) reconnects the stream automatically after a drop; `false` restores fail-fast behaviour |
+
+Boolean arguments (`sdk`, `listen_only`, `tx`, `reconnect`) accept
+`true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off` in any letter case. Any
+other value is an error naming the argument: `Device()` throws, and
+enumeration logs it and lists no device. The seify backend parses its
+booleans with the same code.
 
 ```python
 import SoapySDR
@@ -190,8 +202,23 @@ it does offer. `listClockSources` reports the device's own vocabulary.
 - **TX** is `CF32`, single channel, and setup is attempted only with explicit
   `tx=true` on a native-SDK backend. Compatible licensed hardware is required;
   a failed sink setup leaves no TX channel. Ordinary RX opens never open
-  a TX sink. Bursts transmit immediately; timed TX (`SOAPY_SDR_HAS_TIME`) is
-  unsupported, and TX remains hardware-unverified in this release.
+  a TX sink. Bursts transmit immediately; timed TX is unsupported, so a
+  `writeStream` carrying `SOAPY_SDR_HAS_TIME` returns
+  `SOAPY_SDR_NOT_SUPPORTED` and sends nothing. TX remains
+  hardware-unverified in this release.
+- **TX tuning is the sink's own, not the receiver's.** `getFrequency`,
+  `getSampleRate` and `getGain` for `SOAPY_SDR_TX` report what a burst
+  will be sent with: the `freq`/`rate`/`tx_gain` device arguments where
+  given, otherwise the transmitter's defaults (1 GHz, 10 MS/s, -20 dB),
+  until a TX setter changes them. Set the TX frequency explicitly before
+  transmitting.
+- **TX setters throw.** `setFrequency`, `setSampleRate` and `setGain` for
+  `SOAPY_SDR_TX` throw on a non-finite value, a gain outside
+  `getGainRange`, a device without a transmit path, or a device that
+  refuses the write, rather than logging and leaving the old setting in
+  force. The library additionally refuses to configure a transmitter
+  whose frequency, rate or gain node is missing, or a gain outside the
+  range the device itself declares.
 
 ## Time, gain, sensors
 

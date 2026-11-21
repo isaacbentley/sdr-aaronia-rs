@@ -23,7 +23,8 @@ use tracing::{debug, info, warn};
 use crate::file_source::RtsaSource;
 use crate::http_endpoints::HttpEndpointsClient;
 use crate::http_engine::{
-    CaptureTuning, Chunks, EngineOptions, HttpStreamEngine, ReconnectPolicy, StreamEvent, StreamGap,
+    CaptureTuning, Chunks, EngineOptions, HttpStreamEngine, ReconnectPolicy, SharedTuning,
+    StreamEvent, StreamGap,
 };
 
 #[cfg(all(
@@ -104,6 +105,25 @@ const RECONNECT: ReconnectPolicy = ReconnectPolicy {
 /// timestamp in nanoseconds, and the centre frequency and sample rate it was
 /// captured at.
 type HttpPacket = (Vec<Complex32>, bool, u64, i64, f64, f64);
+
+/// Samples the HTTP reader task may have queued for the reads at once:
+/// 64 MB of `Complex32`.
+///
+/// The packet channel is bounded in packets, and a packet is as large as the
+/// server says it is — up to the parser's payload cap, where a hundred of
+/// them is gigabytes. This bounds what is queued in the unit that costs
+/// memory. It sits above a full channel of real packets (100 × 49 152
+/// samples, the size a V6 sends at full span), so an honest stream never
+/// waits on it; past it the reader task waits, the engine's chunk channel
+/// fills and TCP flow control holds the server.
+const HTTP_QUEUE_SAMPLES: usize = 8 * 1024 * 1024;
+
+/// What a packet of `samples` samples costs against [`HTTP_QUEUE_SAMPLES`]:
+/// its length, but never nothing (an empty packet still takes a slot) and
+/// never more than the whole budget (or it could not be queued at all).
+fn queue_cost(samples: usize) -> u32 {
+    samples.clamp(1, HTTP_QUEUE_SAMPLES) as u32
+}
 
 /// What the server is actually delivering, read back from packet
 /// metadata.
@@ -208,6 +228,7 @@ async fn forward_http_stream(
     sender: tokio::sync::mpsc::Sender<HttpPacket>,
     observed: Arc<Mutex<ObservedStream>>,
     rate_bits: Arc<std::sync::atomic::AtomicU64>,
+    queue_budget: Arc<tokio::sync::Semaphore>,
 ) {
     // A break the next packet must carry: a server gap or backward
     // timestamp step, a lost packet, or a reconnect — samples were missed,
@@ -278,6 +299,21 @@ async fn forward_http_stream(
                     crate::utils::epoch_seconds_to_nanos(packet.metadata.start_time).unwrap_or(0);
                 let center_hz = packet.sdr_config.center_frequency_hz;
                 let rate_hz = packet.sdr_config.sample_rate_hz;
+                // Room for this packet's samples, which the read that takes
+                // it gives back. Watching the channel as well: a reader
+                // that has gone will never make room.
+                tokio::select! {
+                    permit = queue_budget.acquire_many(queue_cost(packet.samples.len())) => {
+                        match permit {
+                            Ok(permit) => permit.forget(),
+                            Err(_) => return,
+                        }
+                    }
+                    () = sender.closed() => {
+                        info!("Receiver dropped, HTTP streaming task exiting.");
+                        return;
+                    }
+                }
                 if sender
                     .send((
                         packet.samples,
@@ -556,11 +592,17 @@ pub struct SpectranSource {
     /// The observed sample rate as `f64` bits, updated by the reader task,
     /// so per-packet readers (`sample_rate_hz`) take no lock.
     http_rate_bits: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// Tuning the HTTP reader task re-applies before each reconnect
-    /// attempt. Shared with the retune setters, which write their *intent*
-    /// here before issuing the PUT — so a reconnect racing a user retune
-    /// re-applies the value the user asked for, not the one it replaced.
-    http_tuning: Option<Arc<Mutex<CaptureTuning>>>,
+    /// The tuning this source has applied to the device, which the HTTP
+    /// reader task re-applies before each reconnect attempt: `None` inside
+    /// until a capture write has succeeded (a listen-only start writes
+    /// none). The retune setters hold it across their PUT and store the new
+    /// tuple only on success — see [`SharedTuning`] and
+    /// [`Self::apply_http_tuning`].
+    http_tuning: Option<SharedTuning>,
+    /// The reader task's allowance of queued samples
+    /// ([`HTTP_QUEUE_SAMPLES`]); each packet a read takes gives its share
+    /// back.
+    http_queue_budget: Option<Arc<tokio::sync::Semaphore>>,
     file_source: Option<RtsaSource>,
     /// IQ packets from the HTTP reader task, each flagged when a break in
     /// the stream precedes it — see `pending_overrun`.
@@ -719,6 +761,7 @@ impl SpectranSource {
             http_observed: None,
             http_rate_bits: None,
             http_tuning: None,
+            http_queue_budget: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -875,7 +918,10 @@ impl SpectranSource {
 
         // Rule 2: If HTTP endpoint provided, use HTTP source only (no fallback)
         if let Some(base_url) = &self.config.http_base_url {
-            info!("HTTP endpoint provided - using HTTP source: {}", base_url);
+            info!(
+                "HTTP endpoint provided - using HTTP source: {}",
+                crate::http_endpoints::redact_url(base_url)
+            );
             return Ok(SourceType::Http);
         }
 
@@ -1057,8 +1103,9 @@ impl SpectranSource {
             .await
             .map_err(|e| {
                 let mut msg = format!(
-                    "Failed to connect to Aaronia RTSA Suite Pro at {base_url}. \
-                     Is it running and accessible? Error: {e}"
+                    "Failed to connect to Aaronia RTSA Suite Pro at {}. \
+                     Is it running and accessible? Error: {e}",
+                    crate::http_endpoints::redact_url(&base_url)
                 );
                 if let Some(hint) = crate::http_port_mismatch_hint(&base_url) {
                     msg.push_str(" (");
@@ -1073,7 +1120,12 @@ impl SpectranSource {
             sample_rate_hz: self.config.sample_rate_hz,
             reference_level_dbm: self.config.reference_level_dbm,
         };
-        if !self.is_listen_only() {
+        // What a reconnect restores: only what was actually applied. A
+        // listen-only start applies nothing, so it arms nothing — otherwise
+        // switching listen-only off later would let the first reconnect push
+        // this configuration (possibly just the defaults) onto a device the
+        // caller only ever asked to read.
+        let applied_tuning = if !self.is_listen_only() {
             // Tune the hardware to the requested frequency *before* opening the
             // stream. Without this the `/stream` endpoint returns whatever the
             // RTSA Suite is already configured to, completely ignoring the
@@ -1088,9 +1140,11 @@ impl SpectranSource {
                 client.configure_capture(initial_tuning.control())
             })
             .await?;
+            Some(initial_tuning)
         } else {
             info!("HTTP source in listen_only mode; skipping initial /control write");
-        }
+            None
+        };
 
         // Packets from the reader task to the reads. Each also carries
         // whether a break in the stream precedes it, so `read_samples` can
@@ -1110,8 +1164,8 @@ impl SpectranSource {
         }
 
         // Tuning shared with the retune setters so a reconnect restores
-        // what the caller most recently asked for.
-        let tuning = Arc::new(Mutex::new(initial_tuning));
+        // what the caller most recently applied.
+        let tuning: SharedTuning = Arc::new(tokio::sync::Mutex::new(applied_tuning));
         let observed = Arc::new(Mutex::new(ObservedStream::default()));
         let rate_bits = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -1138,21 +1192,27 @@ impl SpectranSource {
             retune_on_reconnect: Some(tuning.clone()),
             streaming_control: false,
         })?;
+        let queue_budget = Arc::new(tokio::sync::Semaphore::new(HTTP_QUEUE_SAMPLES));
         let reader_task = tokio::spawn(forward_http_stream(
             engine,
             sender,
             observed.clone(),
             rate_bits.clone(),
+            queue_budget.clone(),
         ));
 
         self.http_client = Some(client);
         self.http_observed = Some(observed);
         self.http_rate_bits = Some(rate_bits);
         self.http_tuning = Some(tuning);
+        self.http_queue_budget = Some(queue_budget);
         self.http_receiver = Some(receiver); // Store the receiver
         self.http_task = Some(reader_task); // Held so stop/drop can abort it
 
-        info!("HTTP client initialized for: {}", base_url);
+        info!(
+            "HTTP client initialized for: {}",
+            crate::http_endpoints::redact_url(&base_url)
+        );
 
         Ok(())
     }
@@ -1428,6 +1488,11 @@ impl SpectranSource {
                             pkt_freq_hz,
                             pkt_rate_hz,
                         ))) => {
+                            // Off the queue: the reader task may queue as
+                            // many samples again.
+                            if let Some(budget) = &self.http_queue_budget {
+                                budget.add_permits(queue_cost(new_samples.len()) as usize);
+                            }
                             if dropped {
                                 if collected > 0 {
                                     // Put the gap on a boundary rather
@@ -1823,6 +1888,7 @@ impl SpectranSource {
                 // stale handle here would let retunes made while stopped
                 // reach a task that no longer exists.
                 self.http_tuning = None;
+                self.http_queue_budget = None;
                 self.http_observed = None;
                 self.http_rate_bits = None;
                 info!("HTTP streaming stopped: reader task aborted, receiver dropped.");
@@ -1836,22 +1902,34 @@ impl SpectranSource {
         Ok(())
     }
 
-    /// Record a tuning change for the HTTP reader task to re-apply if it
-    /// has to reconnect. No-op for non-HTTP sources, which have no
-    /// reader task.
-    fn publish_tuning(
-        tuning: &Option<Arc<Mutex<CaptureTuning>>>,
-        edit: impl FnOnce(&mut CaptureTuning),
-    ) {
-        if let Some(tuning) = tuning {
-            // A panic in the reader task must not turn every later
-            // retune into a panic of its own; the data is a few plain
-            // floats, so recovering the poisoned value is safe.
-            let mut guard = tuning
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            edit(&mut guard);
+    /// Write `tuning` to the device as a full `/control` capture tuple —
+    /// the server ignores a capture `PUT` that lacks `frequencySpan` — and,
+    /// once the server has accepted it, record it as what the HTTP reader
+    /// task restores if it has to reconnect.
+    ///
+    /// The shared tuning is held across the write. The reader task holds it
+    /// across its own re-tune, so the two cannot interleave: a reconnect
+    /// racing this call waits and then restores the value written here,
+    /// rather than landing a copy it took beforehand on top of it. And the
+    /// record changes only on success, so a write that failed leaves the
+    /// next reconnect on what the device was last told. Published before
+    /// the write and not taken back, a refused value would be what a
+    /// reconnect applies: a frequency the caller was told was not set.
+    async fn apply_http_tuning(
+        client: &HttpEndpointsClient,
+        shared: &Option<SharedTuning>,
+        tuning: CaptureTuning,
+    ) -> Result<()> {
+        let mut applied = match shared {
+            Some(shared) => Some(shared.lock().await),
+            // Stopped: no reader task, nothing to keep in step.
+            None => None,
+        };
+        client.configure_capture(tuning.control()).await?;
+        if let Some(applied) = applied.as_mut() {
+            **applied = Some(tuning);
         }
+        Ok(())
     }
 
     /// Retune the source to a new centre frequency without rebuilding it.
@@ -1944,22 +2022,19 @@ impl SpectranSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
-                // Publish the intent *before* the PUT so a reconnect
-                // racing this call restores the frequency the caller
-                // asked for rather than the one it is replacing.
-                Self::publish_tuning(&self.http_tuning, |t| t.center_frequency_hz = hz);
                 // Full tuple, not just the changed field: the server
                 // ignores capture PUTs that lack frequencySpan (see the
                 // doc comment above).
-                client
-                    .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center_hz: Some(hz),
-                        frequency_span_hz: Some(self.config.sample_rate_hz),
-                        reference_level_dbm: Some(self.config.reference_level_dbm as f32),
-                        control_type: crate::http_endpoints::ControlType::Capture,
-                        ..Default::default()
-                    })
-                    .await?;
+                Self::apply_http_tuning(
+                    client,
+                    &self.http_tuning,
+                    CaptureTuning {
+                        center_frequency_hz: hz,
+                        sample_rate_hz: self.config.sample_rate_hz,
+                        reference_level_dbm: self.config.reference_level_dbm,
+                    },
+                )
+                .await?;
             }
             SourceType::File => {
                 warn!(
@@ -2050,18 +2125,18 @@ impl SpectranSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
-                Self::publish_tuning(&self.http_tuning, |t| t.sample_rate_hz = hz);
                 // Full tuple: partial capture PUTs are silently ignored
                 // by the server (see `set_center_frequency_hz`).
-                client
-                    .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center_hz: Some(self.config.center_frequency_hz),
-                        frequency_span_hz: Some(hz),
-                        reference_level_dbm: Some(self.config.reference_level_dbm as f32),
-                        control_type: crate::http_endpoints::ControlType::Capture,
-                        ..Default::default()
-                    })
-                    .await?;
+                Self::apply_http_tuning(
+                    client,
+                    &self.http_tuning,
+                    CaptureTuning {
+                        center_frequency_hz: self.config.center_frequency_hz,
+                        sample_rate_hz: hz,
+                        reference_level_dbm: self.config.reference_level_dbm,
+                    },
+                )
+                .await?;
             }
             SourceType::File => {
                 warn!(
@@ -2183,18 +2258,18 @@ impl SpectranSource {
                     .http_client
                     .as_ref()
                     .ok_or_else(|| Error::Config("HTTP client not initialized".to_string()))?;
-                Self::publish_tuning(&self.http_tuning, |t| t.reference_level_dbm = dbm);
                 // Full tuple: partial capture PUTs are silently ignored
                 // by the server (see `set_center_frequency_hz`).
-                client
-                    .configure_capture(crate::http_endpoints::CaptureControl {
-                        frequency_center_hz: Some(self.config.center_frequency_hz),
-                        frequency_span_hz: Some(self.config.sample_rate_hz),
-                        reference_level_dbm: Some(dbm as f32),
-                        control_type: crate::http_endpoints::ControlType::Capture,
-                        ..Default::default()
-                    })
-                    .await?;
+                Self::apply_http_tuning(
+                    client,
+                    &self.http_tuning,
+                    CaptureTuning {
+                        center_frequency_hz: self.config.center_frequency_hz,
+                        sample_rate_hz: self.config.sample_rate_hz,
+                        reference_level_dbm: dbm,
+                    },
+                )
+                .await?;
             }
             SourceType::File => {
                 warn!("set_reference_level_dbm called on file source (no-op)");
@@ -2550,7 +2625,10 @@ impl SpectranSource {
         match HttpEndpointsClient::new(base_url.clone(), self.http_auth.clone()) {
             Ok(client) => client.get_device_capabilities().await,
             Err(e) => {
-                warn!("device capabilities: could not build a client for {base_url}: {e}");
+                warn!(
+                    "device capabilities: could not build a client for {}: {e}",
+                    crate::http_endpoints::redact_url(base_url)
+                );
                 DeviceCapabilities::default()
             }
         }
@@ -2592,7 +2670,10 @@ impl SpectranSource {
         match HttpEndpointsClient::new(base_url.clone(), self.http_auth.clone()) {
             Ok(client) => client.get_device_sensors().await.unwrap_or_default(),
             Err(e) => {
-                warn!("device sensors: could not build a client for {base_url}: {e}");
+                warn!(
+                    "device sensors: could not build a client for {}: {e}",
+                    crate::http_endpoints::redact_url(base_url)
+                );
                 DeviceSensors::default()
             }
         }
@@ -3041,6 +3122,7 @@ mod tests {
             http_observed: None,
             http_rate_bits: None,
             http_tuning: None,
+            http_queue_budget: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -3130,6 +3212,7 @@ mod tests {
             http_observed: None,
             http_rate_bits: None,
             http_tuning: None,
+            http_queue_budget: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -3171,6 +3254,7 @@ mod tests {
             http_observed: None,
             http_rate_bits: None,
             http_tuning: None,
+            http_queue_budget: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -3214,6 +3298,7 @@ mod tests {
             http_observed: None,
             http_rate_bits: None,
             http_tuning: None,
+            http_queue_budget: None,
             file_source: None,
             http_receiver: None,
             http_task: None,
@@ -3421,6 +3506,7 @@ mod tests {
             http_observed: None,
             http_rate_bits: None,
             http_tuning: None,
+            http_queue_budget: None,
             file_source: None,
             http_receiver: Some(chunk_rx),
             http_task: None,
@@ -3793,6 +3879,174 @@ mod tests {
         );
     }
 
+    /// An HTTP source whose control writes go to `server`, with `applied`
+    /// as the tuning its reader task would restore.
+    fn http_source_writing_to(
+        server: &wiremock::MockServer,
+        applied: Option<CaptureTuning>,
+    ) -> (SpectranSource, SharedTuning) {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut source = http_test_source(rx);
+        source.config.center_frequency_hz = 100e6;
+        source.config.sample_rate_hz = 10e6;
+        source.config.reference_level_dbm = -20.0;
+        source.http_client = Some(
+            HttpEndpointsClient::new(server.uri(), crate::http_endpoints::AuthMethod::None)
+                .unwrap(),
+        );
+        let shared: SharedTuning = Arc::new(tokio::sync::Mutex::new(applied));
+        source.http_tuning = Some(shared.clone());
+        (source, shared)
+    }
+
+    async fn mount_control(server: &wiremock::MockServer, status: u16) {
+        use wiremock::matchers::{method, path};
+        wiremock::Mock::given(method("PUT"))
+            .and(path("/control"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(status).set_body_json(serde_json::json!({})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// A retune the server refused must not become what the next reconnect
+    /// applies. Were the intent published before the PUT and not taken
+    /// back, the reader task would later tune the device to a frequency
+    /// the caller was told was not set — while `config` says otherwise.
+    #[tokio::test]
+    async fn a_failed_retune_leaves_the_reconnect_tuning_alone() {
+        let server = wiremock::MockServer::start().await;
+        mount_control(&server, 500).await;
+        let before = CaptureTuning {
+            center_frequency_hz: 100e6,
+            sample_rate_hz: 10e6,
+            reference_level_dbm: -20.0,
+        };
+        let (mut source, shared) = http_source_writing_to(&server, Some(before));
+
+        assert!(source.set_center_frequency_hz(915e6).await.is_err());
+        assert!(source.set_sample_rate_hz(20e6).await.is_err());
+        assert!(source.set_reference_level_dbm(-35.0).await.is_err());
+
+        let after = shared.lock().await.expect("still armed");
+        assert_eq!(after.center_frequency_hz, 100e6);
+        assert_eq!(after.sample_rate_hz, 10e6);
+        assert_eq!(after.reference_level_dbm, -20.0);
+        assert_eq!(source.config.center_frequency_hz, 100e6);
+        assert_eq!(source.config.sample_rate_hz, 10e6);
+        assert_eq!(source.config.reference_level_dbm, -20.0);
+    }
+
+    /// A source that started listening only has applied nothing, so nothing
+    /// is armed for a reconnect — until a setter's write succeeds, and then
+    /// it is the whole tuple that write carried.
+    #[tokio::test]
+    async fn a_successful_retune_is_what_a_reconnect_restores() {
+        let server = wiremock::MockServer::start().await;
+        mount_control(&server, 200).await;
+        let (mut source, shared) = http_source_writing_to(&server, None);
+        assert!(shared.lock().await.is_none());
+
+        source.set_reference_level_dbm(-35.0).await.unwrap();
+        let applied = shared.lock().await.expect("armed by the write");
+        assert_eq!(applied.center_frequency_hz, 100e6);
+        assert_eq!(applied.sample_rate_hz, 10e6);
+        assert_eq!(applied.reference_level_dbm, -35.0);
+
+        source.set_center_frequency_hz(915e6).await.unwrap();
+        let applied = shared.lock().await.expect("armed");
+        assert_eq!(applied.center_frequency_hz, 915e6);
+        assert_eq!(applied.reference_level_dbm, -35.0);
+        assert_eq!(source.config.center_frequency_hz, 915e6);
+    }
+
+    #[test]
+    fn a_packet_costs_its_samples_within_the_budget() {
+        assert_eq!(queue_cost(0), 1, "an empty packet still takes a slot");
+        assert_eq!(queue_cost(49_152), 49_152);
+        assert_eq!(
+            queue_cost(usize::MAX),
+            HTTP_QUEUE_SAMPLES as u32,
+            "one packet can always be queued"
+        );
+    }
+
+    /// A read gives back the queue allowance of each packet it takes.
+    #[tokio::test]
+    async fn a_read_returns_its_packets_queue_allowance() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut source = http_test_source(rx);
+        let budget = Arc::new(tokio::sync::Semaphore::new(0));
+        source.http_queue_budget = Some(budget.clone());
+        tx.send((vec![Complex32::new(1.0, 0.0); 3], false, 0, 1, 915e6, 1e6))
+            .await
+            .unwrap();
+        let mut buffer = Vec::new();
+        assert_eq!(source.read_samples(&mut buffer, 3).await.unwrap(), 3);
+        assert_eq!(budget.available_permits(), 3);
+    }
+
+    /// The reader task queues samples only within its allowance, however
+    /// many packet slots the channel still has: packet count alone bounds
+    /// nothing when the server chooses the packet size.
+    #[tokio::test]
+    async fn the_reader_task_queues_within_its_sample_allowance() {
+        let client = HttpEndpointsClient::new(
+            "http://localhost:54664".to_string(),
+            crate::http_endpoints::AuthMethod::None,
+        )
+        .unwrap();
+        let mut engine = HttpStreamEngine::new(EngineOptions {
+            stream_client: client.clone(),
+            control_client: client,
+            params: HttpEndpointsClient::stream_params()
+                .format(crate::http_streaming::StreamFormat::Int16)
+                .build(),
+            listen_only: Arc::new(AtomicBool::new(false)),
+            reconnect: ReconnectPolicy {
+                attempts: Some(0),
+                ..RECONNECT
+            },
+            retune_on_reconnect: None,
+            streaming_control: false,
+        })
+        .unwrap();
+        let mut wire = wire_iq_packet(100.000, 100.001, 2);
+        wire.extend(wire_iq_packet(100.001, 100.002, 3));
+        wire.extend(wire_iq_packet(100.002, 100.003, 4));
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(4);
+        chunk_tx.try_send(bytes::Bytes::from(wire)).unwrap();
+        drop(chunk_tx);
+        engine.attach(chunk_rx);
+
+        // Room for the first two packets (2 + 3 samples), not the third.
+        let budget = Arc::new(tokio::sync::Semaphore::new(5));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(forward_http_stream(
+            engine,
+            tx,
+            Arc::new(Mutex::new(ObservedStream::default())),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            budget.clone(),
+        ));
+        assert_eq!(rx.recv().await.unwrap().0.len(), 2);
+        assert_eq!(rx.recv().await.unwrap().0.len(), 3);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "eight slots are free, but the sample allowance is spent"
+        );
+        // The reads took those five samples.
+        budget.add_permits(5);
+        let third = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("room again");
+        assert_eq!(third.unwrap().0.len(), 4);
+        task.await.unwrap();
+    }
+
     /// One int16 IQ packet as the wire carries it.
     fn wire_iq_packet(start: f64, end: f64, pairs: usize) -> Vec<u8> {
         let mut out = format!(
@@ -3856,6 +4110,7 @@ mod tests {
             tx,
             Arc::new(Mutex::new(ObservedStream::default())),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(tokio::sync::Semaphore::new(HTTP_QUEUE_SAMPLES)),
         )
         .await;
         let mut delivered = Vec::new();

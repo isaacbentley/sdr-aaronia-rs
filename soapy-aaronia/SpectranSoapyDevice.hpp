@@ -114,6 +114,11 @@ public:
     SoapySDR::ArgInfo getSensorInfo(const std::string &name) const override;
     std::string readSensor(const std::string &name) const override;
 
+    // The TX gain range getGainRange(TX) advertises and setGain(TX) and
+    // the `tx_gain` device argument enforce.
+    static constexpr double kTxGainMinDb = -50.0;
+    static constexpr double kTxGainMaxDb = 10.0;
+
 private:
     SpectranSource *_source;
     SpectranSink *_sink;
@@ -126,7 +131,11 @@ private:
     double _centerFrequency;
     double _txCenterFrequency;
     double _sampleRate;    // RX sample rate
-    double _txSampleRate;  // TX sample rate (defaults to RX rate)
+    // TX centre, rate and gain as the sink holds them: seeded from
+    // spectran_sink_get_config at construction and updated only by a TX
+    // setter that succeeded, so the getters report what a burst will
+    // actually be sent with. `_txSampleRate` is 0 only without a sink.
+    double _txSampleRate;
     double _referenceLevel;
     double _txGain;
     // Per-direction stream state. RX and TX streams are distinct

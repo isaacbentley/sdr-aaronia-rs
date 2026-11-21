@@ -45,14 +45,6 @@ SpectranSoapyDevice::SpectranSoapyDevice(SpectranSource* source, SpectranSink* s
         throw std::runtime_error("SpectranSoapyDevice initialized with null source pointer");
     }
 
-    if (args.count("tx_gain") != 0) {
-        try {
-            const double g = std::stod(args.at("tx_gain"));
-            if (std::isfinite(g)) _txGain = g;
-        } catch (const std::exception &) {
-        }
-    }
-
     // The URL the source streams from, for the standalone sensor client
     // built lazily on first sensor read (HTTP backend only). Defaults to
     // the RTSA server's own default when the caller named none.
@@ -70,6 +62,20 @@ SpectranSoapyDevice::SpectranSoapyDevice(SpectranSource* source, SpectranSink* s
         _referenceLevel = info->reference_level_dbm;
         _sourceType = info->source_type;
         spectran_source_info_free(info);
+    }
+
+    // What the transmitter will actually use, read from the sink itself:
+    // its builder defaults (1 GHz, 10 MS/s) differ from the receiver's
+    // tuning unless `freq=`/`rate=` set both. Reporting the receiver's
+    // centre for TX would let an application read getFrequency(TX), find
+    // the frequency it wants and transmit a band away.
+    if (_sink) {
+        double txHz = 0.0, txRate = 0.0, txGain = 0.0;
+        if (spectran_sink_get_config(_sink, &txHz, &txRate, &txGain)) {
+            _txCenterFrequency = txHz;
+            _txSampleRate = txRate;
+            _txGain = txGain;
+        }
     }
 
     // Two RX channels exist only when this source was built for dual
@@ -502,19 +508,22 @@ int SpectranSoapyDevice::writeStream(
     const size_t cappedElems = std::min(numElems, static_cast<size_t>(std::numeric_limits<int>::max()));
     if (cappedElems > 0 && (!buffs || !buffs[0])) return SOAPY_SDR_STREAM_ERROR;
 
+    // Burst timing is in the device's master-stream clock domain; a
+    // caller-provided epoch timeNs cannot be mapped onto it without a
+    // clock-transfer step this plugin does not implement, so a timed
+    // burst is refused: sending it now would key the transmitter at
+    // once for an application that scheduled a later slot. Nothing is
+    // sent and the burst state is left as it was.
+    if (flags & SOAPY_SDR_HAS_TIME) {
+        SoapySDR::logf(SOAPY_SDR_ERROR,
+                       "writeStream: timed TX (SOAPY_SDR_HAS_TIME) is not supported; "
+                       "nothing was transmitted");
+        return SOAPY_SDR_NOT_SUPPORTED;
+    }
+
     std::lock_guard<std::mutex> lock(_mutex);
     if (!_sink || !_txSetup || !_txActive) {
         return SOAPY_SDR_STREAM_ERROR;
-    }
-
-    // Burst timing is in the device's master-stream clock domain; a
-    // caller-provided epoch timeNs cannot be mapped onto it without a
-    // clock-transfer step this plugin does not implement, so timed
-    // bursts are refused rather than transmitted at the wrong time.
-    if (flags & SOAPY_SDR_HAS_TIME) {
-        SoapySDR::logf(SOAPY_SDR_WARNING,
-                       "writeStream: timed TX (SOAPY_SDR_HAS_TIME) is not supported; "
-                       "samples are scheduled on the device master stream clock");
     }
 
     const double rate = _txSampleRate > 0.0 ? _txSampleRate : _sampleRate;
@@ -739,20 +748,25 @@ void SpectranSoapyDevice::setFrequency(const int direction, const size_t channel
     (void)channel;
     (void)name;
     (void)args;
-    if (!std::isfinite(frequency) || frequency <= 0.0) return;
-    std::lock_guard<std::mutex> lock(_mutex);
-
     if (direction == SOAPY_SDR_TX) {
-        if (!_sink) return;
-        SpectranFfiError err = spectran_sink_set_center_frequency_hz(_sink, frequency);
-        if (err == Success) {
-            _txCenterFrequency = frequency;
-        } else {
-            SoapySDR::logf(SOAPY_SDR_ERROR, "setFrequency(TX) failed: %s",
-                           lastErrorOr("unknown error").c_str());
+        // A TX setter that fails throws: the next writeStream would
+        // otherwise transmit on the previous frequency while the
+        // application believes it retuned.
+        if (!std::isfinite(frequency) || frequency <= 0.0) {
+            throw std::invalid_argument("setFrequency(TX): frequency must be finite and positive");
         }
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_sink) {
+            throw std::runtime_error("setFrequency(TX): this device has no transmit path");
+        }
+        if (spectran_sink_set_center_frequency_hz(_sink, frequency) != Success) {
+            throw std::runtime_error("setFrequency(TX) failed: " + lastErrorOr("unknown error"));
+        }
+        _txCenterFrequency = frequency;
         return;
     }
+    if (!std::isfinite(frequency) || frequency <= 0.0) return;
+    std::lock_guard<std::mutex> lock(_mutex);
     if (direction != SOAPY_SDR_RX) return;
 
     SpectranFfiError err = spectran_source_set_center_frequency_hz(_source, frequency);
@@ -801,23 +815,24 @@ SoapySDR::RangeList SpectranSoapyDevice::getFrequencyRange(const int direction, 
 
 void SpectranSoapyDevice::setSampleRate(const int direction, const size_t channel, const double rate) {
     (void)channel;
-    if (!std::isfinite(rate) || rate <= 0.0) return;
-    std::lock_guard<std::mutex> lock(_mutex);
-
     if (direction == SOAPY_SDR_TX) {
+        // Throws rather than logs, as setFrequency(TX) does and for the
+        // same reason: bursts are timed and labelled with this rate.
+        if (!std::isfinite(rate) || rate <= 0.0) {
+            throw std::invalid_argument("setSampleRate(TX): rate must be finite and positive");
+        }
+        std::lock_guard<std::mutex> lock(_mutex);
         if (!_sink) {
-            _txSampleRate = rate;
-            return;
+            throw std::runtime_error("setSampleRate(TX): this device has no transmit path");
         }
-        SpectranFfiError err = spectran_sink_set_sample_rate_hz(_sink, rate);
-        if (err == Success) {
-            _txSampleRate = rate;
-        } else {
-            SoapySDR::logf(SOAPY_SDR_ERROR, "setSampleRate(TX) failed: %s",
-                           lastErrorOr("unknown error").c_str());
+        if (spectran_sink_set_sample_rate_hz(_sink, rate) != Success) {
+            throw std::runtime_error("setSampleRate(TX) failed: " + lastErrorOr("unknown error"));
         }
+        _txSampleRate = rate;
         return;
     }
+    if (!std::isfinite(rate) || rate <= 0.0) return;
+    std::lock_guard<std::mutex> lock(_mutex);
     if (direction != SOAPY_SDR_RX) return;
 
     // Snap to a rate the device can actually produce. It decimates a
@@ -937,20 +952,29 @@ std::vector<std::string> SpectranSoapyDevice::listGains(const int direction, con
 void SpectranSoapyDevice::setGain(const int direction, const size_t channel, const std::string &name, const double value) {
     (void)channel;
     (void)name;
-    if (!std::isfinite(value)) return;
-    std::lock_guard<std::mutex> lock(_mutex);
-
     if (direction == SOAPY_SDR_TX) {
-        if (!_sink) return;
-        SpectranFfiError err = spectran_sink_set_trans_gain_db(_sink, value);
-        if (err == Success) {
-            _txGain = value;
-        } else {
-            SoapySDR::logf(SOAPY_SDR_ERROR, "setGain(PA) failed: %s",
-                           lastErrorOr("unknown error").c_str());
+        // The range getGainRange(TX) advertises is enforced here. The
+        // device's own `main/transgain` range is checked again by the
+        // library when the transmitter is configured. Throws rather than
+        // logs: a failed gain change must not leave the application
+        // transmitting at the old power believing it lowered it.
+        if (!std::isfinite(value) || value < kTxGainMinDb || value > kTxGainMaxDb) {
+            throw std::invalid_argument(
+                "setGain(PA): gain must be between " + std::to_string(kTxGainMinDb) +
+                " and " + std::to_string(kTxGainMaxDb) + " dB");
         }
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_sink) {
+            throw std::runtime_error("setGain(PA): this device has no transmit path");
+        }
+        if (spectran_sink_set_trans_gain_db(_sink, value) != Success) {
+            throw std::runtime_error("setGain(PA) failed: " + lastErrorOr("unknown error"));
+        }
+        _txGain = value;
         return;
     }
+    if (!std::isfinite(value)) return;
+    std::lock_guard<std::mutex> lock(_mutex);
     if (direction != SOAPY_SDR_RX) return;
 
     // NOTE: "gain" here is the Aaronia *reference level* in dBm, not an
@@ -980,7 +1004,7 @@ SoapySDR::Range SpectranSoapyDevice::getGainRange(const int direction, const siz
     (void)channel;
     (void)name;
     if (direction == SOAPY_SDR_TX) {
-        return SoapySDR::Range(-50.0, 10.0, 0.5);
+        return SoapySDR::Range(kTxGainMinDb, kTxGainMaxDb, 0.5);
     }
     // Reference level in dBm, as reflevel0 declares it. A V6 ECO says
     // -55 to +23; the constant said -100 to +10, so an application's

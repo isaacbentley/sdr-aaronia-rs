@@ -872,6 +872,120 @@ struct RtsaMetadataBuilder<'a> {
     stream_offset: Option<u64>,
 }
 
+/// Fail with `UnexpectedEof` unless `bytes` more bytes exist past the
+/// reader's position — checked *before* a buffer is sized from them.
+///
+/// Sample counts and chunk sizes come from the file's own headers, and a
+/// chunk header can declare 4 GiB in a file of a few hundred bytes. The
+/// bulk readers allocate what they are asked for and only then find out, in
+/// `read_exact`, that it is not there. This is the same error they would
+/// have returned, without the allocation in front of it. The length is the
+/// file's as it is now, so a recording still being written reads as far as
+/// it has got.
+fn ensure_file_holds(reader: &mut std::io::BufReader<std::fs::File>, bytes: u64) -> Result<()> {
+    let position = reader.stream_position()?;
+    let length = reader.get_ref().metadata()?.len();
+    ensure_span_within(position, length, bytes)
+}
+
+/// The arithmetic of [`ensure_file_holds`].
+fn ensure_span_within(position: u64, length: u64, bytes: u64) -> Result<()> {
+    let available = length.saturating_sub(position);
+    if bytes > available {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "the file declares {bytes} bytes of samples at offset {position}, but only \
+                 {available} remain"
+            ),
+        )));
+    }
+    Ok(())
+}
+
+/// Output `RTSAFileTool` may write for an input of `input_bytes`: 64 times
+/// the input, and never less than 256 MiB.
+///
+/// The tool is run on a file this process has not vetted beyond its chunk
+/// headers, and what it writes lands in the temp directory. The ratio is far
+/// beyond any real IQ compression, so it only ever stops an output that has
+/// stopped being a decompression of its input.
+fn file_tool_output_limit(input_bytes: u64) -> u64 {
+    const FLOOR: u64 = 256 * 1024 * 1024;
+    input_bytes.saturating_mul(64).max(FLOOR)
+}
+
+/// How long `RTSAFileTool` may run on an input of `input_bytes`: a minute,
+/// plus a second per MiB.
+fn file_tool_timeout(input_bytes: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(60 + input_bytes / (1024 * 1024))
+}
+
+/// `path` as an argument for an external tool: absolute, so that it cannot
+/// be read as an option. A relative file name is the caller's, but nothing
+/// stops it beginning with `-`, and `RTSAFileTool repair -compress=0
+/// -x.rtsa out` hands the tool a switch where it expects its input.
+/// Lexical, not `canonicalize`: no symlink is resolved, and on Windows the
+/// result keeps its ordinary form rather than gaining a `\\?\` prefix the
+/// tool may not accept.
+fn tool_path_argument(path: &Path) -> Result<std::path::PathBuf> {
+    Ok(std::path::absolute(path)?)
+}
+
+/// Run `command` to completion, killing it if it outlives `timeout` or
+/// `output` grows past `max_output_bytes`.
+///
+/// `Command::status` waits for as long as the child cares to run and lets
+/// it write as much as the disk will hold; the child here is a closed-source
+/// parser working on an untrusted file.
+fn run_file_tool(
+    command: &mut std::process::Command,
+    output: &Path,
+    max_output_bytes: u64,
+    timeout: std::time::Duration,
+) -> Result<std::process::ExitStatus> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    let output_bytes = || std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+    let too_large = |written: u64| Error::FileFormat {
+        offset: 0,
+        reason: format!(
+            "RTSAFileTool wrote {written} bytes, past the {max_output_bytes} byte limit for \
+             this input; stopped"
+        ),
+    };
+
+    let mut child = command.stdin(std::process::Stdio::null()).spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            // It may have finished between two looks at the file.
+            let written = output_bytes();
+            if written > max_output_bytes {
+                return Err(too_large(written));
+            }
+            return Ok(status);
+        }
+        let written = output_bytes();
+        let stop = if written > max_output_bytes {
+            Some(too_large(written))
+        } else if std::time::Instant::now() >= deadline {
+            Some(Error::FileFormat {
+                offset: 0,
+                reason: format!("RTSAFileTool did not finish within {timeout:?}; stopped"),
+            })
+        } else {
+            None
+        };
+        if let Some(error) = stop {
+            // Best effort: it may have exited on its own in the meantime.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 /// Aaronia RTSA file source
 pub struct RtsaSource {
     reader: std::io::BufReader<std::fs::File>,
@@ -997,12 +1111,19 @@ impl RtsaSource {
                 .into_temp_path();
 
             tracing::info!("DSPT_IQ compression detected. Executing RTSAFileTool to decompress...");
-            let status = std::process::Command::new(&tool_path)
-                .arg("repair")
-                .arg("-compress=0")
-                .arg(path.as_ref())
-                .arg(&new_temp_path)
-                .status()?;
+            // Bounded in time and in what it may write, and given its input
+            // as an absolute path: see `run_file_tool` and
+            // `tool_path_argument`.
+            let status = run_file_tool(
+                std::process::Command::new(&tool_path)
+                    .arg("repair")
+                    .arg("-compress=0")
+                    .arg(tool_path_argument(path.as_ref())?)
+                    .arg(&new_temp_path),
+                &new_temp_path,
+                file_tool_output_limit(file_size),
+                file_tool_timeout(file_size),
+            )?;
 
             if !status.success() {
                 return Err(Error::FileFormat {
@@ -1773,6 +1894,7 @@ impl RtsaSource {
         self.reader.seek(SeekFrom::Start(sample_byte_offset))?;
 
         // Read the raw float32 IQ data in one bulk read + decode.
+        ensure_file_holds(&mut self.reader, (samples_to_read as u64).saturating_mul(8))?;
         let samples = read_iq_f32(&mut self.reader, samples_to_read)?;
 
         // Update current position
@@ -2179,6 +2301,10 @@ impl RtsaSource {
                                                 ),
                                             });
                                         }
+                                        ensure_file_holds(
+                                            &mut self.reader,
+                                            u64::from(to_read) * 8,
+                                        )?;
                                         let samples =
                                             read_iq_f32(&mut self.reader, to_read as usize)?;
                                         Some(SampleData::Iq(samples))
@@ -2194,6 +2320,10 @@ impl RtsaSource {
                                         // ADC-normalised default 1 / 32768.
                                         let scale = self
                                             .int16_scale_for_sub_stream(samp_chunk.sub_stream_id);
+                                        ensure_file_holds(
+                                            &mut self.reader,
+                                            u64::from(to_read) * 4,
+                                        )?;
                                         let samples =
                                             read_iq_i16(&mut self.reader, to_read as usize, scale)?;
                                         Some(SampleData::Iq(samples))
@@ -2278,6 +2408,10 @@ impl RtsaSource {
                                             // `sample_size` bins.
                                             let bins =
                                                 to_read as usize * samp_chunk.sample_size as usize;
+                                            ensure_file_holds(
+                                                &mut self.reader,
+                                                (bins as u64).saturating_mul(4),
+                                            )?;
                                             let samples = read_f32_vec(&mut self.reader, bins)?;
                                             Some(SampleData::Spectra(samples))
                                         }
@@ -5177,5 +5311,130 @@ mod tests {
             ..chunk
         };
         assert_eq!(iq.sample_position(100, 3).unwrap(), (24, 188));
+    }
+}
+
+#[cfg(test)]
+mod untrusted_file_bounds_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A read is refused, with the error `read_exact` would have given,
+    /// before anything is allocated for bytes the file does not hold.
+    #[test]
+    fn a_read_the_file_cannot_satisfy_is_refused_before_allocating() {
+        assert!(ensure_span_within(0, 100, 100).is_ok());
+        assert!(ensure_span_within(10, 100, 90).is_ok());
+        assert!(ensure_span_within(10, 100, 91).is_err());
+        assert!(
+            ensure_span_within(200, 100, 1).is_err(),
+            "past the end already"
+        );
+        assert!(ensure_span_within(0, 100, u64::MAX).is_err());
+        assert!(ensure_span_within(200, 100, 0).is_ok(), "nothing to read");
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&[0u8; 16]).unwrap();
+        file.flush().unwrap();
+        let mut reader = std::io::BufReader::new(std::fs::File::open(file.path()).unwrap());
+        reader.seek(SeekFrom::Start(8)).unwrap();
+        ensure_file_holds(&mut reader, 8).unwrap();
+        // A chunk header's 4 GiB, in a 16-byte file.
+        let error = ensure_file_holds(&mut reader, 4 << 30).unwrap_err();
+        assert!(
+            matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{error:?}"
+        );
+        assert_eq!(
+            reader.stream_position().unwrap(),
+            8,
+            "the check does not move the reader"
+        );
+        // And the reader still reads what is there.
+        assert_eq!(read_iq_f32(&mut reader, 1).unwrap().len(), 1);
+    }
+
+    /// A file name that looks like an option reaches the tool as a path.
+    #[test]
+    fn a_tool_path_argument_cannot_be_read_as_an_option() {
+        for name in ["-compress=9.rtsa", "--help", "-", "capture.rtsa"] {
+            let argument = tool_path_argument(Path::new(name)).unwrap();
+            assert!(argument.is_absolute(), "{argument:?}");
+            assert!(!argument.to_string_lossy().starts_with('-'), "{argument:?}");
+            assert_eq!(argument.file_name().unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn the_tool_limits_scale_with_the_input() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(file_tool_output_limit(0), 256 * MIB);
+        assert_eq!(file_tool_output_limit(MIB), 256 * MIB);
+        assert_eq!(file_tool_output_limit(1024 * MIB), 64 * 1024 * MIB);
+        assert_eq!(file_tool_output_limit(u64::MAX), u64::MAX);
+        assert_eq!(file_tool_timeout(0), std::time::Duration::from_secs(60));
+        assert_eq!(
+            file_tool_timeout(600 * MIB),
+            std::time::Duration::from_secs(660)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_finishes_in_bounds_reports_its_status() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let ok = run_file_tool(
+            &mut std::process::Command::new("true"),
+            output.path(),
+            1024,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(ok.success());
+        let failed = run_file_tool(
+            &mut std::process::Command::new("false"),
+            output.path(),
+            1024,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(!failed.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_outlives_its_timeout_is_killed() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let started = std::time::Instant::now();
+        let error = run_file_tool(
+            std::process::Command::new("sleep").arg("60"),
+            output.path(),
+            1024,
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("did not finish"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_writes_past_its_limit_is_killed() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let started = std::time::Instant::now();
+        // Writes 64 KiB where 1 KiB is allowed, then lingers.
+        let error = run_file_tool(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(r#"head -c 65536 /dev/zero > "$1"; exec sleep 60"#)
+                .arg("sh")
+                .arg(output.path()),
+            output.path(),
+            1024,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("byte limit"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 }

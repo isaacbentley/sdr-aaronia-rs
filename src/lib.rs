@@ -56,6 +56,7 @@ pub mod http_source;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub mod http_streaming;
+pub mod kwargs;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub mod link_budget;

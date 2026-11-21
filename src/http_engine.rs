@@ -41,8 +41,8 @@ use crate::http_streaming::{
 };
 use crate::{Error, Result};
 use bytes::Bytes;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::Instant;
@@ -59,6 +59,15 @@ use tracing::{debug, error, info, warn};
 /// 64 KiB a chunk (71% of them; 32 KiB for most of the rest), so the queue
 /// holds roughly 4 MB — about 45 ms at the 88 MB/s a WiFi 6E path delivers.
 pub(crate) const CHUNK_CHANNEL_DEPTH: usize = 64;
+
+/// How long the engine waits for one of its `/control` streaming switches.
+///
+/// They are best effort — a failure is logged and the stream is opened
+/// anyway — and they run inside [`HttpStreamEngine::next_chunks`] whatever
+/// wait its caller asked for. Left on the control plane's 30 s timeout, a
+/// server that accepts `/control` and never answers held a FutureSDR `work()`
+/// for a minute per reconnect (the stop, then the start).
+pub(crate) const STREAMING_SWITCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How a front-end reconnects after its stream is lost.
 ///
@@ -128,8 +137,9 @@ impl Backoff {
 /// Tuning lives on the device, not the stream, so a plain reconnect usually
 /// keeps it — but an RTSA-Suite that restarted comes back on its mission's
 /// frequency, and the stream would silently deliver the wrong band. The owner
-/// shares this with whatever retunes it, so a reconnect restores the *current*
-/// tuning rather than whatever was configured at startup.
+/// shares this with whatever retunes it (see [`SharedTuning`]), so a reconnect
+/// restores the *current* tuning rather than whatever was configured at
+/// startup.
 // Only `SpectranSource` constructs one; a FutureSDR-only build has no use
 // for it beyond the engine's `None`.
 #[cfg_attr(not(feature = "file"), allow(dead_code))]
@@ -155,6 +165,20 @@ impl CaptureTuning {
     }
 }
 
+/// The tuning an owner has *applied* to the device, shared with the engine.
+///
+/// - `None` until a capture write has succeeded. An owner that started
+///   listening only has written nothing, so there is nothing of its own to
+///   restore: a reconnect after listen-only is switched off must not push a
+///   configuration the caller never applied onto a shared analyser.
+/// - An async mutex, held across the `/control` write by the owner's setters
+///   and by the engine's reconnect alike. That serialises the two writers:
+///   the engine cannot copy a tuning, lose the race to a setter, and then
+///   land its stale copy last. And because a setter stores the new value only
+///   once its write has succeeded, a failed retune leaves this — and so the
+///   next reconnect — on what the device was last told.
+pub(crate) type SharedTuning = Arc<tokio::sync::Mutex<Option<CaptureTuning>>>;
+
 /// What a front-end tells the engine when it builds one.
 pub(crate) struct EngineOptions {
     /// Opens `/stream`. A separate client from `control` only so a front-end
@@ -170,8 +194,9 @@ pub(crate) struct EngineOptions {
     pub(crate) listen_only: Arc<AtomicBool>,
     pub(crate) reconnect: ReconnectPolicy,
     /// Tuning to re-apply, as a full `/control` capture tuple, before every
-    /// reconnect attempt; `None` to leave the device's tuning alone.
-    pub(crate) retune_on_reconnect: Option<Arc<Mutex<CaptureTuning>>>,
+    /// reconnect attempt; `None` to leave the device's tuning alone. Nothing
+    /// is written while the shared value is itself `None`.
+    pub(crate) retune_on_reconnect: Option<SharedTuning>,
     /// Write `/control` streaming start before each open and stop after each
     /// connection ends.
     pub(crate) streaming_control: bool,
@@ -387,8 +412,10 @@ pub(crate) struct HttpStreamEngine {
     control_client: HttpEndpointsClient,
     params: StreamParams,
     listen_only: Arc<AtomicBool>,
-    retune_on_reconnect: Option<Arc<Mutex<CaptureTuning>>>,
+    retune_on_reconnect: Option<SharedTuning>,
     streaming_control: bool,
+    /// [`STREAMING_SWITCH_TIMEOUT`], shortened by tests.
+    switch_timeout: Duration,
     decoder: StreamDecoder,
     backoff: Backoff,
     link: Link,
@@ -412,6 +439,7 @@ impl HttpStreamEngine {
             listen_only: options.listen_only,
             retune_on_reconnect: options.retune_on_reconnect,
             streaming_control: options.streaming_control,
+            switch_timeout: STREAMING_SWITCH_TIMEOUT,
             backoff: Backoff::new(options.reconnect),
             link: Link::Down {
                 due: Instant::now(),
@@ -524,23 +552,29 @@ impl HttpStreamEngine {
     /// On failure the next attempt is scheduled, spending budget.
     async fn attempt(&mut self) -> Result<()> {
         let reconnecting = std::mem::replace(&mut self.attempted, true);
-        if reconnecting
-            && !self.listen_only()
-            && let Some(tuning) = &self.retune_on_reconnect
-        {
-            // Best effort: a wrongly tuned stream is still more useful than
-            // none, and the next attempt tries again.
-            let desired = *tuning.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = self
-                .control_client
-                .configure_capture(desired.control())
-                .await
+        if reconnecting && let Some(tuning) = self.retune_on_reconnect.clone() {
+            // Held across the write, as the owner's setters hold it across
+            // theirs: whichever runs second sees what the first applied, so
+            // a stale copy can never be the last write. See `SharedTuning`.
+            let applied = tuning.lock().await;
+            // Read after the wait for the lock, so a listen-only switch made
+            // while a setter held it is honoured.
+            if !self.listen_only()
+                && let Some(desired) = *applied
             {
-                warn!("Re-applying tuning before reconnecting failed: {e}");
+                // Best effort: a wrongly tuned stream is still more useful
+                // than none, and the next attempt tries again.
+                if let Err(e) = self
+                    .control_client
+                    .configure_capture(desired.control())
+                    .await
+                {
+                    warn!("Re-applying tuning before reconnecting failed: {e}");
+                }
             }
         }
         if self.streaming_control && !self.listen_only() {
-            match self.control_client.control_streaming(true).await {
+            match self.streaming_switch(true).await {
                 Ok(()) => info!("Started streaming via control endpoint"),
                 Err(e) => {
                     debug!("Could not control streaming (device may already be streaming): {e}")
@@ -571,33 +605,67 @@ impl HttpStreamEngine {
         }
     }
 
+    /// One `/control` streaming switch, bounded by the engine's own timeout
+    /// rather than the control plane's. See [`STREAMING_SWITCH_TIMEOUT`].
+    async fn streaming_switch(&self, start: bool) -> Result<()> {
+        match tokio::time::timeout(
+            self.switch_timeout,
+            self.control_client.control_streaming(start),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "no answer to the /control streaming switch within {:?}",
+                    self.switch_timeout
+                ),
+            ))),
+        }
+    }
+
     /// End the current connection and schedule the next one.
+    ///
+    /// Cancel-safe: the next attempt is scheduled, and the budget spent,
+    /// before the one `await` — the stop write. A caller that drops this
+    /// future there (a `select!` or a timeout around
+    /// [`Self::next_chunks`]) leaves an engine that reconnects, where
+    /// parking a placeholder state across the write left one that had
+    /// finished for good without a word.
     async fn end_connection(&mut self) {
-        let healthy = match std::mem::replace(&mut self.link, Link::Finished) {
-            Link::Up(connection) | Link::Broken(connection) => {
-                // Released now rather than after the backoff: a stalled
-                // connection still holds a server slot.
-                let healthy = connection.opened.elapsed() >= self.backoff.policy.healthy_after;
-                drop(connection);
-                self.after_disconnect().await;
-                healthy
-            }
+        let connection = match std::mem::replace(
+            &mut self.link,
+            Link::Down {
+                due: Instant::now(),
+            },
+        ) {
+            Link::Up(connection) | Link::Broken(connection) => connection,
             other => {
                 self.link = other;
                 return;
             }
         };
+        let healthy = connection.opened.elapsed() >= self.backoff.policy.healthy_after;
+        // Released now rather than after the backoff: a stalled connection
+        // still holds a server slot.
+        drop(connection);
         if healthy {
             self.backoff.reset();
         }
         self.retry_later();
+        self.after_disconnect().await;
     }
 
-    /// What every ended connection needs: the stop write, if the owner asked
-    /// for it, and a decoder ready for a new packet sequence.
+    /// What every ended connection needs: a decoder ready for a new packet
+    /// sequence and the stop write, if the owner asked for it.
+    ///
+    /// The decoder first, so that it is done whether or not the caller
+    /// stays for the write.
     async fn after_disconnect(&mut self) {
+        self.decoder.connection_replaced();
         if self.streaming_control && !self.listen_only() {
-            match self.control_client.control_streaming(false).await {
+            match self.streaming_switch(false).await {
                 Ok(()) => info!("Stopped streaming via control endpoint"),
                 Err(e) => debug!(
                     "Could not stop streaming via control endpoint (device may handle this \
@@ -605,7 +673,6 @@ impl HttpStreamEngine {
                 ),
             }
         }
-        self.decoder.connection_replaced();
     }
 
     /// Schedule the next attempt, or finish once the budget is spent.
@@ -645,13 +712,16 @@ impl HttpStreamEngine {
     /// End the current connection, if any — with the stop write, when the
     /// owner asked for one — and leave the next attempt due at once.
     pub(crate) async fn disconnect(&mut self) {
-        if let Link::Up(_) | Link::Broken(_) = self.link {
-            self.link = Link::Finished; // drops the connection
-            self.after_disconnect().await;
-        }
+        let was_connected = matches!(self.link, Link::Up(_) | Link::Broken(_));
+        // Before the stop write, not after it: this drops the connection,
+        // and a caller that abandons the write still has an engine whose
+        // next attempt is due. See `end_connection`.
         self.link = Link::Down {
             due: Instant::now(),
         };
+        if was_connected {
+            self.after_disconnect().await;
+        }
     }
 
     /// Replace the connection on request, for a retune that only a new
@@ -840,11 +910,11 @@ mod tests {
             listen_only: Arc::new(AtomicBool::new(listen_only)),
             reconnect,
             retune_on_reconnect: retune.then(|| {
-                Arc::new(Mutex::new(CaptureTuning {
+                Arc::new(tokio::sync::Mutex::new(Some(CaptureTuning {
                     center_frequency_hz: 915e6,
                     sample_rate_hz: 15.36e6,
                     reference_level_dbm: -20.0,
-                }))
+                })))
             }),
             streaming_control,
         })
@@ -1267,5 +1337,180 @@ mod tests {
             .expect("the stalled reader must give up, not hang");
         assert_eq!(ended, None, "the channel closes: the engine reconnects");
         reader.await.unwrap();
+    }
+
+    /// A `/control` that takes the connection and never answers.
+    async fn mount_hung_control(server: &MockServer) {
+        Mock::given(method("PUT"))
+            .and(path("/control"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({}))
+                    .set_delay(Duration::from_secs(60)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_one_packet_stream(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(iq_packet(100.0, 100.001, 4)))
+            .mount(server)
+            .await;
+    }
+
+    /// Dropping `next_chunks` while it writes the stop for an ended
+    /// connection must leave an engine that reconnects. Were
+    /// `Link::Finished` parked across that write, a caller's timeout there
+    /// would end the stream for good — and `HttpSource` reads `Finished` as
+    /// idle.
+    #[tokio::test]
+    async fn abandoning_the_stop_write_does_not_finish_the_engine() {
+        let server = MockServer::start().await;
+        mount_hung_control(&server).await;
+
+        let mut engine = engine_for(&server.uri(), FAST, false, false, true);
+        engine.switch_timeout = Duration::from_secs(60);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        engine.attach(rx);
+        drop(tx); // the connection ended
+
+        let abandoned =
+            tokio::time::timeout(Duration::from_millis(200), engine.next_chunks(None)).await;
+        assert!(abandoned.is_err(), "the stop write is still unanswered");
+        assert!(
+            matches!(engine.link, Link::Down { .. }),
+            "the next attempt is scheduled before the write, not after it"
+        );
+        assert!(
+            engine.decoder.reconnected,
+            "and the decoder is ready for a new connection"
+        );
+    }
+
+    /// The same for an explicit restart, which the FutureSDR block awaits
+    /// inside `work()`.
+    #[cfg(feature = "futuresdr")]
+    #[tokio::test]
+    async fn abandoning_a_restart_does_not_finish_the_engine() {
+        let server = MockServer::start().await;
+        mount_hung_control(&server).await;
+
+        let mut engine = engine_for(&server.uri(), FAST, false, false, true);
+        engine.switch_timeout = Duration::from_secs(60);
+        let (_tx, rx) = tokio::sync::mpsc::channel(4);
+        engine.attach(rx);
+
+        let abandoned = tokio::time::timeout(Duration::from_millis(200), engine.restart()).await;
+        assert!(abandoned.is_err(), "the stop write is still unanswered");
+        assert!(matches!(engine.link, Link::Down { .. }));
+    }
+
+    /// The streaming switches are best effort and bounded by the engine's
+    /// own short timeout: a `/control` that never answers delays the stream
+    /// by that, not by the control plane's 30 s per write.
+    #[tokio::test]
+    async fn a_hung_control_endpoint_does_not_hold_the_stream() {
+        let server = MockServer::start().await;
+        mount_one_packet_stream(&server).await;
+        mount_hung_control(&server).await;
+
+        let mut engine = engine_for(&server.uri(), FAST, false, false, true);
+        engine.switch_timeout = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        // Two connections: start, open, stop, start, open.
+        let events = decode_until(&mut engine, 2).await;
+        assert_eq!(kinds(&events), ["iq", "reconnect", "iq"]);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "three unanswered switches took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An owner that has applied no tuning — it started listening only —
+    /// has nothing to restore, so a reconnect writes none, even once
+    /// listen-only is off.
+    #[tokio::test]
+    async fn a_tuning_never_applied_is_not_written_on_reconnect() {
+        let server = MockServer::start().await;
+        mount_one_packet_stream(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/control"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let mut engine = engine_for(&server.uri(), FAST, false, true, false);
+        *engine
+            .retune_on_reconnect
+            .as_ref()
+            .unwrap()
+            .try_lock()
+            .unwrap() = None;
+        decode_until(&mut engine, 3).await;
+        let requests = requests(&server).await;
+        assert!(
+            requests
+                .iter()
+                .all(|(m, p, _)| m == "GET" && p == "/stream"),
+            "nothing was ever applied, so nothing is restored: {requests:?}"
+        );
+    }
+
+    /// The reconnect's re-tune and an owner's setter are serialised on the
+    /// shared tuning: the engine waits for a setter in flight and then
+    /// writes what that setter applied, so its write can never be a stale
+    /// copy landing last.
+    #[tokio::test]
+    async fn the_reconnect_retune_waits_for_a_setter_in_flight() {
+        let server = MockServer::start().await;
+        mount_one_packet_stream(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/control"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let mut engine = engine_for(&server.uri(), FAST, false, true, false);
+        let shared = engine.retune_on_reconnect.clone().unwrap();
+        assert_eq!(kinds(&decode_until(&mut engine, 1).await), ["iq"]);
+
+        // A setter mid-write: it holds the tuning across its PUT.
+        let mut setter = shared.lock().await;
+        let blocked = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if let Chunks::Got(_) = engine.next_chunks(None).await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(blocked.is_err(), "the reconnect waits for the setter");
+        assert!(
+            requests(&server).await.iter().all(|(m, _, _)| m == "GET"),
+            "and writes nothing while it waits"
+        );
+
+        // The setter's write succeeded: it records what it applied.
+        *setter = Some(CaptureTuning {
+            center_frequency_hz: 433e6,
+            sample_rate_hz: 15.36e6,
+            reference_level_dbm: -20.0,
+        });
+        drop(setter);
+        decode_until(&mut engine, 1).await;
+        let centres: Vec<f64> = requests(&server)
+            .await
+            .iter()
+            .filter(|(m, _, _)| m == "PUT")
+            .filter_map(|(_, _, body)| body["frequencyCenter"].as_f64())
+            .collect();
+        assert!(!centres.is_empty(), "the reconnect re-tuned");
+        assert!(
+            centres.iter().all(|&hz| hz == 433e6),
+            "only the setter's tuning is ever written: {centres:?}"
+        );
     }
 }
