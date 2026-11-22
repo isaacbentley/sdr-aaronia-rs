@@ -88,7 +88,7 @@ impl std::fmt::Debug for AuthMethod {
 /// connection mid-flight (this bit us at 120 s). Control-plane calls add
 /// a per-request timeout instead.
 pub(crate) fn rtsa_client_builder(connect_timeout: std::time::Duration) -> reqwest::ClientBuilder {
-    Client::builder()
+    let builder = Client::builder()
         .connect_timeout(connect_timeout)
         .user_agent(crate::utils::user_agent())
         // Aggressive TCP optimizations for maximum throughput
@@ -106,13 +106,6 @@ pub(crate) fn rtsa_client_builder(connect_timeout: std::time::Duration) -> reqwe
         // whose ALPN offers only h2. Let ALPN negotiate; a direct RTSA TLS
         // endpoint still lands on HTTP/1.1.
         .http1_title_case_headers()
-        // And when ALPN does land on h2, do not let its flow control be
-        // the link: hyper's default 2 MiB stream window caps a stream at
-        // window / RTT (~84 MB/s at 25 ms, under the 123 MB/s a 30.72 MS/s
-        // int16 stream needs), which the link-budget check would then
-        // measure and blame on the path. The adaptive window sizes itself
-        // to the bandwidth-delay product instead.
-        .http2_adaptive_window(true)
         // RTSA-Suite servers sit on localhost or the operator's direct LAN;
         // routing loopback/LAN control or `/stream` requests through an
         // ambient HTTP_PROXY/ALL_PROXY breaks local connections and adds
@@ -125,7 +118,17 @@ pub(crate) fn rtsa_client_builder(connect_timeout: std::time::Duration) -> reqwe
         // and a redirected `/stream` quietly takes its IQ from somewhere
         // else, an `https://` URL downgraded to `http://` included. RTSA
         // never redirects; a 3xx is an error like any other non-success.
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    // And when ALPN does land on h2, do not let its flow control be the
+    // link: hyper's default 2 MiB stream window caps a stream at
+    // window / RTT (~84 MB/s at 25 ms, under the 123 MB/s a 30.72 MS/s
+    // int16 stream needs), which the link-budget check would then measure
+    // and blame on the path. The adaptive window sizes itself to the
+    // bandwidth-delay product instead. HTTP/2 is only ever negotiated
+    // over TLS here, so it is compiled with the `tls` feature.
+    #[cfg(feature = "tls")]
+    let builder = builder.http2_adaptive_window(true);
+    builder
 }
 
 /// `url` with any credentials in its authority (`user:password@`) replaced,
@@ -202,6 +205,10 @@ fn warn_if_credentials_in_clear(url: &url::Url, auth: &AuthMethod) {
 /// the host is not obviously local, since an RTSA server normally sits
 /// on the operator's own network.
 ///
+/// Without the crate's `tls` feature an `https` URL is refused here, where
+/// the message can name the feature, rather than failing inside `reqwest`
+/// on the first request.
+///
 /// The one copy of this check: `HttpSource` construction and the
 /// link-budget probe both call it, so a future tightening (scheme, host
 /// policy) cannot apply to one path and not the other.
@@ -211,7 +218,16 @@ pub(crate) fn validate_base_url(base_url: &str) -> Result<url::Url> {
     })?;
 
     match parsed_url.scheme() {
-        "http" | "https" => {}
+        "http" => {}
+        #[cfg(feature = "tls")]
+        "https" => {}
+        #[cfg(not(feature = "tls"))]
+        "https" => {
+            return Err(Error::Protocol(
+                "https:// URLs need this crate's `tls` feature, which this build left out"
+                    .to_string(),
+            ));
+        }
         _ => {
             return Err(Error::Protocol(format!(
                 "Only HTTP/HTTPS URLs are allowed, got: {}",
@@ -2779,6 +2795,35 @@ mod tests {
         let shown = error.to_string();
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(shown.contains("[REDACTED]"), "{shown}");
+    }
+
+    /// With the `tls` feature (a default one) an `https://` base URL is
+    /// accepted like an `http://` one.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn an_https_url_is_accepted_with_tls() {
+        let url = validate_base_url("https://rtsa-proxy.local:8443").expect("https with tls");
+        assert_eq!(url.scheme(), "https");
+        assert!(
+            HttpEndpointsClient::new("https://rtsa-proxy.local:8443".into(), AuthMethod::None)
+                .is_ok()
+        );
+    }
+
+    /// Without it there is no TLS in the build, and the refusal names the
+    /// feature when the client is built instead of failing inside
+    /// `reqwest` on the first request. Plain `http://` is unaffected.
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn an_https_url_is_refused_without_tls() {
+        let error = validate_base_url("https://rtsa-proxy.local:8443").unwrap_err();
+        assert!(error.to_string().contains("`tls` feature"), "{error}");
+        let error =
+            HttpEndpointsClient::new("https://rtsa-proxy.local:8443".into(), AuthMethod::None)
+                .err()
+                .expect("https without tls must be refused");
+        assert!(error.to_string().contains("`tls` feature"), "{error}");
+        assert!(validate_base_url("http://localhost:42664").is_ok());
     }
 
     /// `UserInfo` carries the session token; formatting it must not.

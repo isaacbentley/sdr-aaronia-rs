@@ -38,8 +38,11 @@ PROFILE="debug"
 # UB inside std (e.g. allocator code paths) is also caught.
 export RUSTFLAGS="-Z sanitizer=address"
 
-echo "==> cargo +nightly build --target $TARGET (ASAN-instrumented)"
-cargo +nightly build \
+# The manifest declares no `cdylib` (see the note above `[dependencies]`
+# in Cargo.toml), so the shared library is asked for here.
+echo "==> cargo +nightly rustc --lib --crate-type cdylib --target $TARGET (ASAN-instrumented)"
+cargo +nightly rustc \
+    --lib --crate-type cdylib \
     --target "$TARGET" \
     -Z build-std=panic_abort,std
 

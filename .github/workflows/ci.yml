@@ -26,7 +26,8 @@ name: CI
 # native-sdk) stay covered on stable, and the `nightly` job covers
 # `futuresdr`. A new Cargo feature goes into `STABLE_FEATURES` (and the
 # copies in scripts/ci-local.sh and release.yml's semver-checks step)
-# unless it needs nightly too.
+# unless it needs nightly too. `futuresdr-audio` (the NOAA example's
+# audio blocks) implies `futuresdr`, so it is on the nightly side with it.
 #
 # `cargo semver-checks` runs at release time (see release.yml), not here:
 # with `continue-on-error: true` it could never gate a merge, so running it
@@ -58,10 +59,11 @@ env:
   # via `gh workflow run ci.yml -f proptest_cases=4096` once dispatch
   # inputs are wired up. For now the default is fine for PRs.
   PROPTEST_CASES: "256"
-  # Every Cargo feature except `futuresdr`, which needs nightly (see the
-  # header). Steps expand it as `${{ env.STABLE_FEATURES }}`, not
-  # `$STABLE_FEATURES`, so it reads the same in the Windows legs' pwsh.
-  STABLE_FEATURES: "http,file,ffi,seify,native-sdk"
+  # Every Cargo feature except `futuresdr` and `futuresdr-audio`, which
+  # need nightly (see the header). Steps expand it as
+  # `${{ env.STABLE_FEATURES }}`, not `$STABLE_FEATURES`, so it reads the
+  # same in the Windows legs' pwsh.
+  STABLE_FEATURES: "http,file,ffi,tls,seify,native-sdk"
 
 jobs:
   test:
@@ -171,8 +173,9 @@ jobs:
       - name: cargo test --all-features
         run: cargo test --all-features
 
-      # The stable `hack` job excludes `futuresdr`; this is the remainder,
-      # `futuresdr` on its own (--no-default-features --features futuresdr).
+      # The stable `hack` job excludes `futuresdr` and `futuresdr-audio`;
+      # this is the remainder, each on its own
+      # (--no-default-features --features futuresdr, then futuresdr-audio).
       - name: Install cargo-hack
         if: runner.os == 'Linux'
         uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
@@ -182,8 +185,8 @@ jobs:
       - name: cargo hack (futuresdr alone)
         if: runner.os == 'Linux'
         run: |
-          cargo hack check --each-feature --no-dev-deps --include-features futuresdr
-          cargo hack check --each-feature --all-targets --include-features futuresdr
+          cargo hack check --each-feature --no-dev-deps --include-features futuresdr,futuresdr-audio
+          cargo hack check --each-feature --all-targets --include-features futuresdr,futuresdr-audio
 
   miri:
     name: Miri (decompression + http_streaming + utils)
@@ -259,13 +262,14 @@ jobs:
         with:
           tool: cargo-hack
 
-      # --exclude-features futuresdr: it needs nightly, so the `nightly`
-      # job checks it on its own. Excluding it also drops cargo-hack's
-      # --all-features run, which the `nightly` job's clippy covers.
+      # --exclude-features futuresdr,futuresdr-audio: they need nightly, so
+      # the `nightly` job checks them on their own. Excluding them also
+      # drops cargo-hack's --all-features run, which the `nightly` job's
+      # clippy covers. `http` on its own is the build without TLS.
       - name: cargo hack
         run: |
-          cargo hack check --each-feature --no-dev-deps --exclude-features futuresdr
-          cargo hack check --each-feature --all-targets --exclude-features futuresdr
+          cargo hack check --each-feature --no-dev-deps --exclude-features futuresdr,futuresdr-audio
+          cargo hack check --each-feature --all-targets --exclude-features futuresdr,futuresdr-audio
 
   machete:
     name: cargo-machete (unused dependencies)

@@ -4668,6 +4668,8 @@ mod tests {
         assert!(!built.engine.is_listen_only());
     }
 
+    // An `https://` URL: built only with the `tls` feature.
+    #[cfg(feature = "tls")]
     #[tokio::test]
     async fn test_complex_configuration_combinations() {
         // Test complex combinations of settings
@@ -4734,6 +4736,7 @@ mod tests {
         assert!(stats.buffer_level <= stats.buffer_capacity);
     }
 
+    #[cfg(feature = "tls")]
     #[tokio::test]
     async fn test_https_support() {
         // Test HTTPS URL support

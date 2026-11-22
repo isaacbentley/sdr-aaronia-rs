@@ -12,11 +12,16 @@ categories = ["hardware-support", "api-bindings", "science"]
 exclude = ["tests/*.rtsa", "tests/sdk/", "tests/asan/", ".github/"]
 
 [package.metadata.docs.rs]
-features = ["http", "file", "ffi", "native-sdk"]
+features = ["http", "file", "ffi", "tls", "native-sdk"]
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+# No `crate-type`: the library is an rlib, which is all a Rust dependent
+# links. Declaring `cdylib` and `staticlib` here made every build of this
+# crate, as a dependency too, also link a shared library and write a static
+# library holding every dependency and std (300 MB in a debug build), which
+# no Rust dependent uses. The C library is built on request instead:
+#   cargo rustc --release --lib --crate-type staticlib --crate-type cdylib
+# (soapy-aaronia/CMakeLists.txt and tests/asan/run_asan.sh do; PLUGINS.md).
 
 [dependencies]
 # `deflate`/`gzip`: the RTSA control plane compresses when asked and we
@@ -25,7 +30,13 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # every device open. RTSA-Suite's own HTTP Client sends
 # `Accept-Encoding: deflate`. Costs nothing on /stream, which the server
 # does not compress at any level.
-reqwest = { version = "0.13", features = ["blocking", "json", "stream", "deflate", "gzip"], optional = true }
+#
+# `default-features = false`: reqwest's defaults are TLS, HTTP/2, charset
+# decoding and system proxy detection. TLS and HTTP/2 are this crate's
+# `tls` feature (a default one). The other two were dead weight: every
+# client is built with `.no_proxy()`, and RTSA's bodies are read as bytes
+# or JSON, never through a charset. `blocking` was never used.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "deflate", "gzip"], optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 thiserror = "2.0"
@@ -33,7 +44,11 @@ bytes = { version = "1.12", optional = true }
 tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "macros"], optional = true }
 tracing = "0.1"
 url = { version = "2.5", optional = true }
-futuresdr = { version = "0.10", default-features = false, features = ["audio"], optional = true }
+# No `audio`: no block in this crate plays or records sound, and that
+# feature brings cpal, rodio and symphonia with every codec (31 to 39
+# crates, by platform) to whoever enables `futuresdr`. The one user is examples/noaa_scanner.rs,
+# through the `futuresdr-audio` feature.
+futuresdr = { version = "0.10", default-features = false, optional = true }
 futures = { version = "0.3", optional = true }
 byteorder = { version = "1.5", optional = true }
 bitflags = { version = "2.13", optional = true }
@@ -143,18 +158,27 @@ name = "wire_contract"
 required-features = ["http"]
 
 [features]
-default    = ["http", "file", "ffi"]
+default    = ["http", "file", "ffi", "tls"]
 http       = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json",
               "dep:url", "dep:bytes", "dep:futures", "dep:half"]
 file       = ["dep:byteorder", "dep:bitflags", "dep:tempfile"]
+# `https://` base URLs (an RTSA server behind a TLS-terminating proxy), and
+# HTTP/2 when that proxy's ALPN offers it: rustls with aws-lc, about 3 MB
+# of a linked binary. RTSA itself serves plain `http://`, so a build that
+# only reaches it directly can leave this out
+# (`default-features = false, features = ["http", "file"]`); an `https://`
+# URL is then refused when the client is built.
+tls        = ["http", "reqwest/rustls", "reqwest/http2"]
 futuresdr  = ["http", "dep:futuresdr", "dep:anyhow"]
+# FutureSDR's audio blocks, for examples/noaa_scanner.rs only.
+futuresdr-audio = ["futuresdr", "futuresdr/audio"]
 seify      = ["http", "file", "dep:seify"]
 ffi        = ["http", "file"]
 native-sdk = ["dep:libloading", "dep:widestring"]
 
 [[example]]
 name = "noaa_scanner"
-required-features = ["futuresdr", "http", "file"]
+required-features = ["futuresdr-audio", "http", "file"]
 
 [[example]]
 name = "native_sdk_basic"

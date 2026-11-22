@@ -75,11 +75,16 @@ println!("Read {} samples", read);
 
 ### Building the SoapySDR Plugin
 
-The plugin requires `cmake`, `SoapySDR`, and the compiled `sdr-aaronia-rs` static/dynamic library. 
+The plugin requires `cmake`, `SoapySDR` and a Rust toolchain.
 
-1. Ensure the Rust crate is built with the `ffi` feature (which is default).
+1. There is no separate cargo step: CMake builds the Rust static library
+   itself and links it into the module. The crate is an ordinary Rust
+   library (a plain `cargo build` produces no C library), so the build
+   asks for the archive by name. To link the C API (`include/spectran.h`)
+   into a program of your own, run the same command:
    ```bash
-   cargo build --release
+   cargo rustc --release --lib --crate-type staticlib   # target/release/libsdr_aaronia_rs.a (sdr_aaronia_rs.lib with MSVC)
+   cargo rustc --release --lib --crate-type cdylib      # the shared library instead
    ```
 
 2. Build the CMake project:

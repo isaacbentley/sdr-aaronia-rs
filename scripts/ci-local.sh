@@ -41,10 +41,10 @@ export PROPTEST_CASES="${PROPTEST_CASES:-256}"
 # together.
 MIRI_TOOLCHAIN=nightly-2026-01-01
 
-# ci.yml's STABLE_FEATURES (every feature except `futuresdr`; release.yml's
-# semver-checks step carries a copy too) and the `nightly` job's pinned
-# toolchain. Bump/extend them together.
-STABLE_FEATURES=http,file,ffi,seify,native-sdk
+# ci.yml's STABLE_FEATURES (every feature except `futuresdr` and
+# `futuresdr-audio`; release.yml's semver-checks step carries a copy too)
+# and the `nightly` job's pinned toolchain. Bump/extend them together.
+STABLE_FEATURES=http,file,ffi,tls,seify,native-sdk
 NIGHTLY_TOOLCHAIN=nightly-2026-11-21
 
 SKIP="${SKIP:-}"
@@ -129,13 +129,14 @@ fi
 # CI runs this on ubuntu + windows; on macOS --all-features silently
 # skips the native-sdk modules, SdkSinkBlock included (the vm step
 # covers the Linux side). The hack pair is CI's ubuntu-only remainder
-# of the stable hack job: `futuresdr` on its own.
+# of the stable hack job: `futuresdr` and `futuresdr-audio`, each on its
+# own.
 if ! skipped nightly; then
-    step "cargo clippy/test --all-features + hack (futuresdr alone) on $NIGHTLY_TOOLCHAIN"
+    step "cargo clippy/test --all-features + hack (futuresdr, futuresdr-audio alone) on $NIGHTLY_TOOLCHAIN"
     PATH="$(nightly_bin):$PATH" cargo clippy --workspace --all-features --all-targets -- -D warnings
     PATH="$(nightly_bin):$PATH" cargo test --all-features
-    PATH="$(nightly_bin):$PATH" cargo hack check --each-feature --no-dev-deps --include-features futuresdr
-    PATH="$(nightly_bin):$PATH" cargo hack check --each-feature --all-targets --include-features futuresdr
+    PATH="$(nightly_bin):$PATH" cargo hack check --each-feature --no-dev-deps --include-features futuresdr,futuresdr-audio
+    PATH="$(nightly_bin):$PATH" cargo hack check --each-feature --all-targets --include-features futuresdr,futuresdr-audio
 fi
 
 # ---- deny job ------------------------------------------------------
@@ -148,10 +149,11 @@ fi
 
 # ---- hack job ------------------------------------------------------
 if ! skipped hack; then
-    # futuresdr excluded: the nightly step checks it on its own.
-    step "cargo hack check --each-feature --exclude-features futuresdr (--no-dev-deps + --all-targets)"
-    cargo hack check --each-feature --no-dev-deps --exclude-features futuresdr
-    cargo hack check --each-feature --all-targets --exclude-features futuresdr
+    # futuresdr and futuresdr-audio excluded: the nightly step checks them
+    # on their own.
+    step "cargo hack check --each-feature --exclude-features futuresdr,futuresdr-audio (--no-dev-deps + --all-targets)"
+    cargo hack check --each-feature --no-dev-deps --exclude-features futuresdr,futuresdr-audio
+    cargo hack check --each-feature --all-targets --exclude-features futuresdr,futuresdr-audio
 fi
 
 # ---- machete job ---------------------------------------------------
@@ -210,8 +212,8 @@ if ! skipped vm; then
         # futuresdr + native-sdk, compiles). The pinned nightly is
         # installed per run too: --rm discards it with the container.
         # rust:slim lacks what the GitHub ubuntu runner image ships
-        # preinstalled: clippy, pkg-config, ALSA headers (futuresdr's
-        # audio feature -> alsa-sys), and python3 (pyo3's build script
+        # preinstalled: clippy, pkg-config, ALSA headers (the
+        # `futuresdr-audio` feature -> alsa-sys), and python3 (pyo3's build script
         # needs an interpreter for the --workspace clippy leg). Install
         # per run; the persistent target/ under $vm_dir keeps rebuilds
         # incremental.

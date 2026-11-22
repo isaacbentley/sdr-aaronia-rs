@@ -62,10 +62,12 @@ must be launched after `SOAPY_SDR_PLUGIN_PATH` is set.
 
 Requirements: CMake ≥ 3.14, a C++17 compiler, SoapySDR ≥ 0.7 with dev
 headers (`libsoapysdr-dev` / `brew install soapysdr` / vcpkg `soapysdr`),
-and a Rust toolchain. CMake invokes `cargo build --release --locked`
-itself, so the module is built with the dependency versions in the
-repository's `Cargo.lock`; pass `-DAARONIA_CARGO_LOCKED=OFF` only when you
-are changing dependencies.
+and a Rust toolchain. CMake invokes `cargo rustc --release --locked --lib
+--crate-type staticlib` itself, so the module is built with the dependency
+versions in the repository's `Cargo.lock`; pass `-DAARONIA_CARGO_LOCKED=OFF`
+only when you are changing dependencies. The link keeps only the code the
+module reaches, and a Release build leaves local symbol names out of it;
+`-DAARONIA_STRIP_MODULE=OFF` keeps them, for a backtrace with names.
 
 ```bash
 cmake -S soapy-aaronia -B soapy-aaronia/build -DCMAKE_BUILD_TYPE=Release

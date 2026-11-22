@@ -18,10 +18,13 @@
 //!
 //! ## Usage
 //!
+//! FutureSDR needs a nightly toolchain, and its audio blocks are this
+//! crate's `futuresdr-audio` feature:
+//!
 //! ```bash
-//! cargo run --example noaa_scanner
+//! cargo +nightly run --example noaa_scanner --features futuresdr-audio
 //! # Or specify a custom device:
-//! NOAA_DEVICE=http://192.168.1.100:42664 cargo run --example noaa_scanner
+//! NOAA_DEVICE=http://192.168.1.100:42664 cargo +nightly run --example noaa_scanner --features futuresdr-audio
 //! ```
 
 use anyhow::{Context, Result};

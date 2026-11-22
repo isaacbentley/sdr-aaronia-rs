@@ -69,7 +69,8 @@ jobs:
         with:
           tool: cargo-semver-checks
 
-      # Every feature except `futuresdr` (ci.yml's STABLE_FEATURES).
+      # Every feature except `futuresdr` and `futuresdr-audio` (ci.yml's
+      # STABLE_FEATURES).
       # semver-checks' default heuristic would enable `futuresdr` too, and
       # FutureSDR 0.10 builds only on nightly (E0554 on this stable
       # toolchain). Running this job on the pinned nightly instead does not
@@ -81,7 +82,7 @@ jobs:
         run: |
           baseline=$(git describe --tags --match 'v*' --abbrev=0 "$GITHUB_SHA^")
           cargo semver-checks check-release --baseline-rev "$baseline" \
-            --only-explicit-features --features http,file,ffi,seify,native-sdk
+            --only-explicit-features --features http,file,ffi,tls,seify,native-sdk
 
   validate:
     name: Release CI

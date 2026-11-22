@@ -7,6 +7,10 @@
 # ships a module with an absolute-path dependency on a build-machine
 # .so/.dylib that no release artifact contains, and the module can
 # never load on user machines.
+#
+# The crate's manifest declares no `staticlib` (a Rust dependent would
+# then write a 300 MB archive it never links on every build), so the
+# archive is asked for here, with `cargo rustc --crate-type staticlib`.
 cmake_minimum_required(VERSION 3.14)
 project(SoapyAaronia CXX)
 
@@ -73,7 +77,9 @@ endif()
 
 # Build (or refresh) the static lib with the FFI feature set. -p scopes
 # to the root crate so the workspace's python-aaronia member (a pyo3
-# extension) is not dragged into a C++ plugin build.
+# extension) is not dragged into a C++ plugin build. `cargo rustc --lib
+# --crate-type staticlib` is `cargo build` for the library alone, with the
+# archive as its output; it lands where `cargo build` used to put it.
 #
 # A custom *target*, not a custom command producing ${RUST_STATIC_LIB}.
 # The command form is file-driven: with no DEPENDS, CMake considers the
@@ -121,9 +127,9 @@ if (AARONIA_CARGO_LOCKED)
     set(CARGO_LOCKED --locked)
 endif()
 add_custom_target(sdr_aaronia_rs_static ALL
-    COMMAND cargo build --release ${CARGO_LOCKED} -p sdr-aaronia-rs --target-dir ${CARGO_TARGET_DIR} ${CARGO_FEATURES}
+    COMMAND cargo rustc --release ${CARGO_LOCKED} -p sdr-aaronia-rs --lib --crate-type staticlib --target-dir ${CARGO_TARGET_DIR} ${CARGO_FEATURES}
     WORKING_DIRECTORY ${CARGO_MANIFEST_DIR}
-    COMMENT "cargo build --release -p sdr-aaronia-rs (static lib for SoapyAaronia)"
+    COMMENT "cargo rustc --release -p sdr-aaronia-rs --crate-type staticlib (static lib for SoapyAaronia)"
     VERBATIM
 )
 
@@ -134,12 +140,60 @@ set(AaroniaSupport_SOURCES
 )
 
 # Build SoapySDR module
-SOAPY_SDR_MODULE_UTIL(
-    TARGET aaroniaSupport
-    SOURCES ${AaroniaSupport_SOURCES}
-    LIBRARIES ${RUST_STATIC_LIB}
-)
+#
+# Keep only what the module can reach. The Rust archive holds the whole
+# crate, every dependency and std, and the plugin calls part of the C
+# API. Two things kept nearly all of it in the module: nothing asked the
+# linker to drop unreferenced code, and every symbol in the archive is
+# global, so the module exported some 9,700 Rust and aws-lc symbols, and
+# an exported symbol cannot be dropped. SoapySDR finds a module through
+# its static initializers (the registration), not through its exports,
+# so the archive is linked with its symbols hidden and the unreferenced
+# code is collected:
+#   ld64      -load_hidden <archive>, -dead_strip
+#   GNU/lld   --exclude-libs,ALL, --gc-sections
+# MSVC exports nothing unasked and already drops unreferenced code in a
+# Release link (/OPT:REF is its default without /DEBUG). A MinGW build
+# is left as it was.
+if (APPLE)
+    SOAPY_SDR_MODULE_UTIL(
+        TARGET aaroniaSupport
+        SOURCES ${AaroniaSupport_SOURCES}
+    )
+    target_link_options(aaroniaSupport PRIVATE
+        "LINKER:-load_hidden,${RUST_STATIC_LIB}"
+        "LINKER:-dead_strip")
+else()
+    SOAPY_SDR_MODULE_UTIL(
+        TARGET aaroniaSupport
+        SOURCES ${AaroniaSupport_SOURCES}
+        LIBRARIES ${RUST_STATIC_LIB}
+    )
+    if (UNIX)
+        target_link_options(aaroniaSupport PRIVATE
+            "LINKER:--exclude-libs,ALL"
+            "LINKER:--gc-sections")
+    endif()
+endif()
 add_dependencies(aaroniaSupport sdr_aaronia_rs_static)
+
+# And in a Release build leave the local symbol names out of the module.
+# They are a fifth of the file on macOS and half of it on Linux, and
+# only name frames in a backtrace; a module built to debug with keeps
+# them:
+#   -DAARONIA_STRIP_MODULE=OFF
+# Measured (arm64, native-sdk on Linux): 14.6 MB before on macOS, 8.1 MB
+# with names, 6.3 MB without; 21.3 MB, 13.4 MB and 6.6 MB on Linux.
+option(AARONIA_STRIP_MODULE
+    "Leave local symbol names out of a Release build of the module"
+    ON)
+if (AARONIA_STRIP_MODULE)
+    if (APPLE)
+        target_link_options(aaroniaSupport PRIVATE "$<$<CONFIG:Release>:LINKER:-x>")
+    elseif (UNIX)
+        target_link_options(aaroniaSupport PRIVATE "$<$<CONFIG:Release>:LINKER:--strip-all>")
+    endif()
+endif()
 
 if (APPLE)
     # Belt and braces with the flag removal above: whichever `-undefined`

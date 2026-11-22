@@ -239,13 +239,17 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-# By default, includes HTTP, File and C FFI backend support
+# By default: HTTP (with TLS, for `https://` URLs), .rtsa files and the C API
 sdr-aaronia-rs = "0.15"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
 
 # To enable additional backends, opt into their features (e.g. native-sdk, futuresdr;
 # futuresdr needs a nightly toolchain, see Feature Flags)
 # sdr-aaronia-rs = { version = "0.15", features = ["native-sdk", "futuresdr"] }
+
+# RTSA itself serves plain http://. Without TLS the HTTP client is about 3 MB
+# smaller in your binary and builds no C code (see Feature Flags)
+# sdr-aaronia-rs = { version = "0.15", default-features = false, features = ["http", "file"] }
 ```
 
 HTTP reads use one timeout budget for the entire requested block and return partial data at a timeout, frequency change, sample-rate change, or detected gap; native-SDK reads likewise stop at a timeout or a change of packet geometry (centre, span or rate). `capture_frequency_hz()` and `capture_sample_rate_hz()` describe the returned samples even when newer packets are queued. File tuning setters preserve the recording's metadata.
@@ -410,16 +414,18 @@ behaviour of `auto_reconnect(false)`.
 
 ## Feature Flags
 
-Functionality is grouped behind Cargo features so unused dependencies stay out of your build. Every feature except `futuresdr` builds on stable Rust (MSRV 1.100); `futuresdr` needs a nightly toolchain, and CI tests it on `nightly-2026-11-21`.
+Functionality is grouped behind Cargo features so unused dependencies stay out of your build. Every feature except `futuresdr` and `futuresdr-audio` builds on stable Rust (MSRV 1.100); those two need a nightly toolchain, and CI tests them on `nightly-2026-11-21`.
 
 | Feature | Description | Default |
 |---|---|---|
-| `http` | HTTP streaming via `reqwest` and `tokio`. | **Yes** |
+| `http` | HTTP streaming via `reqwest` and `tokio`. On its own it speaks plain `http://` only. | **Yes** |
+| `tls` | `https://` base URLs (an RTSA server behind a TLS-terminating proxy) and HTTP/2 when the proxy offers it, via rustls and aws-lc. About 3 MB of a linked binary, and the one part of the build that compiles C. Without it an `https://` URL is refused when the client is built. Implies `http`. | **Yes** |
 | `file` | Buffered RTSA file parsing. | **Yes** |
 | `native-sdk` | Links the proprietary Aaronia C++ SDK. Windows/Linux only. | No |
 | `futuresdr` | Enables the FutureSDR 0.10 block API: `HttpSource`, `HttpSink`, and their builders (plus `SdkSinkBlock` with `native-sdk`). Implies `http`. FutureSDR 0.10 uses unstable language features, so this feature builds only on a nightly toolchain. | No |
 | `seify` | `SpectranSeifyDevice`, a seify 0.26 driver (see [seify](#seify-rust-native)). Implies `http` and `file`. | No |
-| `ffi` | Builds the C-API export layer. | **Yes** |
+| `futuresdr-audio` | FutureSDR's audio blocks (cpal, rodio, symphonia), for `examples/noaa_scanner.rs`. No block in this crate needs them. Implies `futuresdr`. | No |
+| `ffi` | Compiles the C API (`c_api`, `include/spectran.h`). The C library itself is built on request, with `cargo rustc --crate-type` (see [PLUGINS.md](PLUGINS.md)). Implies `http` and `file`. | **Yes** |
 
 ## Testing & Contributing
 

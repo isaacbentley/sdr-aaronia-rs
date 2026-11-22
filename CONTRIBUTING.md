@@ -8,7 +8,7 @@ First off, thank you for considering contributing to `sdr-aaronia-rs`! This docu
 rustup toolchain install nightly-2026-11-21 --component clippy
 ```
 
-So the checks split in two. On **stable**, name every feature except `futuresdr` — `--features http,file,ffi,seify,native-sdk` — wherever you would have passed `--all-features`. On the **pinned nightly**, `cargo +nightly-2026-11-21 … --all-features` covers everything, `futuresdr` included. (If a Homebrew or other non-rustup `cargo` comes first on your `PATH`, `+toolchain` is not understood; `scripts/ci-local.sh` resolves the toolchain's own `cargo` with `rustup which` for this reason.)
+So the checks split in two. On **stable**, name every feature except `futuresdr` and `futuresdr-audio` (the NOAA example's audio blocks, which imply it) — `--features http,file,ffi,tls,seify,native-sdk` — wherever you would have passed `--all-features`. On the **pinned nightly**, `cargo +nightly-2026-11-21 … --all-features` covers everything, `futuresdr` included. (If a Homebrew or other non-rustup `cargo` comes first on your `PATH`, `+toolchain` is not understood; `scripts/ci-local.sh` resolves the toolchain's own `cargo` with `rustup which` for this reason.)
 
 ## Quick Start
 
@@ -19,8 +19,8 @@ cd sdr-aaronia-rs
 # Run the standard validation suite (stable: every feature but futuresdr)
 cargo test                                        # unit + integration + properties (default features)
 cargo test --test spec_coverage -- --nocapture    # spec inventory report
-cargo test --features http,file,ffi,seify,native-sdk
-cargo clippy --workspace --features http,file,ffi,seify,native-sdk --all-targets -- -D warnings
+cargo test --features http,file,ffi,tls,seify,native-sdk
+cargo clippy --workspace --features http,file,ffi,tls,seify,native-sdk --all-targets -- -D warnings
 cargo fmt --all --check
 
 # The futuresdr feature too (pinned nightly)
@@ -41,9 +41,10 @@ scripts/ci-local.sh
 It reproduces the **exact** command each GitHub Actions job runs — fmt,
 clippy and `cargo test` with every feature but `futuresdr` on stable,
 `cargo deny --all-features check`, `cargo hack check --each-feature
---no-dev-deps --exclude-features futuresdr`, `cargo machete`, the
+--no-dev-deps --exclude-features futuresdr,futuresdr-audio`, `cargo machete`, the
 `nightly` step (`clippy` and `test` with `--all-features`, plus
-`futuresdr` on its own through cargo-hack, on `nightly-2026-11-21`), and
+`futuresdr` and `futuresdr-audio` on their own through cargo-hack, on
+`nightly-2026-11-21`), and
 the pinned-nightly Miri module suite — and fails fast with install
 hints for any missing tool. Skip individual steps with e.g.
 `SKIP="miri hack" scripts/ci-local.sh` when iterating.
@@ -54,8 +55,11 @@ and the *all-features* dependency graph, so a default-features
 will pass. `cargo deny` stays on `--all-features` on stable because it
 only resolves metadata and never compiles `futuresdr`. The feature list
 the stable steps pass (`STABLE_FEATURES` in `ci.yml` and the script) is
-every Cargo feature but `futuresdr`, so a new feature goes into both,
-and into release.yml's `cargo semver-checks` step. If
+every Cargo feature but `futuresdr` and `futuresdr-audio`, so a new
+feature goes into both, and into release.yml's `cargo semver-checks`
+step. `http` without `tls` is a supported build (no TLS, no HTTP/2):
+`cargo hack` checks it, and `cargo test --no-default-features --features
+http,file,ffi --lib` runs its tests. If
 you edit `.github/workflows/ci.yml`, update `scripts/ci-local.sh` in the
 same commit (and vice versa), and run `actionlint .github/workflows/*.yml`.
 
@@ -208,8 +212,8 @@ Three additional CI jobs gate every PR; run their tools locally if your change t
 ```bash
 cargo install cargo-deny cargo-hack cargo-machete
 cargo deny check                                  # licenses/advisories/bans, driven by deny.toml
-cargo hack check --each-feature --no-dev-deps --exclude-features futuresdr   # every feature compiles on its own
-cargo +nightly-2026-11-21 hack check --each-feature --no-dev-deps --include-features futuresdr   # ... futuresdr too
+cargo hack check --each-feature --no-dev-deps --exclude-features futuresdr,futuresdr-audio   # every feature compiles on its own
+cargo +nightly-2026-11-21 hack check --each-feature --no-dev-deps --include-features futuresdr,futuresdr-audio   # ... the FutureSDR ones too
 cargo machete                                     # no unused dependencies
 ```
 
