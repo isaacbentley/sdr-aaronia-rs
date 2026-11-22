@@ -81,8 +81,12 @@ jobs:
       - name: cargo semver-checks
         run: |
           baseline=$(git describe --tags --match 'v*' --abbrev=0 "$GITHUB_SHA^")
+          # `tls` is new in 0.15.1: a baseline before it has no such feature,
+          # so it is asked of the current revision only.
+          tls=--features
+          git show "$baseline:Cargo.toml" | grep -q '^tls *=' || tls=--current-features
           cargo semver-checks check-release --baseline-rev "$baseline" \
-            --only-explicit-features --features http,file,ffi,tls,seify,native-sdk
+            --only-explicit-features --features http,file,ffi,seify,native-sdk "$tls" tls
 
   validate:
     name: Release CI

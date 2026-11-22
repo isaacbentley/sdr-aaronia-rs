@@ -28,7 +28,7 @@ cargo +nightly-2026-11-21 clippy --workspace --all-features --all-targets -- -D 
 cargo +nightly-2026-11-21 test --all-features
 ```
 
-Note that a plain `cargo test` builds with the default features; suites gated on non-default features (e.g. `http_sink_test`, which needs `futuresdr`, and so the nightly) are skipped. CI runs `cargo test --features http,file,ffi,seify,native-sdk` on stable (Linux, macOS, Windows) and `cargo test --all-features` on the pinned nightly (Linux, Windows).
+Note that a plain `cargo test` builds with the default features; suites gated on non-default features (e.g. `http_sink_test`, which needs `futuresdr`, and so the nightly) are skipped. CI runs `cargo test --features http,file,ffi,tls,seify,native-sdk` on stable, the library tests again without `tls`, (Linux, macOS, Windows) and `cargo test --all-features` on the pinned nightly (Linux, Windows).
 
 ## Pre-push: mirror CI locally
 

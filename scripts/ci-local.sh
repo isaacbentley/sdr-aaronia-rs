@@ -123,6 +123,8 @@ if ! skipped test; then
     # test outcome is identical, so plain `cargo test` suffices here.
     step "cargo test --features $STABLE_FEATURES  (PROPTEST_CASES=$PROPTEST_CASES)"
     cargo test --features "$STABLE_FEATURES"
+    step "cargo test --lib --no-default-features --features http,file,ffi  (no tls)"
+    cargo test --lib --no-default-features --features http,file,ffi
 fi
 
 # ---- nightly job (--all-features, futuresdr included) --------------

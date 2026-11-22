@@ -119,6 +119,11 @@ jobs:
         if: matrix.os != 'ubuntu-latest'
         run: cargo test --features ${{ env.STABLE_FEATURES }}
 
+      # The library without `tls`: an https:// URL is refused, and nothing else
+      # tests that path.
+      - name: cargo test --lib without tls
+        run: cargo test --lib --no-default-features --features http,file,ffi
+
       - name: cargo test + coverage (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: cargo llvm-cov --features ${{ env.STABLE_FEATURES }} --lcov --output-path lcov.info

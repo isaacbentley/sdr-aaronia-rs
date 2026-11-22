@@ -163,6 +163,9 @@ if (APPLE)
     target_link_options(aaroniaSupport PRIVATE
         "LINKER:-load_hidden,${RUST_STATIC_LIB}"
         "LINKER:-dead_strip")
+    # A link option is not a file the link depends on: without this a
+    # rebuilt archive left the module linked against the old one.
+    set_property(TARGET aaroniaSupport APPEND PROPERTY LINK_DEPENDS ${RUST_STATIC_LIB})
 else()
     SOAPY_SDR_MODULE_UTIL(
         TARGET aaroniaSupport
